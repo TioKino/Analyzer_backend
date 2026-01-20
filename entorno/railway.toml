@@ -1,0 +1,23 @@
+# ============================================================
+# DJ ANALYZER PRO - RAILWAY DEPLOYMENT
+# ============================================================
+#
+# Este archivo configura el despliegue automático en Railway.app
+#
+# PASOS:
+# 1. Crea cuenta en railway.app
+# 2. Conecta tu repositorio GitHub (carpeta backend/)
+# 3. Configura variables de entorno en Railway Dashboard:
+#    - AUDD_API_TOKEN
+#    - DISCOGS_TOKEN
+# 4. Railway detectará este archivo automáticamente
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
