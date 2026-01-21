@@ -26,7 +26,7 @@ import hashlib
 import requests
 from typing import Dict, List, Optional
 from pydantic import BaseModel
-from config import AUDD_API_TOKEN, DISCOGS_TOKEN, print_config
+from config import AUDD_API_TOKEN, DISCOGS_TOKEN, print_config, BASE_URL
 
 if __name__ == "__main__":
     print_config()  # Muestra configuración al arrancar
@@ -34,8 +34,6 @@ if __name__ == "__main__":
 # ==================== IMPORTS LOCALES ====================
 from database import AnalysisDB
 
-# URL base del servidor (cambiar según tu red)
-BASE_URL = "http://192.168.4.20:8000"
 
 # Importar funciones de artwork y cue points
 try:
