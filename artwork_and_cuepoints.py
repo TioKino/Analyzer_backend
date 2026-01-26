@@ -12,7 +12,7 @@ Exporta:
 - search_artwork_online()
 - ARTWORK_CACHE_DIR
 """
-
+from config import LASTFM_API_KEY
 import os
 import base64
 import requests
@@ -39,7 +39,7 @@ def search_artwork_online(artist: str, title: str, album: str = None) -> Optiona
     
     # Limpiar query
     query = f"{artist} {title}".replace("(", "").replace(")", "").replace("-", " ")
-    print(f"  🔍 Buscando artwork online: {artist} - {title}")
+    print(f"  🔍 Buscando artwork online: {artist} - {title}")
     
     # 1. Intentar iTunes (no requiere API key)
     print(f"    → Intentando iTunes...")
@@ -161,7 +161,7 @@ def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
         from urllib.parse import quote
         
         # Intentar primero buscar el track
-        url = f"https://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key=57ee3318536b23ee81d6b27e36997cde&artist={quote(artist)}&track={quote(title)}&format=json"
+        url = f"https://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key={LASTFM_API_KEY}&artist={quote(artist)}&track={quote(title)}&format=json"
         
         response = requests.get(url, timeout=8)
         if response.status_code == 200:

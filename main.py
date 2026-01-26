@@ -13,9 +13,9 @@ Estructura:
 - api_config.py / config.py - Configuración
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, JSONResponse
 import librosa
 import numpy as np
 import tempfile
@@ -26,7 +26,33 @@ import hashlib
 import requests
 from typing import Dict, List, Optional
 from pydantic import BaseModel
-from config import AUDD_API_TOKEN, DISCOGS_TOKEN, print_config, BASE_URL
+from pydantic import BaseModel
+from spectral_genre_classifier import classify_genre_advanced
+from config import (
+    AUDD_API_TOKEN, 
+    DISCOGS_TOKEN, 
+    print_config, 
+    BASE_URL,
+    CORS_ORIGINS,
+    DEBUG,
+)
+
+# 🆕 Importar módulo de validación
+from validation import (
+    validate_audio_file,
+    validate_bpm_range,
+    validate_energy_range,
+    validate_limit,
+    sanitize_string,
+    validate_key,
+    validate_camelot,
+    validate_track_type,
+    validate_genre,
+    validate_track_id,
+    check_rate_limit,
+    get_client_ip,
+    ValidationError,
+)
 
 if __name__ == "__main__":
     print_config()  # Muestra configuración al arrancar
@@ -53,7 +79,8 @@ except ImportError:
     ARTWORK_CACHE_DIR = "artwork_cache"
     search_artwork_online = None
 
-# Importar detección de género
+# Importar clasificador espectral de géneros
+from spectral_genre_classifier import classify_genre_advanced
 try:
     from genre_detection import GenreDetector
     from api_config import DISCOGS_TOKEN
@@ -85,11 +112,23 @@ app = FastAPI(title="DJ Analyzer Pro API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS if not DEBUG else ["*"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
+
+# 🆕 Manejador de errores de validación
+@app.exception_handler(ValidationError)
+async def validation_error_handler(request: Request, exc: ValidationError):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "validation_error",
+            "detail": exc.detail,
+            "field": getattr(exc, 'field', None)
+        }
+    )
 
 # Inicializar BD
 db = AnalysisDB()
@@ -519,61 +558,6 @@ def classify_track_type(energy: float, segments: dict, duration: float) -> str:
         return "closing"
     return "peak" if energy > 0.6 else "warmup"
 
-def classify_genre_advanced(bpm: float, energy: float, has_bass: bool, 
-                           y, sr, percussion_density: float, 
-                           spectral_centroid, rolloff) -> str:
-    brightness = float(np.mean(spectral_centroid))
-    
-    if 120 <= bpm <= 140:
-        if 0.4 < percussion_density < 0.7 and brightness > 2500:
-            return "detroit techno"
-        if brightness > 3500 and energy > 0.55:
-            return "acid techno"
-        if has_bass and energy > 0.65 and brightness < 2000:
-            return "industrial techno"
-        if energy > 0.75 and percussion_density > 0.7:
-            return "hard techno"
-        if energy > 0.6 and 0.5 < percussion_density < 0.8:
-            return "peak time techno"
-        if energy < 0.5 and percussion_density < 0.5:
-            return "hypnotic techno"
-        if brightness > 2800 and 0.4 < energy < 0.7:
-            return "melodic techno"
-        return "techno"
-    
-    elif 135 <= bpm <= 145:
-        return "uplifting trance" if brightness > 3000 else "progressive trance"
-    
-    elif 145 <= bpm <= 170:
-        if bpm > 160:
-            return "hardcore"
-        elif energy > 0.8:
-            return "hardstyle"
-        else:
-            return "uptempo hardcore"
-    
-    elif 115 <= bpm < 130:
-        if has_bass and energy > 0.6:
-            return "tech house"
-        elif brightness > 2500:
-            return "progressive house"
-        else:
-            return "deep house"
-    
-    elif 160 <= bpm <= 180:
-        if brightness > 3000:
-            return "liquid dnb"
-        elif energy > 0.7:
-            return "neurofunk"
-        else:
-            return "drum & bass"
-    
-    elif 68 <= bpm <= 75 or 136 <= bpm <= 150:
-        if energy > 0.7:
-            return "dubstep"
-    
-    return "electronic"
-
 def detect_vocals_improved(y, sr, spectral_centroid):
     try:
         centroid_mean = float(np.mean(spectral_centroid))
@@ -795,7 +779,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     title_name = id3_data.get('title')
     
     if GENRE_DETECTOR_ENABLED and genre_detector and artist_name and title_name:
-        print(f"  🔍 Buscando género: {artist_name} - {title_name}")
+        print(f"  🔍 Buscando género: {artist_name} - {title_name}")
         # 1. Intentar Discogs primero (mejor para electrónica)
         try:
             discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
@@ -864,7 +848,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
             if artwork_info:
                 print(f"  ⚠️ Artwork ID3 muy pequeño ({artwork_info.get('size', 0)} bytes), buscando online...")
             else:
-                print(f"  🔍 Sin artwork ID3, buscando online...")
+                print(f"  🔍 Sin artwork ID3, buscando online...")
             
             artist_name = id3_data.get('artist')
             title_name = id3_data.get('title')
@@ -931,9 +915,24 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
 # ==================== ENDPOINTS PRINCIPALES ====================
 
 @app.post("/analyze", response_model=AnalysisResult)
-async def analyze_track(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.m4a')):
-        raise HTTPException(400, "Formato no soportado")
+async def analyze_track(request: Request, file: UploadFile = File(...)):
+    # 🆕 Rate limiting (opcional - descomenta si quieres)
+    # check_rate_limit(get_client_ip(request))
+    
+    # 🆕 Validación mejorada de archivo
+    if not file.filename:
+        raise HTTPException(400, "No se proporcionó archivo")
+    
+    if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg')):
+        raise HTTPException(400, "Formato no soportado. Permitidos: mp3, wav, flac, m4a, aac, ogg")
+    
+    # Leer contenido y validar tamaño
+    content = await file.read()
+    max_size = 100 * 1024 * 1024  # 100 MB
+    if len(content) > max_size:
+        raise HTTPException(400, f"Archivo demasiado grande. Máximo: 100 MB")
+    if len(content) < 1000:
+        raise HTTPException(400, "Archivo demasiado pequeño o corrupto")
     
     # Verificar si ya existe en BD
     existing = db.get_track_by_filename(file.filename)
@@ -942,7 +941,6 @@ async def analyze_track(file: UploadFile = File(...)):
         return AnalysisResult(**analysis_json)
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
     
@@ -1086,14 +1084,18 @@ async def analyze_track(file: UploadFile = File(...)):
 
 @app.post("/correction")
 async def save_correction(request: CorrectionRequest):
-    """Guardar corrección manual del usuario"""
-    db.save_correction(
-        request.track_id, 
-        request.field, 
-        request.old_value, 
-        request.new_value, 
-        request.fingerprint
-    )
+    # 🆕 Validar campos
+    track_id = validate_track_id(request.track_id)
+    field = sanitize_string(request.field, max_length=50, allow_empty=False, field_name="field")
+    old_value = sanitize_string(request.old_value, max_length=200, field_name="old_value")
+    new_value = sanitize_string(request.new_value, max_length=200, allow_empty=False, field_name="new_value")
+    
+    # Validar que el campo sea uno permitido
+    allowed_fields = {'genre', 'bpm', 'key', 'camelot', 'energy', 'artist', 'title', 'label', 'track_type'}
+    if field not in allowed_fields:
+        raise HTTPException(400, f"Campo no permitido: {field}. Permitidos: {', '.join(allowed_fields)}")
+    
+    db.save_correction(track_id, field, old_value, new_value, request.fingerprint)
     return {"status": "ok", "message": "Corrección guardada"}
 
 # ==================== IDENTIFICAR TRACK CON AUDD ====================
@@ -1128,7 +1130,7 @@ async def identify_track(file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
         
-        print(f"🔍 Identificando track: {file.filename}")
+        print(f"🔍 Identificando track: {file.filename}")
         fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
         
         # ==================== PASO 1: IDENTIFICAR CON AUDD ====================
@@ -1140,7 +1142,7 @@ async def identify_track(file: UploadFile = File(...)):
             fragment_path = tmp_path + "_fragment.wav"
             sf.write(fragment_path, y, sr)
             audio_to_send = fragment_path
-            print(f"  📎 Fragmento extraído: 20 seg desde 0:30")
+            print(f"  🔎 Fragmento extraído: 20 seg desde 0:30")
         except Exception as e:
             print(f"  ⚠️ No se pudo extraer fragmento: {e}")
         
@@ -1184,7 +1186,7 @@ async def identify_track(file: UploadFile = File(...)):
         genre_source = "default"
         
         if GENRE_DETECTOR_ENABLED and genre_detector and artist and title:
-            print(f"  🔍 Buscando género: {artist} - {title}")
+            print(f"  🔍 Buscando género: {artist} - {title}")
             try:
                 discogs_result = genre_detector.get_discogs_genre(artist, title)
                 if discogs_result and discogs_result.get('genre'):
@@ -1218,7 +1220,7 @@ async def identify_track(file: UploadFile = File(...)):
         bpm_source = 'pending'
         key_source = 'pending'
         
-        print(f"  🔬 Re-analizando audio...")
+        print(f"  🔍¬ Re-analizando audio...")
         try:
             y_full, sr_full = librosa.load(tmp_path, sr=22050, mono=True)
             duration = librosa.get_duration(y=y_full, sr=sr_full)
@@ -1261,7 +1263,7 @@ async def identify_track(file: UploadFile = File(...)):
             print(f"  ⚠️ Re-análisis falló: {e}")
             # 🆕 FALLBACK 1: Buscar en BD colectiva
             if artist and title:
-                print(f"  🔍 Buscando en BD colectiva...")
+                print(f"  🔍 Buscando en BD colectiva...")
                 collective_data = search_collective_db(artist, title)
                 if collective_data:
                     if collective_data.get('bpm'):
@@ -1280,7 +1282,7 @@ async def identify_track(file: UploadFile = File(...)):
                     print(f"    ✗ No encontrado en BD colectiva")
                     
                     # 🆕 FALLBACK 2: Buscar en Beatport
-                    print(f"  🔍 Buscando en Beatport: {artist} - {title}")
+                    print(f"  🔍 Buscando en Beatport: {artist} - {title}")
                     beatport_data = search_beatport(artist, title)
                     if beatport_data:
                         if beatport_data.get('bpm'):
@@ -1427,7 +1429,7 @@ async def recognize_audio(file: UploadFile = File(...)):
         track_data = result.get('result')
         
         if not track_data:
-            print("🔇 No se reconoció ninguna canción")
+            print("🔍‡ No se reconoció ninguna canción")
             return {"status": "not_found", "message": "No se pudo identificar la canción"}
         
         # Extraer datos
@@ -1567,84 +1569,210 @@ async def search_by_artist(artist: str, limit: int = Query(50, ge=1, le=200)):
 
 @app.get("/search/genre/{genre}")
 async def search_by_genre(genre: str, limit: int = Query(100, ge=1, le=500)):
-    """Buscar tracks por género"""
-    results = db.search_by_genre(genre, limit)
-    return {"query": genre, "count": len(results), "tracks": results}
+    # 🆕 Sanitizar género
+    genre = validate_genre(genre)
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_genre(genre, limit)}
 
 @app.get("/search/bpm")
 async def search_by_bpm(
-    min_bpm: float = Query(60, ge=30, le=300),
-    max_bpm: float = Query(200, ge=30, le=300),
+    request: Request,
+    min_bpm: Optional[float] = None,
+    max_bpm: Optional[float] = None,
     limit: int = Query(100, ge=1, le=500)
 ):
-    """Buscar tracks por rango de BPM"""
-    results = db.search_by_bpm_range(min_bpm, max_bpm, limit)
-    return {"min_bpm": min_bpm, "max_bpm": max_bpm, "count": len(results), "tracks": results}
+    # 🆕 Validar rangos
+    min_bpm, max_bpm = validate_bpm_range(min_bpm, max_bpm)
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_bpm(min_bpm, max_bpm, limit)}
 
 @app.get("/search/energy")
 async def search_by_energy(
-    min_energy: int = Query(1, ge=1, le=10),
-    max_energy: int = Query(10, ge=1, le=10),
+    request: Request,
+    min_energy: Optional[int] = None,
+    max_energy: Optional[int] = None,
     limit: int = Query(100, ge=1, le=500)
 ):
-    """Buscar tracks por nivel de energía DJ (1-10)"""
-    results = db.search_by_energy(min_energy, max_energy, limit)
-    return {"min_energy": min_energy, "max_energy": max_energy, "count": len(results), "tracks": results}
+    # 🆕 Validar rangos
+    min_energy, max_energy = validate_energy_range(min_energy, max_energy)
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_energy(min_energy, max_energy, limit)}
 
 @app.get("/search/key/{key}")
 async def search_by_key(key: str, limit: int = Query(100, ge=1, le=500)):
-    """Buscar tracks por tonalidad"""
-    results = db.search_by_key(key, limit)
-    return {"key": key, "count": len(results), "tracks": results}
+    # 🆕 Validar tonalidad
+    try:
+        key = validate_key(key)
+    except ValidationError:
+        # Si no es válido como key, intentar como está
+        key = sanitize_string(key, max_length=10)
+    
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_key(key, limit)}
 
 @app.get("/search/compatible/{camelot}")
 async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=200)):
-    """Buscar tracks con tonalidades compatibles para mezcla"""
-    results = db.search_compatible_keys(camelot, limit)
+    # 🆕 Validar Camelot
+    camelot = validate_camelot(camelot)
+    limit = validate_limit(limit, max_limit=200)
     
-    compatible_keys = []
-    if camelot and len(camelot) >= 2:
-        try:
-            number = int(camelot[:-1])
-            letter = camelot[-1].upper()
-            prev_num = 12 if number == 1 else number - 1
-            next_num = 1 if number == 12 else number + 1
-            other_letter = 'B' if letter == 'A' else 'A'
-            compatible_keys = [camelot, f'{prev_num}{letter}', f'{next_num}{letter}', f'{number}{other_letter}']
-        except:
-            pass
+    # Obtener keys compatibles
+    compatible = CAMELOT_COMPATIBLE.get(camelot, [camelot])
     
-    return {"camelot": camelot, "compatible_keys": compatible_keys, "count": len(results), "tracks": results}
+    return {
+        "camelot": camelot,
+        "compatible_keys": compatible,
+        "tracks": db.search_by_compatible_keys(compatible, limit)
+    }
+@app.get("/search-analyzed")
+async def search_analyzed_track(
+    artist: str = Query(..., description="Nombre del artista"),
+    title: str = Query(..., description="Título del track")
+):
+    """
+    Busca si un track ya fue analizado por algún usuario.
+    Devuelve TODA la información del análisis si existe.
+    
+    Returns:
+        - found: bool - Si se encontró el track
+        - track: dict - Toda la información del análisis (si existe)
+        - in_collective: bool - Si está en la memoria colectiva
+    """
+    import re
+    
+    # Validar y sanitizar entrada
+    artist_clean = sanitize_string(artist, max_length=200, allow_empty=False, field_name="artist")
+    title_clean = sanitize_string(title, max_length=200, allow_empty=False, field_name="title")
+    
+    # Normalizar para búsqueda
+    artist_normalized = artist_clean.lower().strip()
+    title_normalized = re.sub(
+        r'\s*\(?(Original Mix|Extended Mix|Radio Edit|Remix|Club Mix|Dub Mix)\)?', 
+        '', 
+        title_clean, 
+        flags=re.IGNORECASE
+    ).lower().strip()
+    
+    try:
+        conn = db.conn
+        cursor = conn.cursor()
+        
+        # Búsqueda exacta primero
+        cursor.execute("""
+            SELECT * FROM tracks 
+            WHERE LOWER(artist) = ? AND LOWER(title) LIKE ?
+            AND bpm IS NOT NULL AND bpm > 0
+            ORDER BY analyzed_at DESC
+            LIMIT 1
+        """, (artist_normalized, f"%{title_normalized}%"))
+        
+        row = cursor.fetchone()
+        
+        if not row:
+            # Búsqueda más flexible
+            cursor.execute("""
+                SELECT * FROM tracks 
+                WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
+                AND bpm IS NOT NULL AND bpm > 0
+                ORDER BY analyzed_at DESC
+                LIMIT 1
+            """, (f"%{artist_normalized}%", f"%{title_normalized}%"))
+            row = cursor.fetchone()
+        
+        if row:
+            # Convertir a dict usando el método existente
+            track_dict = db._row_to_dict(row)
+            
+            # Si hay analysis_json, parsear para obtener todos los campos
+            if track_dict and track_dict.get('analysis_json'):
+                try:
+                    full_analysis = json.loads(track_dict['analysis_json'])
+                    # Combinar con los campos básicos
+                    track_dict.update(full_analysis)
+                except:
+                    pass
+            
+            # Eliminar el JSON crudo del response
+            if track_dict and 'analysis_json' in track_dict:
+                del track_dict['analysis_json']
+            
+            return {
+                "found": True,
+                "in_collective": True,
+                "track": track_dict
+            }
+        
+        return {
+            "found": False,
+            "in_collective": False,
+            "track": None
+        }
+        
+    except Exception as e:
+        print(f"Error en search-analyzed: {e}")
+        return {
+            "found": False,
+            "in_collective": False,
+            "track": None,
+            "error": str(e)
+        }
 
 @app.get("/search/track-type/{track_type}")
 async def search_by_track_type(track_type: str, limit: int = Query(100, ge=1, le=500)):
-    """Buscar tracks por tipo (warmup, peak, closing)"""
-    results = db.search_by_track_type(track_type, limit)
-    return {"track_type": track_type, "count": len(results), "tracks": results}
+    # 🆕 Validar tipo de track
+    track_type = validate_track_type(track_type)
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_track_type(track_type, limit)}
 
 @app.post("/search/advanced")
-async def search_advanced(request: SearchRequest):
-    """Búsqueda avanzada combinando múltiples criterios"""
-    results = db.search_advanced(
-        artist=request.artist,
-        genre=request.genre,
-        min_bpm=request.min_bpm,
-        max_bpm=request.max_bpm,
-        min_energy=request.min_energy,
-        max_energy=request.max_energy,
-        key=request.key,
-        track_type=request.track_type,
-        limit=request.limit
-    )
-    return {"filters": request.dict(exclude_none=True), "count": len(results), "tracks": results}
+async def search_advanced(search_request: SearchRequest):
+    # 🆕 Validar y sanitizar todos los campos
+    filters = {}
+    
+    if search_request.artist:
+        filters['artist'] = sanitize_string(search_request.artist, max_length=100)
+    
+    if search_request.genre:
+        filters['genre'] = validate_genre(search_request.genre)
+    
+    if search_request.min_bpm is not None or search_request.max_bpm is not None:
+        filters['min_bpm'], filters['max_bpm'] = validate_bpm_range(
+            search_request.min_bpm, 
+            search_request.max_bpm
+        )
+    
+    if search_request.min_energy is not None or search_request.max_energy is not None:
+        filters['min_energy'], filters['max_energy'] = validate_energy_range(
+            search_request.min_energy,
+            search_request.max_energy
+        )
+    
+    if search_request.key:
+        try:
+            filters['key'] = validate_key(search_request.key)
+        except ValidationError:
+            filters['key'] = sanitize_string(search_request.key, max_length=10)
+    
+    if search_request.track_type:
+        filters['track_type'] = validate_track_type(search_request.track_type)
+    
+    filters['limit'] = validate_limit(search_request.limit, max_limit=500)
+    
+    return {"tracks": db.search_advanced(**filters)}
 
 # ==================== ENDPOINTS DE BIBLIOTECA ====================
 
 @app.get("/library/all")
 async def get_all_tracks(limit: int = Query(1000, ge=1, le=5000)):
-    """Obtener todos los tracks analizados"""
-    results = db.get_all_tracks(limit)
-    return {"count": len(results), "tracks": results}
+    # 🆕 Validar límite
+    limit = validate_limit(limit, max_limit=5000)
+    
+    return {"tracks": db.get_all_tracks(limit)}
 
 @app.get("/library/artists")
 async def get_unique_artists():

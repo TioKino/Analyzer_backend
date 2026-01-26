@@ -35,6 +35,7 @@ AUDD_API_TOKEN: str = os.getenv('AUDD_API_TOKEN', '')
 # Discogs API - Metadata de géneros
 # https://www.discogs.com/settings/developers
 DISCOGS_TOKEN: str = os.getenv('DISCOGS_TOKEN', '')
+LASTFM_API_KEY: str = os.getenv('LASTFM_API_KEY', '')
 
 # MusicBrainz User Agent (no requiere token)
 MUSICBRAINZ_USER_AGENT: str = os.getenv(
@@ -145,13 +146,13 @@ def print_config():
     print("  🎧 DJ ANALYZER PRO - CONFIGURACIÓN")
     print("=" * 55)
     print(f"  📍 Modo:       {'DEBUG' if DEBUG else 'PRODUCCIÓN'}")
-    print(f"  🌐 Base URL:   {BASE_URL}")
-    print(f"  🔌 Host:Port:  {HOST}:{PORT}")
+    print(f"  🌐 Base URL:   {BASE_URL}")
+    print(f"  🔍Œ Host:Port:  {HOST}:{PORT}")
     print(f"  💾 Database:   {DATABASE_PATH}")
     print(f"  🖼️  Artwork:    {ARTWORK_CACHE_DIR}")
     print("-" * 55)
-    print(f"  🔑 AudD:       {'✓ Configurado' if AUDD_API_TOKEN else '✗ No configurado'}")
-    print(f"  🔑 Discogs:    {'✓ Configurado' if DISCOGS_TOKEN else '✗ No configurado'}")
+    print(f"  🔍‘ AudD:       {'✓ Configurado' if AUDD_API_TOKEN else '✗ No configurado'}")
+    print(f"  🔍‘ Discogs:    {'✓ Configurado' if DISCOGS_TOKEN else '✗ No configurado'}")
     print(f"  📦 dotenv:     {'✓ Cargado' if _DOTENV_LOADED else '○ No disponible'}")
     
     if warnings:

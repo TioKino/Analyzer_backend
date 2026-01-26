@@ -1,4 +1,0 @@
-# Configuración de APIs
-DISCOGS_TOKEN = "CFOGyEFEJIuSKezpOntkpVQjiKqnhpADAzrhVtaM"  # Lo sacas de Discogs
-ACOUSTICBRAINZ_ENABLED = True
-DISCOGS_ENABLED = True

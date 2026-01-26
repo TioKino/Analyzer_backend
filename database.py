@@ -6,7 +6,15 @@ from typing import List, Dict, Optional
 class AnalysisDB:
     def __init__(self, db_path="analysis.db"):
         self.db_path = db_path
+        self._conn = None  # Conexión persistente
         self.init_db()
+    
+    @property
+    def conn(self):
+        """Propiedad que retorna una conexión a la BD (lazy loading)"""
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        return self._conn
     
     def init_db(self):
         conn = sqlite3.connect(self.db_path)

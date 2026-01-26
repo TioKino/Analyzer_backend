@@ -1,0 +1,19 @@
+# Dependencias para tests del backend DJ Analyzer Pro
+# Instalar con: pip install -r requirements-test.txt
+
+# Testing framework
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+
+# HTTP client para tests
+httpx>=0.24.0
+
+# Mocking
+pytest-mock>=3.10.0
+
+# Reporting
+pytest-html>=3.2.0
+
+# Parallel execution (opcional)
+pytest-xdist>=3.0.0
