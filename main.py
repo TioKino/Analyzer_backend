@@ -24,6 +24,7 @@ import re
 import json
 import hashlib
 import requests
+import sqlite3
 from typing import Dict, List, Optional
 from pydantic import BaseModel
 from pydantic import BaseModel
@@ -1915,3 +1916,53 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "version": "2.3.0"}
+
+# ==================== ADMIN / RESET ====================
+
+@app.delete("/admin/reset-database")
+async def reset_database(confirm: str = Query(..., description="Escribe 'CONFIRMAR' para borrar")):
+    """
+    ⚠️ PELIGROSO: Borra TODA la base de datos.
+    Requiere confirmar escribiendo 'CONFIRMAR' como parámetro.
+    """
+    if confirm != "CONFIRMAR":
+        raise HTTPException(400, "Debes escribir 'CONFIRMAR' para borrar la base de datos")
+    
+    try:
+        import shutil
+        
+        # Borrar artwork cache
+        if os.path.exists(ARTWORK_CACHE_DIR):
+            shutil.rmtree(ARTWORK_CACHE_DIR)
+            os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+        
+        # Borrar y recrear BD
+        conn = sqlite3.connect(db.db_path)
+        c = conn.cursor()
+        c.execute("DELETE FROM tracks")
+        c.execute("DELETE FROM corrections")
+        c.execute("DELETE FROM dj_notes")
+        conn.commit()
+        conn.close()
+        
+        return {
+            "status": "ok",
+            "message": "Base de datos reseteada completamente",
+            "artwork_cache": "limpiado",
+            "tracks": "eliminados",
+            "corrections": "eliminadas"
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Error reseteando: {str(e)}")
+
+@app.delete("/admin/clear-artwork-cache")
+async def clear_artwork_cache():
+    """Limpia solo el caché de artwork"""
+    import shutil
+    try:
+        if os.path.exists(ARTWORK_CACHE_DIR):
+            shutil.rmtree(ARTWORK_CACHE_DIR)
+            os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+        return {"status": "ok", "message": "Caché de artwork limpiado"}
+    except Exception as e:
+        raise HTTPException(500, f"Error: {str(e)}")

@@ -77,10 +77,11 @@ class AnalysisDB:
         conn.commit()
         conn.close()
     
-    def _row_to_dict(self, row) -> Optional[Dict]:
+def _row_to_dict(self, row) -> Optional[Dict]:
         if not row:
             return None
-        return {
+        
+        base_dict = {
             'id': row[0],
             'filename': row[1],
             'artist': row[2],
@@ -96,6 +97,21 @@ class AnalysisDB:
             'analyzed_at': row[12],
             'fingerprint': row[13]
         }
+        
+        # Extraer campos adicionales del analysis_json (artwork_url, label, etc.)
+        if row[11]:  # analysis_json
+            try:
+                full_analysis = json.loads(row[11])
+                # Añadir campos importantes que no están en las columnas
+                for key in ['artwork_url', 'artwork_embedded', 'label', 'year', 'album', 
+                           'isrc', 'bpm_source', 'key_source', 'genre_source',
+                           'cue_points', 'first_beat', 'beat_interval', 'drop_timestamp']:
+                    if key in full_analysis and full_analysis[key] is not None:
+                        base_dict[key] = full_analysis[key]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        return base_dict
     
     def _rows_to_list(self, rows) -> List[Dict]:
         return [self._row_to_dict(row) for row in rows if row]
