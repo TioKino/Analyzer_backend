@@ -1,5 +1,0 @@
-.env
-__pycache__/
-*.pyc
-artwork_cache/
-analysis.db
