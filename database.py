@@ -76,8 +76,8 @@ class AnalysisDB:
         
         conn.commit()
         conn.close()
-    
-def _row_to_dict(self, row) -> Optional[Dict]:
+
+    def _row_to_dict(self, row) -> Optional[Dict]:
         if not row:
             return None
         
