@@ -4,7 +4,7 @@ import json
 from typing import List, Dict, Optional
 
 class AnalysisDB:
-    def __init__(self, db_path="analysis.db"):
+    def __init__(self, db_path="/data/analysis.db"):
         self.db_path = db_path
         self._conn = None  # Conexión persistente
         self.init_db()

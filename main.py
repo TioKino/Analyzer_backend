@@ -91,7 +91,7 @@ try:
 except ImportError:
     print("âš ï¸ artwork_and_cuepoints.py no encontrado - funciones deshabilitadas")
     ARTWORK_ENABLED = False
-    ARTWORK_CACHE_DIR = "artwork_cache"
+    ARTWORK_CACHE_DIR = "/data/artwork_cache"
     search_artwork_online = None
 
 # Importar clasificador espectral de géneros

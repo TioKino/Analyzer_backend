@@ -1,5 +1,5 @@
 """
-DJ Analyzer Pro - Artwork & Cue Points Module v2.3.0
+DJ ANALYZER - Artwork & Cue Points Module v2.3.0
 ====================================================
 Módulo para extracción de artwork y detección de cue points.
 
@@ -19,8 +19,8 @@ import requests
 from typing import Optional, List, Dict
 import numpy as np
 
-# Constante para el directorio de caché
-ARTWORK_CACHE_DIR = "artwork_cache"
+# Constante para el directorio de cache
+ARTWORK_CACHE_DIR = "/data/artwork_cache"
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
 
 # ==================== 0. BÚSQUEDA DE ARTWORK ONLINE ====================
