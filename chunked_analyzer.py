@@ -314,7 +314,8 @@ class ChunkedAudioAnalyzer:
         """Combina las curvas de energía de todos los chunks."""
         full_curve = []
         for r in chunk_results:
-            curve = r.get('energy', {}).get('energy_curve', [])
+            # La curva viene directamente en 'energy_curve', no anidada
+            curve = r.get('energy_curve', [])
             full_curve.extend(curve)
         
         # Ordenar por tiempo
@@ -417,21 +418,43 @@ class ChunkedAudioAnalyzer:
     def detect_cue_points_from_structure(self, structure: Dict, duration: float, bpm: float) -> List[Dict]:
         """
         Genera cue points basados en la estructura detectada.
+        Incluye: mix_in, intro_end, buildup, drop, breakdown, outro_start, mix_out
         """
         cue_points = []
         sections = structure.get('sections', [])
         
-        # Cue 1: Primer beat (inicio del track)
+        # Calcular beats por barra (4 beats) para alinear cue points
+        beat_duration = 60.0 / bpm if bpm > 0 else 0.5
+        bar_duration = beat_duration * 4
+        
+        def snap_to_bar(time_sec):
+            """Alinea el tiempo al inicio de la barra más cercana"""
+            return round(time_sec / bar_duration) * bar_duration
+        
+        # Cue 1: Mix In - punto óptimo para empezar a mezclar (después de intro)
+        intro_end_time = 0.0
+        for section in sections:
+            if section.get('type') == 'intro':
+                intro_end_time = section.get('end', 0)
+        
+        if intro_end_time > 0:
+            mix_in_time = snap_to_bar(intro_end_time)
+        else:
+            # Si no hay intro detectada, usar 16 o 32 barras
+            mix_in_time = snap_to_bar(min(bar_duration * 16, duration * 0.1))
+        
         cue_points.append({
             'index': 0,
-            'time': 0.0,
-            'type': 'start',
-            'label': 'Start'
+            'time': round(mix_in_time, 2),
+            'type': 'mix_in',
+            'label': 'Mix In'
         })
         
         # Buscar transiciones importantes
         cue_index = 1
         prev_type = None
+        drop_count = 0
+        breakdown_count = 0
         
         for section in sections:
             section_type = section.get('type')
@@ -439,45 +462,77 @@ class ChunkedAudioAnalyzer:
             
             # Detectar cambios de sección relevantes para DJs
             if prev_type != section_type:
-                if section_type == 'drop' and prev_type in ['buildup', 'breakdown', 'intro']:
+                # Fin de intro
+                if prev_type == 'intro' and section_type != 'intro':
                     cue_points.append({
                         'index': cue_index,
-                        'time': round(start_time, 2),
-                        'type': 'drop',
-                        'label': f'Drop {cue_index}'
+                        'time': round(snap_to_bar(start_time), 2),
+                        'type': 'intro_end',
+                        'label': 'Fin Intro'
                     })
                     cue_index += 1
                 
-                elif section_type == 'breakdown' and prev_type == 'drop':
-                    cue_points.append({
-                        'index': cue_index,
-                        'time': round(start_time, 2),
-                        'type': 'breakdown',
-                        'label': f'Breakdown'
-                    })
-                    cue_index += 1
-                
+                # Buildup
                 elif section_type == 'buildup':
                     cue_points.append({
                         'index': cue_index,
-                        'time': round(start_time, 2),
+                        'time': round(snap_to_bar(start_time), 2),
                         'type': 'buildup',
-                        'label': f'Buildup'
+                        'label': 'Buildup'
                     })
                     cue_index += 1
                 
+                # Drop
+                elif section_type == 'drop' and prev_type in ['buildup', 'breakdown', 'intro', 'main']:
+                    drop_count += 1
+                    cue_points.append({
+                        'index': cue_index,
+                        'time': round(snap_to_bar(start_time), 2),
+                        'type': 'drop',
+                        'label': f'Drop {drop_count}' if drop_count > 1 else 'Drop'
+                    })
+                    cue_index += 1
+                
+                # Breakdown
+                elif section_type == 'breakdown' and prev_type in ['drop', 'main']:
+                    breakdown_count += 1
+                    cue_points.append({
+                        'index': cue_index,
+                        'time': round(snap_to_bar(start_time), 2),
+                        'type': 'breakdown',
+                        'label': f'Breakdown {breakdown_count}' if breakdown_count > 1 else 'Breakdown'
+                    })
+                    cue_index += 1
+                
+                # Inicio de outro
                 elif section_type == 'outro' and prev_type != 'outro':
                     cue_points.append({
                         'index': cue_index,
-                        'time': round(start_time, 2),
-                        'type': 'outro',
+                        'time': round(snap_to_bar(start_time), 2),
+                        'type': 'outro_start',
                         'label': 'Outro'
                     })
                     cue_index += 1
             
             prev_type = section_type
         
-        # Limitar a 8 cue points (estándar DJ)
+        # Cue final: Mix Out - punto óptimo para salir de la mezcla
+        # Generalmente 16-32 barras antes del final
+        mix_out_time = snap_to_bar(max(duration - bar_duration * 16, duration * 0.85))
+        cue_points.append({
+            'index': cue_index,
+            'time': round(mix_out_time, 2),
+            'type': 'mix_out',
+            'label': 'Mix Out'
+        })
+        
+        # Ordenar por tiempo y limitar a 8 cue points
+        cue_points.sort(key=lambda x: x['time'])
+        
+        # Reindexar
+        for i, cue in enumerate(cue_points[:8]):
+            cue['index'] = i
+        
         return cue_points[:8]
     
     def calculate_beat_grid(self, bpm: float, first_beat_offset: float = 0.0) -> Dict:
