@@ -1092,7 +1092,11 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
 # ==================== ENDPOINTS PRINCIPALES ====================
 
 @app.post("/analyze", response_model=AnalysisResult)
-async def analyze_track(request: Request, file: UploadFile = File(...)):
+async def analyze_track(
+    request: Request, 
+    file: UploadFile = File(...),
+    force: bool = Query(False, description="Forzar reanalisis ignorando cache")
+):
     # 🆕 Rate limiting (opcional - descomenta si quieres)
     # check_rate_limit(get_client_ip(request))
     
@@ -1111,11 +1115,12 @@ async def analyze_track(request: Request, file: UploadFile = File(...)):
     if len(content) < 1000:
         raise HTTPException(400, "Archivo demasiado pequeño o corrupto")
     
-    # Verificar si ya existe en BD
-    existing = db.get_track_by_filename(file.filename)
-    if existing:
-        analysis_json = json.loads(existing[11]) if len(existing) > 11 else {}
-        return AnalysisResult(**analysis_json)
+    # Verificar si ya existe en BD (solo si no es force)
+    if not force:
+        existing = db.get_track_by_filename(file.filename)
+        if existing:
+            analysis_json = json.loads(existing[11]) if len(existing) > 11 else {}
+            return AnalysisResult(**analysis_json)
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
         tmp.write(content)
