@@ -325,7 +325,9 @@ class ChunkedAudioAnalyzer:
     def detect_structure_from_energy(self, energy_curve: List[Dict], duration: float) -> Dict:
         """
         Detecta estructura del track (intro, drop, breakdown, outro) 
-        a partir de la curva de energía completa.
+        a partir de la curva de energia completa.
+        
+        Mejorado para detectar mejor los drops en tracks con energia constante.
         """
         if not energy_curve:
             return {
@@ -338,13 +340,50 @@ class ChunkedAudioAnalyzer:
                 'drop_timestamp': duration / 3
             }
         
-        # Extraer valores de energía
+        # Extraer valores de energia
         energies = np.array([p['energy'] for p in energy_curve])
         times = np.array([p['time'] for p in energy_curve])
         
-        avg_energy = np.mean(energies)
+        # Filtrar NaN
+        valid_mask = ~np.isnan(energies)
+        if not np.any(valid_mask):
+            return {
+                'has_intro': False,
+                'has_buildup': False,
+                'has_drop': False,
+                'has_breakdown': False,
+                'has_outro': False,
+                'sections': [],
+                'drop_timestamp': duration / 3
+            }
         
-        # Dividir en secciones de ~8 segundos para análisis de estructura
+        energies = energies[valid_mask]
+        times = times[valid_mask]
+        
+        avg_energy = np.mean(energies)
+        max_energy = np.max(energies)
+        min_energy = np.min(energies)
+        energy_range = max_energy - min_energy
+        
+        # Umbrales adaptativos basados en el rango de energia del track
+        # Para tracks con poca variacion, usamos umbrales mas sensibles
+        if energy_range < avg_energy * 0.3:
+            # Track con energia muy constante
+            drop_threshold = avg_energy * 1.15
+            breakdown_threshold = avg_energy * 0.85
+            buildup_factor = 1.08
+        elif energy_range < avg_energy * 0.5:
+            # Track con variacion moderada
+            drop_threshold = avg_energy * 1.25
+            breakdown_threshold = avg_energy * 0.75
+            buildup_factor = 1.12
+        else:
+            # Track con mucha variacion (tipico EDM)
+            drop_threshold = avg_energy * 1.35
+            breakdown_threshold = avg_energy * 0.65
+            buildup_factor = 1.15
+        
+        # Dividir en secciones de ~8 segundos para analisis de estructura
         section_duration = 8.0
         num_sections = max(1, int(duration / section_duration))
         
@@ -355,7 +394,7 @@ class ChunkedAudioAnalyzer:
             start_time = i * section_duration
             end_time = min((i + 1) * section_duration, duration)
             
-            # Encontrar puntos de energía en este rango
+            # Encontrar puntos de energia en este rango
             mask = (times >= start_time) & (times < end_time)
             section_e = energies[mask]
             
@@ -368,32 +407,34 @@ class ChunkedAudioAnalyzer:
         
         section_energies = np.array(section_energies)
         
-        # Detectar características estructurales
-        has_intro = section_energies[0] < avg_energy * 0.6 if len(section_energies) > 0 else False
-        has_outro = section_energies[-1] < avg_energy * 0.6 if len(section_energies) > 0 else False
+        # Detectar caracteristicas estructurales
+        has_intro = section_energies[0] < breakdown_threshold if len(section_energies) > 0 else False
+        has_outro = section_energies[-1] < breakdown_threshold if len(section_energies) > 0 else False
         
+        # Buscar el pico maximo de energia (drop principal)
         max_idx = np.argmax(section_energies)
-        has_drop = section_energies[max_idx] > avg_energy * 1.4
+        has_drop = section_energies[max_idx] > drop_threshold
         drop_time = max_idx * section_duration + 4.0 if has_drop else duration / 3
         
-        has_buildup = has_drop and max_idx > 1 and section_energies[max_idx-1] > section_energies[0] * 1.2
-        has_breakdown = has_drop and max_idx < len(section_energies) - 2 and np.min(section_energies[max_idx+1:]) < avg_energy * 0.6
+        has_buildup = max_idx > 1 and section_energies[max_idx-1] > section_energies[0] * buildup_factor
+        has_breakdown = max_idx < len(section_energies) - 2 and np.min(section_energies[max_idx+1:]) < breakdown_threshold
         
-        # Crear lista de secciones
+        # Crear lista de secciones con mejor clasificacion
         for i, e in enumerate(section_energies):
             start = i * section_duration
             end = min((i + 1) * section_duration, duration)
             
-            if e > avg_energy * 1.4:
+            # Clasificar seccion
+            if e > drop_threshold:
                 section_type = 'drop'
-            elif e < avg_energy * 0.6:
+            elif e < breakdown_threshold:
                 if i < 2:
                     section_type = 'intro'
                 elif i > len(section_energies) - 3:
                     section_type = 'outro'
                 else:
                     section_type = 'breakdown'
-            elif i > 0 and e > section_energies[i-1] * 1.15:
+            elif i > 0 and e > section_energies[i-1] * buildup_factor:
                 section_type = 'buildup'
             else:
                 section_type = 'main'
@@ -402,7 +443,7 @@ class ChunkedAudioAnalyzer:
                 'type': section_type,
                 'start': round(start, 2),
                 'end': round(end, 2),
-                'energy': round(e, 4)
+                'energy': round(e, 4) if not np.isnan(e) else 0.0
             })
         
         return {
