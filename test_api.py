@@ -1,5 +1,5 @@
 """
-DJ Analyzer Pro - Tests del Backend (v3 - 100% adaptados)
+DJ ANALYZER - Tests del Backend (v3 - 100% adaptados)
 =========================================================
 Adaptados completamente a la estructura real de la API
 

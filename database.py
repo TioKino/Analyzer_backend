@@ -478,3 +478,13 @@ class AnalysisDB:
         conn.commit()
         conn.close()
         return deleted
+
+    def delete_track_by_filename(self, filename: str) -> bool:
+        """Elimina un track por su filename para permitir reanalisis completo"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('DELETE FROM tracks WHERE filename = ?', (filename,))
+        deleted = c.rowcount > 0
+        conn.commit()
+        conn.close()
+        return deleted

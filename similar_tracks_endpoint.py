@@ -1,5 +1,5 @@
 """
-DJ Analyzer Pro - Similar Tracks Module v2.3.0
+DJ ANALYZER - Similar Tracks Module v2.3.0
 ==============================================
 Módulo para búsqueda de tracks similares por compatibilidad DJ.
 

@@ -1,5 +1,5 @@
 """
-DJ Analyzer Pro - Configuración del Backend
+DJ ANALYZER - Configuración del Backend
 ============================================
 
 Gestiona configuración usando variables de entorno para seguridad.
@@ -143,7 +143,7 @@ def print_config():
     is_valid, errors, warnings = validate_config()
     
     print("\n" + "=" * 55)
-    print("  🎧 DJ ANALYZER PRO - CONFIGURACIÓN")
+    print("  🎧 DJ ANALYZER - CONFIGURACIÓN")
     print("=" * 55)
     print(f"  📍 Modo:       {'DEBUG' if DEBUG else 'PRODUCCIÓN'}")
     print(f"  🌐 Base URL:   {BASE_URL}")

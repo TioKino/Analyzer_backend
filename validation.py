@@ -1,5 +1,5 @@
 """
-DJ Analyzer Pro - Módulo de Validación
+DJ ANALYZER - Módulo de Validación
 ======================================
 Validación de entrada para todos los endpoints.
 

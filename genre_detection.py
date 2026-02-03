@@ -1,6 +1,6 @@
 """
 ============================================================
-DETECCIÓN DE GÉNEROS - DJ ANALYZER PRO
+DETECCIÓN DE GÉNEROS - DJ ANALYZER
 ============================================================
 
 Sistema UNIVERSAL de detección y normalización de géneros.

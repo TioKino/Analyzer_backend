@@ -1,5 +1,5 @@
 """
-Configuración de pytest para DJ Analyzer Pro
+Configuración de pytest para DJ ANALYZER
 """
 
 import pytest

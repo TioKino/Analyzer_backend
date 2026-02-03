@@ -1,4 +1,4 @@
-# Dependencias para tests del backend DJ Analyzer Pro
+# Dependencias para tests del backend DJ ANALYZER
 # Instalar con: pip install -r requirements-test.txt
 
 # Testing framework

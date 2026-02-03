@@ -1,4 +1,4 @@
-# DJ Analyzer Pro - Requirements Mínimos (sin Essentia)
+# DJ ANALYZER - Requirements Mínimos (sin Essentia)
 # Usar si Essentia da problemas de instalación
 
 fastapi==0.109.0

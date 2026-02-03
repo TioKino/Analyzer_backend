@@ -458,123 +458,239 @@ class ChunkedAudioAnalyzer:
     
     def detect_cue_points_from_structure(self, structure: Dict, duration: float, bpm: float) -> List[Dict]:
         """
-        Genera cue points basados en la estructura detectada.
-        Incluye: mix_in, intro_end, buildup, drop, breakdown, outro_start, mix_out
+        Genera cue points de ALTA CALIDAD basados en la estructura detectada.
+        
+        Principios:
+        - Calidad sobre cantidad
+        - Siempre mix_in y mix_out
+        - Solo puntos realmente utiles para DJ
+        - Tracks lineales = menos cue points
         """
-        cue_points = []
         sections = structure.get('sections', [])
         
-        # Calcular beats por barra (4 beats) para alinear cue points
+        # Calcular alineacion a barras
         beat_duration = 60.0 / bpm if bpm > 0 else 0.5
         bar_duration = beat_duration * 4
         
         def snap_to_bar(time_sec):
-            """Alinea el tiempo al inicio de la barra más cercana"""
+            """Alinea el tiempo al inicio de la barra mas cercana"""
             return round(time_sec / bar_duration) * bar_duration
         
-        # Cue 1: Mix In - punto óptimo para empezar a mezclar (después de intro)
-        intro_end_time = 0.0
-        for section in sections:
-            if section.get('type') == 'intro':
-                intro_end_time = section.get('end', 0)
+        # Extraer energias de las secciones
+        section_energies = [s.get('energy', 0) for s in sections]
+        if not section_energies:
+            # Track sin analisis - solo mix_in y mix_out basicos
+            return [
+                {'index': 0, 'time': round(snap_to_bar(duration * 0.05), 2), 'type': 'mix_in', 'label': 'Mix In'},
+                {'index': 1, 'time': round(snap_to_bar(duration * 0.85), 2), 'type': 'mix_out', 'label': 'Mix Out'}
+            ]
         
-        if intro_end_time > 0:
-            mix_in_time = snap_to_bar(intro_end_time)
+        # Filtrar NaN
+        valid_energies = [e for e in section_energies if e is not None and not np.isnan(e)]
+        if not valid_energies:
+            return [
+                {'index': 0, 'time': round(snap_to_bar(duration * 0.05), 2), 'type': 'mix_in', 'label': 'Mix In'},
+                {'index': 1, 'time': round(snap_to_bar(duration * 0.85), 2), 'type': 'mix_out', 'label': 'Mix Out'}
+            ]
+        
+        avg_energy = np.mean(valid_energies)
+        max_energy = np.max(valid_energies)
+        min_energy = np.min(valid_energies)
+        energy_range = max_energy - min_energy
+        
+        # ==================== DETECTAR PUNTOS CLAVE ====================
+        
+        cue_points = []
+        
+        # 1. MIX IN - despues de la intro o al 5-10% del track
+        intro_end = None
+        for i, section in enumerate(sections):
+            if section.get('type') == 'intro':
+                intro_end = section.get('end', 0)
+            elif intro_end is None and section.get('energy', 0) > avg_energy * 0.8:
+                # Primera seccion con energia "normal" = fin de intro
+                intro_end = section.get('start', 0)
+                break
+        
+        if intro_end and intro_end > duration * 0.03:
+            mix_in_time = snap_to_bar(intro_end)
         else:
-            # Si no hay intro detectada, usar 16 o 32 barras
-            mix_in_time = snap_to_bar(min(bar_duration * 16, duration * 0.1))
+            # Sin intro clara, usar ~32 barras desde el inicio
+            mix_in_time = snap_to_bar(min(bar_duration * 16, duration * 0.08))
         
         cue_points.append({
-            'index': 0,
             'time': round(mix_in_time, 2),
             'type': 'mix_in',
             'label': 'Mix In'
         })
         
-        # Buscar transiciones importantes
-        cue_index = 1
-        prev_type = None
-        drop_count = 0
-        breakdown_count = 0
+        # 2. DROPS - buscar picos SIGNIFICATIVOS de energia
+        # Un drop real es cuando la energia sube mucho respecto a la seccion anterior
+        drops_found = []
         
-        for section in sections:
-            section_type = section.get('type')
-            start_time = section.get('start', 0)
+        for i in range(1, len(sections)):
+            current = sections[i]
+            prev = sections[i-1]
             
-            # Detectar cambios de sección relevantes para DJs
-            if prev_type != section_type:
-                # Fin de intro
-                if prev_type == 'intro' and section_type != 'intro':
-                    cue_points.append({
-                        'index': cue_index,
-                        'time': round(snap_to_bar(start_time), 2),
-                        'type': 'intro_end',
-                        'label': 'Fin Intro'
-                    })
-                    cue_index += 1
-                
-                # Buildup
-                elif section_type == 'buildup':
-                    cue_points.append({
-                        'index': cue_index,
-                        'time': round(snap_to_bar(start_time), 2),
-                        'type': 'buildup',
-                        'label': 'Buildup'
-                    })
-                    cue_index += 1
-                
-                # Drop
-                elif section_type == 'drop' and prev_type in ['buildup', 'breakdown', 'intro', 'main']:
-                    drop_count += 1
-                    cue_points.append({
-                        'index': cue_index,
-                        'time': round(snap_to_bar(start_time), 2),
-                        'type': 'drop',
-                        'label': f'Drop {drop_count}' if drop_count > 1 else 'Drop'
-                    })
-                    cue_index += 1
-                
-                # Breakdown
-                elif section_type == 'breakdown' and prev_type in ['drop', 'main']:
-                    breakdown_count += 1
-                    cue_points.append({
-                        'index': cue_index,
-                        'time': round(snap_to_bar(start_time), 2),
-                        'type': 'breakdown',
-                        'label': f'Breakdown {breakdown_count}' if breakdown_count > 1 else 'Breakdown'
-                    })
-                    cue_index += 1
-                
-                # Inicio de outro
-                elif section_type == 'outro' and prev_type != 'outro':
-                    cue_points.append({
-                        'index': cue_index,
-                        'time': round(snap_to_bar(start_time), 2),
-                        'type': 'outro_start',
-                        'label': 'Outro'
-                    })
-                    cue_index += 1
+            current_energy = current.get('energy', 0)
+            prev_energy = prev.get('energy', 0)
             
-            prev_type = section_type
+            # Validar que no sean NaN
+            if current_energy is None or prev_energy is None:
+                continue
+            if np.isnan(current_energy) or np.isnan(prev_energy):
+                continue
+            
+            # Drop = energia alta + salto significativo desde seccion anterior
+            is_high_energy = current_energy > avg_energy * 1.1
+            is_significant_jump = current_energy > prev_energy * 1.3
+            prev_was_low = prev_energy < avg_energy * 0.85
+            
+            if is_high_energy and (is_significant_jump or prev_was_low):
+                drop_time = current.get('start', 0)
+                # Evitar drops muy cercanos (minimo 20 segundos entre drops)
+                if not drops_found or (drop_time - drops_found[-1]) > 20:
+                    drops_found.append(drop_time)
         
-        # Cue final: Mix Out - punto óptimo para salir de la mezcla
-        # Generalmente 16-32 barras antes del final
-        mix_out_time = snap_to_bar(max(duration - bar_duration * 16, duration * 0.85))
+        # Añadir solo los drops mas importantes (max 2-3)
+        for i, drop_time in enumerate(drops_found[:3]):
+            label = 'Drop' if i == 0 else f'Drop {i+1}'
+            cue_points.append({
+                'time': round(snap_to_bar(drop_time), 2),
+                'type': 'drop',
+                'label': label
+            })
+        
+        # 3. BREAKDOWNS - buscar caidas SIGNIFICATIVAS de energia
+        breakdowns_found = []
+        
+        for i in range(1, len(sections)):
+            current = sections[i]
+            prev = sections[i-1]
+            
+            current_energy = current.get('energy', 0)
+            prev_energy = prev.get('energy', 0)
+            
+            if current_energy is None or prev_energy is None:
+                continue
+            if np.isnan(current_energy) or np.isnan(prev_energy):
+                continue
+            
+            # Breakdown = energia baja + caida significativa
+            is_low_energy = current_energy < avg_energy * 0.7
+            is_significant_drop = current_energy < prev_energy * 0.6
+            prev_was_high = prev_energy > avg_energy
+            
+            # No contar como breakdown si es intro u outro
+            section_position = current.get('start', 0) / duration
+            is_middle = 0.15 < section_position < 0.85
+            
+            if is_low_energy and is_significant_drop and prev_was_high and is_middle:
+                bd_time = current.get('start', 0)
+                # Evitar breakdowns muy cercanos
+                if not breakdowns_found or (bd_time - breakdowns_found[-1]) > 30:
+                    breakdowns_found.append(bd_time)
+        
+        # Añadir solo los breakdowns mas importantes (max 2)
+        for i, bd_time in enumerate(breakdowns_found[:2]):
+            label = 'Breakdown' if i == 0 else f'Breakdown {i+1}'
+            cue_points.append({
+                'time': round(snap_to_bar(bd_time), 2),
+                'type': 'breakdown',
+                'label': label
+            })
+        
+        # 4. BUILDUP - solo si hay un drop claro despues
+        # Buscar la subida ANTES del drop principal
+        if drops_found:
+            main_drop_time = drops_found[0]
+            # Buscar seccion de buildup en los 30 segundos antes del drop
+            for section in sections:
+                section_start = section.get('start', 0)
+                section_end = section.get('end', 0)
+                
+                # Esta en la zona pre-drop?
+                if (main_drop_time - 30) < section_start < (main_drop_time - 4):
+                    section_energy = section.get('energy', 0)
+                    if section_energy and not np.isnan(section_energy):
+                        # Energia media-alta = buildup
+                        if avg_energy * 0.7 < section_energy < avg_energy * 1.2:
+                            cue_points.append({
+                                'time': round(snap_to_bar(section_start), 2),
+                                'type': 'buildup',
+                                'label': 'Buildup'
+                            })
+                            break  # Solo un buildup principal
+        
+        # 5. MIX OUT - siempre, en el ultimo 15% del track o inicio del outro
+        outro_start = None
+        for section in reversed(sections):
+            if section.get('type') == 'outro':
+                outro_start = section.get('start', 0)
+                break
+            # O buscar caida final de energia
+            section_energy = section.get('energy', 0)
+            if section_energy and not np.isnan(section_energy):
+                if section_energy < avg_energy * 0.6 and section.get('start', 0) > duration * 0.8:
+                    outro_start = section.get('start', 0)
+                    break
+        
+        if outro_start and outro_start > duration * 0.7:
+            mix_out_time = snap_to_bar(outro_start)
+        else:
+            # Sin outro claro, usar 85% del track
+            mix_out_time = snap_to_bar(duration * 0.85)
+        
+        # Asegurar que mix_out no sea muy cercano al final
+        mix_out_time = min(mix_out_time, duration - bar_duration * 8)
+        
         cue_points.append({
-            'index': cue_index,
             'time': round(mix_out_time, 2),
             'type': 'mix_out',
             'label': 'Mix Out'
         })
         
-        # Ordenar por tiempo y limitar a 8 cue points
+        # ==================== ORDENAR Y LIMPIAR ====================
+        
+        # Ordenar por tiempo
         cue_points.sort(key=lambda x: x['time'])
         
+        # Eliminar duplicados cercanos (menos de 8 segundos)
+        cleaned = []
+        for cue in cue_points:
+            if not cleaned or (cue['time'] - cleaned[-1]['time']) > 8:
+                cleaned.append(cue)
+            else:
+                # Si hay conflicto, preferir mix_in/mix_out/drop sobre buildup
+                priority = {'mix_in': 5, 'mix_out': 5, 'drop': 4, 'breakdown': 3, 'buildup': 2}
+                if priority.get(cue['type'], 1) > priority.get(cleaned[-1]['type'], 1):
+                    cleaned[-1] = cue
+        
+        # Asegurar que mix_in y mix_out estan presentes
+        has_mix_in = any(c['type'] == 'mix_in' for c in cleaned)
+        has_mix_out = any(c['type'] == 'mix_out' for c in cleaned)
+        
+        if not has_mix_in:
+            cleaned.insert(0, {
+                'time': round(snap_to_bar(duration * 0.05), 2),
+                'type': 'mix_in',
+                'label': 'Mix In'
+            })
+        
+        if not has_mix_out:
+            cleaned.append({
+                'time': round(snap_to_bar(duration * 0.85), 2),
+                'type': 'mix_out',
+                'label': 'Mix Out'
+            })
+        
         # Reindexar
-        for i, cue in enumerate(cue_points[:8]):
+        for i, cue in enumerate(cleaned):
             cue['index'] = i
         
-        return cue_points[:8]
+        print(f"    🎯 Cue points detectados: {len(cleaned)} (drops: {len(drops_found)}, breakdowns: {len(breakdowns_found)})")
+        
+        return cleaned
     
     def calculate_beat_grid(self, bpm: float, first_beat_offset: float = 0.0) -> Dict:
         """Calcula el beat grid basado en BPM."""

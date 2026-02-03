@@ -2,14 +2,6 @@
 Audio Analyzer Pro para DJ Analyzer Pro
 ========================================
 
-Módulo de análisis de audio con algoritmos mejorados usando Librosa.
-Implementa técnicas avanzadas para mayor precisión:
-
-- BPM: Autocorrelación + filtrado de armónicos + voting
-- Key: Krumhansl-Schmuckler con perfiles optimizados para electrónica
-- Energía: Análisis perceptual con loudness
-- Estructura: Detección de drops, buildups, breakdowns
-
 v3.0.1 - Librosa optimizado (sin dependencias de Essentia)
 """
 
@@ -21,10 +13,10 @@ import warnings
 try:
     import librosa
     LIBROSA_AVAILABLE = True
-    print("✓ Librosa cargado correctamente")
+    print("Librosa cargado correctamente")
 except ImportError:
     LIBROSA_AVAILABLE = False
-    print("❌ Librosa no disponible")
+    print("Librosa no disponible")
 
 # Essentia no disponible en este sistema
 ESSENTIA_AVAILABLE = False
@@ -45,7 +37,7 @@ KEY_TO_CAMELOT = {
 KRUMHANSL_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 KRUMHANSL_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 
-# Perfiles EDMA (Electronic Dance Music Analysis) - optimizados para electrónica
+# Perfiles EDMA (Electronic Dance Music Analysis) - optimizados para electronica
 EDMA_MAJOR = np.array([7.0, 2.0, 3.5, 2.0, 4.5, 4.0, 2.0, 5.5, 2.0, 3.5, 2.0, 3.0])
 EDMA_MINOR = np.array([7.0, 2.5, 3.5, 5.5, 2.0, 3.5, 2.5, 5.0, 4.0, 2.5, 3.5, 3.0])
 
@@ -57,7 +49,7 @@ class ImprovedLibrosaAnalyzer:
     
     def __init__(self, use_edma_profiles: bool = True):
         if not LIBROSA_AVAILABLE:
-            raise ImportError("Librosa no está instalado")
+            raise ImportError("Librosa no esta instalado")
         
         self.use_edma = use_edma_profiles
         self.major_profile = EDMA_MAJOR if use_edma_profiles else KRUMHANSL_MAJOR
@@ -66,26 +58,26 @@ class ImprovedLibrosaAnalyzer:
         self.major_profile = self.major_profile / np.sum(self.major_profile)
         self.minor_profile = self.minor_profile / np.sum(self.minor_profile)
         
-        print(f"✓ ImprovedLibrosaAnalyzer inicializado (EDMA: {use_edma_profiles})")
+        print(f"ImprovedLibrosaAnalyzer inicializado (EDMA: {use_edma_profiles})")
     
     def load_audio(self, file_path: str, sample_rate: int = 44100) -> Tuple[np.ndarray, int]:
         y, sr = librosa.load(file_path, sr=sample_rate, mono=True)
         return y, sr
     
     def analyze_bpm_improved(self, y: np.ndarray, sr: int = 44100) -> Dict:
-        """BPM con múltiples técnicas y voting."""
+        """BPM con multiples tecnicas y voting."""
         try:
-            # Método 1: Beat tracking estándar
+            # Metodo 1: Beat tracking estandar
             tempo_standard, beats = librosa.beat.beat_track(y=y, sr=sr)
             tempo_standard = float(tempo_standard)
             
-            # Método 2: Onset + autocorrelación
+            # Metodo 2: Onset + autocorrelacion
             onset_env = librosa.onset.onset_strength(y=y, sr=sr)
             tempo_autocorr = librosa.feature.tempo(
                 onset_envelope=onset_env, sr=sr, aggregate=None
             )
             
-            # Método 3: PLP
+            # Metodo 3: PLP
             try:
                 pulse = librosa.beat.plp(onset_envelope=onset_env, sr=sr)
                 tempo_plp = float(60.0 * sr / (np.argmax(pulse) + 1)) if len(pulse) > 0 else tempo_standard
@@ -126,7 +118,7 @@ class ImprovedLibrosaAnalyzer:
                 'source': 'librosa_improved'
             }
         except Exception as e:
-            print(f"⚠️ Error BPM: {e}")
+            print(f" Error BPM: {e}")
             return {'bpm': 120.0, 'confidence': 0.0, 'source': 'error'}
     
     def _filter_harmonics(self, candidates: List[float]) -> List[float]:
@@ -192,7 +184,7 @@ class ImprovedLibrosaAnalyzer:
                 'source': 'librosa_improved'
             }
         except Exception as e:
-            print(f"⚠️ Error Key: {e}")
+            print(f" Error Key: {e}")
             return {'key': 'C', 'camelot': '8B', 'confidence': 0.0, 'source': 'error'}
     
     def analyze_energy(self, y: np.ndarray, sr: int = 44100) -> Dict:
@@ -218,7 +210,7 @@ class ImprovedLibrosaAnalyzer:
                 'source': 'librosa_improved'
             }
         except Exception as e:
-            print(f"⚠️ Error Energy: {e}")
+            print(f" Error Energy: {e}")
             return {'energy_dj': 5, 'source': 'error'}
     
     def analyze_spectral(self, y: np.ndarray, sr: int = 44100) -> Dict:
@@ -245,10 +237,10 @@ class ImprovedLibrosaAnalyzer:
     
     def detect_vocals(self, y: np.ndarray, sr: int = 44100) -> Dict:
         """
-        Detección de vocals DESACTIVADA.
-        La detección automática genera muchos falsos positivos en música electrónica.
+        Deteccion de vocals DESACTIVADA.
+        La deteccion automatica genera muchos falsos positivos en musica electronica.
         """
-        # Siempre devolver False - la detección no es fiable para electrónica
+        # Siempre devolver False - la deteccion no es fiable para electronica
         return {
             'has_vocals': False,
             'confidence': 0.0,
@@ -303,7 +295,7 @@ class ImprovedLibrosaAnalyzer:
             return {'has_drop': False, 'sections': [], 'source': 'error'}
     
     def full_analysis(self, file_path: str, sample_rate: int = 44100) -> Dict:
-        print(f"🔬 Analizando: {file_path}")
+        print(f"ðŸ”¬ Analizando: {file_path}")
         
         y, sr = self.load_audio(file_path, sample_rate)
         duration = len(y) / sr
@@ -315,7 +307,7 @@ class ImprovedLibrosaAnalyzer:
         vocals = self.detect_vocals(y, sr)
         structure = self.analyze_structure(y, sr)
         
-        print(f"  → BPM: {bpm.get('bpm')} | Key: {key.get('key')}/{key.get('camelot')} | Energy: {energy.get('energy_dj')}/10")
+        print(f"  â†’ BPM: {bpm.get('bpm')} | Key: {key.get('key')}/{key.get('camelot')} | Energy: {energy.get('energy_dj')}/10")
         
         return {
             'duration': duration,
@@ -340,4 +332,4 @@ if __name__ == "__main__":
     print("Audio Analyzer Pro - Test")
     print("="*50)
     analyzer = get_analyzer()
-    print(f"✓ {type(analyzer).__name__} listo")
+    print(f"“ {type(analyzer).__name__} listo")
