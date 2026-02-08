@@ -131,6 +131,18 @@ class AnalysisDB:
         result = c.fetchone()
         conn.close()
         return self._row_to_dict(result)
+
+    def get_track_by_fingerprint(self, fingerprint: str) -> Optional[Dict]:
+        """Busca un track por su fingerprint de audio (memoria colectiva)"""
+        if not fingerprint:
+            return None
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        # Buscar por fingerprint O por id (que a veces es el fingerprint)
+        c.execute('SELECT * FROM tracks WHERE fingerprint = ? OR id = ?', (fingerprint, fingerprint))
+        result = c.fetchone()
+        conn.close()
+        return self._row_to_dict(result)    
     
     def save_track(self, track_data):
         conn = sqlite3.connect(self.db_path)

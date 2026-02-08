@@ -1115,16 +1115,17 @@ async def analyze_track(
     if len(content) < 1000:
         raise HTTPException(400, "Archivo demasiado pequeño o corrupto")
     
-# Si force=true, eliminar registro antiguo para reanalisis completo
+    # Si force=true, eliminar registro antiguo para reanalisis completo
     if force:
         db.delete_track_by_filename(file.filename)
     else:
-        # Verificar si ya existe en BD
+        # Verificar si ya existe en BD por filename
         existing = db.get_track_by_filename(file.filename)
         if existing:
             analysis_json = json.loads(existing[11]) if len(existing) > 11 else {}
             return AnalysisResult(**analysis_json)
     
+    # Guardar archivo temporal para calcular fingerprint
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -1133,7 +1134,82 @@ async def analyze_track(
         import warnings
         warnings.filterwarnings('ignore')
         
+        # Calcular fingerprint del archivo
         fingerprint = calculate_fingerprint(tmp_path)
+        
+        # NUEVO: Buscar por fingerprint si no se encontro por filename
+        # Esto recupera datos de AudD guardados previamente
+        if not force:
+            existing_by_fp = db.get_track_by_fingerprint(fingerprint)
+            if existing_by_fp:
+                print(f"[Cache] Track encontrado por fingerprint: {existing_by_fp.get('artist')} - {existing_by_fp.get('title')}")
+                
+                # Actualizar el filename en la BD para futuras busquedas
+                existing_by_fp['filename'] = file.filename
+                db.save_track(existing_by_fp)
+                
+                # Intentar construir respuesta desde analysis_json
+                if existing_by_fp.get('analysis_json'):
+                    try:
+                        analysis_data = json.loads(existing_by_fp['analysis_json'])
+                        # Limpiar archivo temporal antes de retornar
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+                        return AnalysisResult(**analysis_data)
+                    except Exception as e:
+                        print(f"[Cache] Error parseando analysis_json: {e}")
+                
+                # Si no hay analysis_json valido, construir desde los campos
+                try:
+                    result = AnalysisResult(
+                        title=existing_by_fp.get('title'),
+                        artist=existing_by_fp.get('artist'),
+                        album=existing_by_fp.get('album'),
+                        label=existing_by_fp.get('label'),
+                        year=existing_by_fp.get('year'),
+                        duration=existing_by_fp.get('duration') or 0,
+                        bpm=existing_by_fp.get('bpm') or 0,
+                        bpm_confidence=0.8,
+                        bpm_source=existing_by_fp.get('bpm_source') or 'cached',
+                        key=existing_by_fp.get('key'),
+                        camelot=existing_by_fp.get('camelot'),
+                        key_confidence=0.8,
+                        key_source=existing_by_fp.get('key_source') or 'cached',
+                        energy_raw=0,
+                        energy_normalized=0,
+                        energy_dj=existing_by_fp.get('energy_dj') or 5,
+                        genre=existing_by_fp.get('genre') or 'Unknown',
+                        genre_source=existing_by_fp.get('genre_source') or 'cached',
+                        track_type=existing_by_fp.get('track_type') or 'peak',
+                        artwork_url=existing_by_fp.get('artwork_url'),
+                        artwork_embedded=existing_by_fp.get('artwork_embedded') or False,
+                        has_intro=False,
+                        has_buildup=False,
+                        has_drop=False,
+                        has_breakdown=False,
+                        has_outro=False,
+                        structure_sections=[],
+                        has_vocals=False,
+                        has_heavy_bass=False,
+                        has_pads=False,
+                        groove_score=0,
+                        swing_factor=0,
+                        percussion_density=0,
+                        mix_energy_start=0,
+                        mix_energy_end=0,
+                        drop_timestamp=0,
+                        cue_points=existing_by_fp.get('cue_points') or [],
+                        first_beat=existing_by_fp.get('first_beat') or 0,
+                        beat_interval=existing_by_fp.get('beat_interval') or 0,
+                    )
+                    # Limpiar archivo temporal antes de retornar
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                    return result
+                except Exception as e:
+                    print(f"[Cache] Error construyendo resultado desde cache: {e}")
+                    # Continuar con analisis normal si falla
+        
         collective_genre = db.get_collective_genre(fingerprint)
         
         result = analyze_audio(tmp_path, fingerprint)
@@ -1191,7 +1267,12 @@ async def analyze_track(
         print(f" Intentando fallback para: {file.filename}")
         
         try:
-            fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
+            # Intentar fingerprint del contenido primero
+            try:
+                fingerprint = calculate_fingerprint(tmp_path)
+            except Exception:
+                # Si falla (archivo muy corrupto), usar md5 del nombre
+                fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
             
             # Intentar leer metadatos ID3 aunque el audio esté corrupto
             id3_data = {}
@@ -1316,7 +1397,10 @@ async def identify_track(file: UploadFile = File(...)):
             tmp_path = tmp.name
         
         print(f"Identificando track: {file.filename}")
-        fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
+        
+        # Calcular fingerprint del CONTENIDO del archivo (igual que en /analyze)
+        fingerprint = calculate_fingerprint(tmp_path)
+        print(f"  Fingerprint (contenido): {fingerprint[:12]}...")
         
         # ==================== PASO 1: IDENTIFICAR CON AUDD ====================
         audio_to_send = tmp_path
@@ -1329,7 +1413,7 @@ async def identify_track(file: UploadFile = File(...)):
             audio_to_send = fragment_path
             print(f"Fragmento extraído: 20 seg desde 0:30")
         except Exception as e:
-            print(f"No se pudo extraer fragmento: {e}")
+            print(f"No se pudo extraer fragmento, usando archivo completo: {e}")
         
         with open(audio_to_send, 'rb') as audio_file:
             audd_response = requests.post(
@@ -1364,9 +1448,9 @@ async def identify_track(file: UploadFile = File(...)):
         release_date = track_data.get('release_date')
         year = release_date[:4] if release_date and len(release_date) >= 4 else None
         
-        print(f"âœ… AudD identificó: {artist} - {title}")
+        print(f"  AudD identifico: {artist} - {title}")
         
-        # ==================== PASO 2: BUSCAR GÃ‰NERO EN DISCOGS ====================
+        # ==================== PASO 2: BUSCAR GENERO EN DISCOGS ====================
         genre = "Electronic"
         genre_source = "default"
         
@@ -1515,19 +1599,43 @@ async def identify_track(file: UploadFile = File(...)):
             'bpm_source': bpm_source,
             'key': key,
             'camelot': camelot,
+            'key_confidence': 0.8 if key else 0,
             'key_source': key_source,
+            'energy_raw': 0,
+            'energy_normalized': 0,
             'energy_dj': energy_dj,
             'duration': duration,
             'genre': genre,
             'genre_source': genre_source,
             'label': label,
             'year': year,
+            'isrc': None,
             'artwork_url': artwork_url,
-            'track_type': 'Main Floor',  # Default
+            'artwork_embedded': False,
+            'track_type': 'Main Floor',
+            # Campos necesarios para que AnalysisResult funcione al recuperar
+            'has_intro': False,
+            'has_buildup': False,
+            'has_drop': False,
+            'has_breakdown': False,
+            'has_outro': False,
+            'structure_sections': [],
+            'has_vocals': False,
+            'has_heavy_bass': False,
+            'has_pads': False,
+            'groove_score': 0,
+            'swing_factor': 0,
+            'percussion_density': 0,
+            'mix_energy_start': 0,
+            'mix_energy_end': 0,
+            'drop_timestamp': 0,
+            'cue_points': [],
+            'first_beat': 0,
+            'beat_interval': 0,
         }
         
         db.save_track(track_db_data)
-        print(f"Guardado en BD")
+        print(f"  Guardado en BD con fingerprint: {fingerprint[:12]}...")
         
         # ==================== RESPUESTA ====================
         return {
@@ -1744,7 +1852,7 @@ async def get_artwork(track_id: str):
     
     raise HTTPException(404, "Artwork no encontrado")
 
-# ==================== ENDPOINTS DE BÃšSQUEDA ====================
+# ==================== ENDPOINTS DE BUSQUEDA ====================
 
 @app.get("/search/artist/{artist}")
 async def search_by_artist(artist: str, limit: int = Query(50, ge=1, le=200)):
