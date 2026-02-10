@@ -25,6 +25,7 @@ import json
 import hashlib
 import requests
 import sqlite3
+from precision_analyzer import analyze_structure_and_cues
 from typing import Dict, List, Optional
 from pydantic import BaseModel
 from pydantic import BaseModel
@@ -765,10 +766,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     chunk_size = int(sr * 30)
     mix_energy_start = float(np.mean(rms[:min(chunk_size//512, len(rms))]))
     mix_energy_end = float(np.mean(rms[max(0, len(rms)-chunk_size//512):]))
-    
-    # Structure
-    segments = detect_structure(y, sr, duration)
-    
+      
     # Spectral features
     spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
     has_vocals = detect_vocals_improved(y, sr, spectral_centroid)
@@ -839,18 +837,19 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         genre_source = "id3"
         print(f" ID3 (fallback): {genre}")
     
+    # ==================== ANÁLISIS PRECISO v3 ====================
+    # Reemplaza: detect_structure, detect_cue_points, detect_beat_grid
+    precision = analyze_structure_and_cues(y, sr, duration, bpm)
+    
+    # Actualizar segments con secciones precisas
+    segments = precision['structure']
+    
     drop_time = find_drop_timestamp(y, sr, segments)
     
-    # ==================== CUE POINTS ====================
-    cue_points = []
-    first_beat = 0.0
-    beat_interval = 0.5
-    
-    if ARTWORK_ENABLED:
-        cue_points = detect_cue_points(y, sr, duration, segments)
-        beat_grid = detect_beat_grid(y, sr, bpm)
-        first_beat = beat_grid.get('first_beat', 0.0)
-        beat_interval = beat_grid.get('beat_interval', 0.5)
+    # Cue points beat-aligned
+    cue_points = precision['cue_points']
+    first_beat = precision['beat_grid'].get('first_beat', 0.0)
+    beat_interval = precision['beat_grid'].get('beat_interval', 0.5)
     
     # ==================== ARTWORK ====================
     artwork_embedded = False
