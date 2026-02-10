@@ -1021,6 +1021,40 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         genre = id3_genre
         genre_source = "id3"
     
+    # ==================== ANÁLISIS PRECISO v3 (CHUNKED) ====================
+    # Cargar audio a 22050 Hz (mitad de RAM) para precision analysis
+    try:
+        print(f"  🎯 Ejecutando análisis preciso en track chunked...")
+        y_precision, sr_precision = librosa.load(file_path, sr=22050, mono=True)
+        precision = analyze_structure_and_cues(y_precision, sr_precision, duration, bpm)
+        
+        # Sobrescribir structure y cue points con versión precisa
+        segments = precision['structure']
+        cue_points = precision['cue_points']
+        first_beat = precision['beat_grid'].get('first_beat', 0.0)
+        beat_interval = precision['beat_grid'].get('beat_interval', 0.5)
+        drop_time = find_drop_timestamp(y_precision, sr_precision, segments)
+        
+        # Liberar audio
+        del y_precision
+        gc.collect()
+        print(f"    ✓ Precisión aplicada: {len(segments.get('sections', []))} secciones, {len(cue_points)} cues")
+    except Exception as e:
+        print(f"  ⚠️ Error análisis preciso chunked: {e}")
+        # Fallback: usar datos del chunked analyzer
+        segments = {
+            'has_intro': result['has_intro'],
+            'has_buildup': result['has_buildup'],
+            'has_drop': result['has_drop'],
+            'has_breakdown': result['has_breakdown'],
+            'has_outro': result['has_outro'],
+            'sections': result['structure_sections'],
+        }
+        cue_points = result.get('cue_points', [])
+        first_beat = result.get('first_beat', 0.0)
+        beat_interval = result.get('beat_interval', 0.5)
+        drop_time = result.get('drop_timestamp', 30.0)
+    
     # ==================== ARTWORK ====================
     artwork_embedded = False
     artwork_url = None
@@ -1065,12 +1099,12 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         energy_dj=result['energy_dj'],
         groove_score=result['groove_score'],
         swing_factor=result['swing_factor'],
-        has_intro=result['has_intro'],
-        has_buildup=result['has_buildup'],
-        has_drop=result['has_drop'],
-        has_breakdown=result['has_breakdown'],
-        has_outro=result['has_outro'],
-        structure_sections=result['structure_sections'],
+        has_intro=segments.get('has_intro', result['has_intro']),
+        has_buildup=segments.get('has_buildup', result['has_buildup']),
+        has_drop=segments.get('has_drop', result['has_drop']),
+        has_breakdown=segments.get('has_breakdown', result['has_breakdown']),
+        has_outro=segments.get('has_outro', result['has_outro']),
+        structure_sections=segments.get('sections', result['structure_sections']),
         track_type=result['track_type'],
         genre=genre,
         genre_source=genre_source,
@@ -1080,10 +1114,10 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         percussion_density=result['percussion_density'],
         mix_energy_start=result['mix_energy_start'],
         mix_energy_end=result['mix_energy_end'],
-        drop_timestamp=result['drop_timestamp'],
-        cue_points=result['cue_points'],
-        first_beat=result['first_beat'],
-        beat_interval=result['beat_interval'],
+        drop_timestamp=drop_time,
+        cue_points=cue_points,
+        first_beat=first_beat,
+        beat_interval=beat_interval,
         artwork_embedded=artwork_embedded,
         artwork_url=artwork_url,
     )    
