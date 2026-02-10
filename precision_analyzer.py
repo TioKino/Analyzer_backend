@@ -409,7 +409,7 @@ def detect_cue_points_precise(y: np.ndarray, sr: int, duration: float,
             cue_points.append({
                 'timestamp': round(build_start, 2),
                 'type': 'buildup',
-                'name': f'Buildup{f" {i}" if _count_type(sections, "buildup") > 1 else ""}',
+                'name': 'Buildup' + ('' if _count_type(sections, 'buildup') <= 1 else ' %d' % i),
                 'energy': _energy_at_time(energy, energy_times, build_start),
                 'confidence': 0.80,
             })
@@ -421,7 +421,7 @@ def detect_cue_points_precise(y: np.ndarray, sr: int, duration: float,
             cue_points.append({
                 'timestamp': round(drop_onset, 2),
                 'type': 'drop',
-                'name': 'Drop' + (f' {_count_type_before(sections, "drop", i) + 1}' if _count_type(sections, 'drop') > 1 else ''),
+                'name': 'Drop' + ('' if _count_type(sections, 'drop') <= 1 else ' %d' % (_count_type_before(sections, 'drop', i) + 1)),
                 'energy': _energy_at_time(energy, energy_times, drop_onset),
                 'confidence': 0.90,
             })

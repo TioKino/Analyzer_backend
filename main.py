@@ -1022,33 +1022,28 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         genre_source = "id3"
     
     # ==================== ANÁLISIS PRECISO v3 (CHUNKED) ====================
-    # Cargar audio a 22050 Hz (mitad de RAM) para precision analysis
     try:
         print(f"  🎯 Ejecutando análisis preciso en track chunked...")
         y_precision, sr_precision = librosa.load(file_path, sr=22050, mono=True)
         precision = analyze_structure_and_cues(y_precision, sr_precision, duration, bpm)
         
-        # Sobrescribir structure y cue points con versión precisa
         segments = precision['structure']
         cue_points = precision['cue_points']
         first_beat = precision['beat_grid'].get('first_beat', 0.0)
         beat_interval = precision['beat_grid'].get('beat_interval', 0.5)
         drop_time = find_drop_timestamp(y_precision, sr_precision, segments)
         
-        # Liberar audio
         del y_precision
         gc.collect()
-        print(f"    ✓ Precisión aplicada: {len(segments.get('sections', []))} secciones, {len(cue_points)} cues")
+        print(f"    ✓ Precisión: {len(segments.get('sections', []))} secciones, {len(cue_points)} cues")
     except Exception as e:
         print(f"  ⚠️ Error análisis preciso chunked: {e}")
-        # Fallback: usar datos del chunked analyzer
+        import traceback
+        traceback.print_exc()
         segments = {
-            'has_intro': result['has_intro'],
-            'has_buildup': result['has_buildup'],
-            'has_drop': result['has_drop'],
-            'has_breakdown': result['has_breakdown'],
-            'has_outro': result['has_outro'],
-            'sections': result['structure_sections'],
+            'has_intro': result['has_intro'], 'has_buildup': result['has_buildup'],
+            'has_drop': result['has_drop'], 'has_breakdown': result['has_breakdown'],
+            'has_outro': result['has_outro'], 'sections': result['structure_sections'],
         }
         cue_points = result.get('cue_points', [])
         first_beat = result.get('first_beat', 0.0)
