@@ -421,7 +421,7 @@ def detect_cue_points_precise(y: np.ndarray, sr: int, duration: float,
             cue_points.append({
                 'timestamp': round(drop_onset, 2),
                 'type': 'drop',
-                'name': f'Drop{f" {_count_type_before(sections, "drop", i) + 1}" if _count_type(sections, "drop") > 1 else ""}',
+                'name': 'Drop' + (f' {_count_type_before(sections, "drop", i) + 1}' if _count_type(sections, 'drop') > 1 else ''),
                 'energy': _energy_at_time(energy, energy_times, drop_onset),
                 'confidence': 0.90,
             })
