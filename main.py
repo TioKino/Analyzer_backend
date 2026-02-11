@@ -549,18 +549,28 @@ def detect_structure(y, sr, duration):
         'has_breakdown': has_breakdown, 'has_outro': has_outro, 'sections': sections
     }
 
-def find_drop_timestamp(y, sr, segments: dict) -> float:
-    if not segments['sections']:
+def find_drop_timestamp(y, sr, segments: dict, cue_points: list = None) -> float:
+    """Encuentra el timestamp del drop usando cue points de precision si están disponibles."""
+    # 1. Si hay cue points de precision, usar el drop de ahí (más preciso)
+    if cue_points:
+        for cp in cue_points:
+            ts_key = 'timestamp' if 'timestamp' in cp else 'time'
+            if cp.get('type') == 'drop':
+                return cp[ts_key]
+    
+    # 2. Fallback: primera sección drop
+    if not segments.get('sections'):
         return 30.0
     
     for section in segments['sections']:
         if section['type'] == 'drop':
-            return section['start'] + 4.0
+            return section['start']
     
+    # 3. Sección con máxima energía
     max_energy = max(s['energy'] for s in segments['sections'])
     for section in segments['sections']:
         if section['energy'] == max_energy:
-            return section['start'] + 4.0
+            return section['start']
     
     duration = segments['sections'][-1]['end'] if segments['sections'] else 180
     return duration / 3
@@ -844,12 +854,12 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     # Actualizar segments con secciones precisas
     segments = precision['structure']
     
-    drop_time = find_drop_timestamp(y, sr, segments)
-    
     # Cue points beat-aligned
     cue_points = precision['cue_points']
     first_beat = precision['beat_grid'].get('first_beat', 0.0)
     beat_interval = precision['beat_grid'].get('beat_interval', 0.5)
+    
+    drop_time = find_drop_timestamp(y, sr, segments, cue_points)
     
     # ==================== ARTWORK ====================
     artwork_embedded = False
@@ -1031,7 +1041,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         cue_points = precision['cue_points']
         first_beat = precision['beat_grid'].get('first_beat', 0.0)
         beat_interval = precision['beat_grid'].get('beat_interval', 0.5)
-        drop_time = find_drop_timestamp(y_precision, sr_precision, segments)
+        drop_time = find_drop_timestamp(y_precision, sr_precision, segments, cue_points)
         
         del y_precision
         gc.collect()
