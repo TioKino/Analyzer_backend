@@ -551,64 +551,19 @@ def detect_structure(y, sr, duration):
         'has_breakdown': has_breakdown, 'has_outro': has_outro, 'sections': sections
     }
 
-def compute_waveform_data(y, sr, num_bars=1200) -> list:
-    """
-    Computa datos espectrales REALES del audio usando STFT (Short-Time Fourier Transform).
-    Devuelve 1200 barras con bass/mid/treble reales del audio.
-    Esto es lo que Traktor/Rekordbox hacen internamente.
-    """
-    try:
-        # STFT con ventana de ~23ms (1024 samples a 44100Hz)
-        n_fft = 2048
-        hop_length = max(1, len(y) // (num_bars * 2))
+        global_max = 0.0
+        for bar in bars:
+            global_max = max(global_max, bar['b'], bar['m'], bar['t'])
         
-        # Mel spectrogram - descompone en bandas de frecuencia
-        S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop_length))
-        
-        # Frecuencias de cada bin
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-        
-        # Separar en 3 bandas de frecuencia
-        # Bass: 20-250 Hz (kick, sub-bass)
-        # Mids: 250-4000 Hz (vocals, melodies, snares)
-        # Treble: 4000-20000 Hz (hi-hats, cymbals, air)
-        bass_mask = (freqs >= 20) & (freqs < 250)
-        mid_mask = (freqs >= 250) & (freqs < 4000)
-        treble_mask = (freqs >= 4000)
-        
-        # Energía por banda en cada frame
-        bass_energy = np.mean(S[bass_mask, :], axis=0) if bass_mask.any() else np.zeros(S.shape[1])
-        mid_energy = np.mean(S[mid_mask, :], axis=0) if mid_mask.any() else np.zeros(S.shape[1])
-        treble_energy = np.mean(S[treble_mask, :], axis=0) if treble_mask.any() else np.zeros(S.shape[1])
-        
-        # Resample a num_bars barras
-        total_frames = len(bass_energy)
-        frames_per_bar = max(1, total_frames // num_bars)
-        
-        bars = []
-        for i in range(num_bars):
-            start = i * frames_per_bar
-            end = min(start + frames_per_bar, total_frames)
-            if start >= total_frames:
-                bars.append({'b': 0.0, 'm': 0.0, 't': 0.0})
-                continue
-            
-            b = float(np.mean(bass_energy[start:end]))
-            m = float(np.mean(mid_energy[start:end]))
-            t = float(np.mean(treble_energy[start:end]))
-            bars.append({'b': b, 'm': m, 't': t})
-        
-        # Normalizar al pico global (cada banda independiente)
-        max_b = max((bar['b'] for bar in bars), default=1.0) or 1.0
-        max_m = max((bar['m'] for bar in bars), default=1.0) or 1.0
-        max_t = max((bar['t'] for bar in bars), default=1.0) or 1.0
+        if global_max <= 0:
+            global_max = 1.0
         
         for bar in bars:
-            bar['b'] = round(min(bar['b'] / max_b, 1.0), 4)
-            bar['m'] = round(min(bar['m'] / max_m, 1.0), 4)
-            bar['t'] = round(min(bar['t'] / max_t, 1.0), 4)
+            bar['b'] = round(min(bar['b'] / global_max, 1.0), 4)
+            bar['m'] = round(min(bar['m'] / global_max, 1.0), 4)
+            bar['t'] = round(min(bar['t'] / global_max, 1.0), 4)
         
-        print(f"  📊 Waveform: {len(bars)} barras espectrales computadas (STFT real)")
+        print(f"  📊 Waveform: {len(bars)} barras (GLOBAL norm, peak={global_max:.4f})")
         return bars
         
     except Exception as e:
