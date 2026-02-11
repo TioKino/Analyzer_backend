@@ -432,6 +432,8 @@ class AnalysisResult(BaseModel):
     # 🆕 Beat Grid
     first_beat: float = 0.0
     beat_interval: float = 0.5
+    # 🆕 Waveform spectral data (REAL FFT)
+    waveform_data: List[Dict] = []
     # 🆕 Artwork
     artwork_embedded: bool = False
     artwork_url: Optional[str] = None
@@ -548,6 +550,70 @@ def detect_structure(y, sr, duration):
         'has_intro': has_intro, 'has_buildup': has_buildup, 'has_drop': has_drop,
         'has_breakdown': has_breakdown, 'has_outro': has_outro, 'sections': sections
     }
+
+def compute_waveform_data(y, sr, num_bars=1200) -> list:
+    """
+    Computa datos espectrales REALES del audio usando STFT (Short-Time Fourier Transform).
+    Devuelve 1200 barras con bass/mid/treble reales del audio.
+    Esto es lo que Traktor/Rekordbox hacen internamente.
+    """
+    try:
+        # STFT con ventana de ~23ms (1024 samples a 44100Hz)
+        n_fft = 2048
+        hop_length = max(1, len(y) // (num_bars * 2))
+        
+        # Mel spectrogram - descompone en bandas de frecuencia
+        S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop_length))
+        
+        # Frecuencias de cada bin
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        
+        # Separar en 3 bandas de frecuencia
+        # Bass: 20-250 Hz (kick, sub-bass)
+        # Mids: 250-4000 Hz (vocals, melodies, snares)
+        # Treble: 4000-20000 Hz (hi-hats, cymbals, air)
+        bass_mask = (freqs >= 20) & (freqs < 250)
+        mid_mask = (freqs >= 250) & (freqs < 4000)
+        treble_mask = (freqs >= 4000)
+        
+        # Energía por banda en cada frame
+        bass_energy = np.mean(S[bass_mask, :], axis=0) if bass_mask.any() else np.zeros(S.shape[1])
+        mid_energy = np.mean(S[mid_mask, :], axis=0) if mid_mask.any() else np.zeros(S.shape[1])
+        treble_energy = np.mean(S[treble_mask, :], axis=0) if treble_mask.any() else np.zeros(S.shape[1])
+        
+        # Resample a num_bars barras
+        total_frames = len(bass_energy)
+        frames_per_bar = max(1, total_frames // num_bars)
+        
+        bars = []
+        for i in range(num_bars):
+            start = i * frames_per_bar
+            end = min(start + frames_per_bar, total_frames)
+            if start >= total_frames:
+                bars.append({'b': 0.0, 'm': 0.0, 't': 0.0})
+                continue
+            
+            b = float(np.mean(bass_energy[start:end]))
+            m = float(np.mean(mid_energy[start:end]))
+            t = float(np.mean(treble_energy[start:end]))
+            bars.append({'b': b, 'm': m, 't': t})
+        
+        # Normalizar al pico global (cada banda independiente)
+        max_b = max((bar['b'] for bar in bars), default=1.0) or 1.0
+        max_m = max((bar['m'] for bar in bars), default=1.0) or 1.0
+        max_t = max((bar['t'] for bar in bars), default=1.0) or 1.0
+        
+        for bar in bars:
+            bar['b'] = round(min(bar['b'] / max_b, 1.0), 4)
+            bar['m'] = round(min(bar['m'] / max_m, 1.0), 4)
+            bar['t'] = round(min(bar['t'] / max_t, 1.0), 4)
+        
+        print(f"  📊 Waveform: {len(bars)} barras espectrales computadas (STFT real)")
+        return bars
+        
+    except Exception as e:
+        print(f"  ⚠️ Error waveform: {e}")
+        return []
 
 def find_drop_timestamp(y, sr, segments: dict, cue_points: list = None) -> float:
     """Encuentra el timestamp del drop usando cue points de precision si están disponibles."""
@@ -861,6 +927,9 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     
     drop_time = find_drop_timestamp(y, sr, segments, cue_points)
     
+    # ==================== WAVEFORM SPECTRAL (REAL FFT) ====================
+    waveform_data = compute_waveform_data(y, sr)
+    
     # ==================== ARTWORK ====================
     artwork_embedded = False
     artwork_url = None
@@ -944,6 +1013,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         beat_interval=beat_interval,
         artwork_embedded=artwork_embedded,
         artwork_url=artwork_url,
+        waveform_data=waveform_data,
     )
 
 def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> AnalysisResult:
@@ -1032,6 +1102,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         genre_source = "id3"
     
     # ==================== ANÁLISIS PRECISO v3 (CHUNKED) ====================
+    waveform_data = []
     try:
         print(f"  🎯 Ejecutando análisis preciso en track chunked...")
         y_precision, sr_precision = librosa.load(file_path, sr=22050, mono=True)
@@ -1042,6 +1113,9 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         first_beat = precision['beat_grid'].get('first_beat', 0.0)
         beat_interval = precision['beat_grid'].get('beat_interval', 0.5)
         drop_time = find_drop_timestamp(y_precision, sr_precision, segments, cue_points)
+        
+        # Waveform REAL con FFT (antes de liberar memoria)
+        waveform_data = compute_waveform_data(y_precision, sr_precision)
         
         del y_precision
         gc.collect()
@@ -1125,6 +1199,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         beat_interval=beat_interval,
         artwork_embedded=artwork_embedded,
         artwork_url=artwork_url,
+        waveform_data=waveform_data,
     )    
 
 # ==================== ENDPOINTS PRINCIPALES ====================
