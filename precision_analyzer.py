@@ -172,102 +172,124 @@ def compute_energy_curve(y: np.ndarray, sr: int, hop_length: int = 512) -> Tuple
 def detect_structure_precise(y: np.ndarray, sr: int, bpm: float = None, 
                               beat_times: np.ndarray = None) -> Dict:
     """
-    Detección de estructura musical precisa usando novelty curve.
+    Detección de estructura musical precisa v4.
     
-    En lugar de dividir en ventanas fijas, encuentra los puntos reales
-    donde la música cambia y alinea todo a frases musicales (16 beats).
-    
-    Returns:
-        Dict con 'sections', 'has_intro', 'has_buildup', etc.
+    Mejoras vs v3:
+    - Umbral de novelty progresivo (baja hasta encontrar suficientes secciones)
+    - Max section duration (60s) — fuerza split de secciones gigantes
+    - Snap a BAR (4 beats) en vez de frase (16 beats) para más precisión
+    - Clasificación adaptativa con percentiles del propio track
+    - No existe tipo 'body' — todo se clasifica como tipo DJ relevante
     """
     duration = len(y) / sr
     
     if beat_times is None or len(beat_times) < 4:
         beat_times, _, _ = get_beat_times(y, sr, bpm)
     
-    # 1. Compute novelty curve
+    # 1. Compute novelty + energy
     novelty, novelty_times = compute_novelty_curve(y, sr)
     energy, energy_times = compute_energy_curve(y, sr)
     
-    # 2. Find peaks en novelty = section boundaries
-    # Distancia mínima entre secciones: ~8 segundos (2 compases a 120bpm)
+    # 2. Calcular mínimo de secciones esperadas (1 cada ~45s)
+    min_sections = max(4, int(duration / 45))
+    max_section_dur = 60.0  # Ninguna sección > 60 segundos
+    
+    # 3. Buscar boundaries con umbral progresivamente más bajo
     min_distance = int(8.0 * sr / 512)
-    prominence = np.std(novelty) * 1.2  # Solo peaks significativos
+    base_prominence = np.std(novelty)
     
-    peaks, properties = find_peaks(
-        novelty,
-        distance=min_distance,
-        prominence=prominence,
-        height=np.mean(novelty) + np.std(novelty) * 0.5,
-    )
+    boundary_times = None
     
-    # 3. Convertir peaks a timestamps y snap a frase
-    boundary_times = [0.0]  # Siempre empieza en 0
-    
-    for peak_idx in peaks:
-        if peak_idx < len(novelty_times):
-            raw_time = novelty_times[peak_idx]
-            # Snap a frase musical (16 beats) para secciones
-            snapped = snap_to_phrase(raw_time, beat_times, bars_per_phrase=4)
-            # Evitar duplicados y boundaries demasiado cercanos
-            if snapped > boundary_times[-1] + 4.0 and snapped < duration - 4.0:
-                boundary_times.append(snapped)
-    
-    boundary_times.append(duration)
-    
-    # 4. Si hay muy pocas secciones, intentar con threshold más bajo
-    if len(boundary_times) < 4 and duration > 60:
-        peaks2, _ = find_peaks(
+    for factor in [1.2, 0.9, 0.6, 0.4, 0.25]:
+        prom = base_prominence * factor
+        height_thresh = np.mean(novelty) + np.std(novelty) * max(0.1, factor - 0.3)
+        
+        peaks, _ = find_peaks(
             novelty,
             distance=min_distance,
-            prominence=prominence * 0.6,
+            prominence=prom,
+            height=height_thresh,
         )
-        for peak_idx in peaks2:
+        
+        # Convertir a timestamps y snap a bar
+        bounds = [0.0]
+        for peak_idx in peaks:
             if peak_idx < len(novelty_times):
                 raw_time = novelty_times[peak_idx]
-                snapped = snap_to_phrase(raw_time, beat_times, bars_per_phrase=4)
-                if all(abs(snapped - bt) > 8.0 for bt in boundary_times) and 4.0 < snapped < duration - 4.0:
-                    boundary_times.append(snapped)
-        boundary_times.sort()
+                snapped = snap_to_bar(raw_time, beat_times)
+                if snapped > bounds[-1] + 6.0 and snapped < duration - 4.0:
+                    bounds.append(snapped)
+        bounds.append(duration)
+        
+        if len(bounds) - 1 >= min_sections:
+            boundary_times = bounds
+            break
     
-    # 5. Clasificar cada sección por su perfil de energía
-    sections = []
-    avg_energy_global = np.mean(energy)
+    if boundary_times is None:
+        boundary_times = bounds  # Usar lo que tengamos
     
+    # 4. Forzar split de secciones demasiado largas (>60s)
+    boundary_times = _force_split_long_sections(
+        boundary_times, max_section_dur, energy, energy_times, beat_times, duration
+    )
+    
+    # 5. Clasificar con percentiles adaptativos
+    # Primero calcular energía de cada sección
+    raw_sections = []
     for i in range(len(boundary_times) - 1):
         start = boundary_times[i]
         end = boundary_times[i + 1]
-        
-        # Energía media de esta sección
         mask = (energy_times >= start) & (energy_times < end)
-        section_energy = float(np.mean(energy[mask])) if np.any(mask) else 0.5
+        sec_energy = float(np.mean(energy[mask])) if np.any(mask) else 0.5
         
-        # Tendencia de energía (subiendo, bajando, estable)
-        if np.sum(mask) > 2:
-            section_rms = energy[mask]
-            first_quarter = np.mean(section_rms[:len(section_rms)//4+1])
-            last_quarter = np.mean(section_rms[3*len(section_rms)//4:])
-            trend = last_quarter - first_quarter
-        else:
-            trend = 0.0
+        # Tendencia
+        trend = 0.0
+        if np.sum(mask) > 4:
+            sec_rms = energy[mask]
+            q1 = np.mean(sec_rms[:len(sec_rms)//4+1])
+            q4 = np.mean(sec_rms[3*len(sec_rms)//4:])
+            trend = q4 - q1
         
-        # Clasificar
-        section_type = _classify_section(
-            section_energy, avg_energy_global, trend,
-            i, len(boundary_times) - 1, duration, start, end
-        )
+        # Varianza (alta = sección dinámica, baja = estable)
+        variance = float(np.std(energy[mask])) if np.any(mask) else 0.0
         
-        sections.append({
-            'type': section_type,
+        raw_sections.append({
             'start': round(start, 2),
             'end': round(end, 2),
-            'energy': round(section_energy, 3),
+            'energy': round(sec_energy, 3),
+            'trend': round(trend, 4),
+            'variance': round(variance, 4),
         })
     
-    # 6. Post-proceso: fusionar secciones consecutivas iguales muy cortas
-    sections = _merge_short_sections(sections, min_duration=6.0)
+    # Calcular percentiles de energía de ESTE track
+    energies = [s['energy'] for s in raw_sections]
+    if len(energies) >= 3:
+        p25 = float(np.percentile(energies, 25))
+        p50 = float(np.percentile(energies, 50))
+        p75 = float(np.percentile(energies, 75))
+    else:
+        avg = np.mean(energies) if energies else 0.5
+        p25, p50, p75 = avg * 0.7, avg, avg * 1.15
     
-    # 7. Determinar flags
+    # Clasificar cada sección
+    sections = []
+    for i, s in enumerate(raw_sections):
+        s['type'] = _classify_section_v4(
+            s, i, len(raw_sections), duration, p25, p50, p75
+        )
+        sections.append(s)
+    
+    # 6. Post-proceso: limitar buildups, asegurar coherencia
+    sections = _postprocess_sections(sections)
+    
+    # 7. Merge secciones consecutivas del mismo tipo
+    sections = _merge_same_type(sections)
+    
+    # Limpiar campos internos
+    for s in sections:
+        s.pop('trend', None)
+        s.pop('variance', None)
+    
     types_present = set(s['type'] for s in sections)
     
     return {
@@ -277,66 +299,180 @@ def detect_structure_precise(y: np.ndarray, sr: int, bpm: float = None,
         'has_breakdown': 'breakdown' in types_present,
         'has_outro': 'outro' in types_present,
         'sections': sections,
-        'source': 'precision_v3',
+        'source': 'precision_v4',
     }
 
 
-def _classify_section(energy: float, avg: float, trend: float,
-                       index: int, total: int, duration: float,
-                       start: float, end: float) -> str:
+def _force_split_long_sections(boundary_times, max_dur, energy, energy_times, beat_times, duration):
+    """Divide secciones > max_dur buscando el punto de menor energía interno."""
+    result = [boundary_times[0]]
+    
+    for i in range(len(boundary_times) - 1):
+        start = boundary_times[i]
+        end = boundary_times[i + 1]
+        
+        while end - start > max_dur:
+            # Buscar el mínimo de energía en la mitad central de la sección
+            mid_start = start + (end - start) * 0.3
+            mid_end = start + (end - start) * 0.7
+            mask = (energy_times >= mid_start) & (energy_times <= mid_end)
+            
+            if np.any(mask):
+                min_idx = np.argmin(energy[mask])
+                split_time = energy_times[mask][min_idx]
+                split_time = snap_to_bar(split_time, beat_times)
+            else:
+                split_time = snap_to_bar((start + end) / 2, beat_times)
+            
+            # Evitar splits demasiado cercanos al boundary anterior
+            if split_time - start < 12.0:
+                split_time = snap_to_bar(start + max_dur * 0.5, beat_times)
+            if split_time >= end - 8.0:
+                break
+            
+            result.append(split_time)
+            start = split_time
+        
+        result.append(end)
+    
+    result = sorted(set(result))
+    return result
+
+
+def _classify_section_v4(section: Dict, index: int, total: int, 
+                          duration: float, p25: float, p50: float, p75: float) -> str:
     """
-    Clasifica una sección por su energía, posición y tendencia.
+    Clasificación adaptativa v4: usa percentiles del track.
+    
+    Reglas:
+    - INTRO: primera(s) sección(es) con energía < p50
+    - OUTRO: última(s) sección(es) con energía < p50  
+    - DROP: energía >= p75 y estable o descendente (el peak del track)
+    - BUILDUP: tendencia creciente significativa
+    - BREAKDOWN: energía < p25 en zona media del track
+    - GROOVE: energía entre p50-p75, estable (meseta, no pico)
     """
-    section_duration = end - start
-    fraction_start = start / duration
-    fraction_end = end / duration
+    e = section['energy']
+    trend = section['trend']
+    frac_start = section['start'] / duration
+    frac_end = section['end'] / duration
+    sec_dur = section['end'] - section['start']
     
-    # INTRO: primeras secciones con energía baja
-    if index == 0 and energy < avg * 0.7:
+    # ---- INTRO ----
+    if index == 0 and e < p50:
         return 'intro'
-    if fraction_start < 0.15 and energy < avg * 0.65:
+    if frac_end < 0.12 and e < p50:
+        return 'intro'
+    # Intro extendida: primera sección larga con energía baja
+    if index <= 1 and frac_end < 0.20 and e < p25 * 1.15:
         return 'intro'
     
-    # OUTRO: últimas secciones con energía baja
-    if index == total - 1 and energy < avg * 0.7:
+    # ---- OUTRO ----
+    if index == total - 1 and e < p50:
         return 'outro'
-    if fraction_end > 0.85 and energy < avg * 0.65:
+    if frac_start > 0.88 and e < p50:
+        return 'outro'
+    if index >= total - 2 and frac_start > 0.82 and e < p25 * 1.15:
         return 'outro'
     
-    # DROP: energía alta, estable o ligeramente bajando
-    if energy > avg * 1.25:
-        return 'drop'
-    
-    # BUILDUP: energía media-alta con tendencia creciente
-    if trend > 0.08 and energy > avg * 0.6:
-        return 'buildup'
-    
-    # BREAKDOWN: energía baja en el medio del track
-    if energy < avg * 0.55 and 0.15 < fraction_start < 0.85:
+    # ---- BREAKDOWN ----
+    # Energía muy por debajo del track, en la zona media
+    if e < p25 and 0.10 < frac_start < 0.90:
+        return 'breakdown'
+    # Dip significativo respecto a p50
+    if e < p50 * 0.7 and 0.15 < frac_start < 0.85:
         return 'breakdown'
     
-    # BODY: todo lo demás
-    return 'body'
+    # ---- BUILDUP ----
+    # Tendencia creciente clara
+    if trend > 0.06 and e < p75:
+        return 'buildup'
+    # Sección corta antes de una zona de alta energía, con trend positivo
+    if trend > 0.03 and sec_dur < 35 and e > p25:
+        return 'buildup'
+    
+    # ---- DROP ----
+    # Energía alta = peak del track = drop para DJs
+    if e >= p75:
+        return 'drop'
+    # Energía significativamente por encima de la media
+    if e > p50 * 1.15 and e > p25 * 1.4:
+        return 'drop'
+    
+    # ---- GROOVE ----
+    # Energía media-alta, estable — sección "principal" del track
+    # En techno esto es la groove section (kick + hats + percussion)
+    if e >= p50:
+        # Si tiene tendencia descendente leve, podría ser post-drop
+        if trend < -0.04:
+            return 'drop'  # Aún suena a peak, bajando gradualmente
+        return 'drop'  # En techno, groove sections = peak energy = "drop" para DJs
+    
+    # ---- Fallback: clasificar por tendencia ----
+    if trend > 0.02:
+        return 'buildup'
+    if trend < -0.03 and frac_start > 0.7:
+        return 'outro'
+    
+    # Energía media sin tendencia clara = groove ligero
+    if frac_start < 0.15:
+        return 'intro'
+    if frac_start > 0.85:
+        return 'outro'
+    
+    return 'buildup'  # Transición por defecto, nunca "body"
 
 
-def _merge_short_sections(sections: List[Dict], min_duration: float = 6.0) -> List[Dict]:
-    """Fusiona secciones consecutivas del mismo tipo si son muy cortas."""
+def _postprocess_sections(sections: List[Dict]) -> List[Dict]:
+    """
+    Post-proceso para asegurar coherencia estructural:
+    - Max 3 buildups
+    - Al menos 1 drop si hay secciones con energía alta
+    - Breakdowns siempre seguidos de buildup o drop
+    """
+    # Limitar buildups: mantener los 3 más significativos (mayor trend)
+    buildups = [(i, s) for i, s in enumerate(sections) if s['type'] == 'buildup']
+    if len(buildups) > 3:
+        # Ordenar por trend descendente, mantener top 3
+        buildups.sort(key=lambda x: x[1].get('trend', 0), reverse=True)
+        keep_indices = set(b[0] for b in buildups[:3])
+        for i, s in buildups:
+            if i not in keep_indices:
+                # Reclasificar como drop o breakdown según energía
+                energies = [sec['energy'] for sec in sections]
+                p50 = np.percentile(energies, 50) if energies else 0.5
+                s['type'] = 'drop' if s['energy'] >= p50 else 'breakdown'
+    
+    # Asegurar que hay al menos 1 drop
+    has_drop = any(s['type'] == 'drop' for s in sections)
+    if not has_drop and len(sections) > 2:
+        # Encontrar la sección de mayor energía que no sea intro/outro
+        candidates = [(i, s) for i, s in enumerate(sections) 
+                      if s['type'] not in ('intro', 'outro')]
+        if candidates:
+            best = max(candidates, key=lambda x: x[1]['energy'])
+            sections[best[0]]['type'] = 'drop'
+    
+    return sections
+
+
+def _merge_same_type(sections: List[Dict]) -> List[Dict]:
+    """Fusiona secciones consecutivas del MISMO tipo."""
     if len(sections) <= 1:
         return sections
     
-    merged = [sections[0]]
+    merged = [dict(sections[0])]
     for s in sections[1:]:
         prev = merged[-1]
-        if s['type'] == prev['type'] or (s['end'] - s['start'] < min_duration):
-            # Fusionar
+        if s['type'] == prev['type']:
             merged[-1] = {
-                'type': prev['type'] if (prev['end'] - prev['start']) >= (s['end'] - s['start']) else s['type'],
+                'type': prev['type'],
                 'start': prev['start'],
                 'end': s['end'],
                 'energy': round((prev['energy'] + s['energy']) / 2, 3),
             }
         else:
-            merged.append(s)
+            merged.append(dict(s))
     
     return merged
 
