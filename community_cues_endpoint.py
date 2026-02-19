@@ -313,5 +313,85 @@ def register_community_endpoints(app, db):
                 for r in rows
             ],
         }
+
+    # ==================== USER CUES (PERSONAL SYNC) ====================
+
+    @app.get("/user-cues/{device_id}/{fingerprint}")
+    async def get_user_cues_for_track(device_id: str, fingerprint: str):
+        """
+        Devuelve los cues de un DJ especifico para un track.
+        El movil usa esto para mostrar los cues que el usuario puso en desktop.
+        """
+        conn = db.conn
+        c = conn.cursor()
+        c.execute(
+            'SELECT cue_type, position_ms, end_position_ms, note, created_at '
+            'FROM community_cues WHERE device_id = ? AND fingerprint = ? '
+            'ORDER BY position_ms',
+            (device_id, fingerprint)
+        )
+        rows = c.fetchall()
+        return {
+            "fingerprint": fingerprint,
+            "device_id": device_id,
+            "cues": [
+                {
+                    "type": r[0],
+                    "position_ms": r[1],
+                    "end_position_ms": r[2],
+                    "note": r[3],
+                    "created_at": r[4],
+                }
+                for r in rows
+            ],
+            "total": len(rows),
+        }
+
+    @app.get("/user-cues/{device_id}")
+    async def get_all_user_cues(device_id: str, since: Optional[str] = None):
+        """
+        Devuelve TODOS los cues de un DJ (todos los tracks).
+        El movil usa esto para sincronizar todo de una vez.
+        Parametro 'since' (ISO datetime) para sync incremental.
+        """
+        conn = db.conn
+        c = conn.cursor()
+        if since:
+            c.execute(
+                'SELECT fingerprint, cue_type, position_ms, end_position_ms, note, created_at '
+                'FROM community_cues WHERE device_id = ? AND created_at > ? '
+                'ORDER BY fingerprint, position_ms',
+                (device_id, since)
+            )
+        else:
+            c.execute(
+                'SELECT fingerprint, cue_type, position_ms, end_position_ms, note, created_at '
+                'FROM community_cues WHERE device_id = ? '
+                'ORDER BY fingerprint, position_ms',
+                (device_id,)
+            )
+        rows = c.fetchall()
+
+        # Agrupar por fingerprint
+        from collections import defaultdict
+        by_track = defaultdict(list)
+        for r in rows:
+            by_track[r[0]].append({
+                "type": r[1],
+                "position_ms": r[2],
+                "end_position_ms": r[3],
+                "note": r[4],
+                "created_at": r[5],
+            })
+
+        return {
+            "device_id": device_id,
+            "tracks": [
+                {"fingerprint": fp, "cues": cues}
+                for fp, cues in by_track.items()
+            ],
+            "total_tracks": len(by_track),
+            "total_cues": len(rows),
+        }
     
     logger.info("Community cues endpoints registered")
