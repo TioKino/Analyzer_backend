@@ -56,7 +56,6 @@ from validation import (
     ValidationError,
 )
 
-
 if __name__ == "__main__":
     print_config()  # Muestra configuración al arrancar
 
@@ -122,6 +121,9 @@ except ImportError:
     print("similar_tracks_endpoint.py no encontrado")
     SIMILAR_TRACKS_ENABLED = False
 
+# Importar community cues
+from community_cues_endpoint import register_community_endpoints
+
 # ==================== APP ====================
 
 app = FastAPI(title="DJ Analyzer Pro API", version="2.3.0")
@@ -148,6 +150,8 @@ async def validation_error_handler(request: Request, exc: ValidationError):
 
 # Inicializar BD
 db = AnalysisDB()
+
+register_community_endpoints(app, db)
 
 # Crear directorio de caché para artwork
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)

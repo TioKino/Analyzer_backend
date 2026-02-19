@@ -74,6 +74,22 @@ class AnalysisDB:
             )
         ''')
         
+        # Tabla de cues comunitarios (Community CueFlow)
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS community_cues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                cue_type TEXT NOT NULL,
+                position_ms INTEGER NOT NULL,
+                end_position_ms INTEGER,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(fingerprint, device_id, cue_type, position_ms)
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_cc_fingerprint ON community_cues(fingerprint)')
+        
         conn.commit()
         conn.close()
 
