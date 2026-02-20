@@ -1,7 +1,7 @@
 """
 DJ ANALYZER - Artwork & Cue Points Module v2.3.0
 ====================================================
-Módulo para extracción de artwork y detección de cue points.
+Modulo para extraccion de artwork y deteccion de cue points.
 
 Exporta:
 - extract_artwork_from_file()
@@ -23,47 +23,47 @@ import numpy as np
 ARTWORK_CACHE_DIR = "/data/artwork_cache"
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
 
-# ==================== 0. BÚSQUEDA DE ARTWORK ONLINE ====================
+# ==================== 0. BUSQUEDA DE ARTWORK ONLINE ====================
 
 def search_artwork_online(artist: str, title: str, album: str = None) -> Optional[Dict]:
     """
-    Busca artwork en servicios online cuando no hay ID3 o es inválido.
+    Busca artwork en servicios online cuando no hay ID3 o es invalido.
     Intenta: iTunes -> Deezer -> Last.fm
     
     Returns:
         Dict con 'url', 'data' (bytes), 'mime_type', 'size', 'source' o None
     """
     if not artist or not title:
-        print(f"  ⚠️ No se puede buscar artwork: artist={artist}, title={title}")
+        print(f"   No se puede buscar artwork: artist={artist}, title={title}")
         return None
     
     # Limpiar query
     query = f"{artist} {title}".replace("(", "").replace(")", "").replace("-", " ")
-    print(f"  🔍 Buscando artwork online: {artist} - {title}")
+    print(f"   Buscando artwork online: {artist} - {title}")
     
     # 1. Intentar iTunes (no requiere API key)
-    print(f"    → Intentando iTunes...")
+    print(f"     Intentando iTunes...")
     artwork = _search_itunes(query)
     if artwork:
-        print(f"    ✓ iTunes encontró artwork")
+        print(f"     iTunes encontro artwork")
         return artwork
-    print(f"    ✗ iTunes no encontró")
+    print(f"     iTunes no encontro")
     
     # 2. Intentar Deezer (no requiere API key)
-    print(f"    → Intentando Deezer...")
+    print(f"     Intentando Deezer...")
     artwork = _search_deezer(artist, title)
     if artwork:
-        print(f"    ✓ Deezer encontró artwork")
+        print(f"     Deezer encontro artwork")
         return artwork
-    print(f"    ✗ Deezer no encontró")
+    print(f"     Deezer no encontro")
     
     # 3. Intentar Last.fm
-    print(f"    → Intentando Last.fm...")
+    print(f"     Intentando Last.fm...")
     artwork = _search_lastfm(artist, title)
     if artwork:
-        print(f"    ✓ Last.fm encontró artwork")
+        print(f"     Last.fm encontro artwork")
         return artwork
-    print(f"    ✗ Last.fm no encontró")
+    print(f"     Last.fm no encontro")
     
     return None
 
@@ -94,7 +94,7 @@ def _search_itunes(query: str) -> Optional[Dict]:
                                 'source': 'itunes'
                             }
     except Exception as e:
-        print(f"  ⚠️ Error iTunes: {e}")
+        print(f"   Error iTunes: {e}")
     
     return None
 
@@ -102,7 +102,7 @@ def _search_deezer(artist: str, title: str) -> Optional[Dict]:
     """Buscar artwork en Deezer API"""
     try:
         from urllib.parse import quote
-        # Intentar búsqueda exacta primero
+        # Intentar busqueda exacta primero
         url = f"https://api.deezer.com/search?q=artist:\"{quote(artist)}\" track:\"{quote(title)}\"&limit=5"
         
         response = requests.get(url, timeout=5)
@@ -125,7 +125,7 @@ def _search_deezer(artist: str, title: str) -> Optional[Dict]:
                                 'source': 'deezer'
                             }
         
-        # Si no encuentra con búsqueda exacta, intentar búsqueda general
+        # Si no encuentra con busqueda exacta, intentar busqueda general
         url = f"https://api.deezer.com/search?q={quote(artist + ' ' + title)}&limit=5"
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
@@ -145,14 +145,14 @@ def _search_deezer(artist: str, title: str) -> Optional[Dict]:
                                 'source': 'deezer'
                             }
     except Exception as e:
-        print(f"  ⚠️ Error Deezer: {e}")
+        print(f"   Error Deezer: {e}")
     
     return None
 
 def _search_spotify(artist: str, title: str) -> Optional[Dict]:
-    """Spotify requiere OAuth - no disponible sin autenticación"""
+    """Spotify requiere OAuth - no disponible sin autenticacion"""
     # La API de Spotify requiere token de acceso
-    # No es posible buscar sin autenticación
+    # No es posible buscar sin autenticacion
     return None
 
 def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
@@ -169,18 +169,18 @@ def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
             
             # Verificar si hay error
             if 'error' in data:
-                print(f"  ⚠️ Last.fm: {data.get('message', 'Track no encontrado')}")
+                print(f"   Last.fm: {data.get('message', 'Track no encontrado')}")
             else:
                 track = data.get('track', {})
                 album = track.get('album', {})
                 images = album.get('image', [])
                 
-                # Buscar imagen más grande (última en la lista)
+                # Buscar imagen mas grande (ultima en la lista)
                 for img in reversed(images):
                     img_url = img.get('#text', '')
                     if img_url and len(img_url) > 10:
-                        # Last.fm a veces devuelve URLs vacías o placeholder
-                        # Intentar obtener versión grande
+                        # Last.fm a veces devuelve URLs vacias o placeholder
+                        # Intentar obtener version grande
                         if '/i/u/' in img_url:
                             # Formato: https://lastfm.freetls.fastly.net/i/u/300x300/xxx.jpg
                             img_url = img_url.replace('/64s/', '/300x300/').replace('/174s/', '/300x300/')
@@ -188,7 +188,7 @@ def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
                         try:
                             img_response = requests.get(img_url, timeout=5)
                             if img_response.status_code == 200 and len(img_response.content) > 5000:
-                                print(f"  🖼️ Artwork Last.fm: {len(img_response.content)} bytes")
+                                print(f"   Artwork Last.fm: {len(img_response.content)} bytes")
                                 return {
                                     'url': img_url,
                                     'data': img_response.content,
@@ -199,7 +199,7 @@ def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
                         except:
                             continue
         
-        # Si no encontró por track, intentar por álbum/artista
+        # Si no encontro por track, intentar por album/artista
         url = f"https://ws.audioscrobbler.com/2.0/?method=artist.getTopAlbums&api_key=57ee3318536b23ee81d6b27e36997cde&artist={quote(artist)}&limit=1&format=json"
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
@@ -213,7 +213,7 @@ def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
                         try:
                             img_response = requests.get(img_url, timeout=5)
                             if img_response.status_code == 200 and len(img_response.content) > 5000:
-                                print(f"  🖼️ Artwork Last.fm (álbum): {len(img_response.content)} bytes")
+                                print(f"   Artwork Last.fm (album): {len(img_response.content)} bytes")
                                 return {
                                     'url': img_url,
                                     'data': img_response.content,
@@ -225,11 +225,11 @@ def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
                             continue
                             
     except Exception as e:
-        print(f"  ⚠️ Error Last.fm: {e}")
+        print(f"   Error Last.fm: {e}")
     
     return None
 
-# ==================== 1. EXTRACCIÓN DE ARTWORK ====================
+# ==================== 1. EXTRACCIN DE ARTWORK ====================
 
 def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
     """
@@ -283,7 +283,7 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
                     if hasattr(covers[0], 'imageformat'):
                         mime_type = 'image/png' if covers[0].imageformat == 14 else 'image/jpeg'
         
-        # Fallback genérico para otros formatos
+        # Fallback generico para otros formatos
         else:
             if hasattr(audio, 'pictures') and audio.pictures:
                 pic = audio.pictures[0]
@@ -300,7 +300,7 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
         return None
         
     except ImportError:
-        print("⚠️ mutagen no instalado. Ejecuta: pip install mutagen")
+        print(" mutagen no instalado. Ejecuta: pip install mutagen")
         return None
     except Exception as e:
         print(f"Error extrayendo artwork: {e}")
@@ -309,7 +309,7 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
 
 def save_artwork_to_cache(fingerprint: str, artwork_data: bytes, mime_type: str) -> str:
     """
-    Guarda artwork en caché local y devuelve el nombre del archivo
+    Guarda artwork en cache local y devuelve el nombre del archivo
     """
     ext = 'jpg' if 'jpeg' in mime_type else 'png' if 'png' in mime_type else 'jpg'
     filename = f"{fingerprint}.{ext}"
@@ -321,7 +321,7 @@ def save_artwork_to_cache(fingerprint: str, artwork_data: bytes, mime_type: str)
     return filename
 
 
-# ==================== EXTRACCIÓN DE ID3 METADATA ====================
+# ==================== EXTRACCIN DE ID3 METADATA ====================
 
 def extract_id3_metadata(file_path: str) -> Dict:
     """
@@ -421,7 +421,7 @@ def extract_id3_metadata(file_path: str) -> Dict:
                 print(f"Error leyendo M4A: {e}")
     
     except ImportError:
-        print("⚠️ mutagen no instalado. Ejecuta: pip install mutagen")
+        print(" mutagen no instalado. Ejecuta: pip install mutagen")
     
     return metadata
 
@@ -453,13 +453,13 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
     Detecta cue points profesionales para DJs
     
     Tipos de cue points:
-    - MIX_IN: Punto óptimo para empezar a mezclar (inicio del track)
+    - MIX_IN: Punto optimo para empezar a mezclar (inicio del track)
     - INTRO_END: Fin de la intro, empieza el cuerpo
     - BUILDUP: Inicio del buildup antes del drop
     - DROP: El drop principal
     - BREAKDOWN: Inicio del breakdown
     - BREAKDOWN_END: Fin del breakdown (antes del siguiente buildup)
-    - MIX_OUT: Punto óptimo para empezar a sacar el track
+    - MIX_OUT: Punto optimo para empezar a sacar el track
     - OUTRO_START: Inicio del outro
     
     Returns:
@@ -474,7 +474,7 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
     if not sections:
         return []
     
-    # Calcular energía por sección más detallada (segmentos de 4 segundos)
+    # Calcular energia por seccion mas detallada (segmentos de 4 segundos)
     segment_length = int(sr * 4)
     n_segments = len(y) // segment_length
     
@@ -496,15 +496,15 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
     max_rms = np.max([e['rms'] for e in detailed_energies])
     
     # ==================== MIX IN POINT ====================
-    # Buscar el primer momento con energía suficiente para mezclar
-    # Típicamente después de 4-8 segundos de intro
+    # Buscar el primer momento con energia suficiente para mezclar
+    # Tipicamente despues de 4-8 segundos de intro
     mix_in_time = 0.0
     for e in detailed_energies[:10]:  # Primeros 40 segundos
         if e['rms'] > avg_rms * 0.4:
             mix_in_time = e['time']
             break
     
-    # Si no hay nada con energía, usar el inicio
+    # Si no hay nada con energia, usar el inicio
     if mix_in_time == 0.0 and detailed_energies:
         mix_in_time = 4.0  # Default a 4 segundos
     
@@ -517,7 +517,7 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
     ))
     
     # ==================== INTRO END ====================
-    # Buscar donde la energía sube significativamente
+    # Buscar donde la energia sube significativamente
     intro_end = None
     for i, e in enumerate(detailed_energies[2:15], start=2):  # Entre 8 y 60 segundos
         if e['rms'] > avg_rms * 0.7:
@@ -532,21 +532,21 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
             break
     
     # ==================== DROPS ====================
-    # Detectar todos los drops (picos de energía significativos)
+    # Detectar todos los drops (picos de energia significativos)
     drop_indices = []
     drop_threshold = avg_rms * 1.3
     
     for i, e in enumerate(detailed_energies):
         if e['rms'] > drop_threshold:
-            # Verificar que sea un pico real (no continuación de otro drop)
+            # Verificar que sea un pico real (no continuacion de otro drop)
             if not drop_indices or (e['time'] - detailed_energies[drop_indices[-1]]['time']) > 30:
                 drop_indices.append(i)
     
-    # Añadir cue points para cada drop detectado
+    # Anadir cue points para cada drop detectado
     for idx, drop_idx in enumerate(drop_indices):
         drop_time = detailed_energies[drop_idx]['time']
         
-        # Buscar el buildup antes del drop (caída de energía seguida de subida)
+        # Buscar el buildup antes del drop (caida de energia seguida de subida)
         buildup_time = drop_time - 16  # Default: 16 segundos antes
         for i in range(max(0, drop_idx - 8), drop_idx):
             if detailed_energies[i]['rms'] < avg_rms * 0.6:
@@ -571,7 +571,7 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
         ))
     
     # ==================== BREAKDOWNS ====================
-    # Buscar valles de energía significativos (no al principio ni al final)
+    # Buscar valles de energia significativos (no al principio ni al final)
     breakdown_threshold = avg_rms * 0.5
     in_breakdown = False
     breakdown_start = None
@@ -600,11 +600,11 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
             breakdown_start = None
     
     # ==================== MIX OUT / OUTRO ====================
-    # Buscar donde empieza a bajar la energía para el outro
+    # Buscar donde empieza a bajar la energia para el outro
     outro_start = None
     mix_out = None
     
-    # Buscar desde el final hacia atrás
+    # Buscar desde el final hacia atras
     for i in range(len(detailed_energies) - 1, max(len(detailed_energies) - 20, 0), -1):
         e = detailed_energies[i]
         if e['rms'] > avg_rms * 0.6 and outro_start is None:
@@ -621,7 +621,7 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
             confidence=0.7
         ))
     
-    # Mix out: punto óptimo para empezar a mezclar el siguiente track
+    # Mix out: punto optimo para empezar a mezclar el siguiente track
     if mix_out:
         cue_points.append(CuePoint(
             timestamp=mix_out,
@@ -648,7 +648,10 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
 
 def detect_beat_grid(y, sr, bpm: float) -> Dict:
     """
-    Detecta el beat grid preciso para sincronización
+    Detecta el beat grid preciso para sincronizacion.
+    
+    v2: Usa 60/BPM como intervalo (mas preciso que mediana de detecciones)
+    y calcula firstBeat optimo con media circular de fases.
     
     Returns:
         Dict con first_beat, beat_interval, beats (lista de timestamps)
@@ -656,55 +659,104 @@ def detect_beat_grid(y, sr, bpm: float) -> Dict:
     import librosa
     import numpy as np
     
-    # Detectar beats
+    if bpm <= 0:
+        return {
+            'first_beat': 0.0,
+            'beat_interval': 0.5,
+            'beats': [],
+        }
+    
+    # INTERVALO: usar 60/BPM directamente (mucho mas preciso)
+    # np.median(intervals) acumula drift: 0.001s/beat * 900 beats = 0.9s error
+    beat_interval = 60.0 / bpm
+    
+    # Detectar beats con librosa
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr, bpm=bpm)
     beat_times = librosa.frames_to_time(beats, sr=sr)
     
     if len(beat_times) < 2:
         return {
             'first_beat': 0.0,
-            'beat_interval': 60.0 / bpm if bpm > 0 else 0.5,
+            'beat_interval': round(beat_interval, 6),
             'beats': [],
         }
     
-    # Calcular intervalo medio entre beats
-    intervals = np.diff(beat_times)
-    beat_interval = float(np.median(intervals))
+    # FIRST BEAT OPTIMO (media circular de fases)
+    # En vez de usar beat_times[0] (puede ser impreciso),
+    # calculamos la fase optima que minimiza el error contra
+    # TODOS los beats detectados por librosa.
+    phases = beat_times % beat_interval
     
-    # Primer beat (downbeat)
-    first_beat = float(beat_times[0])
+    # Media circular: convertir a angulos, promediar como vectores
+    angles = phases * (2 * np.pi / beat_interval)
+    mean_sin = float(np.mean(np.sin(angles)))
+    mean_cos = float(np.mean(np.cos(angles)))
+    optimal_phase = np.arctan2(mean_sin, mean_cos) * (beat_interval / (2 * np.pi))
     
-    # Solo devolver los primeros N beats para no sobrecargar
+    if optimal_phase < 0:
+        optimal_phase += beat_interval
+    
+    first_beat = float(optimal_phase)
+    while first_beat > beat_interval:
+        first_beat -= beat_interval
+    
+    # Verificar alineacion: calcular error promedio
+    errors = []
+    for bt in beat_times:
+        nearest_grid = round((bt - first_beat) / beat_interval) * beat_interval + first_beat
+        errors.append(abs(bt - nearest_grid))
+    avg_error = float(np.mean(errors))
+    
+    # Si error >50ms, refinar con onset detection
+    if avg_error > 0.05:
+        try:
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+            onset_times = librosa.times_like(onset_env, sr=sr)
+            search_window = beat_interval * 0.4
+            mask = np.abs(onset_times - first_beat) < search_window
+            if np.any(mask):
+                onset_near = onset_env[mask]
+                times_near = onset_times[mask]
+                best_idx = np.argmax(onset_near)
+                refined_fb = float(times_near[best_idx])
+                errors2 = [abs(bt - (round((bt - refined_fb) / beat_interval) * beat_interval + refined_fb)) for bt in beat_times]
+                if np.mean(errors2) < avg_error:
+                    first_beat = refined_fb
+                    avg_error = float(np.mean(errors2))
+        except Exception:
+            pass
+    
     max_beats = 500
     
     return {
         'first_beat': round(first_beat, 4),
-        'beat_interval': round(beat_interval, 4),
+        'beat_interval': round(beat_interval, 6),
         'beats': [round(b, 4) for b in beat_times[:max_beats]],
         'total_beats': len(beat_times),
+        'grid_error_ms': round(avg_error * 1000, 1),
     }
 
 
 # ==================== 3. MODELO ACTUALIZADO ====================
 
 """
-Añadir estos campos al modelo AnalysisResult en main.py:
+Anadir estos campos al modelo AnalysisResult en main.py:
 
 class AnalysisResult(BaseModel):
     # ... campos existentes ...
     
-    # 🆕 Artwork
+    #  Artwork
     artwork_embedded: bool = False  # Si tiene artwork embebido
     artwork_url: Optional[str] = None  # URL del artwork (si se sirve)
     
-    # 🆕 Cue Points
+    #  Cue Points
     cue_points: List[Dict] = []  # Lista de cue points detectados
     
-    # 🆕 Beat Grid
+    #  Beat Grid
     first_beat: float = 0.0  # Timestamp del primer beat
     beat_interval: float = 0.5  # Intervalo entre beats en segundos
     
-    # 🆕 Metadata adicional
+    #  Metadata adicional
     label: Optional[str] = None
     year: Optional[str] = None
     isrc: Optional[str] = None
@@ -715,14 +767,14 @@ class AnalysisResult(BaseModel):
 # ==================== 4. ENDPOINTS NUEVOS ====================
 
 """
-Añadir estos endpoints a main.py:
+Anadir estos endpoints a main.py:
 
 @app.get("/artwork/{track_id}")
 async def get_artwork(track_id: str):
     '''
     Devuelve el artwork de un track como imagen
     '''
-    # Buscar en caché
+    # Buscar en cache
     cache_path_jpg = f"artwork_cache/{track_id}.jpg"
     cache_path_png = f"artwork_cache/{track_id}.png"
     
@@ -751,28 +803,28 @@ async def get_cue_points(track_id: str):
 """
 
 
-# ==================== 5. INTEGRACIÓN EN analyze_audio() ====================
+# ==================== 5. INTEGRACIN EN analyze_audio() ====================
 
 """
-Modificar la función analyze_audio() en main.py para incluir las nuevas features:
+Modificar la funcion analyze_audio() en main.py para incluir las nuevas features:
 
 def analyze_audio(file_path: str) -> AnalysisResult:
-    # ... código existente ...
+    # ... codigo existente ...
     
-    # 🆕 Extraer artwork
+    #  Extraer artwork
     artwork_info = extract_artwork_from_file(file_path)
     artwork_embedded = artwork_info is not None
     
-    # 🆕 Detectar cue points
+    #  Detectar cue points
     cue_points = detect_cue_points(y, sr, duration, segments)
     
-    # 🆕 Detectar beat grid
+    #  Detectar beat grid
     beat_grid = detect_beat_grid(y, sr, bpm)
     
     return AnalysisResult(
         # ... campos existentes ...
         
-        # 🆕 Nuevos campos
+        #  Nuevos campos
         artwork_embedded=artwork_embedded,
         cue_points=cue_points,
         first_beat=beat_grid['first_beat'],
@@ -781,24 +833,24 @@ def analyze_audio(file_path: str) -> AnalysisResult:
 """
 
 
-# ==================== 6. FUNCIÓN DE TEST ====================
+# ==================== 6. FUNCIN DE TEST ====================
 
 def test_cue_points():
-    """Test de detección de cue points con datos simulados"""
+    """Test de deteccion de cue points con datos simulados"""
     import numpy as np
     
-    # Simular 5 minutos de audio con estructura típica
+    # Simular 5 minutos de audio con estructura tipica
     duration = 300  # 5 minutos
     sr = 44100
     
-    # Crear señal simulada con estructura
-    # Intro (0-30s): energía baja
-    # Buildup (30-60s): energía subiendo
-    # Drop 1 (60-120s): energía alta
-    # Breakdown (120-150s): energía baja
-    # Buildup 2 (150-180s): energía subiendo
-    # Drop 2 (180-240s): energía alta
-    # Outro (240-300s): energía bajando
+    # Crear senal simulada con estructura
+    # Intro (0-30s): energia baja
+    # Buildup (30-60s): energia subiendo
+    # Drop 1 (60-120s): energia alta
+    # Breakdown (120-150s): energia baja
+    # Buildup 2 (150-180s): energia subiendo
+    # Drop 2 (180-240s): energia alta
+    # Outro (240-300s): energia bajando
     
     segments = {
         'has_intro': True,
@@ -817,7 +869,7 @@ def test_cue_points():
     }
     
     print("Test de cue points:")
-    print(f"  Duración: {duration}s")
+    print(f"  Duracion: {duration}s")
     print(f"  Secciones: {len(segments['sections'])}")
     print("\nNOTA: Para test real, ejecutar con archivo de audio")
 
