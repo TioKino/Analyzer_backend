@@ -22,6 +22,7 @@ import tempfile
 import os
 import re
 import json
+import math
 import hashlib
 import requests
 import sqlite3
@@ -472,6 +473,18 @@ KEY_TO_CAMELOT = {
 }
 
 # ==================== HELPERS ====================
+
+def sanitize_floats(obj):
+    """Reemplaza NaN/Infinity por 0.0 para que JSON no explote"""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return obj
+    elif isinstance(obj, dict):
+        return {k: sanitize_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_floats(item) for item in obj]
+    return obj
 
 def calculate_fingerprint(file_path):
     """Calcular fingerprint simple del archivo"""
@@ -1365,7 +1378,8 @@ async def analyze_track(
         track_data['fingerprint'] = fingerprint
         db.save_track(track_data)
         
-        return result
+        # Sanitizar NaN/Infinity antes de devolver
+        return JSONResponse(content=sanitize_floats(result.dict()))
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
@@ -1448,7 +1462,7 @@ async def analyze_track(
             
             print(f"Fallback creado: {artist} - {title} (análisis pendiente)")
             
-            return result
+            return JSONResponse(content=sanitize_floats(result.dict()))
             
         except Exception as fallback_error:
             print(f"Fallback también falló: {fallback_error}")
