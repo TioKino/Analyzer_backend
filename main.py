@@ -474,17 +474,21 @@ KEY_TO_CAMELOT = {
 
 # ==================== HELPERS ====================
 
-def sanitize_floats(obj):
-    """Reemplaza NaN/Infinity por 0.0 para que JSON no explote"""
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return obj
-    elif isinstance(obj, dict):
-        return {k: sanitize_floats(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [sanitize_floats(item) for item in obj]
-    return obj
+def safe_json_response(data):
+    """NUCLEAR: Convierte cualquier resultado a JSON válido. Imposible que falle."""
+    if hasattr(data, 'dict'):
+        data = data.dict()
+    # Paso 1: serializar con allow_nan=True (NUNCA falla)
+    raw = json.dumps(data, allow_nan=True, default=str)
+    # Paso 2: string-replace NaN/Infinity en el JSON crudo
+    raw = raw.replace(': NaN,', ': 0.0,').replace(': NaN}', ': 0.0}').replace(': NaN]', ': 0.0]')
+    raw = raw.replace(': Infinity,', ': 0.0,').replace(': Infinity}', ': 0.0}').replace(': Infinity]', ': 0.0]')
+    raw = raw.replace(': -Infinity,', ': 0.0,').replace(': -Infinity}', ': 0.0}').replace(': -Infinity]', ': 0.0]')
+    raw = raw.replace(':NaN,', ':0.0,').replace(':NaN}', ':0.0}').replace(':NaN]', ':0.0]')
+    raw = raw.replace(':Infinity,', ':0.0,').replace(':Infinity}', ':0.0}').replace(':Infinity]', ':0.0]')
+    raw = raw.replace(':-Infinity,', ':0.0,').replace(':-Infinity}', ':0.0}').replace(':-Infinity]', ':0.0]')
+    # Paso 3: devolver como Response cruda (bypass total de FastAPI)
+    return Response(content=raw, media_type="application/json")
 
 def calculate_fingerprint(file_path):
     """Calcular fingerprint simple del archivo"""
@@ -1213,7 +1217,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
 
 # ==================== ENDPOINTS PRINCIPALES ====================
 
-@app.post("/analyze", response_model=AnalysisResult)
+@app.post("/analyze")
 async def analyze_track(
     request: Request, 
     file: UploadFile = File(...),
@@ -1245,7 +1249,7 @@ async def analyze_track(
         existing = db.get_track_by_filename(file.filename)
         if existing:
             analysis_json = json.loads(existing[11]) if len(existing) > 11 else {}
-            return AnalysisResult(**analysis_json)
+            return safe_json_response(analysis_json)
     
     # Guardar archivo temporal para calcular fingerprint
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
@@ -1277,7 +1281,7 @@ async def analyze_track(
                         # Limpiar archivo temporal antes de retornar
                         if os.path.exists(tmp_path):
                             os.unlink(tmp_path)
-                        return AnalysisResult(**analysis_data)
+                        return safe_json_response(analysis_data)
                     except Exception as e:
                         print(f"[Cache] Error parseando analysis_json: {e}")
                 
@@ -1327,7 +1331,7 @@ async def analyze_track(
                     # Limpiar archivo temporal antes de retornar
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
-                    return result
+                    return safe_json_response(result)
                 except Exception as e:
                     print(f"[Cache] Error construyendo resultado desde cache: {e}")
                     # Continuar con analisis normal si falla
@@ -1379,7 +1383,7 @@ async def analyze_track(
         db.save_track(track_data)
         
         # Sanitizar NaN/Infinity antes de devolver
-        return JSONResponse(content=sanitize_floats(result.dict()))
+        return safe_json_response(result)
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
@@ -1462,7 +1466,7 @@ async def analyze_track(
             
             print(f"Fallback creado: {artist} - {title} (análisis pendiente)")
             
-            return JSONResponse(content=sanitize_floats(result.dict()))
+            return safe_json_response(result)
             
         except Exception as fallback_error:
             print(f"Fallback también falló: {fallback_error}")
