@@ -772,10 +772,8 @@ class ChunkedAudioAnalyzer:
         # Estructura del track
         structure = self.detect_structure_from_energy(energy_curve, duration)
         
-        # Cue points
-        cue_points = self.detect_cue_points_from_structure(
-            structure, duration, bpm_final['bpm']
-        )
+        # Cue points automaticos deshabilitados - el usuario los pone a mano
+        cue_points = []
         
         # Beat grid
         beat_grid = self.calculate_beat_grid(bpm_final['bpm'])
