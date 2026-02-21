@@ -73,6 +73,21 @@ class AnalysisDB:
                 FOREIGN KEY (track_id) REFERENCES tracks(id)
             )
         ''')
+
+        # Tabla de correcciones de beat grid comunitarias
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS beat_grid_corrections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                bpm_adjust REAL DEFAULT 0.0,
+                beat_offset REAL DEFAULT 0.0,
+                original_bpm REAL,
+                submitted_at TEXT,
+                UNIQUE(fingerprint, device_id)
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_bgc_fp ON beat_grid_corrections(fingerprint)')
         
         # Tabla de cues comunitarios (Community CueFlow)
         c.execute('''
@@ -516,3 +531,51 @@ class AnalysisDB:
         conn.commit()
         conn.close()
         return deleted
+
+    def submit_beat_grid_correction(self, fingerprint: str, device_id: str,
+                                      bpm_adjust: float, beat_offset: float,
+                                      original_bpm: float):
+        c = self.conn.cursor()
+        now = datetime.now().isoformat()
+        c.execute('''
+            INSERT INTO beat_grid_corrections 
+            (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(fingerprint, device_id) 
+            DO UPDATE SET bpm_adjust=?, beat_offset=?, submitted_at=?
+        ''', (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, now,
+              bpm_adjust, beat_offset, now))
+        self.conn.commit()
+
+    def get_community_beat_grid(self, fingerprint: str):
+        c = self.conn.cursor()
+        c.execute('''
+            SELECT bpm_adjust, beat_offset, original_bpm, device_id
+            FROM beat_grid_corrections
+            WHERE fingerprint = ?
+            ORDER BY submitted_at DESC
+        ''', (fingerprint,))
+        rows = c.fetchall()
+        if not rows:
+            return None
+        
+        # Si hay 2+ correcciones similares, promediar
+        if len(rows) >= 2:
+            avg_bpm = sum(r[0] for r in rows) / len(rows)
+            avg_offset = sum(r[1] for r in rows) / len(rows)
+            return {
+                'bpm_adjust': round(avg_bpm, 2),
+                'beat_offset': round(avg_offset, 4),
+                'original_bpm': rows[0][2],
+                'contributors': len(rows),
+                'validated': True
+            }
+        
+        # Solo 1 correccion: devolver pero marcar como no validada
+        return {
+            'bpm_adjust': rows[0][0],
+            'beat_offset': rows[0][1],
+            'original_bpm': rows[0][2],
+            'contributors': 1,
+            'validated': False
+        }
