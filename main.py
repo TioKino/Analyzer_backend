@@ -933,8 +933,8 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     # Actualizar segments con secciones precisas
     segments = precision['structure']
     
-    # Cue points beat-aligned
-    cue_points = precision['cue_points']
+    # Cue points automaticos deshabilitados - el usuario los pone a mano
+    cue_points = []
     first_beat = precision['beat_grid'].get('first_beat', 0.0)
     beat_interval = precision['beat_grid'].get('beat_interval', 0.5)
     
@@ -1122,10 +1122,10 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         precision = analyze_structure_and_cues(y_precision, sr_precision, duration, bpm)
         
         segments = precision['structure']
-        cue_points = precision['cue_points']
+        cue_points = []  # Automaticos deshabilitados
         first_beat = precision['beat_grid'].get('first_beat', 0.0)
         beat_interval = precision['beat_grid'].get('beat_interval', 0.5)
-        drop_time = find_drop_timestamp(y_precision, sr_precision, segments, cue_points)
+        drop_time = find_drop_timestamp(y_precision, sr_precision, segments, [])
         
         # Waveform REAL con FFT (antes de liberar memoria)
         waveform_data = compute_waveform_data(y_precision, sr_precision)
@@ -1142,7 +1142,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
             'has_drop': result['has_drop'], 'has_breakdown': result['has_breakdown'],
             'has_outro': result['has_outro'], 'sections': result['structure_sections'],
         }
-        cue_points = result.get('cue_points', [])
+        cue_points = []  # Automaticos deshabilitados
         first_beat = result.get('first_beat', 0.0)
         beat_interval = result.get('beat_interval', 0.5)
         drop_time = result.get('drop_timestamp', 30.0)
@@ -2331,6 +2331,40 @@ async def root():
             "Advanced search filters",
         ]
     }
+@app.post("/community/beat-grid")
+async def submit_beat_grid(request: Request):
+    try:
+        data = await request.json()
+        fingerprint = data.get('fingerprint', '')
+        device_id = data.get('device_id', '')
+        bpm_adjust = float(data.get('bpm_adjust', 0.0))
+        beat_offset = float(data.get('beat_offset', 0.0))
+        original_bpm = float(data.get('original_bpm', 0.0))
+        
+        if not fingerprint or not device_id:
+            return {"error": "fingerprint and device_id required"}
+        
+        # Solo guardar si hay un ajuste real
+        if bpm_adjust == 0.0 and beat_offset == 0.0:
+            return {"status": "skipped", "reason": "no adjustments"}
+        
+        db.submit_beat_grid_correction(
+            fingerprint, device_id, bpm_adjust, beat_offset, original_bpm
+        )
+        
+        return {"status": "ok"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/community/beat-grid/{fingerprint}")
+async def get_beat_grid(fingerprint: str):
+    try:
+        result = db.get_community_beat_grid(fingerprint)
+        if result:
+            return result
+        return {"bpm_adjust": 0.0, "beat_offset": 0.0, "contributors": 0, "validated": False}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/health")
 async def health():
