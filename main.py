@@ -442,6 +442,8 @@ class AnalysisResult(BaseModel):
     # 🆕 Artwork
     artwork_embedded: bool = False
     artwork_url: Optional[str] = None
+    # Fingerprint (para community features)
+    fingerprint: Optional[str] = None
 
 class CorrectionRequest(BaseModel):
     track_id: str
@@ -1374,6 +1376,9 @@ async def analyze_track(
             # Fallback a AcousticBrainz
             result.genre = ab_genre
             result.genre_source = "acousticbrainz"
+        
+        # Guardar fingerprint en resultado para Flutter
+        result.fingerprint = fingerprint
         
         # Guardar en BD
         track_data = result.dict()
