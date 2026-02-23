@@ -6,12 +6,12 @@ from typing import List, Dict, Optional
 class AnalysisDB:
     def __init__(self, db_path="/data/analysis.db"):
         self.db_path = db_path
-        self._conn = None  # Conexión persistente
+        self._conn = None  # Conexin persistente
         self.init_db()
     
     @property
     def conn(self):
-        """Propiedad que retorna una conexión a la BD (lazy loading)"""
+        """Propiedad que retorna una conexin a la BD (lazy loading)"""
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         return self._conn
@@ -20,7 +20,7 @@ class AnalysisDB:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         
-        # Tabla de análisis
+        # Tabla de anlisis
         c.execute('''
             CREATE TABLE IF NOT EXISTS tracks (
                 id TEXT PRIMARY KEY,
@@ -40,7 +40,7 @@ class AnalysisDB:
             )
         ''')
         
-        # Crear índices para búsquedas rápidas
+        # Crear ndices para bsquedas rpidas
         c.execute('CREATE INDEX IF NOT EXISTS idx_artist ON tracks(artist)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_genre ON tracks(genre)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_bpm ON tracks(bpm)')
@@ -73,37 +73,20 @@ class AnalysisDB:
                 FOREIGN KEY (track_id) REFERENCES tracks(id)
             )
         ''')
-
-        # Tabla de correcciones de beat grid comunitarias
-        c.execute('''
+        
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS beat_grid_corrections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fingerprint TEXT NOT NULL,
                 device_id TEXT NOT NULL,
                 bpm_adjust REAL DEFAULT 0.0,
                 beat_offset REAL DEFAULT 0.0,
-                original_bpm REAL,
-                submitted_at TEXT,
+                original_bpm REAL DEFAULT 0.0,
+                created_at TEXT,
+                updated_at TEXT,
                 UNIQUE(fingerprint, device_id)
             )
         ''')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_bgc_fp ON beat_grid_corrections(fingerprint)')
-        
-        # Tabla de cues comunitarios (Community CueFlow)
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS community_cues (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fingerprint TEXT NOT NULL,
-                device_id TEXT NOT NULL,
-                cue_type TEXT NOT NULL,
-                position_ms INTEGER NOT NULL,
-                end_position_ms INTEGER,
-                note TEXT,
-                created_at TEXT NOT NULL,
-                UNIQUE(fingerprint, device_id, cue_type, position_ms)
-            )
-        ''')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_cc_fingerprint ON community_cues(fingerprint)')
         
         conn.commit()
         conn.close()
@@ -133,7 +116,7 @@ class AnalysisDB:
         if row[11]:  # analysis_json
             try:
                 full_analysis = json.loads(row[11])
-                # Añadir campos importantes que no están en las columnas
+                # A+/-adir campos importantes que no estn en las columnas
                 for key in ['artwork_url', 'artwork_embedded', 'label', 'year', 'album', 
                            'isrc', 'bpm_source', 'key_source', 'genre_source',
                            'cue_points', 'first_beat', 'beat_interval', 'drop_timestamp']:
@@ -238,7 +221,7 @@ class AnalysisDB:
         
         return result[0] if result else None
     
-    # ==================== BÚSQUEDAS ====================
+    # ==================== BSQUEDAS ====================
     
     def search_by_artist_title(self, artist: str, title: str):
         conn = sqlite3.connect(self.db_path)
@@ -532,50 +515,53 @@ class AnalysisDB:
         conn.close()
         return deleted
 
-    def submit_beat_grid_correction(self, fingerprint: str, device_id: str,
-                                      bpm_adjust: float, beat_offset: float,
-                                      original_bpm: float):
-        c = self.conn.cursor()
-        now = datetime.now().isoformat()
-        c.execute('''
-            INSERT INTO beat_grid_corrections 
-            (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, submitted_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(fingerprint, device_id) 
-            DO UPDATE SET bpm_adjust=?, beat_offset=?, submitted_at=?
-        ''', (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, now,
-              bpm_adjust, beat_offset, now))
-        self.conn.commit()
+    # ==================== COMMUNITY BEAT GRID ====================
 
-    def get_community_beat_grid(self, fingerprint: str):
-        c = self.conn.cursor()
+    def submit_beat_grid_correction(self, fingerprint: str, device_id: str,
+                                     bpm_adjust: float, beat_offset: float,
+                                     original_bpm: float):
+        """Guarda o actualiza la correccion de beat grid de un DJ"""
+        from datetime import datetime
+        now = datetime.utcnow().isoformat()
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
         c.execute('''
-            SELECT bpm_adjust, beat_offset, original_bpm, device_id
+            INSERT INTO beat_grid_corrections (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(fingerprint, device_id) DO UPDATE SET
+                bpm_adjust = excluded.bpm_adjust,
+                beat_offset = excluded.beat_offset,
+                original_bpm = excluded.original_bpm,
+                updated_at = excluded.updated_at
+        ''', (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, now, now))
+        conn.commit()
+        conn.close()
+
+    def get_community_beat_grid(self, fingerprint: str) -> Dict:
+        """Obtiene la correccion promedio de la comunidad para un track"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            SELECT AVG(bpm_adjust), AVG(beat_offset), COUNT(*), AVG(original_bpm)
             FROM beat_grid_corrections
             WHERE fingerprint = ?
-            ORDER BY submitted_at DESC
         ''', (fingerprint,))
-        rows = c.fetchall()
-        if not rows:
-            return None
-        
-        # Si hay 2+ correcciones similares, promediar
-        if len(rows) >= 2:
-            avg_bpm = sum(r[0] for r in rows) / len(rows)
-            avg_offset = sum(r[1] for r in rows) / len(rows)
+        row = c.fetchone()
+        conn.close()
+        if row and row[2] > 0:
+            contributors = row[2]
+            # Validado si >= 2 DJs con ajustes similares
+            validated = contributors >= 2
             return {
-                'bpm_adjust': round(avg_bpm, 2),
-                'beat_offset': round(avg_offset, 4),
-                'original_bpm': rows[0][2],
-                'contributors': len(rows),
-                'validated': True
+                'bpm_adjust': round(row[0] or 0.0, 4),
+                'beat_offset': round(row[1] or 0.0, 6),
+                'contributors': contributors,
+                'validated': validated,
+                'original_bpm': round(row[3] or 0.0, 2),
             }
-        
-        # Solo 1 correccion: devolver pero marcar como no validada
         return {
-            'bpm_adjust': rows[0][0],
-            'beat_offset': rows[0][1],
-            'original_bpm': rows[0][2],
-            'contributors': 1,
-            'validated': False
+            'bpm_adjust': 0.0,
+            'beat_offset': 0.0,
+            'contributors': 0,
+            'validated': False,
         }
