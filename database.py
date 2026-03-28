@@ -36,10 +36,17 @@ class AnalysisDB:
                 track_type TEXT,
                 analysis_json TEXT,
                 analyzed_at TEXT,
-                fingerprint TEXT
+                fingerprint TEXT,
+                chromaprint TEXT
             )
         ''')
-        
+
+        # Migración: añadir columna chromaprint si no existe (BD existentes)
+        try:
+            c.execute('ALTER TABLE tracks ADD COLUMN chromaprint TEXT')
+        except Exception:
+            pass  # Ya existe
+
         # Crear ndices para bsquedas rpidas
         c.execute('CREATE INDEX IF NOT EXISTS idx_artist ON tracks(artist)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_genre ON tracks(genre)')
@@ -47,6 +54,7 @@ class AnalysisDB:
         c.execute('CREATE INDEX IF NOT EXISTS idx_energy ON tracks(energy_dj)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_key ON tracks(key)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_camelot ON tracks(camelot)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_chromaprint ON tracks(chromaprint)')
         
         # Tabla de correcciones manuales (memoria colectiva)
         c.execute('''

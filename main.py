@@ -1,26 +1,36 @@
 """
-DJ Analyzer Pro API v2.3.0
+DJ Analyzer Pro API v2.5.0
 ==========================
-Backend principal - Importa funcionalidad de mdulos separados
+Backend principal - Importa funcionalidad de modulos separados
 
 Estructura:
-- main.py (este archivo) - FastAPI app, endpoints principales
-- database.py - Gestin de SQLite
-- genre_detection.py - Deteccin de g(c)nero con mltiples fuentes
-- artwork_and_cuepoints.py - Extraccin artwork + cue points
-- similar_tracks_endpoint.py - Bsqueda de tracks similares
-- essentia_analyzer.py - Anlisis con Essentia (opcional)
-- api_config.py / config.py - Configuracin
+- main.py          - FastAPI app, analysis engine, main endpoints
+- models.py        - Pydantic models (AnalysisResult, CorrectionRequest)
+- audio_helpers.py - Fingerprint, filename parsing, structure detection, vocals
+- bpm_utils.py     - BPM validation and correction (half/double tempo)
+- beatport.py      - Beatport search and genre intelligence
+- preview_generator.py - 6-second MP3 preview snippet generation
+- database.py      - SQLite management
+- genre_detection.py - Genre detection with multiple sources
+- artwork_and_cuepoints.py - Artwork extraction + cue points
+- similar_tracks_endpoint.py - Similar tracks search
+- spectral_genre_classifier.py - Spectral genre classification
+- routes/          - Extracted route modules (search, library, admin, etc.)
+- sync_endpoints.py - Cloud sync endpoints
+- validation.py    - Input validation
+- config.py        - Configuration
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 from sync_endpoints import sync_router
 from routes import (
     search_router, library_router, admin_router, community_router,
+    preview_router, media_router,
     init_search, init_library, init_admin, init_community,
+    init_preview, init_media,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.responses import FileResponse, Response
 import logging
 import librosa
 import numpy as np
@@ -32,8 +42,19 @@ import hashlib
 import requests
 import sqlite3
 from typing import Dict, List, Optional
-from pydantic import BaseModel
 from spectral_genre_classifier import classify_genre_advanced
+
+# Split modules
+from models import AnalysisResult, CorrectionRequest, KEY_TO_CAMELOT, get_camelot
+from audio_helpers import (
+    sanitize_float, sanitize_for_json, SafeJSONResponse,
+    calculate_fingerprint, parse_filename, detect_structure,
+    find_drop_timestamp, classify_track_type, detect_vocals_improved,
+    get_acousticbrainz_genre,
+)
+from bpm_utils import validate_beatport_bpm, smart_bpm_correction, try_bpm_double_half
+from beatport import search_beatport, find_tracks_in_json, clean_beatport_genre, convert_beatport_key
+from preview_generator import generate_preview_snippet as _generate_preview_snippet, init_previews_dir
 from config import (
     AUDD_API_TOKEN,
     DISCOGS_TOKEN,
@@ -154,136 +175,6 @@ except ImportError:
     CAMELOT_COMPATIBLE = {}
 
 
-# ==================== FLOAT SANITIZER ====================
-import math
-
-def sanitize_float(v):
-    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-        return 0.0
-    return v
-
-def sanitize_for_json(obj):
-    if isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [sanitize_for_json(item) for item in obj]
-    elif isinstance(obj, float):
-        return sanitize_float(obj)
-    return obj
-
-class SafeJSONResponse(JSONResponse):
-    def render(self, content) -> bytes:
-        content = sanitize_for_json(content)
-        return json.dumps(
-            content,
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-
-def validate_beatport_bpm(local_bpm: float, beatport_bpm: float, tolerance: float = 0.12) -> bool:
-    """Valida si el BPM de Beatport corresponde al track local."""
-    if local_bpm <= 0 or beatport_bpm <= 0:
-        return True
-    ratio = beatport_bpm / local_bpm
-    if abs(ratio - 1.0) <= tolerance:
-        return True
-    if abs(ratio - 2.0) <= tolerance and beatport_bpm >= 80:
-        return True
-    if abs(ratio - 0.5) <= tolerance and beatport_bpm >= 80:
-        return True
-    return False
-
-
-def smart_bpm_correction(local_bpm: float, beatport_bpm: float) -> float:
-    """
-    Correccion inteligente de BPM half/double tempo.
-    
-    Si Beatport dice 140 y local dice 70 -> es double tempo -> corregir a 140.
-    Si Beatport dice 70 y local dice 140 -> es half tempo -> corregir a 70.
-    Si estan dentro del 12%, Beatport gana (datos del sello).
-    Si no hay match, devolver None (rechazar Beatport).
-    
-    Returns: BPM corregido, o None si no hay match valido.
-    """
-    if local_bpm <= 0 or beatport_bpm <= 0:
-        return beatport_bpm or local_bpm
-    
-    ratio = beatport_bpm / local_bpm
-    
-    # Match directo (dentro del 12%)
-    if abs(ratio - 1.0) <= 0.12:
-        return beatport_bpm  # Beatport gana
-    
-    # Half tempo: local=70, beatport=140 -> ratio=2.0
-    if abs(ratio - 2.0) <= 0.15:
-        return beatport_bpm  # Beatport gana, local estaba a mitad
-    
-    # Double tempo: local=140, beatport=70 -> ratio=0.5
-    if abs(ratio - 0.5) <= 0.15:
-        return beatport_bpm  # Beatport gana, local estaba al doble
-    
-    # No hay match razonable
-    return None
-
-
-def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset_env=None) -> float:
-    """
-    Si la confianza del BPM es baja, probar con doble y mitad.
-    
-    Logica: si librosa dice 131 con confianza 0.4, probar 262 y 65.5.
-    Si alguno de esos tiene sentido musical (60-200 BPM range) Y tiene
-    mejor alineacion con los beats, usarlo.
-    
-    Args:
-        onset_env: Si ya se calculó onset_strength, pasarlo para no duplicar CPU.
-    """
-    if bpm_confidence >= 0.7:
-        return original_bpm  # Alta confianza, no tocar
-    
-    candidates = [original_bpm]
-    
-    # Probar doble
-    double = original_bpm * 2
-    if 60 <= double <= 200:
-        candidates.append(double)
-    
-    # Probar mitad
-    half = original_bpm / 2
-    if 60 <= half <= 200:
-        candidates.append(half)
-    
-    if len(candidates) == 1:
-        return original_bpm
-    
-    # Evaluar cual se alinea mejor con onset strength
-    try:
-        if onset_env is None:
-            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        best_bpm = original_bpm
-        best_score = 0
-        
-        for candidate in candidates:
-            # Crear pulso teorico para este BPM
-            beat_interval = 60.0 / candidate
-            sr_onset = sr / 512  # hop_length default
-            
-            # Autocorrelacion con el BPM candidato
-            period = int(round(sr_onset * beat_interval))
-            if period > 0 and period < len(onset_env) // 2:
-                corr = np.correlate(onset_env[:len(onset_env)//2], 
-                                     onset_env[period:period + len(onset_env)//2])
-                score = float(np.max(corr)) if len(corr) > 0 else 0
-                if score > best_score:
-                    best_score = score
-                    best_bpm = candidate
-        
-        if best_bpm != original_bpm:
-            logger.debug(f"BPM auto-corregido: {original_bpm:.1f} -> {best_bpm:.1f} (confianza baja: {bpm_confidence:.2f})")
-        
-        return best_bpm
-    except (ValueError, TypeError, RuntimeError) as e:
-        return original_bpm
-
 # ==================== APP ====================
 
 app = FastAPI(title="DJ Analyzer Pro API", version="2.3.0", default_response_class=SafeJSONResponse)
@@ -318,11 +209,22 @@ init_library(db)
 init_admin(db, artwork_cache_dir=ARTWORK_CACHE_DIR, artwork_enabled=ARTWORK_ENABLED,
            genre_detector_enabled=GENRE_DETECTOR_ENABLED, similar_tracks_enabled=SIMILAR_TRACKS_ENABLED)
 init_community(db)
+init_media(db, ARTWORK_CACHE_DIR)
+
+# Preview: init directory + wrapper for preview_generator module
+init_previews_dir(PREVIEWS_DIR)
+
+def generate_preview_snippet(file_path, fingerprint, drop_timestamp, duration):
+    return _generate_preview_snippet(file_path, fingerprint, drop_timestamp, duration, PREVIEWS_DIR)
+
+init_preview(db, PREVIEWS_DIR, generate_preview_snippet)
 
 app.include_router(search_router)
 app.include_router(library_router)
 app.include_router(admin_router)
 app.include_router(community_router)
+app.include_router(preview_router)
+app.include_router(media_router)
 
 # Crear directorio de cach(c) para artwork
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
@@ -385,599 +287,6 @@ def search_collective_db(artist: str, title: str) -> Optional[Dict]:
         
     except sqlite3.Error as e:
         logger.error(f"Error buscando en BD colectiva: {e}")
-        return None
-
-
-# ==================== BEATPORT SEARCH ====================
-
-def search_beatport(artist: str, title: str) -> Optional[Dict]:
-    """
-    Busca BPM y Key de un track en Beatport via scraping HTML.
-    Beatport es Next.js y embebe datos en __NEXT_DATA__.
-    Campos: track_name, bpm, key_name, genre[].genre_name, artists[].artist_name, length (ms)
-    """
-    try:
-        import urllib.parse
-        
-        # Limpiar titulo
-        clean_title = re.sub(r'\s*\(?(Original Mix|Extended Mix|Radio Edit)\)?', '', title, flags=re.IGNORECASE).strip()
-        clean_title = re.sub(r'^[A-D]\d\s+', '', clean_title).strip()
-        
-        # Limpiar artista
-        clean_artist = artist.strip().rstrip('.')
-        
-        query = f"{clean_artist} {clean_title}"
-        encoded_query = urllib.parse.quote(query)
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-        }
-        
-        search_url = f"https://www.beatport.com/search?q={encoded_query}"
-        
-        response = requests.get(search_url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            logger.warning(f"[Beatport] HTTP {response.status_code}")
-            return None
-        
-        # Extraer __NEXT_DATA__
-        next_data_match = re.search(
-            r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
-            response.text, re.DOTALL
-        )
-        if not next_data_match:
-            logger.warning(f"[Beatport] No __NEXT_DATA__ encontrado")
-            return None
-        
-        data = json.loads(next_data_match.group(1))
-        
-        # Navegar a la ruta de tracks
-        # props.pageProps.dehydratedState.queries[0].state.data.tracks.data
-        try:
-            tracks = data["props"]["pageProps"]["dehydratedState"]["queries"][0]["state"]["data"]["tracks"]["data"]
-        except (KeyError, IndexError, TypeError):
-            logger.warning(f"[Beatport] Estructura JSON no esperada")
-            return None
-        
-        if not tracks:
-            return None
-        
-        # Buscar match
-        artist_lower = clean_artist.lower()
-        title_lower = clean_title.lower()
-        
-        for track in tracks:
-            if not isinstance(track, dict):
-                continue
-            
-            track_name = track.get('track_name', '').lower()
-            
-            # Match de titulo
-            title_match = (title_lower in track_name) or (track_name in title_lower)
-            if not title_match:
-                title_words = set(title_lower.split())
-                track_words = set(track_name.split())
-                if title_words and track_words:
-                    overlap = len(title_words & track_words) / max(len(title_words), 1)
-                    title_match = overlap >= 0.6
-            
-            if not title_match:
-                continue
-            
-            # Match de artista
-            track_artists = track.get('artists', [])
-            artist_match = False
-            for a in track_artists:
-                a_name = a.get('artist_name', '').lower() if isinstance(a, dict) else str(a).lower()
-                if artist_lower in a_name or a_name in artist_lower:
-                    artist_match = True
-                    break
-            
-            if not artist_match and track_artists:
-                continue
-            
-            # Extraer resultado
-            result = {}
-            
-            # BPM
-            if track.get('bpm'):
-                try:
-                    result['bpm'] = float(track['bpm'])
-                except (ValueError, TypeError):
-                    pass
-            
-            # Key - viene como key_name: "C Major", "D Minor", etc.
-            key_name = track.get('key_name', '')
-            if key_name:
-                result['key'] = convert_beatport_key(key_name)
-            
-            # Duration - viene en milisegundos en campo "length"
-            if track.get('length'):
-                try:
-                    result['duration'] = float(track['length']) / 1000.0
-                except (ValueError, TypeError):
-                    pass
-            
-            # Genre - viene como lista: [{"genre_id": 6, "genre_name": "Techno (Peak Time / Driving)"}]
-            genres = track.get('genre', [])
-            if genres and isinstance(genres, list):
-                genre_names = [g.get('genre_name', '') for g in genres if isinstance(g, dict)]
-                if genre_names:
-                    raw_genre = genre_names[0]
-                    cleaned = clean_beatport_genre(raw_genre)
-                    result['genre'] = cleaned['genre']
-                    result['genre_raw'] = raw_genre
-                    result['is_junk_genre'] = cleaned['is_junk']
-                    if cleaned['track_type_hint']:
-                        result['track_type_hint'] = cleaned['track_type_hint']
-            
-            if result.get('bpm') or result.get('key'):
-                return result
-        
-        return None
-        
-    except requests.exceptions.Timeout:
-        logger.warning(f"[Beatport] Timeout")
-        return None
-    except (requests.RequestException, ConnectionError, TimeoutError) as e:
-        logger.error(f"[Beatport] Error: {e}")
-        return None
-
-
-def find_tracks_in_json(obj, results):
-    """Busca recursivamente tracks en estructura JSON"""
-    if isinstance(obj, dict):
-        # Si tiene bpm y name, probablemente es un track
-        if 'bpm' in obj and ('name' in obj or 'title' in obj or 'track_name' in obj):
-            results.append(obj)
-        # Buscar en valores
-        for v in obj.values():
-            find_tracks_in_json(v, results)
-    elif isinstance(obj, list):
-        for item in obj:
-            find_tracks_in_json(item, results)
-    return results
-
-
-# ==================== BEATPORT GENRE INTELLIGENCE ====================
-
-# Generos Beatport que NO son generos reales (son categorias comerciales)
-BEATPORT_JUNK_GENRES = {
-    'Mainstage', 'DJ Tools', 'Beats', 'Dance / Pop',
-}
-
-# Mapeo de calificadores Beatport entre parentesis -> track_type
-BEATPORT_QUALIFIER_TO_TYPE = {
-    # Peak / High energy
-    'Peak Time': 'peak_time',
-    'Driving': 'peak_time',
-    'Raw': 'peak_time',
-    'Hard': 'peak_time',
-    # Melodic / Builder
-    'Melodic': 'builder',
-    'Progressive': 'builder',
-    'Uplifting': 'builder',
-    # Deep / Opener
-    'Deep': 'opener',
-    'Hypnotic': 'opener',
-    'Minimal': 'opener',
-    'Deep Tech': 'opener',
-    # Chill / Warmup
-    'Downtempo': 'warmup',
-    'Ambient': 'warmup',
-    'Organic': 'warmup',
-    'Chill': 'warmup',
-    'Electronica': 'warmup',
-    # Anthem / Big room
-    'Big Room': 'anthem',
-    'Electro House': 'anthem',
-    'Future Rave': 'anthem',
-}
-
-def clean_beatport_genre(raw_genre: str) -> dict:
-    """
-    Procesa un genero de Beatport y extrae:
-    - genre: el genero limpio (sin calificadores entre parentesis)
-    - track_type_hint: sugerencia de track_type basada en calificadores
-    - is_junk: True si el genero es una categoria comercial sin valor
-    
-    Ejemplo:
-      "Techno (Peak Time / Driving)" -> {
-          'genre': 'Techno',
-          'track_type_hint': 'peak_time',
-          'is_junk': False
-      }
-      "Mainstage" -> {
-          'genre': 'Mainstage',
-          'track_type_hint': None,
-          'is_junk': True
-      }
-    """
-    if not raw_genre:
-        return {'genre': raw_genre, 'track_type_hint': None, 'is_junk': True}
-    
-    result = {
-        'genre': raw_genre,
-        'track_type_hint': None,
-        'is_junk': raw_genre in BEATPORT_JUNK_GENRES,
-    }
-    
-    # Extraer calificadores entre parentesis: "Techno (Peak Time / Driving)"
-    paren_match = re.match(r'^(.+?)\s*\((.+)\)$', raw_genre)
-    if paren_match:
-        base_genre = paren_match.group(1).strip()
-        qualifiers_str = paren_match.group(2).strip()
-        
-        # El genero limpio es la parte antes del parentesis
-        result['genre'] = base_genre
-        
-        # Buscar track_type en los calificadores
-        qualifiers = [q.strip() for q in qualifiers_str.replace('/', ',').split(',')]
-        for q in qualifiers:
-            q_clean = q.strip()
-            if q_clean in BEATPORT_QUALIFIER_TO_TYPE:
-                result['track_type_hint'] = BEATPORT_QUALIFIER_TO_TYPE[q_clean]
-                break
-    
-    # Generos compuestos con "/" pero sin parentesis: "Minimal / Deep Tech"
-    elif '/' in raw_genre and '(' not in raw_genre:
-        parts = [p.strip() for p in raw_genre.split('/')]
-        # Usar el primer componente como genero principal
-        result['genre'] = raw_genre  # mantener completo, es descriptivo
-        # Buscar hints en las partes
-        for p in parts:
-            if p in BEATPORT_QUALIFIER_TO_TYPE:
-                result['track_type_hint'] = BEATPORT_QUALIFIER_TO_TYPE[p]
-                break
-    
-    return result
-
-
-def convert_beatport_key(beatport_key: str) -> str:
-    """
-    Convierte key de formato Beatport a formato estandar.
-    Beatport: "D Minor", "G Major", "F# Minor", "G Flat Minor", "E Flat Major"
-    Estandar: "Dm", "G", "F#m", "F#m", "D#"
-    """
-    if not beatport_key:
-        return None
-    
-    key = beatport_key.strip()
-    
-    # Convertir "Flat" a "b" primero
-    key = key.replace(' Flat', 'b').replace(' flat', 'b')
-    # Convertir "Sharp" a "#"
-    key = key.replace(' Sharp', '#').replace(' sharp', '#')
-    
-    # Convertir "D Minor" -> "Dm", "G Major" -> "G"
-    key = key.replace(' Minor', 'm').replace(' minor', 'm')
-    key = key.replace(' Major', '').replace(' major', '')
-    key = key.replace(' min', 'm').replace(' maj', '')
-    
-    # Convertir bemoles a sostenidos (KEY_TO_CAMELOT solo tiene sostenidos)
-    # Enharmonicos: Cb=B, Db=C#, Eb=D#, Fb=E, Gb=F#, Ab=G#, Bb=A#
-    FLAT_TO_SHARP = {
-        'Cb': 'B',  'Db': 'C#', 'Eb': 'D#', 'Fb': 'E',
-        'Gb': 'F#', 'Ab': 'G#', 'Bb': 'A#',
-    }
-    
-    # Extraer la nota base y el sufijo (m o nada)
-    is_minor = key.endswith('m')
-    base = key[:-1] if is_minor else key
-    
-    if base in FLAT_TO_SHARP:
-        base = FLAT_TO_SHARP[base]
-    
-    return base + ('m' if is_minor else '')
-
-# ==================== MODELOS ====================
-
-class AnalysisResult(BaseModel):
-    title: Optional[str] = None
-    artist: Optional[str] = None
-    album: Optional[str] = None
-    label: Optional[str] = None
-    year: Optional[str] = None
-    isrc: Optional[str] = None
-    duration: float
-    bpm: float
-    bpm_confidence: float
-    bpm_source: str = "analysis"
-    key: Optional[str] = None
-    camelot: Optional[str] = None
-    key_confidence: float
-    key_source: str = "analysis"
-    energy_raw: float
-    energy_normalized: float
-    energy_dj: int
-    groove_score: float
-    swing_factor: float
-    has_intro: bool
-    has_buildup: bool
-    has_drop: bool
-    has_breakdown: bool
-    has_outro: bool
-    structure_sections: List[Dict]
-    track_type: str
-    track_type_source: str = "waveform"
-    genre: str = "unknown"
-    subgenre: Optional[str] = None
-    genre_source: str = "spectral_analysis"
-    has_vocals: bool
-    has_heavy_bass: bool
-    has_pads: bool
-    percussion_density: float
-    mix_energy_start: float
-    mix_energy_end: float
-    drop_timestamp: float
-    #  Cue Points
-    cue_points: List[Dict] = []
-    #  Beat Grid
-    first_beat: float = 0.0
-    beat_interval: float = 0.5
-    #  Artwork
-    artwork_embedded: bool = False
-    artwork_url: Optional[str] = None
-    # Preview snippet URL (6 segundos)
-    preview_url: Optional[str] = None
-    # Fingerprint del archivo
-    fingerprint: Optional[str] = None
-
-class CorrectionRequest(BaseModel):
-    track_id: str
-    field: str
-    old_value: str
-    new_value: str
-    fingerprint: Optional[str] = None
-
-# ==================== MAPEOS ====================
-
-KEY_TO_CAMELOT = {
-    'C': '8B', 'C#': '3B', 'D': '10B', 'D#': '5B',
-    'E': '12B', 'F': '7B', 'F#': '2B', 'G': '9B',
-    'G#': '4B', 'A': '11B', 'A#': '6B', 'B': '1B',
-    'Cm': '5A', 'C#m': '12A', 'Dm': '7A', 'D#m': '2A',
-    'Em': '9A', 'Fm': '4A', 'F#m': '11A', 'Gm': '6A',
-    'G#m': '1A', 'Am': '8A', 'A#m': '3A', 'Bm': '10A'
-}
-
-def get_camelot(key: str) -> str:
-    """Convierte key musical a notacion Camelot"""
-    return KEY_TO_CAMELOT.get(key, '?')
-
-# ==================== HELPERS ====================
-
-def calculate_fingerprint(file_path):
-    """Calcular fingerprint simple del archivo"""
-    with open(file_path, 'rb') as f:
-        file_hash = hashlib.md5(f.read()).hexdigest()
-    return file_hash
-
-def parse_filename(filename: str) -> dict:
-    name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
-    name = re.sub(r'^\d+[\s\-_.]+', '', name)
-    name = re.sub(r'[\[\(][A-Z0-9]+[\]\)]', '', name)
-    name = re.sub(r'(?i)\(original mix\)|\[original mix\]', '', name)
-    name = re.sub(r'(?i)\(extended\)|\[extended\]', '', name)
-    
-    artist = None
-    title = None
-    
-    if ' - ' in name:
-        parts = name.split(' - ', 1)
-        artist = parts[0].strip()
-        title = parts[1].strip()
-    elif '-' in name and len(name.split('-')) == 2:
-        parts = name.split('-', 1)
-        artist = parts[0].strip()
-        title = parts[1].strip()
-    else:
-        title = name.strip()
-    
-    if artist:
-        artist = ' '.join(artist.split())
-    if title:
-        title = ' '.join(title.split())
-    
-    return {'artist': artist, 'title': title if title else name.strip()}
-
-def detect_structure(y, sr, duration):
-    segment_length = int(sr * 8)
-    n_segments = len(y) // segment_length
-    
-    if n_segments == 0:
-        return {
-            'has_intro': False, 'has_buildup': False, 'has_drop': False,
-            'has_breakdown': False, 'has_outro': False, 'sections': []
-        }
-    
-    energies = []
-    for i in range(n_segments):
-        segment = y[i*segment_length:(i+1)*segment_length]
-        energies.append(np.mean(librosa.feature.rms(y=segment)))
-    
-    energies = np.array(energies)
-    avg_energy = np.mean(energies)
-    
-    has_intro = energies[0] < avg_energy * 0.6 if len(energies) > 0 else False
-    has_outro = energies[-1] < avg_energy * 0.6 if len(energies) > 0 else False
-    has_drop = np.max(energies) > avg_energy * 1.4 if len(energies) > 0 else False
-    has_breakdown = np.min(energies[1:-1]) < avg_energy * 0.5 if len(energies) > 2 else False
-    has_buildup = has_drop
-    
-    sections = []
-    for i, e in enumerate(energies):
-        section_type = "body"
-        if i == 0 and has_intro:
-            section_type = "intro"
-        elif i == len(energies)-1 and has_outro:
-            section_type = "outro"
-        elif e > avg_energy * 1.4:
-            section_type = "drop"
-        elif e < avg_energy * 0.5:
-            section_type = "breakdown"
-        
-        sections.append({
-            "type": section_type,
-            "start": i * 8.0,
-            "end": (i + 1) * 8.0,
-            "energy": float(e)
-        })
-    
-    return {
-        'has_intro': has_intro, 'has_buildup': has_buildup, 'has_drop': has_drop,
-        'has_breakdown': has_breakdown, 'has_outro': has_outro, 'sections': sections
-    }
-
-def find_drop_timestamp(y, sr, segments: dict) -> float:
-    if not segments['sections']:
-        return 30.0
-    
-    for section in segments['sections']:
-        if section['type'] == 'drop':
-            return section['start'] + 4.0
-    
-    max_energy = max(s['energy'] for s in segments['sections'])
-    for section in segments['sections']:
-        if section['energy'] == max_energy:
-            return section['start'] + 4.0
-    
-    duration = segments['sections'][-1]['end'] if segments['sections'] else 180
-    return duration / 3
-
-def classify_track_type(energy: float, segments: dict, duration: float) -> str:
-    if energy < 0.5 and segments['has_intro']:
-        return "warmup"
-    if energy > 0.7 and segments['has_drop']:
-        return "peak"
-    if segments['has_outro'] and duration > 300:
-        return "closing"
-    return "peak" if energy > 0.6 else "warmup"
-
-def detect_vocals_improved(y, sr, spectral_centroid):
-    try:
-        centroid_mean = float(np.mean(spectral_centroid))
-        has_high_centroid = centroid_mean > 3500
-        
-        flatness = librosa.feature.spectral_flatness(y=y)
-        flatness_mean = float(np.mean(flatness))
-        is_tonal = flatness_mean < 0.15
-        
-        centroid_std = float(np.std(spectral_centroid))
-        has_variation = centroid_std > 500
-        
-        zcr = librosa.feature.zero_crossing_rate(y)
-        zcr_mean = float(np.mean(zcr))
-        zcr_in_voice_range = 0.05 < zcr_mean < 0.15
-        
-        criteria_met = sum([has_high_centroid, is_tonal, has_variation, zcr_in_voice_range])
-        return criteria_met >= 3
-        
-    except (ValueError, TypeError, RuntimeError) as e:
-        logger.error(f"Error detectando vocals: {e}")
-        return False
-
-def get_acousticbrainz_genre(fingerprint=None, artist=None, title=None):
-    """AcousticBrainz cerró en 2022. Stub que retorna None para no romper llamadas."""
-    return None
-
-
-# ==================== PREVIEW SNIPPET ====================
-
-import subprocess
-from pathlib import Path as PathLib
-
-# Asegurar directorio de previews
-PathLib(PREVIEWS_DIR).mkdir(parents=True, exist_ok=True)
-
-def generate_preview_snippet(
-    file_path: str,
-    fingerprint: str,
-    drop_timestamp: float,
-    duration: float,
-) -> Optional[str]:
-    """
-    Genera snippet MP3 de 6s desde el punto más interesante del track.
-    
-    Formato: MP3 mono, 64kbps, 22050Hz ≈ 48KB por track.
-    Incluye fade in (0.3s) y fade out (0.5s) via ffmpeg.
-    
-    Args:
-        file_path: Ruta al archivo de audio temporal
-        fingerprint: Hash MD5 del archivo (usado como ID)
-        drop_timestamp: Timestamp del drop/punto energético (en segundos)
-        duration: Duración total del track (en segundos)
-    
-    Returns:
-        Ruta al snippet generado, o None si falla
-    """
-    output_path = os.path.join(PREVIEWS_DIR, f"{fingerprint}.mp3")
-    
-    # Si ya existe, no regenerar
-    if os.path.exists(output_path):
-        logger.debug(f"[Preview] Ya existe snippet para {fingerprint[:8]}...")
-        return output_path
-    
-    # Calcular punto de inicio: 2s antes del drop para capturar buildup
-    start = max(0, drop_timestamp - 2.0)
-    # Asegurar que no nos pasamos del final
-    if start + 6 > duration:
-        start = max(0, duration - 6)
-    # Si el track dura menos de 6s, empezar desde 0
-    if duration < 6:
-        start = 0
-    
-    try:
-        cmd = [
-            'ffmpeg', '-y',
-            '-ss', str(round(start, 2)),
-            '-i', file_path,
-            '-t', '6',
-            '-ac', '1',           # Mono
-            '-ab', '64k',         # 64kbps
-            '-ar', '22050',       # Sample rate bajo (suficiente para preview)
-            '-af', 'afade=t=in:st=0:d=0.3,afade=t=out:st=5.5:d=0.5',  # Fade in/out
-            output_path
-        ]
-        
-        proc_result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=15,
-            check=True,
-        )
-        
-        # Verificar que el archivo se generó y tiene tamaño razonable
-        if os.path.exists(output_path):
-            size = os.path.getsize(output_path)
-            if size > 1000:  # Mínimo 1KB
-                logger.info(f"[Preview] Snippet generado: {fingerprint[:8]}... "
-                      f"({size//1024}KB, start={start:.1f}s)")
-                return output_path
-            else:
-                logger.warning(f"[Preview] Snippet demasiado pequeño ({size}B), eliminando")
-                os.unlink(output_path)
-                return None
-        
-        return None
-        
-    except subprocess.TimeoutExpired:
-        logger.warning(f"[Preview] Timeout generando snippet para {fingerprint[:8]}...")
-        if os.path.exists(output_path):
-            os.unlink(output_path)
-        return None
-    except subprocess.CalledProcessError as e:
-        stderr_msg = e.stderr.decode('utf-8', errors='replace')[:200] if e.stderr else 'unknown'
-        logger.error(f"[Preview] ffmpeg error: {stderr_msg}")
-        if os.path.exists(output_path):
-            os.unlink(output_path)
-        return None
-    except (FileNotFoundError, IOError, OSError) as e:
-        logger.error(f"[Preview] Error generando snippet: {e}")
-        if os.path.exists(output_path):
-            os.unlink(output_path)
         return None
 
 
@@ -1724,8 +1033,8 @@ async def analyze_track(
         import warnings
         warnings.filterwarnings('ignore')
         
-        # Calcular fingerprint del archivo
-        fingerprint = calculate_fingerprint(tmp_path)
+        # Calcular fingerprint del archivo (Chromaprint basado en audio real)
+        fingerprint, chromaprint_raw = calculate_fingerprint(tmp_path)
         
         # NUEVO: Buscar por fingerprint si no se encontro por filename
         # Esto recupera datos de AudD guardados previamente
@@ -1861,6 +1170,8 @@ async def analyze_track(
         track_data['id'] = fingerprint
         track_data['filename'] = file.filename
         track_data['fingerprint'] = fingerprint
+        if chromaprint_raw:
+            track_data['chromaprint'] = chromaprint_raw
         # Guardar path original del cliente para preview on-the-fly
         if original_path:
             track_data['original_file_path'] = original_path
@@ -2456,83 +1767,10 @@ async def recognize_audio(file: UploadFile = File(...)):
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-@app.post("/check-analyzed")
-async def check_analyzed(filenames: list[str]):
-    """Verificar cules tracks ya estn analizados"""
-    analyzed = []
-    not_analyzed = []
-    
-    for filename in filenames:
-        existing = db.get_track_by_filename(filename)
-        if existing:
-            analyzed.append(filename)
-        else:
-            not_analyzed.append(filename)
-    
-    return {
-        "analyzed": analyzed,
-        "not_analyzed": not_analyzed,
-        "total": len(filenames),
-        "analyzed_count": len(analyzed),
-        "not_analyzed_count": len(not_analyzed)
-    }
-
-# ==================== ENDPOINTS DE ARTWORK ====================
-
-@app.get("/analysis/{filename:path}")
-async def get_analysis(filename: str):
-    """Obtener anlisis guardado de un track por filename"""
-    # Decodificar filename si viene con URL encoding
-    from urllib.parse import unquote
-    import json
-    filename = unquote(filename)
-    
-    existing = db.get_track_by_filename(filename)
-    if existing:
-        # existing es una tupla, convertir a diccionario
-        # Columnas: id, filename, artist, title, duration, bpm, key, camelot, 
-        #           energy_dj, genre, track_type, analysis_json, analyzed_at, fingerprint
-        try:
-            # Si hay analysis_json guardado, usarlo directamente
-            analysis_json = existing[11]  # ndice de analysis_json
-            if analysis_json:
-                return json.loads(analysis_json)
-        except:
-            pass
-        
-        # Fallback: construir respuesta bsica
-        return {
-            "id": existing[0],
-            "filename": existing[1],
-            "artist": existing[2],
-            "title": existing[3],
-            "duration": existing[4],
-            "bpm": existing[5],
-            "key": existing[6],
-            "camelot": existing[7],
-            "energy_dj": existing[8],
-            "genre": existing[9],
-            "track_type": existing[10],
-            "fingerprint": existing[13] if len(existing) > 13 else None,
-        }
-    
-    raise HTTPException(404, f"Anlisis no encontrado para: {filename}")
-
-@app.get("/artwork/{track_id}")
-async def get_artwork(track_id: str):
-    """Devuelve el artwork de un track como imagen"""
-    for ext in ['jpg', 'png', 'jpeg']:
-        cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
-        if os.path.exists(cache_path):
-            media_type = "image/jpeg" if ext in ['jpg', 'jpeg'] else "image/png"
-            return FileResponse(cache_path, media_type=media_type)
-    
-    raise HTTPException(404, "Artwork no encontrado")
-
-
-# ==================== SEARCH / LIBRARY / ADMIN / COMMUNITY ====================
-# These routes have been extracted to routes/ modules.
-# See: routes/search.py, routes/library.py, routes/admin.py, routes/community.py
+# ==================== EXTRACTED TO ROUTE MODULES ====================
+# /check-analyzed, /analysis/{filename}, /artwork/{track_id} → routes/media.py
+# /preview/{track_id}, /preview/generate, /previews/check → routes/preview.py
+# /search/*, /library/*, /admin/*, /community/* → routes/search.py, library.py, admin.py, community.py
 
 # ==================== ENDPOINTS SIMILAR TRACKS ====================
 
@@ -2611,318 +1849,4 @@ if SIMILAR_TRACKS_ENABLED:
         
         return results[:limit]
 
-# ==================== INFO ====================
-
-@app.get("/preview/{track_id}")
-async def get_preview(track_id: str):
-    """
-    Sirve el snippet de preview de un track (MP3 6s).
-    
-    1. Si ya existe en PREVIEWS_DIR → servir directamente
-    2. Si no existe pero el track está en DB → intentar generar on-the-fly
-       buscando el archivo original en disco (local engine) o en /tmp/
-    """
-    # Validar formato de track_id
-    if not track_id or len(track_id) > 64:
-        raise HTTPException(400, "track_id inválido")
-    
-    # Sanitizar para evitar path traversal
-    safe_id = re.sub(r'[^a-fA-F0-9]', '', track_id)
-    if safe_id != track_id:
-        raise HTTPException(400, "track_id contiene caracteres inválidos")
-    
-    preview_path = os.path.join(PREVIEWS_DIR, f"{safe_id}.mp3")
-    
-    # 1. Servir desde cache si existe
-    if os.path.exists(preview_path):
-        return FileResponse(
-            preview_path,
-            media_type="audio/mpeg",
-            headers={
-                "Cache-Control": "public, max-age=31536000",
-                "Content-Disposition": f"inline; filename={safe_id}_preview.mp3",
-            }
-        )
-    
-    # 2. Intentar generar on-the-fly
-    track = db.get_track_by_id(safe_id) or db.get_track_by_fingerprint(safe_id)
-    if not track:
-        raise HTTPException(status_code=404, detail="Track not found")
-    
-    # Buscar archivo de audio en posibles ubicaciones
-    filename = track.get('filename', '')
-    audio_path = None
-    
-    # Extraer file_path del analysis_json si existe
-    analysis_json = track.get('analysis_json')
-    original_path = None
-    drop_ts = 30.0
-    duration = track.get('duration', 0) or 180.0
-    
-    if analysis_json:
-        try:
-            aj = json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json
-            # Buscar path original: puede estar en varios campos
-            original_path = (
-                aj.get('original_file_path')
-                or aj.get('track', {}).get('filePath')
-                or aj.get('track', {}).get('file_path')
-            )
-            drop_ts = aj.get('drop_timestamp', 0) or 30.0
-            duration = aj.get('duration', duration)
-        except (json.JSONDecodeError, TypeError, KeyError):
-            pass  # TODO: add specific exception
-    
-    # Intentar encontrar el archivo
-    candidates = [
-        original_path,
-        f"/tmp/{filename}" if filename else None,
-        filename if filename and os.path.isabs(filename) else None,
-    ]
-    for path in candidates:
-        if path and os.path.exists(path):
-            audio_path = path
-            break
-    
-    if not audio_path:
-        raise HTTPException(status_code=404, detail="Preview not available — audio file not found on server")
-    
-    # Generar snippet
-    result = generate_preview_snippet(
-        file_path=audio_path,
-        fingerprint=safe_id,
-        drop_timestamp=drop_ts,
-        duration=duration,
-    )
-    
-    if result and os.path.exists(result):
-        return FileResponse(
-            result,
-            media_type="audio/mpeg",
-            headers={
-                "Cache-Control": "public, max-age=31536000",
-                "Content-Disposition": f"inline; filename={safe_id}_preview.mp3",
-                "X-Preview-Generated": "on-the-fly",
-            }
-        )
-    
-    raise HTTPException(status_code=500, detail="Failed to generate preview")
-
-
-class PreviewGenerateRequest(BaseModel):
-    track_id: str
-    file_path: str
-    drop_timestamp: float = 30.0
-    duration: float = 180.0
-
-@app.post("/preview/generate")
-async def generate_preview_on_demand(req: PreviewGenerateRequest):
-    """
-    Genera preview snippet on-demand dado un file_path local.
-    
-    Usado por el cliente desktop/mobile cuando tiene el archivo localmente
-    pero el preview no se generó durante el análisis original.
-    El cliente envía el path del archivo en su disco y el backend
-    genera el snippet de 6s.
-    """
-    safe_id = re.sub(r'[^a-fA-F0-9]', '', req.track_id)
-    if not safe_id:
-        raise HTTPException(400, "track_id inválido")
-    
-    # Si ya existe, retornar OK
-    preview_path = os.path.join(PREVIEWS_DIR, f"{safe_id}.mp3")
-    if os.path.exists(preview_path):
-        return {"status": "exists", "url": f"/preview/{safe_id}"}
-    
-    # Verificar que el archivo existe en disco (solo funciona en local engine)
-    if not os.path.exists(req.file_path):
-        raise HTTPException(404, f"File not found: {req.file_path}")
-    
-    result = generate_preview_snippet(
-        file_path=req.file_path,
-        fingerprint=safe_id,
-        drop_timestamp=req.drop_timestamp,
-        duration=req.duration,
-    )
-    
-    if result and os.path.exists(result):
-        # Actualizar analysis_json con original_file_path para futuras peticiones
-        track = db.get_track_by_id(safe_id) or db.get_track_by_fingerprint(safe_id)
-        if track and track.get('analysis_json'):
-            try:
-                aj = json.loads(track['analysis_json']) if isinstance(track['analysis_json'], str) else track['analysis_json']
-                aj['original_file_path'] = req.file_path
-                # Re-guardar con el path actualizado
-                aj['id'] = safe_id
-                aj['filename'] = track.get('filename', '')
-                aj['fingerprint'] = safe_id
-                db.save_track(aj)
-            except (json.JSONDecodeError, TypeError, KeyError):
-                pass  # TODO: add specific exception
-        
-        return {"status": "generated", "url": f"/preview/{safe_id}"}
-    
-    raise HTTPException(500, "Failed to generate preview")
-
-
-class PreviewCheckRequest(BaseModel):
-    track_ids: List[str]
-
-@app.post("/previews/check")
-async def check_previews(request: PreviewCheckRequest):
-    """
-    Devuelve qué track_ids tienen preview snippet disponible.
-    
-    Útil para que el cliente sepa de antemano cuáles puede preescuchar
-    sin tener que intentar reproducir y fallar.
-    
-    Máximo 500 IDs por petición.
-    """
-    track_ids = request.track_ids
-    
-    if len(track_ids) > 500:
-        raise HTTPException(400, "Máximo 500 track_ids por petición")
-    
-    available = []
-    for tid in track_ids:
-        safe_id = re.sub(r'[^a-fA-F0-9]', '', tid)
-        if safe_id and os.path.exists(os.path.join(PREVIEWS_DIR, f"{safe_id}.mp3")):
-            available.append(tid)
-    
-    return {
-        "available": available,
-        "total_checked": len(track_ids),
-        "total_available": len(available),
-    }
-
-
-# ==================== INFO ====================
-
-@app.get("/")
-async def root():
-    return {
-        "name": "DJ Analyzer Pro API",
-        "version": "2.3.0",
-        "status": "running",
-        "modules": {
-            "artwork": ARTWORK_ENABLED,
-            "genre_detector": GENRE_DETECTOR_ENABLED,
-            "similar_tracks": SIMILAR_TRACKS_ENABLED,
-            "preview_snippets": True,
-        },
-        "features": [
-            "BPM detection (ID3 + analysis)",
-            "Key & Camelot (ID3 + analysis)",
-            "Energy analysis (1-10 scale)",
-            "Structure analysis (intro/drop/breakdown/outro)",
-            "Cue points detection",
-            "Beat grid detection",
-            "Artwork extraction (ID3)",
-            "Genre detection (ID3/AcousticBrainz/spectral)",
-            "Collective memory",
-            "Similar tracks search",
-            "Advanced search filters",
-            "Preview snippets (6s streaming)",
-        ]
-    }
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "version": "2.3.0"}
-
-# ==================== ADMIN / RESET ====================
-
-async def _verify_admin_token(request: Request):
-    """Verifica token admin en header Authorization: Bearer <token>."""
-    if not ADMIN_TOKEN:
-        return  # Sin token configurado = dev mode
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or auth[7:] != ADMIN_TOKEN:
-        raise HTTPException(401, "Admin token requerido")
-
-from fastapi import Depends
-
-@app.delete("/admin/reset-database", dependencies=[Depends(_verify_admin_token)])
-async def reset_database(confirm: str = Query(..., description="Escribe 'CONFIRMAR' para borrar")):
-    """
-    PELIGROSO: Borra TODA la base de datos.
-    Requiere confirmar escribiendo 'CONFIRMAR' como parmetro.
-    """
-    if confirm != "CONFIRMAR":
-        raise HTTPException(400, "Debes escribir 'CONFIRMAR' para borrar la base de datos")
-    
-    try:
-        import shutil
-        
-        # Borrar artwork cache
-        if os.path.exists(ARTWORK_CACHE_DIR):
-            shutil.rmtree(ARTWORK_CACHE_DIR)
-            os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
-        
-        # Borrar y recrear BD
-        conn = sqlite3.connect(db.db_path)
-        c = conn.cursor()
-        c.execute("DELETE FROM tracks")
-        c.execute("DELETE FROM corrections")
-        c.execute("DELETE FROM dj_notes")
-        conn.commit()
-        conn.close()
-        
-        return {
-            "status": "ok",
-            "message": "Base de datos reseteada completamente",
-            "artwork_cache": "limpiado",
-            "tracks": "eliminados",
-            "corrections": "eliminadas"
-        }
-    except Exception as e:
-        raise HTTPException(500, f"Error reseteando: {str(e)}")
-
-@app.delete("/admin/clear-artwork-cache", dependencies=[Depends(_verify_admin_token)])
-async def clear_artwork_cache():
-    """Limpia solo el cach(c) de artwork"""
-    import shutil
-    try:
-        if os.path.exists(ARTWORK_CACHE_DIR):
-            shutil.rmtree(ARTWORK_CACHE_DIR)
-            os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
-        return {"status": "ok", "message": "Cach(c) de artwork limpiado"}
-    except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
-
-# ==================== COMMUNITY BEAT GRID ====================
-
-class BeatGridCorrectionRequest(BaseModel):
-    fingerprint: str
-    device_id: str
-    bpm_adjust: float = 0.0
-    beat_offset: float = 0.0
-    original_bpm: float = 0.0
-
-@app.post("/community/beat-grid")
-async def submit_beat_grid_correction(request: BeatGridCorrectionRequest):
-    """Recibe correccion de beat grid de un DJ"""
-    try:
-        db.submit_beat_grid_correction(
-            fingerprint=request.fingerprint,
-            device_id=request.device_id,
-            bpm_adjust=request.bpm_adjust,
-            beat_offset=request.beat_offset,
-            original_bpm=request.original_bpm,
-        )
-        logger.info(f"[Community] Beat grid correction: fp={request.fingerprint[:8]}... "
-              f"BPM+{request.bpm_adjust:.2f} OFF+{request.beat_offset*1000:.1f}ms")
-        return {"status": "ok"}
-    except Exception as e:
-        logger.error(f"[Community] Error saving beat grid: {e}")
-        raise HTTPException(500, f"Error: {str(e)}")
-
-@app.get("/community/beat-grid/{fingerprint}")
-async def get_community_beat_grid(fingerprint: str):
-    """Obtiene la correccion promedio de la comunidad"""
-    try:
-        result = db.get_community_beat_grid(fingerprint)
-        return result
-    except Exception as e:
-        logger.error(f"[Community] Error fetching beat grid: {e}")
-        return {"bpm_adjust": 0.0, "beat_offset": 0.0, "contributors": 0, "validated": False}
+# Preview + media endpoints extracted to routes/preview.py and routes/media.py
