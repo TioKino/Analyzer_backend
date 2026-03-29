@@ -103,12 +103,23 @@ async def reset_database(confirm: str = Query(..., description="Escribe 'CONFIRM
         conn.commit()
         conn.close()
 
+        # Borrar sync DB también
+        sync_db_path = os.environ.get("SYNC_DB_PATH", "/data/sync.db")
+        sync_cleared = False
+        if os.path.exists(sync_db_path):
+            sync_conn = sqlite3.connect(sync_db_path)
+            sync_conn.execute("DELETE FROM sync_items")
+            sync_conn.commit()
+            sync_conn.close()
+            sync_cleared = True
+
         return {
             "status": "ok",
             "message": "Base de datos reseteada completamente",
             "artwork_cache": "limpiado",
             "tracks": "eliminados",
-            "corrections": "eliminadas"
+            "corrections": "eliminadas",
+            "sync": "limpiado" if sync_cleared else "no encontrado",
         }
     except Exception as e:
         raise HTTPException(500, f"Error reseteando: {str(e)}")
