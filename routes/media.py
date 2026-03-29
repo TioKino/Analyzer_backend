@@ -2,11 +2,12 @@
 Media endpoints — artwork images, stored analysis, and batch checks.
 """
 import os
+import re
 import json
 import logging
 from urllib.parse import unquote
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File as FastAPIFile
 from fastapi.responses import FileResponse
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,34 @@ async def get_artwork(track_id: str):
             return FileResponse(cache_path, media_type=media_type)
 
     raise HTTPException(404, "Artwork not found")
+
+
+@media_router.post("/artwork/upload/{track_id}")
+async def upload_artwork(track_id: str, file: UploadFile = FastAPIFile(...)):
+    """Upload artwork image from desktop to Render for mobile access."""
+    safe_id = re.sub(r'[^a-fA-F0-9]', '', track_id)
+    if not safe_id or len(safe_id) > 64:
+        raise HTTPException(400, "track_id inválido")
+
+    content = await file.read()
+    if len(content) < 100:
+        raise HTTPException(400, "Archivo demasiado pequeño")
+    if len(content) > 2_000_000:  # 2MB max
+        raise HTTPException(400, "Archivo demasiado grande")
+
+    # Detectar extensión
+    ext = 'jpg'
+    if content[:8].startswith(b'\x89PNG'):
+        ext = 'png'
+
+    os.makedirs(_artwork_cache_dir, exist_ok=True)
+    artwork_path = os.path.join(_artwork_cache_dir, f"{safe_id}.{ext}")
+
+    with open(artwork_path, 'wb') as f:
+        f.write(content)
+
+    logger.info(f"[Artwork] Uploaded: {safe_id} ({len(content)} bytes)")
+    return {"status": "ok", "track_id": safe_id, "size": len(content)}
 
 
 @media_router.post("/check-analyzed")
