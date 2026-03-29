@@ -1,5 +1,5 @@
 """
-Preview endpoints — serve, generate, and check 6s MP3 preview snippets.
+Preview endpoints — serve, generate, upload, and check 6s MP3 preview snippets.
 """
 import os
 import re
@@ -7,7 +7,7 @@ import json
 import logging
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File as FastAPIFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -183,3 +183,29 @@ async def check_previews(request: PreviewCheckRequest):
         "total_checked": len(track_ids),
         "total_available": len(available),
     }
+
+
+@preview_router.post("/preview/upload/{track_id}")
+async def upload_preview(track_id: str, file: UploadFile = FastAPIFile(...)):
+    """
+    Upload a preview MP3 snippet from desktop to Render.
+    Called during sync to make previews available for mobile.
+    """
+    safe_id = re.sub(r'[^a-fA-F0-9]', '', track_id)
+    if not safe_id or len(safe_id) > 64:
+        raise HTTPException(400, "track_id inválido")
+
+    content = await file.read()
+    if len(content) < 100:
+        raise HTTPException(400, "Archivo demasiado pequeño")
+    if len(content) > 500_000:  # 500KB max for a 6s preview
+        raise HTTPException(400, "Archivo demasiado grande")
+
+    preview_path = os.path.join(_previews_dir, f"{safe_id}.mp3")
+    os.makedirs(_previews_dir, exist_ok=True)
+
+    with open(preview_path, 'wb') as f:
+        f.write(content)
+
+    logger.info(f"[Preview] Uploaded: {safe_id} ({len(content)} bytes)")
+    return {"status": "ok", "track_id": safe_id, "size": len(content)}
