@@ -651,91 +651,138 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
 
 def detect_beat_grid(y, sr, bpm: float) -> Dict:
     """
-    Detecta el beat grid preciso para sincronizacion.
-    
-    v2: Usa 60/BPM como intervalo (mas preciso que mediana de detecciones)
-    y calcula firstBeat optimo con media circular de fases.
-    
+    Detecta el beat grid preciso para sincronización.
+
+    v3: Enfoque onset-first — usa onset strength para encontrar los transitorios
+    reales del audio, filtra outliers, y ajusta la fase con búsqueda de
+    máxima correlación contra el grid teórico.
+
     Returns:
         Dict con first_beat, beat_interval, beats (lista de timestamps)
     """
     import librosa
     import numpy as np
-    
+
     if bpm <= 0:
         return {
             'first_beat': 0.0,
             'beat_interval': 0.5,
             'beats': [],
         }
-    
-    # INTERVALO: usar 60/BPM directamente (mucho mas preciso)
-    # np.median(intervals) acumula drift: 0.001s/beat * 900 beats = 0.9s error
+
     beat_interval = 60.0 / bpm
-    
-    # Detectar beats con librosa
-    tempo, beats = librosa.beat.beat_track(y=y, sr=sr, bpm=bpm)
-    beat_times = librosa.frames_to_time(beats, sr=sr)
-    
-    if len(beat_times) < 2:
-        return {
-            'first_beat': 0.0,
-            'beat_interval': round(beat_interval, 6),
-            'beats': [],
-        }
-    
-    # FIRST BEAT OPTIMO (media circular de fases)
-    # En vez de usar beat_times[0] (puede ser impreciso),
-    # calculamos la fase optima que minimiza el error contra
-    # TODOS los beats detectados por librosa.
-    phases = beat_times % beat_interval
-    
-    # Media circular: convertir a angulos, promediar como vectores
-    angles = phases * (2 * np.pi / beat_interval)
-    mean_sin = float(np.mean(np.sin(angles)))
-    mean_cos = float(np.mean(np.cos(angles)))
-    optimal_phase = np.arctan2(mean_sin, mean_cos) * (beat_interval / (2 * np.pi))
-    
-    if optimal_phase < 0:
-        optimal_phase += beat_interval
-    
-    first_beat = float(optimal_phase)
-    while first_beat > beat_interval:
-        first_beat -= beat_interval
-    
-    # Verificar alineacion: calcular error promedio
-    errors = []
-    for bt in beat_times:
-        nearest_grid = round((bt - first_beat) / beat_interval) * beat_interval + first_beat
-        errors.append(abs(bt - nearest_grid))
-    avg_error = float(np.mean(errors))
-    
-    # Si error >50ms, refinar con onset detection
-    if avg_error > 0.05:
-        try:
-            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-            onset_times = librosa.times_like(onset_env, sr=sr)
-            search_window = beat_interval * 0.4
-            mask = np.abs(onset_times - first_beat) < search_window
-            if np.any(mask):
-                onset_near = onset_env[mask]
-                times_near = onset_times[mask]
-                best_idx = np.argmax(onset_near)
-                refined_fb = float(times_near[best_idx])
-                errors2 = [abs(bt - (round((bt - refined_fb) / beat_interval) * beat_interval + refined_fb)) for bt in beat_times]
-                if np.mean(errors2) < avg_error:
-                    first_beat = refined_fb
-                    avg_error = float(np.mean(errors2))
-        except (ValueError, TypeError, RuntimeError):
-            pass  # TODO: handle specifically
-    
+    duration = len(y) / sr
+
+    # ===== PASO 1: Onset strength — detectar transitorios reales =====
+    # Más fiable que librosa.beat.beat_track para música electrónica
+    hop_length = 512
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    onset_times = librosa.times_like(onset_env, sr=sr, hop_length=hop_length)
+
+    # ===== PASO 2: Autocorrelación para verificar/corregir BPM =====
+    # Verificar que el BPM es correcto usando la autocorrelación del onset
+    ac = librosa.autocorrelate(onset_env, max_size=int(sr / hop_length * 2))
+    # Buscar pico de autocorrelación cerca del BPM esperado
+    expected_lag = int((60.0 / bpm) * sr / hop_length)
+    search_range = max(int(expected_lag * 0.1), 3)  # ±10%
+    lag_start = max(1, expected_lag - search_range)
+    lag_end = min(len(ac) - 1, expected_lag + search_range)
+    if lag_end > lag_start:
+        best_lag = lag_start + np.argmax(ac[lag_start:lag_end + 1])
+        refined_interval = best_lag * hop_length / sr
+        # Solo usar si la diferencia es pequeña (< 3%)
+        if abs(refined_interval - beat_interval) / beat_interval < 0.03:
+            beat_interval = refined_interval
+
+    # ===== PASO 3: Brute-force phase search =====
+    # Probar 100 fases candidatas y elegir la que maximiza la
+    # energía de onset acumulada en posiciones de beat
+    n_candidates = 100
+    best_phase = 0.0
+    best_score = -1.0
+
+    for i in range(n_candidates):
+        phase = i * beat_interval / n_candidates
+        score = 0.0
+        n_beats = 0
+        t = phase
+        while t < duration:
+            # Encontrar el frame de onset más cercano
+            idx = int(t * sr / hop_length)
+            if 0 <= idx < len(onset_env):
+                # Sumar onset strength en ventana de ±15ms
+                window = max(1, int(0.015 * sr / hop_length))
+                start = max(0, idx - window)
+                end = min(len(onset_env), idx + window + 1)
+                score += float(np.max(onset_env[start:end]))
+                n_beats += 1
+            t += beat_interval
+
+        if n_beats > 0:
+            score /= n_beats
+        if score > best_score:
+            best_score = score
+            best_phase = phase
+
+    first_beat = best_phase
+
+    # ===== PASO 4: Refinar fase con sub-frame precision =====
+    # Fine-tune alrededor de la mejor fase con resolución de 1ms
+    fine_range = beat_interval / n_candidates
+    fine_steps = 20
+    best_fine_phase = first_beat
+    best_fine_score = best_score
+
+    for i in range(fine_steps):
+        phase = first_beat - fine_range + (2 * fine_range * i / fine_steps)
+        if phase < 0:
+            phase += beat_interval
+        score = 0.0
+        n_beats = 0
+        t = phase
+        while t < duration:
+            idx = int(t * sr / hop_length)
+            if 0 <= idx < len(onset_env):
+                window = max(1, int(0.010 * sr / hop_length))
+                start = max(0, idx - window)
+                end = min(len(onset_env), idx + window + 1)
+                score += float(np.max(onset_env[start:end]))
+                n_beats += 1
+            t += beat_interval
+        if n_beats > 0:
+            score /= n_beats
+        if score > best_fine_score:
+            best_fine_score = score
+            best_fine_phase = phase
+
+    first_beat = best_fine_phase
+
+    # ===== PASO 5: Generar grid y calcular error =====
+    grid_beats = []
+    t = first_beat
+    while t < duration:
+        grid_beats.append(round(t, 4))
+        t += beat_interval
+
+    # Calcular error usando detected beats de librosa como referencia
+    try:
+        tempo, lib_beats = librosa.beat.beat_track(y=y, sr=sr, bpm=bpm)
+        lib_times = librosa.frames_to_time(lib_beats, sr=sr)
+        errors = []
+        for bt in lib_times:
+            nearest = round((bt - first_beat) / beat_interval) * beat_interval + first_beat
+            errors.append(abs(bt - nearest))
+        avg_error = float(np.mean(errors)) if errors else 0.0
+    except Exception:
+        avg_error = 0.0
+
     max_beats = 500
-    
+
     return {
         'first_beat': round(first_beat, 4),
         'beat_interval': round(beat_interval, 6),
-        'beats': [round(b, 4) for b in beat_times[:max_beats]],
-        'total_beats': len(beat_times),
+        'beats': grid_beats[:max_beats],
+        'total_beats': len(grid_beats),
         'grid_error_ms': round(avg_error * 1000, 1),
     }
 

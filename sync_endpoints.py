@@ -25,12 +25,6 @@ from config import SYNC_AUTH_SECRET
 
 logger = logging.getLogger(__name__)
 
-sync_router = APIRouter(
-    prefix="/sync",
-    tags=["sync"],
-    dependencies=[Depends(_verify_sync_auth)],
-)
-
 
 # ── HMAC-SHA256 Auth ─────────────────────────────────────────
 # Si SYNC_AUTH_SECRET está configurado, todos los endpoints de sync
@@ -56,6 +50,13 @@ async def _verify_sync_auth(request: Request):
 
     if not _hmac.compare_digest(signature, expected):
         raise HTTPException(status_code=401, detail="Invalid signature")
+
+
+sync_router = APIRouter(
+    prefix="/sync",
+    tags=["sync"],
+    dependencies=[Depends(_verify_sync_auth)],
+)
 
 # ── SQLite persistente ───────────────────────────────────────
 

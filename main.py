@@ -602,16 +602,23 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
 
     drop_time = find_drop_timestamp(y, sr, segments)
     
-    # ==================== CUE POINTS ====================
+    # ==================== CUE POINTS + BEAT GRID ====================
     cue_points = []
-    first_beat = 0.0
-    beat_interval = 0.5
-    
+
     if ARTWORK_ENABLED:
         cue_points = detect_cue_points(y, sr, duration, segments)
+
+    # Beat grid: SIEMPRE detectar (no depende de ARTWORK_ENABLED)
+    # El intervalo se calcula del BPM final (que puede venir de ID3/Beatport)
+    beat_interval = 60.0 / bpm if bpm > 0 else 0.5
+    first_beat = 0.0
+    try:
         beat_grid = detect_beat_grid(y, sr, bpm)
         first_beat = beat_grid.get('first_beat', 0.0)
-        beat_interval = beat_grid.get('beat_interval', 0.5)
+        beat_interval = beat_grid.get('beat_interval', beat_interval)
+        logger.info(f"[Beat Grid] fb={first_beat:.4f}s iv={beat_interval:.6f}s err={beat_grid.get('grid_error_ms', '?')}ms")
+    except Exception as e:
+        logger.warning(f"[Beat Grid] Error: {e}, usando defaults")
     
     # ==================== ARTWORK ====================
     artwork_embedded = False
