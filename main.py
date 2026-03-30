@@ -655,7 +655,8 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                     artwork_embedded = False  # No est embebido, viene de online
                     artwork_source = online_artwork.get('source', 'online')
                     save_artwork_to_cache(fingerprint, online_artwork['data'], online_artwork['mime_type'])
-                    artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
+                    # Usar URL directa de iTunes/Deezer para que funcione en todos los dispositivos
+                    artwork_url = online_artwork.get('url') or f"{BASE_URL}/artwork/{fingerprint}"
                     logger.info(f"Artwork {artwork_source}: {online_artwork.get('size', 0)} bytes")
                 else:
                     logger.debug(f"No se encontr artwork online")
