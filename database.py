@@ -44,7 +44,7 @@ class AnalysisDB:
         # Migración: añadir columna chromaprint si no existe (BD existentes)
         try:
             c.execute('ALTER TABLE tracks ADD COLUMN chromaprint TEXT')
-        except Exception:
+        except sqlite3.OperationalError:
             pass  # Ya existe
 
         # Crear ndices para bsquedas rpidas

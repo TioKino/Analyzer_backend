@@ -3,6 +3,7 @@ Search route handlers for DJ Analyzer Pro API.
 """
 import re
 import json
+import sqlite3
 import logging
 from typing import Optional
 
@@ -208,7 +209,7 @@ async def search_analyzed_track(
             "track": None
         }
 
-    except Exception as e:
+    except (sqlite3.DatabaseError, ValueError, TypeError, KeyError) as e:
         logger.error(f"Error en search-analyzed: {e}")
         return {
             "found": False,

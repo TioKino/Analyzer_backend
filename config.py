@@ -113,7 +113,9 @@ ADMIN_TOKEN: str = os.getenv('ADMIN_TOKEN', '')
 # ==================== CORS ====================
 
 # Orígenes permitidos para CORS (separados por coma)
-CORS_ORIGINS: list = os.getenv('CORS_ORIGINS', '*').split(',')
+# En producción se recomienda configurar explícitamente
+_cors_env = os.getenv('CORS_ORIGINS', '')
+CORS_ORIGINS: list = _cors_env.split(',') if _cors_env else ['*']
 
 
 # ==================== FUNCIONES DE UTILIDAD ====================
@@ -138,18 +140,29 @@ def validate_config() -> tuple[bool, list[str], list[str]]:
     # Directorios
     try:
         Path(ARTWORK_CACHE_DIR).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
+    except OSError as e:
         errors.append(f"No se pudo crear {ARTWORK_CACHE_DIR}: {e}")
-    
+
     try:
         Path(PREVIEWS_DIR).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
+    except OSError as e:
         errors.append(f"No se pudo crear {PREVIEWS_DIR}: {e}")
     
-    # Base URL en producción
+    # Seguridad en producción
+    is_production = bool(os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'))
+
     if not DEBUG and BASE_URL.startswith('http://localhost'):
         warnings.append("BASE_URL apunta a localhost en modo producción")
-    
+
+    if is_production and not SYNC_AUTH_SECRET:
+        warnings.append("SYNC_AUTH_SECRET no configurado - sync sin autenticación")
+
+    if is_production and not ADMIN_TOKEN:
+        warnings.append("ADMIN_TOKEN no configurado - endpoints admin sin protección")
+
+    if is_production and CORS_ORIGINS == ['*']:
+        warnings.append("CORS_ORIGINS es wildcard (*) en producción - configurar orígenes explícitos")
+
     is_valid = len(errors) == 0
     return is_valid, errors, warnings
 

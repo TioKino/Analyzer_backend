@@ -34,7 +34,10 @@ def init(database, artwork_cache_dir=None, artwork_enabled=False,
 async def _verify_admin_token(request: Request):
     """Verifica token admin en header Authorization: Bearer <token>."""
     if not ADMIN_TOKEN:
-        return  # Sin token configurado = dev mode
+        # Solo permitir sin token en entorno local
+        if os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'):
+            raise HTTPException(status_code=500, detail="ADMIN_TOKEN required in production")
+        return  # Dev mode local: sin token
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer ") or auth[7:] != ADMIN_TOKEN:
         raise HTTPException(401, "Admin token requerido")
@@ -121,7 +124,7 @@ async def reset_database(confirm: str = Query(..., description="Escribe 'CONFIRM
             "corrections": "eliminadas",
             "sync": "limpiado" if sync_cleared else "no encontrado",
         }
-    except Exception as e:
+    except (sqlite3.DatabaseError, OSError, PermissionError) as e:
         raise HTTPException(500, f"Error reseteando: {str(e)}")
 
 
@@ -134,5 +137,5 @@ async def clear_artwork_cache():
             shutil.rmtree(ARTWORK_CACHE_DIR)
             os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
         return {"status": "ok", "message": "Caché de artwork limpiado"}
-    except Exception as e:
+    except (OSError, PermissionError) as e:
         raise HTTPException(500, f"Error: {str(e)}")

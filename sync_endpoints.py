@@ -34,7 +34,10 @@ logger = logging.getLogger(__name__)
 async def _verify_sync_auth(request: Request):
     """Dependency de FastAPI que valida HMAC si el secret está configurado."""
     if not SYNC_AUTH_SECRET:
-        return  # Dev mode: sin auth
+        # Dev mode: solo permitir sin auth si es entorno local
+        if os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'):
+            raise HTTPException(status_code=500, detail="SYNC_AUTH_SECRET required in production")
+        return  # Dev mode local: sin auth
 
     body = await request.body()
     signature = request.headers.get("X-Signature", "")

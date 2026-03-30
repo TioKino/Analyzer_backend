@@ -1,6 +1,7 @@
 """
 Community route handlers for DJ Analyzer Pro API.
 """
+import sqlite3
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -43,7 +44,7 @@ async def submit_beat_grid_correction(request: BeatGridCorrectionRequest):
         logger.info(f"[Community] Beat grid correction: fp={request.fingerprint[:8]}... "
               f"BPM+{request.bpm_adjust:.2f} OFF+{request.beat_offset*1000:.1f}ms")
         return {"status": "ok"}
-    except Exception as e:
+    except (sqlite3.DatabaseError, ValueError, TypeError) as e:
         logger.error(f"[Community] Error saving beat grid: {e}")
         raise HTTPException(500, f"Error: {str(e)}")
 
@@ -54,6 +55,6 @@ async def get_community_beat_grid(fingerprint: str):
     try:
         result = db.get_community_beat_grid(fingerprint)
         return result
-    except Exception as e:
+    except (sqlite3.DatabaseError, ValueError, TypeError) as e:
         logger.error(f"[Community] Error fetching beat grid: {e}")
         return {"bpm_adjust": 0.0, "beat_offset": 0.0, "contributors": 0, "validated": False}

@@ -64,6 +64,7 @@ from config import (
     DEBUG,
     PREVIEWS_DIR,
     ADMIN_TOKEN,
+    RATE_LIMIT_ENABLED,
 )
 
 #  Importar mdulo de validacin
@@ -617,7 +618,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         first_beat = beat_grid.get('first_beat', 0.0)
         beat_interval = beat_grid.get('beat_interval', beat_interval)
         logger.info(f"[Beat Grid] fb={first_beat:.4f}s iv={beat_interval:.6f}s err={beat_grid.get('grid_error_ms', '?')}ms")
-    except Exception as e:
+    except (ValueError, TypeError, KeyError, IndexError) as e:
         logger.warning(f"[Beat Grid] Error: {e}, usando defaults")
     
     # ==================== ARTWORK ====================
@@ -980,8 +981,9 @@ async def analyze_track(
 ):
     # Leer path original del cliente (enviado como header)
     original_path = request.headers.get('x-original-path')
-    #  Rate limiting (opcional - descomenta si quieres)
-    # check_rate_limit(get_client_ip(request))
+    # Rate limiting
+    if RATE_LIMIT_ENABLED:
+        check_rate_limit(get_client_ip(request))
     
     #  Validacin mejorada de archivo
     if not file.filename:
@@ -1205,11 +1207,12 @@ async def analyze_track(
         
         result.fingerprint = fingerprint
         return result
-    except Exception as e:
+    except (ValueError, TypeError, KeyError, IndexError, IOError, OSError,
+            json.JSONDecodeError) as e:
         import traceback
         error_detail = traceback.format_exc()
         logger.error(f"ERROR en anlisis de audio:\n{error_detail}")
-        
+
         # ==================== FALLBACK: Track corrupto ====================
         # Intentar crear resultado bsico con ID3 y/o filename
         logger.warning(f"Intentando fallback para: {file.filename}")
@@ -1227,7 +1230,7 @@ async def analyze_track(
             if ARTWORK_ENABLED:
                 try:
                     id3_data = extract_id3_metadata(tmp_path)
-                except:
+                except (ValueError, TypeError, KeyError, IOError, OSError):
                     pass
             
             # Parsear filename
@@ -1656,10 +1659,14 @@ async def identify_track(file: UploadFile = File(...)):
             "reanalyzed": True,
         }
         
-    except Exception as e:
+    except (ValueError, TypeError, KeyError, IOError, OSError,
+            json.JSONDecodeError, sqlite3.DatabaseError) as e:
         import traceback
         logger.error(f"Error identificando: {traceback.format_exc()}")
         raise HTTPException(500, f"Error: {str(e)}")
+    except requests.RequestException as e:
+        logger.error(f"Error de red identificando: {e}")
+        raise HTTPException(502, f"Error de red: {str(e)}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -1767,7 +1774,11 @@ async def recognize_audio(file: UploadFile = File(...)):
     except requests.Timeout:
         logger.warning("AudD timeout")
         raise HTTPException(504, "Timeout conectando con AudD")
-    except Exception as e:
+    except requests.RequestException as e:
+        logger.error(f"Error de red en reconocimiento: {e}")
+        raise HTTPException(502, f"Error de red: {str(e)}")
+    except (ValueError, TypeError, KeyError, IOError, OSError,
+            json.JSONDecodeError) as e:
         import traceback
         logger.error(f"Error reconocimiento: {traceback.format_exc()}")
         raise HTTPException(500, f"Error: {str(e)}")

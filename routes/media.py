@@ -4,11 +4,12 @@ Media endpoints — artwork images, stored analysis, and batch checks.
 import os
 import re
 import json
+import hashlib
 import logging
 from urllib.parse import unquote
 
-from fastapi import APIRouter, HTTPException, UploadFile, File as FastAPIFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, UploadFile, File as FastAPIFile, Request
+from fastapi.responses import FileResponse, Response
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +60,29 @@ async def get_analysis(filename: str):
 
 
 @media_router.get("/artwork/{track_id}")
-async def get_artwork(track_id: str):
-    """Return track artwork image."""
+async def get_artwork(track_id: str, request: Request):
+    """Return track artwork image with caching headers."""
     for ext in ['jpg', 'png', 'jpeg']:
         cache_path = os.path.join(_artwork_cache_dir, f"{track_id}.{ext}")
         if os.path.exists(cache_path):
+            # ETag basado en tamaño + mtime del archivo
+            stat = os.stat(cache_path)
+            etag = hashlib.md5(f"{stat.st_size}-{stat.st_mtime}".encode()).hexdigest()
+
+            # Si el cliente ya tiene esta versión, devolver 304
+            if_none_match = request.headers.get("if-none-match")
+            if if_none_match and if_none_match.strip('"') == etag:
+                return Response(status_code=304)
+
             media_type = "image/jpeg" if ext in ['jpg', 'jpeg'] else "image/png"
-            return FileResponse(cache_path, media_type=media_type)
+            return FileResponse(
+                cache_path,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "public, max-age=2592000",  # 30 días
+                    "ETag": f'"{etag}"',
+                },
+            )
 
     raise HTTPException(404, "Artwork not found")
 
