@@ -1,27 +1,34 @@
 # ============================================================================
-# SYNC ENDPOINTS v5.0 — DJ Analyzer Pro
+# SYNC ENDPOINTS v6.0 — DJ Analyzer Pro (Multi-Tenant)
 # ============================================================================
-# CAMBIOS vs v4.0:
-#   1. PERSISTENCIA SQLite — ya no se pierden datos al reiniciar Render
-#   2. FIX _compute_detail — dispositivo nuevo usa categorías "_initial"
-#      en vez de "_added" para que el diálogo no mienta
-#   3. Reutiliza la ruta /data/ que ya usa el resto del backend
+# CAMBIOS vs v5.0:
+#   1. MULTI-TENANT — Aislamiento total entre usuarios
+#   2. USER ACCOUNTS — Registro anónimo + vinculación de dispositivos por código
+#   3. MEMORIA COLECTIVA — data_types compartidos entre todos los usuarios
+#   4. ADMIN ENDPOINTS — Vista completa de todos los usuarios y datos
+#   5. MIGRACIÓN AUTOMÁTICA — Datos existentes se asignan al primer usuario
 #
-# SINGLE SOURCE OF TRUTH — Last-write-wins
-# Claves: "data_type|item_key" (sin device_id)
-# Cada item guarda quién lo subió último (last_device_id) y cuándo.
+# ARQUITECTURA:
+#   - Cada usuario tiene un user_id (UUID)
+#   - Cada device_id se vincula a un user_id
+#   - Pull/Push/Pending solo ven datos del MISMO usuario
+#   - Tipos "collective" se comparten entre todos
+#   - Admin con ADMIN_TOKEN ve todo
 # ============================================================================
 
 import hmac as _hmac
 import logging
+import uuid
+import random
+import string
 
 from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Any, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json, hashlib, sqlite3, os
 
-from config import SYNC_AUTH_SECRET
+from config import SYNC_AUTH_SECRET, ADMIN_TOKEN
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +109,67 @@ def _init_tables(conn: sqlite3.Connection):
             payload   TEXT,
             PRIMARY KEY (device_id, item_key)
         );
+
+        -- v6.0: Multi-tenant tables
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     TEXT PRIMARY KEY,
+            created_at  TEXT NOT NULL,
+            label       TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS user_devices (
+            device_id   TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            device_type TEXT DEFAULT 'unknown',
+            device_name TEXT DEFAULT '',
+            linked_at   TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_devices_user
+            ON user_devices(user_id);
+
+        CREATE TABLE IF NOT EXISTS link_codes (
+            code        TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
     """)
+
+    # Migración: añadir user_id a sync_items si no existe
+    _migrate_add_user_id(conn)
+
     conn.commit()
+
+
+def _migrate_add_user_id(conn: sqlite3.Connection):
+    """Añade columna user_id a sync_items y detected_tracks_sync si no existe."""
+    # sync_items
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(sync_items)").fetchall()]
+    if "user_id" not in cols:
+        conn.execute("ALTER TABLE sync_items ADD COLUMN user_id TEXT DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_items_user ON sync_items(user_id)")
+        logger.info("Migrated sync_items: added user_id column")
+
+    # detected_tracks_sync (puede no existir aún)
+    try:
+        cols_dt = [row[1] for row in conn.execute("PRAGMA table_info(detected_tracks_sync)").fetchall()]
+        if cols_dt and "user_id" not in cols_dt:
+            conn.execute("ALTER TABLE detected_tracks_sync ADD COLUMN user_id TEXT DEFAULT ''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dts_user ON detected_tracks_sync(user_id)")
+            logger.info("Migrated detected_tracks_sync: added user_id column")
+    except sqlite3.OperationalError:
+        pass  # Table doesn't exist yet
+
+
+# ── Data types compartidos (Memoria Colectiva) ──────────────
+
+COLLECTIVE_DATA_TYPES = frozenset({
+    "cue_memory",
+    "collective_notes",
+    "manual_edits",
+})
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -127,6 +193,222 @@ def _normalize_for_hash(obj):
     return obj
 
 
+# ── User / Device helpers ───────────────────────────────────
+
+def _get_user_id_for_device(conn: sqlite3.Connection, device_id: str) -> Optional[str]:
+    """Busca el user_id asociado a un device_id. Retorna None si no está registrado."""
+    row = conn.execute(
+        "SELECT user_id FROM user_devices WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _get_all_device_ids_for_user(conn: sqlite3.Connection, user_id: str) -> list[str]:
+    """Retorna todos los device_id vinculados a un user_id."""
+    rows = conn.execute(
+        "SELECT device_id FROM user_devices WHERE user_id = ?", (user_id,)
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _require_user_id(conn: sqlite3.Connection, device_id: str) -> str:
+    """Obtiene user_id o lanza 403 si el dispositivo no está registrado."""
+    user_id = _get_user_id_for_device(conn, device_id)
+    if not user_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Device '{device_id}' not registered. Call POST /sync/register first."
+        )
+    return user_id
+
+
+def _generate_link_code() -> str:
+    """Genera un código alfanumérico de 6 caracteres (sin ambigüedades)."""
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I
+    return "".join(random.choices(chars, k=6))
+
+
+def _is_collective(data_type: str) -> bool:
+    """Retorna True si este data_type es memoria colectiva (compartido)."""
+    return data_type in COLLECTIVE_DATA_TYPES
+
+
+# ── REGISTER & LINK ────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    device_id: str
+    device_type: str = "unknown"
+    device_name: str = ""
+
+
+@sync_router.post("/register")
+async def sync_register(req: RegisterRequest):
+    """
+    Registra un dispositivo. Si ya existe, retorna su user_id.
+    Si es nuevo, crea un usuario nuevo y lo vincula.
+    """
+    conn = _get_conn()
+
+    existing = _get_user_id_for_device(conn, req.device_id)
+    if existing:
+        devices = _get_all_device_ids_for_user(conn, existing)
+        return {
+            "user_id": existing,
+            "device_id": req.device_id,
+            "already_registered": True,
+            "linked_devices": len(devices),
+        }
+
+    # Crear usuario nuevo
+    user_id = str(uuid.uuid4())
+    now = _now_iso()
+
+    conn.execute(
+        "INSERT INTO users (user_id, created_at) VALUES (?, ?)",
+        (user_id, now),
+    )
+    conn.execute(
+        "INSERT INTO user_devices (device_id, user_id, device_type, device_name, linked_at) VALUES (?, ?, ?, ?, ?)",
+        (req.device_id, user_id, req.device_type, req.device_name, now),
+    )
+
+    # Migración: asignar datos existentes sin user_id a este usuario
+    _assign_orphan_data(conn, req.device_id, user_id)
+
+    conn.commit()
+    logger.info(f"New user registered: {user_id} (device: {req.device_id})")
+
+    return {
+        "user_id": user_id,
+        "device_id": req.device_id,
+        "already_registered": False,
+        "linked_devices": 1,
+    }
+
+
+def _assign_orphan_data(conn: sqlite3.Connection, device_id: str, user_id: str):
+    """Asigna datos huérfanos (sin user_id) que pertenecen a este device_id."""
+    conn.execute(
+        "UPDATE sync_items SET user_id = ? WHERE last_device_id = ? AND (user_id = '' OR user_id IS NULL)",
+        (user_id, device_id),
+    )
+    try:
+        conn.execute(
+            "UPDATE detected_tracks_sync SET user_id = ? WHERE device_id = ? AND (user_id = '' OR user_id IS NULL)",
+            (user_id, device_id),
+        )
+    except sqlite3.OperationalError:
+        pass  # Table may not exist yet
+
+
+class LinkGenerateRequest(BaseModel):
+    device_id: str
+
+
+@sync_router.post("/link/generate")
+async def sync_link_generate(req: LinkGenerateRequest):
+    """
+    Genera un código de vinculación de 6 caracteres (válido 10 minutos).
+    El dispositivo que genera el código ya debe estar registrado.
+    """
+    conn = _get_conn()
+    user_id = _require_user_id(conn, req.device_id)
+
+    # Limpiar códigos expirados
+    conn.execute("DELETE FROM link_codes WHERE expires_at < ?", (_now_iso(),))
+
+    code = _generate_link_code()
+    now = _now_iso()
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+
+    conn.execute(
+        "INSERT INTO link_codes (code, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (code, user_id, now, expires),
+    )
+    conn.commit()
+
+    return {
+        "code": code,
+        "expires_at": expires,
+        "user_id": user_id,
+    }
+
+
+class LinkJoinRequest(BaseModel):
+    device_id: str
+    code: str
+    device_type: str = "unknown"
+    device_name: str = ""
+
+
+@sync_router.post("/link/join")
+async def sync_link_join(req: LinkJoinRequest):
+    """
+    Vincula un dispositivo a un usuario existente usando el código de 6 caracteres.
+    Si el dispositivo ya está registrado con otro usuario, se re-vincula.
+    """
+    conn = _get_conn()
+
+    # Buscar código válido
+    row = conn.execute(
+        "SELECT user_id, expires_at FROM link_codes WHERE code = ?",
+        (req.code.upper(),),
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Invalid or expired link code")
+
+    target_user_id, expires_at = row
+    if expires_at < _now_iso():
+        conn.execute("DELETE FROM link_codes WHERE code = ?", (req.code.upper(),))
+        conn.commit()
+        raise HTTPException(status_code=410, detail="Link code expired")
+
+    now = _now_iso()
+
+    # Si el dispositivo ya estaba registrado, re-vincular
+    existing_user = _get_user_id_for_device(conn, req.device_id)
+    if existing_user == target_user_id:
+        # Ya vinculado al mismo usuario
+        conn.execute("DELETE FROM link_codes WHERE code = ?", (req.code.upper(),))
+        conn.commit()
+        devices = _get_all_device_ids_for_user(conn, target_user_id)
+        return {
+            "user_id": target_user_id,
+            "device_id": req.device_id,
+            "already_linked": True,
+            "linked_devices": len(devices),
+        }
+
+    if existing_user:
+        # Re-vincular de un usuario a otro
+        conn.execute("DELETE FROM user_devices WHERE device_id = ?", (req.device_id,))
+
+    conn.execute(
+        "INSERT INTO user_devices (device_id, user_id, device_type, device_name, linked_at) VALUES (?, ?, ?, ?, ?)",
+        (req.device_id, target_user_id, req.device_type, req.device_name, now),
+    )
+
+    # Migrar datos huérfanos
+    _assign_orphan_data(conn, req.device_id, target_user_id)
+
+    # Consumir código
+    conn.execute("DELETE FROM link_codes WHERE code = ?", (req.code.upper(),))
+    conn.commit()
+
+    devices = _get_all_device_ids_for_user(conn, target_user_id)
+    logger.info(f"Device {req.device_id} linked to user {target_user_id} via code {req.code}")
+
+    return {
+        "user_id": target_user_id,
+        "device_id": req.device_id,
+        "already_linked": False,
+        "linked_devices": len(devices),
+    }
+
+
+# ── Models ──────────────────────────────────────────────────
+
 class SyncChange(BaseModel):
     data_type: str
     item_key: str
@@ -145,14 +427,27 @@ class PushRequest(BaseModel):
 
 @sync_router.post("/push")
 async def sync_push(req: PushRequest):
-    """Push sobreescribe la verdad del backend. Last-write-wins."""
+    """Push sobreescribe la verdad del backend. Last-write-wins.
+
+    Multi-tenant: cada item se etiqueta con el user_id del dispositivo.
+    Tipos colectivos (cue_memory, collective_notes, manual_edits) se
+    almacenan con user_id='__collective__' y son visibles para todos.
+    """
     conn = _get_conn()
+    user_id = _require_user_id(conn, req.device_id)
     synced = 0
     skipped = 0
     now = _now_iso()
 
     for change in req.changes:
-        key = f"{change.data_type}|{change.item_key}"
+        # Colectivos: clave global. Privados: clave scoped por usuario.
+        if _is_collective(change.data_type):
+            key = f"{change.data_type}|{change.item_key}"
+            item_user_id = "__collective__"
+        else:
+            key = f"{user_id}|{change.data_type}|{change.item_key}"
+            item_user_id = user_id
+
         change_time = change.updated_at or now
         new_hash = _payload_hash(change.payload)
         payload_json = json.dumps(change.payload, default=str)
@@ -163,7 +458,6 @@ async def sync_push(req: PushRequest):
         ).fetchone()
         if row and row[0] == new_hash:
             skipped += 1
-            # Igual actualizar device_seen con payload
             conn.execute(
                 """INSERT INTO device_seen (device_id, item_key, hash, payload)
                    VALUES (?, ?, ?, ?)
@@ -172,26 +466,26 @@ async def sync_push(req: PushRequest):
             )
             continue
 
-        # Upsert del item
+        # Upsert del item con user_id
         conn.execute(
             """INSERT INTO sync_items
                    (key, data_type, item_key, payload, deleted,
-                    updated_at, last_device_id, device_type, hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    updated_at, last_device_id, device_type, hash, user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(key) DO UPDATE SET
                    payload = excluded.payload,
                    deleted = excluded.deleted,
                    updated_at = excluded.updated_at,
                    last_device_id = excluded.last_device_id,
                    device_type = excluded.device_type,
-                   hash = excluded.hash""",
+                   hash = excluded.hash,
+                   user_id = excluded.user_id""",
             (key, change.data_type, change.item_key, payload_json,
              1 if change.deleted else 0, change_time,
-             req.device_id, req.device_type, new_hash),
+             req.device_id, req.device_type, new_hash, item_user_id),
         )
         synced += 1
 
-        # Registrar que este dispositivo conoce este hash + payload
         conn.execute(
             """INSERT INTO device_seen (device_id, item_key, hash, payload)
                VALUES (?, ?, ?, ?)
@@ -200,7 +494,7 @@ async def sync_push(req: PushRequest):
         )
 
     conn.commit()
-    return {"synced": synced, "skipped": skipped, "conflicts": [], "timestamp": now}
+    return {"synced": synced, "skipped": skipped, "conflicts": [], "timestamp": now, "user_id": user_id}
 
 
 # ── PULL ─────────────────────────────────────────────────────
@@ -209,18 +503,23 @@ async def sync_push(req: PushRequest):
 async def sync_pull(
     device_id: str,
     since: Optional[str] = None,
-    only_from: Optional[str] = None,
 ):
-    """Descarga items cuyo hash sea DIFERENTE al que este dispositivo conoce."""
-    conn = _get_conn()
+    """Descarga items cuyo hash sea DIFERENTE al que este dispositivo conoce.
 
-    # Obtener todos los items que NO subió este dispositivo
+    Multi-tenant: solo devuelve items del MISMO usuario + colectivos.
+    Filtra por user_id (no por device_id como antes).
+    """
+    conn = _get_conn()
+    user_id = _require_user_id(conn, device_id)
+
+    # Items del mismo usuario + colectivos, que NO subió este device
     rows = conn.execute(
         """SELECT si.key, si.data_type, si.item_key, si.payload, si.deleted,
                   si.updated_at, si.device_type, si.hash
            FROM sync_items si
-           WHERE si.last_device_id != ?""",
-        (device_id,),
+           WHERE si.last_device_id != ?
+             AND (si.user_id = ? OR si.user_id = '__collective__')""",
+        (device_id, user_id),
     ).fetchall()
 
     changes = []
@@ -249,7 +548,6 @@ async def sync_pull(
 
     # Marcar como vistos con payload
     for dev_id, key, h in update_seen:
-        # Buscar el payload del item para guardarlo en device_seen
         row = conn.execute("SELECT payload FROM sync_items WHERE key = ?", (key,)).fetchone()
         payload_to_save = row[0] if row else None
         conn.execute(
@@ -265,6 +563,7 @@ async def sync_pull(
         "total":     len(changes),
         "alerts":    [],
         "timestamp": _now_iso(),
+        "user_id":   user_id,
     }
 
 
@@ -273,11 +572,11 @@ async def sync_pull(
 @sync_router.get("/pending/{device_id}")
 async def sync_pending(device_id: str, since: Optional[str] = None):
     """Desglose detallado: añadidos, eliminados, modificados por tipo.
-    
-    Usa device_seen para saber qué versión conoce este dispositivo,
-    y compara con el estado actual del backend para calcular el diff real.
+
+    Multi-tenant: solo cuenta items del MISMO usuario + colectivos.
     """
     conn = _get_conn()
+    user_id = _require_user_id(conn, device_id)
 
     # Migración: añadir columna payload si no existe
     try:
@@ -286,12 +585,13 @@ async def sync_pending(device_id: str, since: Optional[str] = None):
     except sqlite3.OperationalError:
         pass  # Ya existe
 
-    # Items remotos (no subidos por este dispositivo)
+    # Items remotos del mismo usuario + colectivos
     remote_rows = conn.execute(
         """SELECT si.key, si.data_type, si.item_key, si.payload, si.hash
            FROM sync_items si
-           WHERE si.last_device_id != ?""",
-        (device_id,),
+           WHERE si.last_device_id != ?
+             AND (si.user_id = ? OR si.user_id = '__collective__')""",
+        (device_id, user_id),
     ).fetchall()
 
     detail: dict[str, int] = {}
@@ -492,11 +792,16 @@ async def sync_status():
             "SELECT device_id, COUNT(*) FROM device_seen GROUP BY device_id"
         ).fetchall()
     }
+    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_registered_devices = conn.execute("SELECT COUNT(*) FROM user_devices").fetchone()[0]
     return {
         "total_items":    len(rows),
         "by_type":        by_type,
         "devices":        list(devices),
         "device_seen":    device_seen_counts,
+        "total_users":    total_users,
+        "total_registered_devices": total_registered_devices,
+        "version":        "6.0",
     }
 
 
@@ -542,35 +847,38 @@ def _init_detected_table(conn: sqlite3.Connection):
 
 @sync_router.post("/detected-track")
 async def sync_push_detected_track(track: DetectedTrackSync):
-    """Sube un track detectado vía Shazam para sincronizarlo entre dispositivos"""
+    """Sube un track detectado vía Shazam, etiquetado con user_id."""
     if not track.device_id or not track.artist or not track.title:
         return {"status": "error", "message": "device_id, artist y title requeridos"}
 
     conn = _get_conn()
     _init_detected_table(conn)
+    user_id = _require_user_id(conn, track.device_id)
 
     try:
         payload_str = json.dumps(track.payload, ensure_ascii=False)
 
         conn.execute("""
             INSERT INTO detected_tracks_sync
-                (device_id, artist, title, payload, detected_at)
-            VALUES (?, ?, ?, ?, ?)
+                (device_id, artist, title, payload, detected_at, user_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, artist, title)
             DO UPDATE SET
                 payload = excluded.payload,
-                detected_at = excluded.detected_at
+                detected_at = excluded.detected_at,
+                user_id = excluded.user_id
         """, (
             track.device_id,
             track.artist,
             track.title,
             payload_str,
             track.detected_at,
+            user_id,
         ))
         conn.commit()
 
-        logger.info(f"Detected track saved: {track.artist} - {track.title}")
-        return {"status": "ok"}
+        logger.info(f"Detected track saved: {track.artist} - {track.title} (user: {user_id[:8]})")
+        return {"status": "ok", "user_id": user_id}
 
     except (sqlite3.Error, json.JSONDecodeError, TypeError) as e:
         logger.error(f"Detected track error: {e}")
@@ -584,26 +892,29 @@ async def sync_pull_detected_tracks(
     limit: int = 200,
 ):
     """
-    Descarga tracks detectados de TODOS los dispositivos.
+    Descarga tracks detectados SOLO del mismo usuario.
     Útil para ver en el PC lo que escaneaste con el móvil.
+    Solo muestra tracks de dispositivos vinculados al mismo user_id.
     """
     conn = _get_conn()
     _init_detected_table(conn)
+    user_id = _require_user_id(conn, device_id)
 
     try:
         if since:
             rows = conn.execute("""
                 SELECT artist, title, payload, detected_at, device_id
                 FROM detected_tracks_sync
-                WHERE detected_at > ?
+                WHERE user_id = ? AND detected_at > ?
                 ORDER BY detected_at DESC LIMIT ?
-            """, (since, limit)).fetchall()
+            """, (user_id, since, limit)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT artist, title, payload, detected_at, device_id
                 FROM detected_tracks_sync
+                WHERE user_id = ?
                 ORDER BY detected_at DESC LIMIT ?
-            """, (limit,)).fetchall()
+            """, (user_id, limit)).fetchall()
 
         tracks = []
         for row in rows:
@@ -624,9 +935,285 @@ async def sync_pull_detected_tracks(
             "tracks": tracks,
             "total": len(tracks),
             "server_time": _now_iso(),
+            "user_id": user_id,
         }
 
     except (sqlite3.Error, json.JSONDecodeError, TypeError) as e:
         logger.error(f"Pull detected tracks error: {e}")
         return {"tracks": [], "total": 0, "error": str(e)}
+
+
+# ════════════════════════════════════════════════════════════════
+# ADMIN ENDPOINTS — Vista de red para el administrador
+# ════════════════════════════════════════════════════════════════
+# Protegidos por ADMIN_TOKEN (header Authorization: Bearer <token>)
+# Proporcionan acceso a TODOS los datos de TODOS los usuarios.
+
+async def _verify_admin(request: Request):
+    """Verifica ADMIN_TOKEN para endpoints admin de sync."""
+    if not ADMIN_TOKEN:
+        if os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'):
+            raise HTTPException(status_code=500, detail="ADMIN_TOKEN required in production")
+        return
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != ADMIN_TOKEN:
+        raise HTTPException(401, "Admin token required")
+
+
+admin_sync_router = APIRouter(
+    prefix="/sync/admin",
+    tags=["sync-admin"],
+    dependencies=[Depends(_verify_sync_auth), Depends(_verify_admin)],
+)
+
+
+@admin_sync_router.get("/users")
+async def admin_list_users():
+    """Lista todos los usuarios registrados con sus dispositivos y estadísticas."""
+    conn = _get_conn()
+
+    users = conn.execute(
+        "SELECT user_id, created_at, label FROM users ORDER BY created_at DESC"
+    ).fetchall()
+
+    result = []
+    for user_id, created_at, label in users:
+        devices = conn.execute(
+            "SELECT device_id, device_type, device_name, linked_at FROM user_devices WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+
+        item_count = conn.execute(
+            "SELECT COUNT(*) FROM sync_items WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+
+        by_type = {}
+        for row in conn.execute(
+            "SELECT data_type, COUNT(*) FROM sync_items WHERE user_id = ? GROUP BY data_type",
+            (user_id,),
+        ).fetchall():
+            by_type[row[0]] = row[1]
+
+        result.append({
+            "user_id": user_id,
+            "created_at": created_at,
+            "label": label,
+            "devices": [
+                {
+                    "device_id": d[0],
+                    "device_type": d[1],
+                    "device_name": d[2],
+                    "linked_at": d[3],
+                }
+                for d in devices
+            ],
+            "total_items": item_count,
+            "items_by_type": by_type,
+        })
+
+    # Datos colectivos
+    collective_count = conn.execute(
+        "SELECT COUNT(*) FROM sync_items WHERE user_id = '__collective__'"
+    ).fetchone()[0]
+
+    return {
+        "total_users": len(result),
+        "users": result,
+        "collective_items": collective_count,
+    }
+
+
+@admin_sync_router.get("/users/{user_id}")
+async def admin_get_user_data(user_id: str, data_type: Optional[str] = None):
+    """Obtiene TODOS los datos de un usuario específico. Vista detallada."""
+    conn = _get_conn()
+
+    # Verificar que el usuario existe
+    user = conn.execute("SELECT created_at, label FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    devices = conn.execute(
+        "SELECT device_id, device_type, device_name, linked_at FROM user_devices WHERE user_id = ?",
+        (user_id,),
+    ).fetchall()
+
+    # Items del usuario
+    if data_type:
+        items = conn.execute(
+            "SELECT key, data_type, item_key, payload, deleted, updated_at, last_device_id, device_type FROM sync_items WHERE user_id = ? AND data_type = ?",
+            (user_id, data_type),
+        ).fetchall()
+    else:
+        items = conn.execute(
+            "SELECT key, data_type, item_key, payload, deleted, updated_at, last_device_id, device_type FROM sync_items WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+
+    items_list = []
+    for row in items:
+        try:
+            payload = json.loads(row[3])
+        except (json.JSONDecodeError, TypeError):
+            payload = row[3]
+        items_list.append({
+            "key": row[0],
+            "data_type": row[1],
+            "item_key": row[2],
+            "payload": payload,
+            "deleted": bool(row[4]),
+            "updated_at": row[5],
+            "last_device_id": row[6],
+            "device_type": row[7],
+        })
+
+    # Detected tracks del usuario
+    detected = []
+    try:
+        dt_rows = conn.execute(
+            "SELECT artist, title, detected_at, device_id FROM detected_tracks_sync WHERE user_id = ? ORDER BY detected_at DESC LIMIT 100",
+            (user_id,),
+        ).fetchall()
+        for r in dt_rows:
+            detected.append({"artist": r[0], "title": r[1], "detected_at": r[2], "device_id": r[3][:8] + "..."})
+    except sqlite3.OperationalError:
+        pass
+
+    return {
+        "user_id": user_id,
+        "created_at": user[0],
+        "label": user[1],
+        "devices": [
+            {"device_id": d[0], "device_type": d[1], "device_name": d[2], "linked_at": d[3]}
+            for d in devices
+        ],
+        "items": items_list,
+        "total_items": len(items_list),
+        "detected_tracks": detected,
+    }
+
+
+@admin_sync_router.get("/network")
+async def admin_network_overview():
+    """Vista de red completa: todos los usuarios, dispositivos, items, colectivos.
+    Diseñada para el panel de administrador.
+    """
+    conn = _get_conn()
+
+    # Usuarios
+    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_devices = conn.execute("SELECT COUNT(*) FROM user_devices").fetchone()[0]
+    total_items = conn.execute("SELECT COUNT(*) FROM sync_items").fetchone()[0]
+    collective_items = conn.execute(
+        "SELECT COUNT(*) FROM sync_items WHERE user_id = '__collective__'"
+    ).fetchone()[0]
+
+    # Items por tipo global
+    by_type = {}
+    for row in conn.execute("SELECT data_type, COUNT(*) FROM sync_items GROUP BY data_type").fetchall():
+        by_type[row[0]] = row[1]
+
+    # Top usuarios por cantidad de items
+    top_users = conn.execute("""
+        SELECT u.user_id, u.label, COUNT(si.key) as item_count,
+               (SELECT COUNT(*) FROM user_devices ud WHERE ud.user_id = u.user_id) as device_count
+        FROM users u
+        LEFT JOIN sync_items si ON si.user_id = u.user_id
+        GROUP BY u.user_id
+        ORDER BY item_count DESC
+        LIMIT 50
+    """).fetchall()
+
+    # Detected tracks global
+    total_detected = 0
+    try:
+        total_detected = conn.execute("SELECT COUNT(*) FROM detected_tracks_sync").fetchone()[0]
+    except sqlite3.OperationalError:
+        pass
+
+    # Link codes activos
+    active_codes = conn.execute(
+        "SELECT COUNT(*) FROM link_codes WHERE expires_at > ?", (_now_iso(),)
+    ).fetchone()[0]
+
+    return {
+        "total_users": total_users,
+        "total_devices": total_devices,
+        "total_items": total_items,
+        "collective_items": collective_items,
+        "total_detected_tracks": total_detected,
+        "active_link_codes": active_codes,
+        "items_by_type": by_type,
+        "top_users": [
+            {
+                "user_id": r[0],
+                "label": r[1] or "",
+                "items": r[2],
+                "devices": r[3],
+            }
+            for r in top_users
+        ],
+    }
+
+
+@admin_sync_router.get("/all-items")
+async def admin_all_items(
+    data_type: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = 500,
+    offset: int = 0,
+):
+    """Lista paginada de TODOS los items. Filtrable por data_type y/o user_id."""
+    conn = _get_conn()
+
+    where_parts = []
+    params: list = []
+
+    if data_type:
+        where_parts.append("data_type = ?")
+        params.append(data_type)
+    if user_id:
+        where_parts.append("user_id = ?")
+        params.append(user_id)
+
+    where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM sync_items {where_sql}", params
+    ).fetchone()[0]
+
+    rows = conn.execute(
+        f"""SELECT key, data_type, item_key, payload, deleted, updated_at,
+                   last_device_id, device_type, user_id, hash
+            FROM sync_items {where_sql}
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?""",
+        params + [limit, offset],
+    ).fetchall()
+
+    items = []
+    for row in rows:
+        try:
+            payload = json.loads(row[3])
+        except (json.JSONDecodeError, TypeError):
+            payload = row[3]
+        items.append({
+            "key": row[0],
+            "data_type": row[1],
+            "item_key": row[2],
+            "payload": payload,
+            "deleted": bool(row[4]),
+            "updated_at": row[5],
+            "last_device_id": row[6],
+            "device_type": row[7],
+            "user_id": row[8],
+            "hash": row[9],
+        })
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
