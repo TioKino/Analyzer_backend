@@ -22,7 +22,7 @@ Estructura:
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
-from sync_endpoints import sync_router
+from sync_endpoints import sync_router, admin_sync_router
 from routes import (
     search_router, library_router, admin_router, community_router,
     preview_router, media_router,
@@ -180,6 +180,7 @@ except ImportError:
 
 app = FastAPI(title="DJ Analyzer Pro API", version="2.3.0", default_response_class=SafeJSONResponse)
 app.include_router(sync_router)
+app.include_router(admin_sync_router)
 
 app.add_middleware(
     CORSMiddleware,
