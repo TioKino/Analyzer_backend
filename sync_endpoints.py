@@ -135,7 +135,27 @@ def _init_tables(conn: sqlite3.Connection):
             expires_at  TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         );
+
+        CREATE TABLE IF NOT EXISTS detected_tracks_sync (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            artist TEXT NOT NULL,
+            title TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            UNIQUE(device_id, artist, title)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dts_device
+            ON detected_tracks_sync(device_id);
+        CREATE INDEX IF NOT EXISTS idx_dts_date
+            ON detected_tracks_sync(detected_at);
     """)
+
+    # Migration: add payload column to device_seen if missing
+    try:
+        conn.execute("ALTER TABLE device_seen ADD COLUMN payload TEXT")
+    except sqlite3.OperationalError:
+        pass  # Already exists
 
     # Migración: añadir user_id a sync_items si no existe
     _migrate_add_user_id(conn)
@@ -578,13 +598,6 @@ async def sync_pending(device_id: str, since: Optional[str] = None):
     conn = _get_conn()
     user_id = _require_user_id(conn, device_id)
 
-    # Migración: añadir columna payload si no existe
-    try:
-        conn.execute("ALTER TABLE device_seen ADD COLUMN payload TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # Ya existe
-
     # Items remotos del mismo usuario + colectivos
     remote_rows = conn.execute(
         """SELECT si.key, si.data_type, si.item_key, si.payload, si.hash
@@ -808,12 +821,29 @@ async def sync_status():
 # ── CLEAR ─────────────────────────────────────────────────────
 
 @sync_router.delete("/clear")
-async def sync_clear():
+async def sync_clear(request: Request, device_id: Optional[str] = None):
+    # Require X-Admin-Key header or a specific device_id to prevent accidental mass deletion
+    admin_key = request.headers.get("X-Admin-Key", "")
+    if not admin_key and not device_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Must provide device_id query param or X-Admin-Key header to confirm clear"
+        )
+
     conn = _get_conn()
+
+    if device_id:
+        # Only clear data for a specific device
+        conn.execute("DELETE FROM sync_items WHERE last_device_id = ?", (device_id,))
+        conn.execute("DELETE FROM device_seen WHERE device_id = ?", (device_id,))
+        conn.commit()
+        return {"cleared": True, "scope": f"device:{device_id}"}
+
+    # Full clear (admin only)
     conn.execute("DELETE FROM sync_items")
     conn.execute("DELETE FROM device_seen")
     conn.commit()
-    return {"cleared": True}
+    return {"cleared": True, "scope": "all"}
 
 
 # ── DETECTED TRACKS (Shazam sync) ────────────────────────────
@@ -852,7 +882,6 @@ async def sync_push_detected_track(track: DetectedTrackSync):
         return {"status": "error", "message": "device_id, artist y title requeridos"}
 
     conn = _get_conn()
-    _init_detected_table(conn)
     user_id = _require_user_id(conn, track.device_id)
 
     try:
@@ -897,7 +926,6 @@ async def sync_pull_detected_tracks(
     Solo muestra tracks de dispositivos vinculados al mismo user_id.
     """
     conn = _get_conn()
-    _init_detected_table(conn)
     user_id = _require_user_id(conn, device_id)
 
     try:

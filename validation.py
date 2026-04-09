@@ -435,8 +435,12 @@ class SimpleRateLimiter:
                 if req_time > minute_ago
             ]
             
+            # Limpiar entrada si quedó vacía
+            if not self.requests[client_id]:
+                del self.requests[client_id]
+
             # Verificar límite
-            if len(self.requests[client_id]) >= self.requests_per_minute:
+            if len(self.requests.get(client_id, [])) >= self.requests_per_minute:
                 return False
             
             # Registrar request

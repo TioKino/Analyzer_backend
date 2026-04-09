@@ -193,7 +193,7 @@ app.add_middleware(
 #  Manejador de errores de validacin
 @app.exception_handler(ValidationError)
 async def validation_error_handler(request: Request, exc: ValidationError):
-    return JSONResponse(
+    return SafeJSONResponse(
         status_code=400,
         content={
             "error": "validation_error",
@@ -318,7 +318,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     
     # BPM
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
-    bpm = float(tempo)
+    bpm = float(tempo[0]) if isinstance(tempo, np.ndarray) else float(tempo)
     bpm_source = "analysis"
     
     # Usar BPM de ID3 si existe y es razonable
@@ -552,7 +552,6 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                         beatport_data = None
                     elif corrected != bp_bpm:
                         logger.info(f"[Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
-                    beatport_data = None
 
                 if beatport_data:
                     # BPM validado
@@ -841,7 +840,6 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                         beatport_data = None
                     elif corrected != bp_bpm:
                         logger.info(f"[Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
-                    beatport_data = None
 
                 if beatport_data:
                     # BPM validado
@@ -1221,7 +1219,7 @@ async def analyze_track(
         try:
             # Intentar fingerprint del contenido primero
             try:
-                fingerprint = calculate_fingerprint(tmp_path)
+                fingerprint, _ = calculate_fingerprint(tmp_path)
             except (FileNotFoundError, IOError, OSError, ValueError) as e:
                 # Si falla (archivo muy corrupto), usar md5 del nombre
                 fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
@@ -1352,7 +1350,7 @@ async def identify_track(file: UploadFile = File(...)):
         logger.info(f"Identificando track: {file.filename}")
         
         # Calcular fingerprint del CONTENIDO del archivo (igual que en /analyze)
-        fingerprint = calculate_fingerprint(tmp_path)
+        fingerprint, _ = calculate_fingerprint(tmp_path)
         logger.debug(f"Fingerprint (contenido): {fingerprint[:12]}...")
         
         # ==================== PASO 1: IDENTIFICAR CON AUDD ====================
@@ -1509,7 +1507,7 @@ async def identify_track(file: UploadFile = File(...)):
                 energy_dj = max(1, min(10, energy_dj))
             logger.info(f"Energy: {energy_dj} (raw: {avg_rms:.4f})")
             
-        except (ValueError, TypeError, RuntimeError) as e:
+        except Exception as e:
             logger.error(f"Re-anlisis fall: {e}")
             # FALLBACK 1: Buscar en BD colectiva
             if artist and title:
@@ -1668,6 +1666,10 @@ async def identify_track(file: UploadFile = File(...)):
     except requests.RequestException as e:
         logger.error(f"Error de red identificando: {e}")
         raise HTTPException(502, f"Error de red: {str(e)}")
+    except Exception as e:
+        import traceback
+        logger.error(f"Error inesperado identificando: {traceback.format_exc()}")
+        raise HTTPException(500, f"Error inesperado: {str(e)}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)

@@ -118,6 +118,9 @@ async def upload_artwork(track_id: str, file: UploadFile = FastAPIFile(...)):
 @media_router.post("/check-analyzed")
 async def check_analyzed(filenames: list[str]):
     """Check which tracks are already analyzed."""
+    if len(filenames) > 500:
+        filenames = filenames[:500]
+
     analyzed = []
     not_analyzed = []
 

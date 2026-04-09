@@ -203,7 +203,7 @@ def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
                             continue
         
         # Si no encontro por track, intentar por album/artista
-        url = f"https://ws.audioscrobbler.com/2.0/?method=artist.getTopAlbums&api_key=57ee3318536b23ee81d6b27e36997cde&artist={quote(artist)}&limit=1&format=json"
+        url = f"https://ws.audioscrobbler.com/2.0/?method=artist.getTopAlbums&api_key={LASTFM_API_KEY}&artist={quote(artist)}&limit=1&format=json"
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             data = response.json()
