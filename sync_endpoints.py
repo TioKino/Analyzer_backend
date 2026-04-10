@@ -427,6 +427,66 @@ async def sync_link_join(req: LinkJoinRequest):
     }
 
 
+class UnlinkRequest(BaseModel):
+    device_id: str
+    target_device_id: str
+
+
+@sync_router.post("/link/unlink")
+async def sync_link_unlink(req: UnlinkRequest):
+    """
+    Desvincula un dispositivo del usuario actual.
+    El dispositivo desvinculado queda como un nuevo usuario independiente.
+    No se puede desvincular a uno mismo.
+    """
+    conn = _get_conn()
+    user_id = _require_user_id(conn, req.device_id)
+
+    if req.device_id == req.target_device_id:
+        raise HTTPException(status_code=400, detail="Cannot unlink yourself")
+
+    # Verificar que el target pertenece al mismo usuario
+    target_user = _get_user_id_for_device(conn, req.target_device_id)
+    if target_user != user_id:
+        raise HTTPException(status_code=404, detail="Target device not found in your account")
+
+    # Crear nuevo usuario para el dispositivo desvinculado
+    new_user_id = str(uuid.uuid4())
+    now = _now_iso()
+
+    conn.execute(
+        "INSERT INTO users (user_id, created_at) VALUES (?, ?)",
+        (new_user_id, now),
+    )
+
+    # Mover el dispositivo al nuevo usuario
+    conn.execute(
+        "UPDATE user_devices SET user_id = ? WHERE device_id = ?",
+        (new_user_id, req.target_device_id),
+    )
+
+    conn.commit()
+
+    # Retornar lista actualizada de dispositivos del usuario
+    remaining = conn.execute(
+        "SELECT device_id, device_type, device_name, linked_at FROM user_devices WHERE user_id = ?",
+        (user_id,),
+    ).fetchall()
+
+    devices_list = [
+        {"device_id": r[0], "device_type": r[1], "device_name": r[2], "linked_at": r[3]}
+        for r in remaining
+    ]
+
+    logger.info(f"Device {req.target_device_id} unlinked from user {user_id}")
+
+    return {
+        "user_id": user_id,
+        "unlinked_device_id": req.target_device_id,
+        "linked_devices": devices_list,
+    }
+
+
 # ── Models ──────────────────────────────────────────────────
 
 class SyncChange(BaseModel):
