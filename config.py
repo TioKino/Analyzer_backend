@@ -48,7 +48,9 @@ MUSICBRAINZ_USER_AGENT: str = os.getenv(
 
 DATABASE_PATH: str = os.getenv('DATABASE_PATH', 'analysis.db')
 ARTWORK_CACHE_DIR: str = os.getenv('ARTWORK_CACHE_DIR', 'artwork_cache')
-PREVIEWS_DIR: str = os.getenv('PREVIEWS_DIR', 'previews_cache')
+# On Render, use persistent disk to survive redeploys
+_default_previews = '/data/previews' if os.getenv('RENDER') else 'previews_cache'
+PREVIEWS_DIR: str = os.getenv('PREVIEWS_DIR', _default_previews)
 
 
 # ==================== SERVIDOR ====================
