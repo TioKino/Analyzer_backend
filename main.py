@@ -65,6 +65,7 @@ from config import (
     PREVIEWS_DIR,
     ADMIN_TOKEN,
     RATE_LIMIT_ENABLED,
+    DATABASE_PATH,
 )
 
 #  Importar mdulo de validacin
@@ -147,8 +148,7 @@ except ImportError:
     ARTWORK_CACHE_DIR = "/data/artwork_cache"
     search_artwork_online = None
 
-# Importar clasificador espectral de g(c)neros
-from spectral_genre_classifier import classify_genre_advanced
+# Importar clasificador de géneros
 try:
     from genre_detection import GenreDetector
     from api_config import DISCOGS_TOKEN
@@ -187,7 +187,7 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS if not DEBUG else ["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Signature", "X-Device-Id", "X-Original-Path"],
 )
 
 #  Manejador de errores de validacin
@@ -202,8 +202,8 @@ async def validation_error_handler(request: Request, exc: ValidationError):
         }
     )
 
-# Inicializar BD
-db = AnalysisDB()
+# Inicializar BD con path de config (no hardcoded)
+db = AnalysisDB(db_path=DATABASE_PATH)
 
 # Inicializar y montar route modules
 init_search(db, camelot_compatible=CAMELOT_COMPATIBLE)
@@ -248,39 +248,52 @@ def search_collective_db(artist: str, title: str) -> Optional[Dict]:
         cursor = conn.cursor()
         
         # Bsqueda exacta primero
+        # Only query columns that exist in the tracks table schema
         cursor.execute("""
-            SELECT bpm, key, camelot, duration, genre, label, bpm_source, key_source
-            FROM tracks 
+            SELECT bpm, key, camelot, duration, genre, analysis_json
+            FROM tracks
             WHERE LOWER(artist) = ? AND LOWER(title) LIKE ?
             AND bpm IS NOT NULL AND bpm > 0
             ORDER BY analyzed_at DESC
             LIMIT 1
         """, (clean_artist, f"%{clean_title}%"))
-        
+
         row = cursor.fetchone()
-        
+
         if not row:
             # Bsqueda ms flexible
             cursor.execute("""
-                SELECT bpm, key, camelot, duration, genre, label, bpm_source, key_source
-                FROM tracks 
+                SELECT bpm, key, camelot, duration, genre, analysis_json
+                FROM tracks
                 WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
                 AND bpm IS NOT NULL AND bpm > 0
                 ORDER BY analyzed_at DESC
                 LIMIT 1
             """, (f"%{clean_artist}%", f"%{clean_title}%"))
             row = cursor.fetchone()
-        
+
         if row:
+            # Extract label, bpm_source, key_source from analysis_json if available
+            label = None
+            bpm_source = None
+            key_source = None
+            if row[5]:
+                try:
+                    aj = json.loads(row[5])
+                    label = aj.get('label')
+                    bpm_source = aj.get('bpm_source')
+                    key_source = aj.get('key_source')
+                except (json.JSONDecodeError, TypeError):
+                    pass
             result = {
                 'bpm': row[0],
                 'key': row[1],
                 'camelot': row[2],
                 'duration': row[3],
                 'genre': row[4],
-                'label': row[5],
-                'bpm_source': row[6],
-                'key_source': row[7],
+                'label': label,
+                'bpm_source': bpm_source,
+                'key_source': key_source,
                 'source': 'collective_db'
             }
             return result
@@ -668,7 +681,9 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     # Si Beatport dio un track_type_hint, tiene prioridad sobre waveform
     track_type_source = 'waveform'
     # Guard: asegurar que track_type existe (por si classify_track_type falló)
-    if 'track_type' not in dir():
+    try:
+        track_type
+    except NameError:
         track_type = 'peak_time'
     if artist_name and title_name:
         try:
@@ -1006,7 +1021,7 @@ async def analyze_track(
         # Verificar si ya existe en BD por filename
         existing = db.get_track_by_filename(file.filename)
         if existing:
-            analysis_json = json.loads(existing[11]) if len(existing) > 11 else {}
+            analysis_json = json.loads(existing[11]) if len(existing) > 11 and existing[11] else {}
             
             # Si no tiene preview, intentar generarlo ahora
             fp = analysis_json.get('fingerprint') or (existing[13] if len(existing) > 13 else None)

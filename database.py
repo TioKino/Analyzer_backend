@@ -14,6 +14,7 @@ class AnalysisDB:
         """Propiedad que retorna una conexin a la BD (lazy loading)"""
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
         return self._conn
     
     def init_db(self):
@@ -82,6 +83,23 @@ class AnalysisDB:
             )
         ''')
         
+        # Community cues table (for community_cues_endpoint.py)
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS community_cues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                cue_type TEXT NOT NULL,
+                position_ms INTEGER NOT NULL,
+                end_position_ms INTEGER,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(fingerprint, device_id, cue_type, position_ms)
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_cc_fingerprint ON community_cues(fingerprint)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_cc_device ON community_cues(device_id)')
+
         conn.execute('''
             CREATE TABLE IF NOT EXISTS beat_grid_corrections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,7 +135,8 @@ class AnalysisDB:
             'track_type': row[10],
             'analysis_json': row[11],
             'analyzed_at': row[12],
-            'fingerprint': row[13]
+            'fingerprint': row[13],
+            'chromaprint': row[14] if len(row) > 14 else None
         }
         
         # Extraer campos adicionales del analysis_json (artwork_url, label, etc.)

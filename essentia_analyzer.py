@@ -298,7 +298,7 @@ class ImprovedLibrosaAnalyzer:
             return {'has_drop': False, 'sections': [], 'source': 'error'}
     
     def full_analysis(self, file_path: str, sample_rate: int = 44100) -> Dict:
-        logger.info(f”Analizando: {file_path}”)
+        logger.info(f"Analizando: {file_path}")
         
         y, sr = self.load_audio(file_path, sample_rate)
         duration = len(y) / sr
@@ -310,7 +310,7 @@ class ImprovedLibrosaAnalyzer:
         vocals = self.detect_vocals(y, sr)
         structure = self.analyze_structure(y, sr)
         
-        logger.info(f"BPM: {bpm.get(‘bpm’)} | Key: {key.get(‘key’)}/{key.get(‘camelot’)} | Energy: {energy.get(‘energy_dj’)}/10")
+        logger.info(f"BPM: {bpm.get('bpm')} | Key: {key.get('key')}/{key.get('camelot')} | Energy: {energy.get('energy_dj')}/10")
         
         return {
             'duration': duration,
@@ -331,8 +331,8 @@ def get_analyzer():
 
 
 if __name__ == "__main__":
-    logger.info(“=” * 50)
-    logger.info(“Audio Analyzer Pro - Test”)
-    logger.info(“=” * 50)
+    logger.info("=" * 50)
+    logger.info("Audio Analyzer Pro - Test")
+    logger.info("=" * 50)
     analyzer = get_analyzer()
-    logger.info(f”{type(analyzer).__name__} listo”)
+    logger.info(f"{type(analyzer).__name__} listo")

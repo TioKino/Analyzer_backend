@@ -6,8 +6,8 @@ import pytest
 import sys
 import os
 
-# Añadir el directorio raíz al path para imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Añadir el directorio del proyecto al path para imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Configurar variables de entorno para tests
 os.environ.setdefault('AUDD_API_TOKEN', 'test_token')
