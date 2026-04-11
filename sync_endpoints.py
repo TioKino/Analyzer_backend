@@ -231,6 +231,18 @@ def _get_all_device_ids_for_user(conn: sqlite3.Connection, user_id: str) -> list
     return [r[0] for r in rows]
 
 
+def _get_all_devices_for_user(conn: sqlite3.Connection, user_id: str) -> list[dict]:
+    """Retorna info completa de todos los dispositivos de un user_id."""
+    rows = conn.execute(
+        "SELECT device_id, device_type, device_name, linked_at FROM user_devices WHERE user_id = ?",
+        (user_id,),
+    ).fetchall()
+    return [
+        {"device_id": r[0], "device_type": r[1], "device_name": r[2], "linked_at": r[3]}
+        for r in rows
+    ]
+
+
 def _require_user_id(conn: sqlite3.Connection, device_id: str) -> str:
     """Obtiene user_id o lanza 403 si el dispositivo no está registrado."""
     user_id = _get_user_id_for_device(conn, device_id)
@@ -271,12 +283,12 @@ async def sync_register(req: RegisterRequest):
 
     existing = _get_user_id_for_device(conn, req.device_id)
     if existing:
-        devices = _get_all_device_ids_for_user(conn, existing)
+        devices = _get_all_devices_for_user(conn, existing)
         return {
             "user_id": existing,
             "device_id": req.device_id,
             "already_registered": True,
-            "linked_devices": len(devices),
+            "linked_devices": devices,
         }
 
     # Crear usuario nuevo
@@ -298,11 +310,12 @@ async def sync_register(req: RegisterRequest):
     conn.commit()
     logger.info(f"New user registered: {user_id} (device: {req.device_id})")
 
+    devices = _get_all_devices_for_user(conn, user_id)
     return {
         "user_id": user_id,
         "device_id": req.device_id,
         "already_registered": False,
-        "linked_devices": 1,
+        "linked_devices": devices,
     }
 
 
@@ -392,12 +405,12 @@ async def sync_link_join(req: LinkJoinRequest):
         # Ya vinculado al mismo usuario
         conn.execute("DELETE FROM link_codes WHERE code = ?", (req.code.upper(),))
         conn.commit()
-        devices = _get_all_device_ids_for_user(conn, target_user_id)
+        devices = _get_all_devices_for_user(conn, target_user_id)
         return {
             "user_id": target_user_id,
             "device_id": req.device_id,
             "already_linked": True,
-            "linked_devices": len(devices),
+            "linked_devices": devices,
         }
 
     if existing_user:
@@ -416,14 +429,14 @@ async def sync_link_join(req: LinkJoinRequest):
     conn.execute("DELETE FROM link_codes WHERE code = ?", (req.code.upper(),))
     conn.commit()
 
-    devices = _get_all_device_ids_for_user(conn, target_user_id)
+    devices = _get_all_devices_for_user(conn, target_user_id)
     logger.info(f"Device {req.device_id} linked to user {target_user_id} via code {req.code}")
 
     return {
         "user_id": target_user_id,
         "device_id": req.device_id,
         "already_linked": False,
-        "linked_devices": len(devices),
+        "linked_devices": devices,
     }
 
 
