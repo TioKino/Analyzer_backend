@@ -8,6 +8,7 @@ from .admin import admin_router, init as init_admin
 from .community import community_router, init as init_community
 from .preview import preview_router, init as init_preview
 from .media import media_router, init as init_media
+from .admin_panel import admin_panel_router
 
 
 def init_all(database, previews_dir="", artwork_cache_dir="", generate_snippet_fn=None):

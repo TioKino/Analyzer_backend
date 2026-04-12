@@ -15,6 +15,7 @@ Estructura:
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 from sync_endpoints import sync_router
+from routes.admin_panel import admin_panel_router
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, JSONResponse
 import librosa
@@ -277,13 +278,14 @@ def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset
 
 app = FastAPI(title="DJ Analyzer Pro API", version="2.3.0", default_response_class=SafeJSONResponse)
 app.include_router(sync_router)
+app.include_router(admin_panel_router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS if not DEBUG else ["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Signature", "X-Device-Id", "X-Original-Path"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Signature", "X-Device-Id", "X-Original-Path", "X-Admin-Secret"],
 )
 
 #  Manejador de errores de validacin
