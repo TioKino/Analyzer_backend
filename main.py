@@ -854,10 +854,10 @@ def classify_track_type(energy: float, segments: dict, duration: float) -> str:
     if energy < 0.5 and segments['has_intro']:
         return "warmup"
     if energy > 0.7 and segments['has_drop']:
-        return "peak"
+        return "peak_time"
     if segments['has_outro'] and duration > 300:
         return "closing"
-    return "peak" if energy > 0.6 else "warmup"
+    return "peak_time" if energy > 0.6 else "warmup"
 
 def detect_vocals_improved(y, sr, spectral_centroid):
     try:
