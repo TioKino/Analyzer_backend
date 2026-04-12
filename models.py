@@ -6,6 +6,8 @@ from pydantic import BaseModel
 
 
 class AnalysisResult(BaseModel):
+    model_config = {"extra": "ignore"}
+
     title: Optional[str] = None
     artist: Optional[str] = None
     album: Optional[str] = None

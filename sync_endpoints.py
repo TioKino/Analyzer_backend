@@ -882,24 +882,25 @@ async def sync_status():
 
 @sync_router.delete("/clear")
 async def sync_clear(request: Request, device_id: Optional[str] = None):
-    # Require X-Admin-Key header or a specific device_id to prevent accidental mass deletion
+    # Full clear requires valid ADMIN_TOKEN
     admin_key = request.headers.get("X-Admin-Key", "")
-    if not admin_key and not device_id:
+
+    if not device_id and not (admin_key and ADMIN_TOKEN and admin_key == ADMIN_TOKEN):
         raise HTTPException(
-            status_code=400,
-            detail="Must provide device_id query param or X-Admin-Key header to confirm clear"
+            status_code=403,
+            detail="Full clear requires valid X-Admin-Key header. Per-device clear requires device_id param."
         )
 
     conn = _get_conn()
 
     if device_id:
-        # Only clear data for a specific device
+        # Only clear data for a specific device (still protected by sync HMAC auth)
         conn.execute("DELETE FROM sync_items WHERE last_device_id = ?", (device_id,))
         conn.execute("DELETE FROM device_seen WHERE device_id = ?", (device_id,))
         conn.commit()
         return {"cleared": True, "scope": f"device:{device_id}"}
 
-    # Full clear (admin only)
+    # Full clear (admin only — verified above)
     conn.execute("DELETE FROM sync_items")
     conn.execute("DELETE FROM device_seen")
     conn.commit()

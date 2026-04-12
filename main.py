@@ -38,6 +38,9 @@ from config import (
     CORS_ORIGINS,
     DEBUG,
     PREVIEWS_DIR,
+    ADMIN_TOKEN,
+    RATE_LIMIT_ENABLED,
+    DATABASE_PATH,
 )
 
 #  Importar mdulo de validacin
@@ -113,8 +116,7 @@ except ImportError:
     ARTWORK_CACHE_DIR = "/data/artwork_cache"
     search_artwork_online = None
 
-# Importar clasificador espectral de g(c)neros
-from spectral_genre_classifier import classify_genre_advanced
+# Importar clasificador de géneros
 try:
     from genre_detection import GenreDetector
     from api_config import DISCOGS_TOKEN
@@ -281,7 +283,7 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS if not DEBUG else ["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Signature", "X-Device-Id", "X-Original-Path"],
 )
 
 #  Manejador de errores de validacin
@@ -296,8 +298,8 @@ async def validation_error_handler(request: Request, exc: ValidationError):
         }
     )
 
-# Inicializar BD
-db = AnalysisDB()
+# Inicializar BD con path de config (no hardcoded)
+db = AnalysisDB(db_path=DATABASE_PATH)
 
 # Crear directorio de cach(c) para artwork
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
@@ -319,39 +321,52 @@ def search_collective_db(artist: str, title: str) -> Optional[Dict]:
         cursor = conn.cursor()
         
         # Bsqueda exacta primero
+        # Only query columns that exist in the tracks table schema
         cursor.execute("""
-            SELECT bpm, key, camelot, duration, genre, label, bpm_source, key_source
-            FROM tracks 
+            SELECT bpm, key, camelot, duration, genre, analysis_json
+            FROM tracks
             WHERE LOWER(artist) = ? AND LOWER(title) LIKE ?
             AND bpm IS NOT NULL AND bpm > 0
             ORDER BY analyzed_at DESC
             LIMIT 1
         """, (clean_artist, f"%{clean_title}%"))
-        
+
         row = cursor.fetchone()
-        
+
         if not row:
             # Bsqueda ms flexible
             cursor.execute("""
-                SELECT bpm, key, camelot, duration, genre, label, bpm_source, key_source
-                FROM tracks 
+                SELECT bpm, key, camelot, duration, genre, analysis_json
+                FROM tracks
                 WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
                 AND bpm IS NOT NULL AND bpm > 0
                 ORDER BY analyzed_at DESC
                 LIMIT 1
             """, (f"%{clean_artist}%", f"%{clean_title}%"))
             row = cursor.fetchone()
-        
+
         if row:
+            # Extract label, bpm_source, key_source from analysis_json if available
+            label = None
+            bpm_source = None
+            key_source = None
+            if row[5]:
+                try:
+                    aj = json.loads(row[5])
+                    label = aj.get('label')
+                    bpm_source = aj.get('bpm_source')
+                    key_source = aj.get('key_source')
+                except (json.JSONDecodeError, TypeError):
+                    pass
             result = {
                 'bpm': row[0],
                 'key': row[1],
                 'camelot': row[2],
                 'duration': row[3],
                 'genre': row[4],
-                'label': row[5],
-                'bpm_source': row[6],
-                'key_source': row[7],
+                'label': label,
+                'bpm_source': bpm_source,
+                'key_source': key_source,
                 'source': 'collective_db'
             }
             return result
@@ -1336,7 +1351,9 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     # Si Beatport dio un track_type_hint, tiene prioridad sobre waveform
     track_type_source = 'waveform'
     # Guard: asegurar que track_type existe (por si classify_track_type falló)
-    if 'track_type' not in dir():
+    try:
+        track_type
+    except NameError:
         track_type = 'peak_time'
     if artist_name and title_name:
         try:
@@ -1664,7 +1681,30 @@ async def analyze_track(
         # Verificar si ya existe en BD por filename
         existing = db.get_track_by_filename(file.filename)
         if existing:
-            analysis_json = json.loads(existing[11]) if len(existing) > 11 else {}
+            analysis_json = json.loads(existing[11]) if len(existing) > 11 and existing[11] else {}
+
+            # Si no tiene preview, intentar generarlo ahora
+            fp = analysis_json.get('fingerprint') or (existing[13] if len(existing) > 13 else None)
+            if fp:
+                preview_file = os.path.join(PREVIEWS_DIR, f"{fp}.mp3")
+                if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
+                    logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
+                    try:
+                        generate_preview_snippet(
+                            file_path=original_path,
+                            fingerprint=fp,
+                            drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
+                            duration=analysis_json.get('duration', 180.0),
+                        )
+                    except (FileNotFoundError, IOError, OSError) as e:
+                        logger.error(f"[Preview] Error generando desde cache: {e}")
+
+                # Asegurar que el original_path se guarda para futuras peticiones
+                if original_path and not analysis_json.get('original_file_path'):
+                    analysis_json['original_file_path'] = original_path
+                    existing_dict = db._row_to_dict(existing) or {}
+                    existing_dict['analysis_json'] = json.dumps(analysis_json)
+                    # Re-save no es trivial, pero al menos guardamos el path
             return AnalysisResult(**analysis_json)
     
     # Guardar archivo temporal para calcular fingerprint
@@ -2366,11 +2406,55 @@ async def recognize_audio(file: UploadFile = File(...)):
             "deezer": deezer_data,
             "apple_music": apple_music_data,
         }
-        
+
         # Si tenemos anlisis previo, incluirlo
         if backend_analysis:
             response["backend_analysis"] = backend_analysis
-        
+
+        # Guardar reconocimiento en BD colectiva para enriquecer futuras consultas
+        # (artwork, genero, label, etc. disponibles para todos los usuarios)
+        if not backend_analysis and artist and title:
+            try:
+                # Buscar artwork del track detectado
+                artwork_url = None
+                if search_artwork_online:
+                    artwork_info = search_artwork_online(artist, title)
+                    if artwork_info:
+                        # Generar un ID estable basado en artist+title
+                        detect_id = hashlib.md5(f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
+                        save_artwork_to_cache(detect_id, artwork_info['data'], artwork_info['mime_type'])
+                        artwork_url = f"{BASE_URL}/artwork/{detect_id}"
+                        response["artwork_url"] = artwork_url
+                        logger.info(f"Artwork guardado para deteccion: {detect_id[:12]}")
+
+                # Guardar datos basicos en BD colectiva
+                detect_id = hashlib.md5(f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
+                detect_data = {
+                    'id': detect_id,
+                    'filename': f"{artist} - {title}",
+                    'fingerprint': detect_id,
+                    'title': title,
+                    'artist': artist,
+                    'album': album,
+                    'label': label,
+                    'duration': 0,
+                    'bpm': 0,
+                    'key': None,
+                    'camelot': None,
+                    'energy_dj': 5,
+                    'genre': 'Electronic',
+                    'track_type': 'peak_time',
+                    'bpm_source': 'pending',
+                    'key_source': 'pending',
+                }
+                # Solo guardar si no existe ya (no sobreescribir datos mejores)
+                existing = db.get_track(detect_id)
+                if not existing:
+                    db.save_track(detect_data)
+                    logger.info(f"Deteccion guardada en BD colectiva: {detect_id[:12]}")
+            except Exception as e:
+                logger.error(f"Error guardando deteccion en BD: {e}")
+
         return response
         
     except requests.Timeout:

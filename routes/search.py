@@ -121,10 +121,12 @@ async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=2
     # Obtener keys compatibles
     compatible = CAMELOT_COMPATIBLE.get(camelot, [camelot])
 
+    # db.search_compatible_keys expects a single camelot string and computes
+    # compatible keys internally. Pass the original camelot string, not the list.
     return {
         "camelot": camelot,
         "compatible_keys": compatible,
-        "tracks": db.search_compatible_keys(compatible, limit)
+        "tracks": db.search_compatible_keys(camelot, limit)
     }
 
 @search_router.get("/search-analyzed")

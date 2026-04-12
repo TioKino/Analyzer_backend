@@ -50,10 +50,12 @@ MAX_FILENAME_LENGTH = 255
 MAX_SEARCH_LIMIT = 1000
 DEFAULT_SEARCH_LIMIT = 100
 
-# Caracteres peligrosos
-DANGEROUS_CHARS = re.compile(r'[<>"\';`\\]')
+# Caracteres peligrosos (allow single quotes for names like "Guns N' Roses")
+DANGEROUS_CHARS = re.compile(r'[<>"`\\]')
+# Only detect multi-keyword SQL injection patterns, not standalone words
+# like "DROP" (artist "Drop The Mic") or "ALTER" (song "Alter Ego")
 SQL_INJECTION_PATTERNS = re.compile(
-    r'(\b(SELECT|INSERT|UPDATE|DELETE|DROP|UNION|ALTER|CREATE|EXEC)\b)',
+    r'(\b(SELECT\s+.+\s+FROM|INSERT\s+INTO|UPDATE\s+.+\s+SET|DELETE\s+FROM|DROP\s+(TABLE|DATABASE)|UNION\s+SELECT|ALTER\s+TABLE|CREATE\s+TABLE|EXEC\s*\()\b)',
     re.IGNORECASE
 )
 
