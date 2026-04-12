@@ -72,7 +72,7 @@ VALID_CAMELOT = {
     '1B', '2B', '3B', '4B', '5B', '6B', '7B', '8B', '9B', '10B', '11B', '12B'
 }
 
-VALID_TRACK_TYPES = {'warmup', 'peak', 'closing', 'all'}
+VALID_TRACK_TYPES = {'warmup', 'peak', 'peak_time', 'closing', 'builder', 'opener', 'anthem', 'all'}
 
 
 # ============================================================================

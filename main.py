@@ -1244,7 +1244,6 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                         beatport_data = None
                     elif corrected != bp_bpm:
                         print(f"  [Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
-                    beatport_data = None
                 
                 if beatport_data:
                     # BPM validado
@@ -1527,7 +1526,6 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                         beatport_data = None
                     elif corrected != bp_bpm:
                         print(f"  [Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
-                    beatport_data = None
                 
                 if beatport_data:
                     # BPM validado
@@ -1661,6 +1659,9 @@ async def analyze_track(
     #  Rate limiting (opcional - descomenta si quieres)
     # check_rate_limit(get_client_ip(request))
     
+    # Obtener path original del cliente (para generacion de previews)
+    original_path = request.headers.get("X-Original-Path", "")
+
     #  Validacin mejorada de archivo
     if not file.filename:
         raise HTTPException(400, "No se proporcion archivo")
