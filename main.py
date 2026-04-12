@@ -186,34 +186,25 @@ def validate_beatport_bpm(local_bpm: float, beatport_bpm: float, tolerance: floa
 
 def smart_bpm_correction(local_bpm: float, beatport_bpm: float) -> float:
     """
-    Correccion inteligente de BPM half/double tempo.
-    
-    Si Beatport dice 140 y local dice 70 -> es double tempo -> corregir a 140.
-    Si Beatport dice 70 y local dice 140 -> es half tempo -> corregir a 70.
-    Si estan dentro del 12%, Beatport gana (datos del sello).
-    Si no hay match, devolver None (rechazar Beatport).
-    
-    Returns: BPM corregido, o None si no hay match valido.
+    Correccion de BPM: Beatport SIEMPRE tiene prioridad.
+
+    Beatport obtiene el BPM directamente del sello discografico,
+    por lo que es mas fiable que librosa. Librosa puede detectar
+    half/double tempo o valores incorrectos en tracks complejos.
+
+    Returns: BPM de Beatport siempre (nunca None).
     """
-    if local_bpm <= 0 or beatport_bpm <= 0:
-        return beatport_bpm or local_bpm
-    
-    ratio = beatport_bpm / local_bpm
-    
-    # Match directo (dentro del 12%)
-    if abs(ratio - 1.0) <= 0.12:
-        return beatport_bpm  # Beatport gana
-    
-    # Half tempo: local=70, beatport=140 -> ratio=2.0
-    if abs(ratio - 2.0) <= 0.15:
-        return beatport_bpm  # Beatport gana, local estaba a mitad
-    
-    # Double tempo: local=140, beatport=70 -> ratio=0.5
-    if abs(ratio - 0.5) <= 0.15:
-        return beatport_bpm  # Beatport gana, local estaba al doble
-    
-    # No hay match razonable
-    return None
+    if beatport_bpm and beatport_bpm > 0:
+        if local_bpm > 0:
+            ratio = beatport_bpm / local_bpm
+            if abs(ratio - 1.0) <= 0.12:
+                print(f"  [Beatport] BPM match directo: {beatport_bpm}")
+            elif abs(ratio - 2.0) <= 0.15 or abs(ratio - 0.5) <= 0.15:
+                print(f"  [Beatport] BPM half/double corregido: local {local_bpm:.1f} -> Beatport {beatport_bpm}")
+            else:
+                print(f"  [Beatport] BPM override: local {local_bpm:.1f} -> Beatport {beatport_bpm} (Beatport tiene prioridad)")
+        return beatport_bpm
+    return local_bpm
 
 
 def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset_env=None) -> float:
@@ -1235,59 +1226,49 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         try:
             beatport_data = search_beatport(artist_name, title_name)
             if beatport_data:
-                # ===== VALIDAR BPM con correccion inteligente =====
+                # ===== BPM: Beatport siempre tiene prioridad =====
                 bp_bpm = beatport_data.get('bpm')
                 if bp_bpm:
                     corrected = smart_bpm_correction(bpm, bp_bpm)
-                    if corrected is None:
-                        print(f"  [Beatport] MATCH RECHAZADO: BPM {bp_bpm} vs local {bpm:.1f} (sin match half/double)")
-                        beatport_data = None
-                    elif corrected != bp_bpm:
-                        print(f"  [Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
-                
-                if beatport_data:
-                    # BPM validado
-                    if beatport_data.get('bpm'):
-                        print(f"  [Beatport] BPM: {beatport_data['bpm']} (local: {bpm:.1f})")
-                        bpm = beatport_data['bpm']
-                        bpm_source = 'beatport'
-                        bpm_confidence = 0.99
-                    
-                    # Key
-                    if beatport_data.get('key'):
-                        bp_key = beatport_data['key']
-                        bp_camelot = KEY_TO_CAMELOT.get(bp_key, None)
-                        if bp_camelot:
-                            key = bp_key
-                            camelot = bp_camelot
-                            key_source = 'beatport'
-                            key_confidence = 0.99
-                            print(f"  [Beatport] Key: {key} ({camelot})")
-                        else:
-                            print(f"  [Beatport] Key '{bp_key}' no mapeada a Camelot")
-                    
-                    # Genero (proteger Discogs/MusicBrainz)
-                    if beatport_data.get('genre'):
-                        bp_genre = beatport_data['genre']
-                        generic_genres = ['Electronic', 'Dance', 'Unknown', 'electronic', 'dance']
-                        if genre_source in ['discogs', 'musicbrainz']:
-                            print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-                        elif genre in generic_genres or genre_source in ['spectral_analysis', 'chunked_analysis', 'id3']:
-                            genre = bp_genre
-                            genre_source = 'beatport'
-                            print(f"  [Beatport] Genre: {genre}")
-                        else:
-                            print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-                    
-                    # Track type hint (si tienes clean_beatport_genre)
-                    if beatport_data.get('track_type_hint'):
-                        tt_hint = beatport_data['track_type_hint']
-                        old_type = track_type
-                        track_type = tt_hint
-                        track_type_source = 'beatport'
-                        print(f"  [Beatport] Track type hint: {tt_hint}")
-                        if old_type != tt_hint:
-                            print(f"  [Beatport] Track type override: {old_type} -> {tt_hint}")
+                    bpm = corrected
+                    bpm_source = 'beatport'
+                    bpm_confidence = 0.99
+
+                # Key
+                if beatport_data.get('key'):
+                    bp_key = beatport_data['key']
+                    bp_camelot = KEY_TO_CAMELOT.get(bp_key, None)
+                    if bp_camelot:
+                        key = bp_key
+                        camelot = bp_camelot
+                        key_source = 'beatport'
+                        key_confidence = 0.99
+                        print(f"  [Beatport] Key: {key} ({camelot})")
+                    else:
+                        print(f"  [Beatport] Key '{bp_key}' no mapeada a Camelot")
+
+                # Genero (proteger Discogs/MusicBrainz)
+                if beatport_data.get('genre'):
+                    bp_genre = beatport_data['genre']
+                    generic_genres = ['Electronic', 'Dance', 'Unknown', 'electronic', 'dance']
+                    if genre_source in ['discogs', 'musicbrainz']:
+                        print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
+                    elif genre in generic_genres or genre_source in ['spectral_analysis', 'chunked_analysis', 'id3']:
+                        genre = bp_genre
+                        genre_source = 'beatport'
+                        print(f"  [Beatport] Genre: {genre}")
+                    else:
+                        print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
+
+                # Track type hint
+                if beatport_data.get('track_type_hint'):
+                    tt_hint = beatport_data['track_type_hint']
+                    old_type = track_type
+                    track_type = tt_hint
+                    track_type_source = 'beatport'
+                    print(f"  [Beatport] Track type hint: {tt_hint}")
+                    if old_type != tt_hint:
+                        print(f"  [Beatport] Track type override: {old_type} -> {tt_hint}")
             else:
                 print(f"  [Beatport] No encontrado")
         except Exception as e:
@@ -1517,56 +1498,44 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         try:
             beatport_data = search_beatport(artist_name, title_name)
             if beatport_data:
-                # ===== VALIDAR BPM con correccion inteligente =====
+                # ===== BPM: Beatport siempre tiene prioridad =====
                 bp_bpm = beatport_data.get('bpm')
                 if bp_bpm:
                     corrected = smart_bpm_correction(bpm, bp_bpm)
-                    if corrected is None:
-                        print(f"  [Beatport] MATCH RECHAZADO: BPM {bp_bpm} vs local {bpm:.1f} (sin match half/double)")
-                        beatport_data = None
-                    elif corrected != bp_bpm:
-                        print(f"  [Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
-                
-                if beatport_data:
-                    # BPM validado
-                    if beatport_data.get('bpm'):
-                        print(f"  [Beatport] BPM: {beatport_data['bpm']} (local: {bpm:.1f})")
-                        bpm = beatport_data['bpm']
-                        bpm_source = 'beatport'
-                        bpm_confidence = 0.99
-                    
-                    # Key
-                    if beatport_data.get('key'):
-                        bp_key = beatport_data['key']
-                        bp_camelot = KEY_TO_CAMELOT.get(bp_key, None)
-                        if bp_camelot:
-                            key = bp_key
-                            camelot = bp_camelot
-                            key_source = 'beatport'
-                            key_confidence = 0.99
-                            print(f"  [Beatport] Key: {key} ({camelot})")
-                        else:
-                            print(f"  [Beatport] Key '{bp_key}' no mapeada a Camelot")
-                    
-                    # Genero (proteger Discogs/MusicBrainz)
-                    if beatport_data.get('genre'):
-                        bp_genre = beatport_data['genre']
-                        generic_genres = ['Electronic', 'Dance', 'Unknown', 'electronic', 'dance']
-                        if genre_source in ['discogs', 'musicbrainz']:
-                            print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-                        elif genre in generic_genres or genre_source in ['spectral_analysis', 'chunked_analysis', 'id3']:
-                            genre = bp_genre
-                            genre_source = 'beatport'
-                            print(f"  [Beatport] Genre: {genre}")
-                        else:
-                            print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-                    
-                    # Track type hint se aplica más abajo después de definir track_type
+                    bpm = corrected
+                    bpm_source = 'beatport'
+                    bpm_confidence = 0.99
+
+                # Key
+                if beatport_data.get('key'):
+                    bp_key = beatport_data['key']
+                    bp_camelot = KEY_TO_CAMELOT.get(bp_key, None)
+                    if bp_camelot:
+                        key = bp_key
+                        camelot = bp_camelot
+                        key_source = 'beatport'
+                        key_confidence = 0.99
+                        print(f"  [Beatport] Key: {key} ({camelot})")
+                    else:
+                        print(f"  [Beatport] Key '{bp_key}' no mapeada a Camelot")
+
+                # Genero (proteger Discogs/MusicBrainz)
+                if beatport_data.get('genre'):
+                    bp_genre = beatport_data['genre']
+                    generic_genres = ['Electronic', 'Dance', 'Unknown', 'electronic', 'dance']
+                    if genre_source in ['discogs', 'musicbrainz']:
+                        print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
+                    elif genre in generic_genres or genre_source in ['spectral_analysis', 'chunked_analysis', 'id3']:
+                        genre = bp_genre
+                        genre_source = 'beatport'
+                        print(f"  [Beatport] Genre: {genre}")
+                    else:
+                        print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
             else:
                 print(f"  [Beatport] No encontrado")
         except Exception as e:
             print(f"  [Beatport] Error: {e}")
-    
+
     # ==================== ARTWORK ====================
     artwork_embedded = False
     artwork_url = None
