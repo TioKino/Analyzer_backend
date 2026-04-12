@@ -1,37 +1,22 @@
 """
-DJ Analyzer Pro API v2.5.0
+DJ Analyzer Pro API v2.3.0
 ==========================
-Backend principal - Importa funcionalidad de modulos separados
+Backend principal - Importa funcionalidad de mdulos separados
 
 Estructura:
-- main.py          - FastAPI app, analysis engine, main endpoints
-- models.py        - Pydantic models (AnalysisResult, CorrectionRequest)
-- audio_helpers.py - Fingerprint, filename parsing, structure detection, vocals
-- bpm_utils.py     - BPM validation and correction (half/double tempo)
-- beatport.py      - Beatport search and genre intelligence
-- preview_generator.py - 6-second MP3 preview snippet generation
-- database.py      - SQLite management
-- genre_detection.py - Genre detection with multiple sources
-- artwork_and_cuepoints.py - Artwork extraction + cue points
-- similar_tracks_endpoint.py - Similar tracks search
-- spectral_genre_classifier.py - Spectral genre classification
-- routes/          - Extracted route modules (search, library, admin, etc.)
-- sync_endpoints.py - Cloud sync endpoints
-- validation.py    - Input validation
-- config.py        - Configuration
+- main.py (este archivo) - FastAPI app, endpoints principales
+- database.py - Gestin de SQLite
+- genre_detection.py - Deteccin de g(c)nero con mltiples fuentes
+- artwork_and_cuepoints.py - Extraccin artwork + cue points
+- similar_tracks_endpoint.py - Bsqueda de tracks similares
+- essentia_analyzer.py - Anlisis con Essentia (opcional)
+- api_config.py / config.py - Configuracin
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
-from sync_endpoints import sync_router, admin_sync_router
-from routes import (
-    search_router, library_router, admin_router, community_router,
-    preview_router, media_router,
-    init_search, init_library, init_admin, init_community,
-    init_preview, init_media,
-)
+from sync_endpoints import sync_router
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
-import logging
+from fastapi.responses import FileResponse, Response, JSONResponse
 import librosa
 import numpy as np
 import tempfile
@@ -42,29 +27,17 @@ import hashlib
 import requests
 import sqlite3
 from typing import Dict, List, Optional
+from pydantic import BaseModel
+from pydantic import BaseModel
 from spectral_genre_classifier import classify_genre_advanced
-
-# Split modules
-from models import AnalysisResult, CorrectionRequest, KEY_TO_CAMELOT, get_camelot
-from audio_helpers import (
-    sanitize_float, sanitize_for_json, SafeJSONResponse,
-    calculate_fingerprint, parse_filename, detect_structure,
-    find_drop_timestamp, classify_track_type, detect_vocals_improved,
-    get_acousticbrainz_genre,
-)
-from bpm_utils import validate_beatport_bpm, smart_bpm_correction, try_bpm_double_half
-from beatport import search_beatport, find_tracks_in_json, clean_beatport_genre, convert_beatport_key
-from preview_generator import generate_preview_snippet as _generate_preview_snippet, init_previews_dir
 from config import (
-    AUDD_API_TOKEN,
-    DISCOGS_TOKEN,
-    print_config,
+    AUDD_API_TOKEN, 
+    DISCOGS_TOKEN, 
+    print_config, 
     BASE_URL,
     CORS_ORIGINS,
     DEBUG,
     PREVIEWS_DIR,
-    ADMIN_TOKEN,
-    RATE_LIMIT_ENABLED,
 )
 
 #  Importar mdulo de validacin
@@ -84,23 +57,16 @@ from validation import (
     ValidationError,
 )
 
-logger = logging.getLogger(__name__)
-
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.DEBUG if DEBUG else logging.INFO,
-        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
-        datefmt='%H:%M:%S'
-    )
     print_config()  # Muestra configuracin al arrancar
 
 try:
     from chunked_analyzer import ChunkedAudioAnalyzer, get_chunked_analyzer
     CHUNKED_ANALYZER_ENABLED = True
-    logger.info("ChunkedAudioAnalyzer disponible para tracks largos")
+    print(" ChunkedAudioAnalyzer disponible para tracks largos")
 except ImportError as e:
     CHUNKED_ANALYZER_ENABLED = False
-    logger.warning(f"ChunkedAudioAnalyzer no disponible: {e}")
+    print(f" ChunkedAudioAnalyzer no disponible: {e}")
 
 # ==================== MODO LOCAL ====================
 # Cuando corre via local_engine.py, tiene toda la CPU del usuario.
@@ -110,14 +76,14 @@ IS_LOCAL_ENGINE = os.environ.get('LOCAL_ENGINE', 'false').lower() == 'true'
 
 if IS_LOCAL_ENGINE:
     CHUNKED_ANALYZER_ENABLED = False  # No necesario: RAM del usuario suficiente
-    logger.info("=" * 50)
-    logger.info("  MODO LOCAL: Análisis completo activado")
-    logger.info("  - Chunked deshabilitado (RAM suficiente)")
-    logger.info("  - Track completo en memoria (sr=44100)")
-    logger.info("  - Key: Krumhansl-Kessler + multi-pasada")
-    logger.info("  - BPM: Smart correction + double/half")
-    logger.info("  - Energy: Power curve optimizada")
-    logger.info("=" * 50)
+    print("=" * 50)
+    print("  MODO LOCAL: Análisis completo activado")
+    print("  - Chunked deshabilitado (RAM suficiente)")
+    print("  - Track completo en memoria (sr=44100)")
+    print("  - Key: Krumhansl-Kessler + multi-pasada")
+    print("  - BPM: Smart correction + double/half")
+    print("  - Energy: Power curve optimizada")
+    print("=" * 50)
 
 # Umbral de duracin para usar anlisis por chunks (en segundos)
 # Tracks > 4 minutos usarn el analizador por chunks
@@ -142,7 +108,7 @@ try:
     )
     ARTWORK_ENABLED = True
 except ImportError:
-    logger.warning("artwork_and_cuepoints.py no encontrado - funciones deshabilitadas")
+    print("artwork_and_cuepoints.py no encontrado - funciones deshabilitadas")
     ARTWORK_ENABLED = False
     ARTWORK_CACHE_DIR = "/data/artwork_cache"
     search_artwork_online = None
@@ -154,9 +120,9 @@ try:
     from api_config import DISCOGS_TOKEN
     genre_detector = GenreDetector(discogs_token=DISCOGS_TOKEN)
     GENRE_DETECTOR_ENABLED = True
-    logger.info(f"GenreDetector inicializado (Discogs: {'S' if DISCOGS_TOKEN else 'No'})")
+    print(f"GenreDetector inicializado (Discogs: {'S' if DISCOGS_TOKEN else 'No'})")
 except ImportError as e:
-    logger.warning(f"genre_detection.py no encontrado: {e}")
+    print(f"genre_detection.py no encontrado: {e}")
     GENRE_DETECTOR_ENABLED = False
     genre_detector = None
 
@@ -171,16 +137,144 @@ try:
     )
     SIMILAR_TRACKS_ENABLED = True
 except ImportError:
-    logger.warning("similar_tracks_endpoint.py no encontrado")
+    print("similar_tracks_endpoint.py no encontrado")
     SIMILAR_TRACKS_ENABLED = False
-    CAMELOT_COMPATIBLE = {}
 
+
+# ==================== FLOAT SANITIZER ====================
+import math
+
+def sanitize_float(v):
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return 0.0
+    return v
+
+def sanitize_for_json(obj):
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, float):
+        return sanitize_float(obj)
+    return obj
+
+class SafeJSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        content = sanitize_for_json(content)
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+
+def validate_beatport_bpm(local_bpm: float, beatport_bpm: float, tolerance: float = 0.12) -> bool:
+    """Valida si el BPM de Beatport corresponde al track local."""
+    if local_bpm <= 0 or beatport_bpm <= 0:
+        return True
+    ratio = beatport_bpm / local_bpm
+    if abs(ratio - 1.0) <= tolerance:
+        return True
+    if abs(ratio - 2.0) <= tolerance and beatport_bpm >= 80:
+        return True
+    if abs(ratio - 0.5) <= tolerance and beatport_bpm >= 80:
+        return True
+    return False
+
+
+def smart_bpm_correction(local_bpm: float, beatport_bpm: float) -> float:
+    """
+    Correccion inteligente de BPM half/double tempo.
+    
+    Si Beatport dice 140 y local dice 70 -> es double tempo -> corregir a 140.
+    Si Beatport dice 70 y local dice 140 -> es half tempo -> corregir a 70.
+    Si estan dentro del 12%, Beatport gana (datos del sello).
+    Si no hay match, devolver None (rechazar Beatport).
+    
+    Returns: BPM corregido, o None si no hay match valido.
+    """
+    if local_bpm <= 0 or beatport_bpm <= 0:
+        return beatport_bpm or local_bpm
+    
+    ratio = beatport_bpm / local_bpm
+    
+    # Match directo (dentro del 12%)
+    if abs(ratio - 1.0) <= 0.12:
+        return beatport_bpm  # Beatport gana
+    
+    # Half tempo: local=70, beatport=140 -> ratio=2.0
+    if abs(ratio - 2.0) <= 0.15:
+        return beatport_bpm  # Beatport gana, local estaba a mitad
+    
+    # Double tempo: local=140, beatport=70 -> ratio=0.5
+    if abs(ratio - 0.5) <= 0.15:
+        return beatport_bpm  # Beatport gana, local estaba al doble
+    
+    # No hay match razonable
+    return None
+
+
+def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset_env=None) -> float:
+    """
+    Si la confianza del BPM es baja, probar con doble y mitad.
+    
+    Logica: si librosa dice 131 con confianza 0.4, probar 262 y 65.5.
+    Si alguno de esos tiene sentido musical (60-200 BPM range) Y tiene
+    mejor alineacion con los beats, usarlo.
+    
+    Args:
+        onset_env: Si ya se calculó onset_strength, pasarlo para no duplicar CPU.
+    """
+    if bpm_confidence >= 0.7:
+        return original_bpm  # Alta confianza, no tocar
+    
+    candidates = [original_bpm]
+    
+    # Probar doble
+    double = original_bpm * 2
+    if 60 <= double <= 200:
+        candidates.append(double)
+    
+    # Probar mitad
+    half = original_bpm / 2
+    if 60 <= half <= 200:
+        candidates.append(half)
+    
+    if len(candidates) == 1:
+        return original_bpm
+    
+    # Evaluar cual se alinea mejor con onset strength
+    try:
+        if onset_env is None:
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        best_bpm = original_bpm
+        best_score = 0
+        
+        for candidate in candidates:
+            # Crear pulso teorico para este BPM
+            beat_interval = 60.0 / candidate
+            sr_onset = sr / 512  # hop_length default
+            
+            # Autocorrelacion con el BPM candidato
+            period = int(round(sr_onset * beat_interval))
+            if period > 0 and period < len(onset_env) // 2:
+                corr = np.correlate(onset_env[:len(onset_env)//2], 
+                                     onset_env[period:period + len(onset_env)//2])
+                score = float(np.max(corr)) if len(corr) > 0 else 0
+                if score > best_score:
+                    best_score = score
+                    best_bpm = candidate
+        
+        if best_bpm != original_bpm:
+            print(f"   BPM auto-corregido: {original_bpm:.1f} -> {best_bpm:.1f} (confianza baja: {bpm_confidence:.2f})")
+        
+        return best_bpm
+    except Exception:
+        return original_bpm
 
 # ==================== APP ====================
 
 app = FastAPI(title="DJ Analyzer Pro API", version="2.3.0", default_response_class=SafeJSONResponse)
 app.include_router(sync_router)
-app.include_router(admin_sync_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -193,7 +287,7 @@ app.add_middleware(
 #  Manejador de errores de validacin
 @app.exception_handler(ValidationError)
 async def validation_error_handler(request: Request, exc: ValidationError):
-    return SafeJSONResponse(
+    return JSONResponse(
         status_code=400,
         content={
             "error": "validation_error",
@@ -204,29 +298,6 @@ async def validation_error_handler(request: Request, exc: ValidationError):
 
 # Inicializar BD
 db = AnalysisDB()
-
-# Inicializar y montar route modules
-init_search(db, camelot_compatible=CAMELOT_COMPATIBLE)
-init_library(db)
-init_admin(db, artwork_cache_dir=ARTWORK_CACHE_DIR, artwork_enabled=ARTWORK_ENABLED,
-           genre_detector_enabled=GENRE_DETECTOR_ENABLED, similar_tracks_enabled=SIMILAR_TRACKS_ENABLED)
-init_community(db)
-init_media(db, ARTWORK_CACHE_DIR)
-
-# Preview: init directory + wrapper for preview_generator module
-init_previews_dir(PREVIEWS_DIR)
-
-def generate_preview_snippet(file_path, fingerprint, drop_timestamp, duration):
-    return _generate_preview_snippet(file_path, fingerprint, drop_timestamp, duration, PREVIEWS_DIR)
-
-init_preview(db, PREVIEWS_DIR, generate_preview_snippet)
-
-app.include_router(search_router)
-app.include_router(library_router)
-app.include_router(admin_router)
-app.include_router(community_router)
-app.include_router(preview_router)
-app.include_router(media_router)
 
 # Crear directorio de cach(c) para artwork
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
@@ -287,8 +358,612 @@ def search_collective_db(artist: str, title: str) -> Optional[Dict]:
         
         return None
         
-    except sqlite3.Error as e:
-        logger.error(f"Error buscando en BD colectiva: {e}")
+    except Exception as e:
+        print(f" Error buscando en BD colectiva: {e}")
+        return None
+
+
+# ==================== BEATPORT SEARCH ====================
+
+def search_beatport(artist: str, title: str) -> Optional[Dict]:
+    """
+    Busca BPM y Key de un track en Beatport via scraping HTML.
+    Beatport es Next.js y embebe datos en __NEXT_DATA__.
+    Campos: track_name, bpm, key_name, genre[].genre_name, artists[].artist_name, length (ms)
+    """
+    try:
+        import urllib.parse
+        
+        # Limpiar titulo
+        clean_title = re.sub(r'\s*\(?(Original Mix|Extended Mix|Radio Edit)\)?', '', title, flags=re.IGNORECASE).strip()
+        clean_title = re.sub(r'^[A-D]\d\s+', '', clean_title).strip()
+        
+        # Limpiar artista
+        clean_artist = artist.strip().rstrip('.')
+        
+        query = f"{clean_artist} {clean_title}"
+        encoded_query = urllib.parse.quote(query)
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+        
+        search_url = f"https://www.beatport.com/search?q={encoded_query}"
+        
+        response = requests.get(search_url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            print(f"  [Beatport] HTTP {response.status_code}")
+            return None
+        
+        # Extraer __NEXT_DATA__
+        next_data_match = re.search(
+            r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
+            response.text, re.DOTALL
+        )
+        if not next_data_match:
+            print(f"  [Beatport] No __NEXT_DATA__ encontrado")
+            return None
+        
+        data = json.loads(next_data_match.group(1))
+        
+        # Navegar a la ruta de tracks
+        # props.pageProps.dehydratedState.queries[0].state.data.tracks.data
+        try:
+            tracks = data["props"]["pageProps"]["dehydratedState"]["queries"][0]["state"]["data"]["tracks"]["data"]
+        except (KeyError, IndexError, TypeError):
+            print(f"  [Beatport] Estructura JSON no esperada")
+            return None
+        
+        if not tracks:
+            return None
+        
+        # Buscar match
+        artist_lower = clean_artist.lower()
+        title_lower = clean_title.lower()
+        
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            
+            track_name = track.get('track_name', '').lower()
+            
+            # Match de titulo
+            title_match = (title_lower in track_name) or (track_name in title_lower)
+            if not title_match:
+                title_words = set(title_lower.split())
+                track_words = set(track_name.split())
+                if title_words and track_words:
+                    overlap = len(title_words & track_words) / max(len(title_words), 1)
+                    title_match = overlap >= 0.6
+            
+            if not title_match:
+                continue
+            
+            # Match de artista
+            track_artists = track.get('artists', [])
+            artist_match = False
+            for a in track_artists:
+                a_name = a.get('artist_name', '').lower() if isinstance(a, dict) else str(a).lower()
+                if artist_lower in a_name or a_name in artist_lower:
+                    artist_match = True
+                    break
+            
+            if not artist_match and track_artists:
+                continue
+            
+            # Extraer resultado
+            result = {}
+            
+            # BPM
+            if track.get('bpm'):
+                try:
+                    result['bpm'] = float(track['bpm'])
+                except (ValueError, TypeError):
+                    pass
+            
+            # Key - viene como key_name: "C Major", "D Minor", etc.
+            key_name = track.get('key_name', '')
+            if key_name:
+                result['key'] = convert_beatport_key(key_name)
+            
+            # Duration - viene en milisegundos en campo "length"
+            if track.get('length'):
+                try:
+                    result['duration'] = float(track['length']) / 1000.0
+                except (ValueError, TypeError):
+                    pass
+            
+            # Genre - viene como lista: [{"genre_id": 6, "genre_name": "Techno (Peak Time / Driving)"}]
+            genres = track.get('genre', [])
+            if genres and isinstance(genres, list):
+                genre_names = [g.get('genre_name', '') for g in genres if isinstance(g, dict)]
+                if genre_names:
+                    raw_genre = genre_names[0]
+                    cleaned = clean_beatport_genre(raw_genre)
+                    result['genre'] = cleaned['genre']
+                    result['genre_raw'] = raw_genre
+                    result['is_junk_genre'] = cleaned['is_junk']
+                    if cleaned['track_type_hint']:
+                        result['track_type_hint'] = cleaned['track_type_hint']
+            
+            if result.get('bpm') or result.get('key'):
+                return result
+        
+        return None
+        
+    except requests.exceptions.Timeout:
+        print(f"  [Beatport] Timeout")
+        return None
+    except Exception as e:
+        print(f"  [Beatport] Error: {e}")
+        return None
+
+
+def find_tracks_in_json(obj, results):
+    """Busca recursivamente tracks en estructura JSON"""
+    if isinstance(obj, dict):
+        # Si tiene bpm y name, probablemente es un track
+        if 'bpm' in obj and ('name' in obj or 'title' in obj or 'track_name' in obj):
+            results.append(obj)
+        # Buscar en valores
+        for v in obj.values():
+            find_tracks_in_json(v, results)
+    elif isinstance(obj, list):
+        for item in obj:
+            find_tracks_in_json(item, results)
+    return results
+
+
+# ==================== BEATPORT GENRE INTELLIGENCE ====================
+
+# Generos Beatport que NO son generos reales (son categorias comerciales)
+BEATPORT_JUNK_GENRES = {
+    'Mainstage', 'DJ Tools', 'Beats', 'Dance / Pop',
+}
+
+# Mapeo de calificadores Beatport entre parentesis -> track_type
+BEATPORT_QUALIFIER_TO_TYPE = {
+    # Peak / High energy
+    'Peak Time': 'peak_time',
+    'Driving': 'peak_time',
+    'Raw': 'peak_time',
+    'Hard': 'peak_time',
+    # Melodic / Builder
+    'Melodic': 'builder',
+    'Progressive': 'builder',
+    'Uplifting': 'builder',
+    # Deep / Opener
+    'Deep': 'opener',
+    'Hypnotic': 'opener',
+    'Minimal': 'opener',
+    'Deep Tech': 'opener',
+    # Chill / Warmup
+    'Downtempo': 'warmup',
+    'Ambient': 'warmup',
+    'Organic': 'warmup',
+    'Chill': 'warmup',
+    'Electronica': 'warmup',
+    # Anthem / Big room
+    'Big Room': 'anthem',
+    'Electro House': 'anthem',
+    'Future Rave': 'anthem',
+}
+
+def clean_beatport_genre(raw_genre: str) -> dict:
+    """
+    Procesa un genero de Beatport y extrae:
+    - genre: el genero limpio (sin calificadores entre parentesis)
+    - track_type_hint: sugerencia de track_type basada en calificadores
+    - is_junk: True si el genero es una categoria comercial sin valor
+    
+    Ejemplo:
+      "Techno (Peak Time / Driving)" -> {
+          'genre': 'Techno',
+          'track_type_hint': 'peak_time',
+          'is_junk': False
+      }
+      "Mainstage" -> {
+          'genre': 'Mainstage',
+          'track_type_hint': None,
+          'is_junk': True
+      }
+    """
+    if not raw_genre:
+        return {'genre': raw_genre, 'track_type_hint': None, 'is_junk': True}
+    
+    result = {
+        'genre': raw_genre,
+        'track_type_hint': None,
+        'is_junk': raw_genre in BEATPORT_JUNK_GENRES,
+    }
+    
+    # Extraer calificadores entre parentesis: "Techno (Peak Time / Driving)"
+    paren_match = re.match(r'^(.+?)\s*\((.+)\)$', raw_genre)
+    if paren_match:
+        base_genre = paren_match.group(1).strip()
+        qualifiers_str = paren_match.group(2).strip()
+        
+        # El genero limpio es la parte antes del parentesis
+        result['genre'] = base_genre
+        
+        # Buscar track_type en los calificadores
+        qualifiers = [q.strip() for q in qualifiers_str.replace('/', ',').split(',')]
+        for q in qualifiers:
+            q_clean = q.strip()
+            if q_clean in BEATPORT_QUALIFIER_TO_TYPE:
+                result['track_type_hint'] = BEATPORT_QUALIFIER_TO_TYPE[q_clean]
+                break
+    
+    # Generos compuestos con "/" pero sin parentesis: "Minimal / Deep Tech"
+    elif '/' in raw_genre and '(' not in raw_genre:
+        parts = [p.strip() for p in raw_genre.split('/')]
+        # Usar el primer componente como genero principal
+        result['genre'] = raw_genre  # mantener completo, es descriptivo
+        # Buscar hints en las partes
+        for p in parts:
+            if p in BEATPORT_QUALIFIER_TO_TYPE:
+                result['track_type_hint'] = BEATPORT_QUALIFIER_TO_TYPE[p]
+                break
+    
+    return result
+
+
+def convert_beatport_key(beatport_key: str) -> str:
+    """
+    Convierte key de formato Beatport a formato estandar.
+    Beatport: "D Minor", "G Major", "F# Minor", "G Flat Minor", "E Flat Major"
+    Estandar: "Dm", "G", "F#m", "F#m", "D#"
+    """
+    if not beatport_key:
+        return None
+    
+    key = beatport_key.strip()
+    
+    # Convertir "Flat" a "b" primero
+    key = key.replace(' Flat', 'b').replace(' flat', 'b')
+    # Convertir "Sharp" a "#"
+    key = key.replace(' Sharp', '#').replace(' sharp', '#')
+    
+    # Convertir "D Minor" -> "Dm", "G Major" -> "G"
+    key = key.replace(' Minor', 'm').replace(' minor', 'm')
+    key = key.replace(' Major', '').replace(' major', '')
+    key = key.replace(' min', 'm').replace(' maj', '')
+    
+    # Convertir bemoles a sostenidos (KEY_TO_CAMELOT solo tiene sostenidos)
+    # Enharmonicos: Cb=B, Db=C#, Eb=D#, Fb=E, Gb=F#, Ab=G#, Bb=A#
+    FLAT_TO_SHARP = {
+        'Cb': 'B',  'Db': 'C#', 'Eb': 'D#', 'Fb': 'E',
+        'Gb': 'F#', 'Ab': 'G#', 'Bb': 'A#',
+    }
+    
+    # Extraer la nota base y el sufijo (m o nada)
+    is_minor = key.endswith('m')
+    base = key[:-1] if is_minor else key
+    
+    if base in FLAT_TO_SHARP:
+        base = FLAT_TO_SHARP[base]
+    
+    return base + ('m' if is_minor else '')
+
+# ==================== MODELOS ====================
+
+class AnalysisResult(BaseModel):
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    album: Optional[str] = None
+    label: Optional[str] = None
+    year: Optional[str] = None
+    isrc: Optional[str] = None
+    duration: float
+    bpm: float
+    bpm_confidence: float
+    bpm_source: str = "analysis"
+    key: Optional[str] = None
+    camelot: Optional[str] = None
+    key_confidence: float
+    key_source: str = "analysis"
+    energy_raw: float
+    energy_normalized: float
+    energy_dj: int
+    groove_score: float
+    swing_factor: float
+    has_intro: bool
+    has_buildup: bool
+    has_drop: bool
+    has_breakdown: bool
+    has_outro: bool
+    structure_sections: List[Dict]
+    track_type: str
+    track_type_source: str = "waveform"
+    genre: str = "unknown"
+    subgenre: Optional[str] = None
+    genre_source: str = "spectral_analysis"
+    has_vocals: bool
+    has_heavy_bass: bool
+    has_pads: bool
+    percussion_density: float
+    mix_energy_start: float
+    mix_energy_end: float
+    drop_timestamp: float
+    #  Cue Points
+    cue_points: List[Dict] = []
+    #  Beat Grid
+    first_beat: float = 0.0
+    beat_interval: float = 0.5
+    #  Artwork
+    artwork_embedded: bool = False
+    artwork_url: Optional[str] = None
+    # Preview snippet URL (6 segundos)
+    preview_url: Optional[str] = None
+    # Fingerprint del archivo
+    fingerprint: Optional[str] = None
+
+class CorrectionRequest(BaseModel):
+    track_id: str
+    field: str
+    old_value: str
+    new_value: str
+    fingerprint: Optional[str] = None
+
+class SearchRequest(BaseModel):
+    artist: Optional[str] = None
+    genre: Optional[str] = None
+    min_bpm: Optional[float] = None
+    max_bpm: Optional[float] = None
+    min_energy: Optional[int] = None
+    max_energy: Optional[int] = None
+    key: Optional[str] = None
+    track_type: Optional[str] = None
+    limit: int = 100
+
+# ==================== MAPEOS ====================
+
+KEY_TO_CAMELOT = {
+    'C': '8B', 'C#': '3B', 'D': '10B', 'D#': '5B',
+    'E': '12B', 'F': '7B', 'F#': '2B', 'G': '9B',
+    'G#': '4B', 'A': '11B', 'A#': '6B', 'B': '1B',
+    'Cm': '5A', 'C#m': '12A', 'Dm': '7A', 'D#m': '2A',
+    'Em': '9A', 'Fm': '4A', 'F#m': '11A', 'Gm': '6A',
+    'G#m': '1A', 'Am': '8A', 'A#m': '3A', 'Bm': '10A'
+}
+
+def get_camelot(key: str) -> str:
+    """Convierte key musical a notacion Camelot"""
+    return KEY_TO_CAMELOT.get(key, '?')
+
+# ==================== HELPERS ====================
+
+def calculate_fingerprint(file_path):
+    """Calcular fingerprint simple del archivo"""
+    with open(file_path, 'rb') as f:
+        file_hash = hashlib.md5(f.read()).hexdigest()
+    return file_hash
+
+def parse_filename(filename: str) -> dict:
+    name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
+    name = re.sub(r'^\d+[\s\-_.]+', '', name)
+    name = re.sub(r'[\[\(][A-Z0-9]+[\]\)]', '', name)
+    name = re.sub(r'(?i)\(original mix\)|\[original mix\]', '', name)
+    name = re.sub(r'(?i)\(extended\)|\[extended\]', '', name)
+    
+    artist = None
+    title = None
+    
+    if ' - ' in name:
+        parts = name.split(' - ', 1)
+        artist = parts[0].strip()
+        title = parts[1].strip()
+    elif '-' in name and len(name.split('-')) == 2:
+        parts = name.split('-', 1)
+        artist = parts[0].strip()
+        title = parts[1].strip()
+    else:
+        title = name.strip()
+    
+    if artist:
+        artist = ' '.join(artist.split())
+    if title:
+        title = ' '.join(title.split())
+    
+    return {'artist': artist, 'title': title if title else name.strip()}
+
+def detect_structure(y, sr, duration):
+    segment_length = int(sr * 8)
+    n_segments = len(y) // segment_length
+    
+    if n_segments == 0:
+        return {
+            'has_intro': False, 'has_buildup': False, 'has_drop': False,
+            'has_breakdown': False, 'has_outro': False, 'sections': []
+        }
+    
+    energies = []
+    for i in range(n_segments):
+        segment = y[i*segment_length:(i+1)*segment_length]
+        energies.append(np.mean(librosa.feature.rms(y=segment)))
+    
+    energies = np.array(energies)
+    avg_energy = np.mean(energies)
+    
+    has_intro = energies[0] < avg_energy * 0.6 if len(energies) > 0 else False
+    has_outro = energies[-1] < avg_energy * 0.6 if len(energies) > 0 else False
+    has_drop = np.max(energies) > avg_energy * 1.4 if len(energies) > 0 else False
+    has_breakdown = np.min(energies[1:-1]) < avg_energy * 0.5 if len(energies) > 2 else False
+    has_buildup = has_drop
+    
+    sections = []
+    for i, e in enumerate(energies):
+        section_type = "body"
+        if i == 0 and has_intro:
+            section_type = "intro"
+        elif i == len(energies)-1 and has_outro:
+            section_type = "outro"
+        elif e > avg_energy * 1.4:
+            section_type = "drop"
+        elif e < avg_energy * 0.5:
+            section_type = "breakdown"
+        
+        sections.append({
+            "type": section_type,
+            "start": i * 8.0,
+            "end": (i + 1) * 8.0,
+            "energy": float(e)
+        })
+    
+    return {
+        'has_intro': has_intro, 'has_buildup': has_buildup, 'has_drop': has_drop,
+        'has_breakdown': has_breakdown, 'has_outro': has_outro, 'sections': sections
+    }
+
+def find_drop_timestamp(y, sr, segments: dict) -> float:
+    if not segments['sections']:
+        return 30.0
+    
+    for section in segments['sections']:
+        if section['type'] == 'drop':
+            return section['start'] + 4.0
+    
+    max_energy = max(s['energy'] for s in segments['sections'])
+    for section in segments['sections']:
+        if section['energy'] == max_energy:
+            return section['start'] + 4.0
+    
+    duration = segments['sections'][-1]['end'] if segments['sections'] else 180
+    return duration / 3
+
+def classify_track_type(energy: float, segments: dict, duration: float) -> str:
+    if energy < 0.5 and segments['has_intro']:
+        return "warmup"
+    if energy > 0.7 and segments['has_drop']:
+        return "peak"
+    if segments['has_outro'] and duration > 300:
+        return "closing"
+    return "peak" if energy > 0.6 else "warmup"
+
+def detect_vocals_improved(y, sr, spectral_centroid):
+    try:
+        centroid_mean = float(np.mean(spectral_centroid))
+        has_high_centroid = centroid_mean > 3500
+        
+        flatness = librosa.feature.spectral_flatness(y=y)
+        flatness_mean = float(np.mean(flatness))
+        is_tonal = flatness_mean < 0.15
+        
+        centroid_std = float(np.std(spectral_centroid))
+        has_variation = centroid_std > 500
+        
+        zcr = librosa.feature.zero_crossing_rate(y)
+        zcr_mean = float(np.mean(zcr))
+        zcr_in_voice_range = 0.05 < zcr_mean < 0.15
+        
+        criteria_met = sum([has_high_centroid, is_tonal, has_variation, zcr_in_voice_range])
+        return criteria_met >= 3
+        
+    except Exception as e:
+        print(f"Error detectando vocals: {e}")
+        return False
+
+def get_acousticbrainz_genre(fingerprint=None, artist=None, title=None):
+    """AcousticBrainz cerró en 2022. Stub que retorna None para no romper llamadas."""
+    return None
+
+
+# ==================== PREVIEW SNIPPET ====================
+
+import subprocess
+from pathlib import Path as PathLib
+
+# Asegurar directorio de previews
+PathLib(PREVIEWS_DIR).mkdir(parents=True, exist_ok=True)
+
+def generate_preview_snippet(
+    file_path: str,
+    fingerprint: str,
+    drop_timestamp: float,
+    duration: float,
+) -> Optional[str]:
+    """
+    Genera snippet MP3 de 6s desde el punto más interesante del track.
+    
+    Formato: MP3 mono, 64kbps, 22050Hz ≈ 48KB por track.
+    Incluye fade in (0.3s) y fade out (0.5s) via ffmpeg.
+    
+    Args:
+        file_path: Ruta al archivo de audio temporal
+        fingerprint: Hash MD5 del archivo (usado como ID)
+        drop_timestamp: Timestamp del drop/punto energético (en segundos)
+        duration: Duración total del track (en segundos)
+    
+    Returns:
+        Ruta al snippet generado, o None si falla
+    """
+    output_path = os.path.join(PREVIEWS_DIR, f"{fingerprint}.mp3")
+    
+    # Si ya existe, no regenerar
+    if os.path.exists(output_path):
+        print(f"  [Preview] Ya existe snippet para {fingerprint[:8]}...")
+        return output_path
+    
+    # Calcular punto de inicio: 2s antes del drop para capturar buildup
+    start = max(0, drop_timestamp - 2.0)
+    # Asegurar que no nos pasamos del final
+    if start + 6 > duration:
+        start = max(0, duration - 6)
+    # Si el track dura menos de 6s, empezar desde 0
+    if duration < 6:
+        start = 0
+    
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(round(start, 2)),
+            '-i', file_path,
+            '-t', '6',
+            '-ac', '1',           # Mono
+            '-ab', '64k',         # 64kbps
+            '-ar', '22050',       # Sample rate bajo (suficiente para preview)
+            '-af', 'afade=t=in:st=0:d=0.3,afade=t=out:st=5.5:d=0.5',  # Fade in/out
+            output_path
+        ]
+        
+        proc_result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=15,
+            check=True,
+        )
+        
+        # Verificar que el archivo se generó y tiene tamaño razonable
+        if os.path.exists(output_path):
+            size = os.path.getsize(output_path)
+            if size > 1000:  # Mínimo 1KB
+                print(f"  [Preview] Snippet generado: {fingerprint[:8]}... "
+                      f"({size//1024}KB, start={start:.1f}s)")
+                return output_path
+            else:
+                print(f"  [Preview] Snippet demasiado pequeño ({size}B), eliminando")
+                os.unlink(output_path)
+                return None
+        
+        return None
+        
+    except subprocess.TimeoutExpired:
+        print(f"  [Preview] Timeout generando snippet para {fingerprint[:8]}...")
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+        return None
+    except subprocess.CalledProcessError as e:
+        stderr_msg = e.stderr.decode('utf-8', errors='replace')[:200] if e.stderr else 'unknown'
+        print(f"  [Preview] ffmpeg error: {stderr_msg}")
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+        return None
+    except Exception as e:
+        print(f"  [Preview] Error generando snippet: {e}")
+        if os.path.exists(output_path):
+            os.unlink(output_path)
         return None
 
 
@@ -303,11 +978,11 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     
     #  Si el track es largo (>4 min), usar anlisis por chunks
     if CHUNKED_ANALYZER_ENABLED and duration > CHUNK_ANALYSIS_THRESHOLD:
-        logger.info(f"Track largo ({duration/60:.1f} min) - Usando anlisis por chunks")
+        print(f" Track largo ({duration/60:.1f} min) - Usando anlisis por chunks")
         return analyze_audio_chunked(file_path, fingerprint, duration)
     
     # Track corto: anlisis tradicional (carga todo en RAM)
-    logger.info(f"Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
+    print(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
     y, sr = librosa.load(file_path, sr=44100, mono=True)
 
     
@@ -318,7 +993,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     
     # BPM
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
-    bpm = float(tempo[0]) if isinstance(tempo, np.ndarray) else float(tempo)
+    bpm = float(tempo)
     bpm_source = "analysis"
     
     # Usar BPM de ID3 si existe y es razonable
@@ -398,7 +1073,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     mode_margin = abs(major_best - minor_best)
     if mode_margin < 0.05:
         key_confidence = min(key_confidence, 0.55)  # Baja confianza en modo
-        logger.debug(f"Key: {key} ({camelot}) [modo ambiguo: margen={mode_margin:.3f}]")
+        print(f"   Key: {key} ({camelot}) [modo ambiguo: margen={mode_margin:.3f}]")
     
     # Usar Key de ID3 solo si existe y es vlido
     id3_key = id3_data.get('key')
@@ -438,7 +1113,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         energy_dj = max(1, min(10, energy_dj))
     
     energy_normalized = energy_dj / 10.0
-    logger.debug(f"Energia: raw={energy_raw:.4f} -> DJ level {energy_dj}")
+    print(f"   Energia: raw={energy_raw:.4f} -> DJ level {energy_dj}")
     
     chunk_size = int(sr * 30)
     mix_energy_start = float(np.mean(rms[:min(chunk_size//512, len(rms))]))
@@ -464,8 +1139,8 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     track_type = 'peak_time'  # default seguro
     try:
         track_type = classify_track_type(energy_normalized, segments, duration)
-    except (ValueError, TypeError, RuntimeError) as e:
-        logger.error(f"[TrackType] Error clasificando: {e}")
+    except Exception as e:
+        print(f"  [TrackType] Error clasificando: {e}")
     genre = classify_genre_advanced(
         bpm, energy_normalized, has_heavy_bass,
         y, sr, percussion_density,
@@ -486,7 +1161,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     title_name = id3_data.get('title')
     
     if GENRE_DETECTOR_ENABLED and genre_detector and artist_name and title_name:
-        logger.info(f"Buscando genero: {artist_name} - {title_name}")
+        print(f" Buscando g(c)nero: {artist_name} - {title_name}")
         # 1. Intentar Discogs primero (mejor para electrnica)
         try:
             discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
@@ -498,12 +1173,12 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                     label = discogs_result['label']
                 if not year and discogs_result.get('year'):
                     year = str(discogs_result['year'])
-                logger.info(f"Discogs: {genre} | {label} ({year})")
+                print(f" Discogs: {genre} | {label} ({year})")
             else:
-                logger.debug(f"Discogs: No encontrado")
-        except (requests.RequestException, ConnectionError, TimeoutError) as e:
-            logger.error(f"Error Discogs: {e}")
-
+                print(f" Discogs: No encontrado")
+        except Exception as e:
+            print(f" Error Discogs: {e}")
+        
         # 2. Si no hay Discogs, intentar MusicBrainz
         if genre_source not in ["discogs"]:
             try:
@@ -511,15 +1186,15 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                 if mb_result and mb_result.get('genre'):
                     genre = mb_result.get('genre')
                     genre_source = "musicbrainz"
-                    logger.info(f"MusicBrainz: {genre}")
-            except (requests.RequestException, ConnectionError, TimeoutError) as e:
-                logger.error(f"Error MusicBrainz: {e}")
-
+                    print(f"   MusicBrainz: {genre}")
+            except Exception as e:
+                print(f" Error MusicBrainz: {e}")
+    
     # 3. Si no hay Discogs ni MusicBrainz, usar ID3 (gen(c)rico pero mejor que nada)
     if genre_source == "spectral_analysis" and id3_genre:
         genre = id3_genre
         genre_source = "id3"
-        logger.info(f"ID3 (fallback): {genre}")
+        print(f" ID3 (fallback): {genre}")
     
     # ==================== BEATPORT: FUENTE PRIMARIA BPM/KEY/GENRE ====================
     # Beatport tiene datos 100% precisos del sello discografico
@@ -539,7 +1214,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
             title_name = parsed.get('title')
     
     if artist_name and title_name:
-        logger.info(f"BEATPORT: Buscando {artist_name} - {title_name}")
+        print(f"  BEATPORT: Buscando {artist_name} - {title_name}")
         try:
             beatport_data = search_beatport(artist_name, title_name)
             if beatport_data:
@@ -548,19 +1223,20 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                 if bp_bpm:
                     corrected = smart_bpm_correction(bpm, bp_bpm)
                     if corrected is None:
-                        logger.warning(f"[Beatport] MATCH RECHAZADO: BPM {bp_bpm} vs local {bpm:.1f} (sin match half/double)")
+                        print(f"  [Beatport] MATCH RECHAZADO: BPM {bp_bpm} vs local {bpm:.1f} (sin match half/double)")
                         beatport_data = None
                     elif corrected != bp_bpm:
-                        logger.info(f"[Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
-
+                        print(f"  [Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
+                    beatport_data = None
+                
                 if beatport_data:
                     # BPM validado
                     if beatport_data.get('bpm'):
-                        logger.info(f"[Beatport] BPM: {beatport_data['bpm']} (local: {bpm:.1f})")
+                        print(f"  [Beatport] BPM: {beatport_data['bpm']} (local: {bpm:.1f})")
                         bpm = beatport_data['bpm']
                         bpm_source = 'beatport'
                         bpm_confidence = 0.99
-
+                    
                     # Key
                     if beatport_data.get('key'):
                         bp_key = beatport_data['key']
@@ -570,56 +1246,49 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                             camelot = bp_camelot
                             key_source = 'beatport'
                             key_confidence = 0.99
-                            logger.info(f"[Beatport] Key: {key} ({camelot})")
+                            print(f"  [Beatport] Key: {key} ({camelot})")
                         else:
-                            logger.warning(f"[Beatport] Key '{bp_key}' no mapeada a Camelot")
-
+                            print(f"  [Beatport] Key '{bp_key}' no mapeada a Camelot")
+                    
                     # Genero (proteger Discogs/MusicBrainz)
                     if beatport_data.get('genre'):
                         bp_genre = beatport_data['genre']
                         generic_genres = ['Electronic', 'Dance', 'Unknown', 'electronic', 'dance']
                         if genre_source in ['discogs', 'musicbrainz']:
-                            logger.debug(f"[Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
+                            print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
                         elif genre in generic_genres or genre_source in ['spectral_analysis', 'chunked_analysis', 'id3']:
                             genre = bp_genre
                             genre_source = 'beatport'
-                            logger.info(f"[Beatport] Genre: {genre}")
+                            print(f"  [Beatport] Genre: {genre}")
                         else:
-                            logger.debug(f"[Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-
+                            print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
+                    
                     # Track type hint (si tienes clean_beatport_genre)
                     if beatport_data.get('track_type_hint'):
                         tt_hint = beatport_data['track_type_hint']
                         old_type = track_type
                         track_type = tt_hint
                         track_type_source = 'beatport'
-                        logger.info(f"[Beatport] Track type hint: {tt_hint}")
+                        print(f"  [Beatport] Track type hint: {tt_hint}")
                         if old_type != tt_hint:
-                            logger.info(f"[Beatport] Track type override: {old_type} -> {tt_hint}")
+                            print(f"  [Beatport] Track type override: {old_type} -> {tt_hint}")
             else:
-                logger.debug(f"[Beatport] No encontrado")
-        except (requests.RequestException, ConnectionError, TimeoutError) as e:
-            logger.error(f"[Beatport] Error: {e}")
-
+                print(f"  [Beatport] No encontrado")
+        except Exception as e:
+            print(f"  [Beatport] Error: {e}")
+    
     drop_time = find_drop_timestamp(y, sr, segments)
     
-    # ==================== CUE POINTS + BEAT GRID ====================
+    # ==================== CUE POINTS ====================
     cue_points = []
-
+    first_beat = 0.0
+    beat_interval = 0.5
+    
     if ARTWORK_ENABLED:
         cue_points = detect_cue_points(y, sr, duration, segments)
-
-    # Beat grid: SIEMPRE detectar (no depende de ARTWORK_ENABLED)
-    # El intervalo se calcula del BPM final (que puede venir de ID3/Beatport)
-    beat_interval = 60.0 / bpm if bpm > 0 else 0.5
-    first_beat = 0.0
-    try:
         beat_grid = detect_beat_grid(y, sr, bpm)
         first_beat = beat_grid.get('first_beat', 0.0)
-        beat_interval = beat_grid.get('beat_interval', beat_interval)
-        logger.info(f"[Beat Grid] fb={first_beat:.4f}s iv={beat_interval:.6f}s err={beat_grid.get('grid_error_ms', '?')}ms")
-    except (ValueError, TypeError, KeyError, IndexError) as e:
-        logger.warning(f"[Beat Grid] Error: {e}, usando defaults")
+        beat_interval = beat_grid.get('beat_interval', 0.5)
     
     # ==================== ARTWORK ====================
     artwork_embedded = False
@@ -636,13 +1305,13 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
             # Guardar en cach(c)
             save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
             artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-            logger.debug(f"Artwork ID3: {artwork_info.get('size', 0)} bytes")
+            print(f"   Artwork ID3: {artwork_info.get('size', 0)} bytes")
         else:
             # Fallback: buscar online (iTunes/Deezer)
             if artwork_info:
-                logger.info(f"Artwork ID3 muy pequeno ({artwork_info.get('size', 0)} bytes), buscando online...")
+                print(f" Artwork ID3 muy peque+/-o ({artwork_info.get('size', 0)} bytes), buscando online...")
             else:
-                logger.info(f"Sin artwork ID3, buscando online...")
+                print(f" Sin artwork ID3, buscando online...")
             
             artist_name = id3_data.get('artist')
             title_name = id3_data.get('title')
@@ -656,13 +1325,12 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                     artwork_embedded = False  # No est embebido, viene de online
                     artwork_source = online_artwork.get('source', 'online')
                     save_artwork_to_cache(fingerprint, online_artwork['data'], online_artwork['mime_type'])
-                    # Usar URL directa de iTunes/Deezer para que funcione en todos los dispositivos
-                    artwork_url = online_artwork.get('url') or f"{BASE_URL}/artwork/{fingerprint}"
-                    logger.info(f"Artwork {artwork_source}: {online_artwork.get('size', 0)} bytes")
+                    artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
+                    print(f"   Artwork {artwork_source}: {online_artwork.get('size', 0)} bytes")
                 else:
-                    logger.debug(f"No se encontr artwork online")
-            except (requests.RequestException, ConnectionError, TimeoutError) as e:
-                logger.error(f"Error buscando artwork online: {e}")
+                    print(f" No se encontr artwork online")
+            except Exception as e:
+                print(f" Error buscando artwork online: {e}")
     
     # ==================== TRACK TYPE: BEATPORT OVERRIDE ====================
     # Si Beatport dio un track_type_hint, tiene prioridad sobre waveform
@@ -674,12 +1342,12 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         try:
             if beatport_data and beatport_data.get('track_type_hint'):
                 bp_type = beatport_data['track_type_hint']
-                logger.info(f"[Beatport] Track type override: {track_type} -> {bp_type}")
+                print(f"  [Beatport] Track type override: {track_type} -> {bp_type}")
                 track_type = bp_type
                 track_type_source = 'beatport'
         except NameError:
             pass  # beatport_data no existe si no se ejecuto el bloque
-
+    
     return AnalysisResult(
         title=id3_data.get('title'),
         artist=id3_data.get('artist'),
@@ -781,7 +1449,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
     
     # Intentar obtener g(c)nero de Discogs/MusicBrainz
     if GENRE_DETECTOR_ENABLED and genre_detector and artist_name and title_name:
-        logger.info(f"Buscando genero: {artist_name} - {title_name}")
+        print(f"   Buscando g(c)nero: {artist_name} - {title_name}")
         try:
             discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
             if discogs_result and discogs_result.get('genre'):
@@ -791,19 +1459,19 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                     label = discogs_result['label']
                 if not year and discogs_result.get('year'):
                     year = str(discogs_result['year'])
-                logger.info(f"Discogs: {genre}")
-        except (requests.RequestException, ConnectionError, TimeoutError) as e:
-            logger.error(f"Error Discogs: {e}")
-
+                print(f"   Discogs: {genre}")
+        except Exception as e:
+            print(f"   Error Discogs: {e}")
+        
         if genre_source not in ["discogs"]:
             try:
                 mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
                 if mb_result and mb_result.get('genre'):
                     genre = mb_result.get('genre')
                     genre_source = "musicbrainz"
-                    logger.info(f"MusicBrainz: {genre}")
-            except (requests.RequestException, ConnectionError, TimeoutError) as e:
-                logger.error(f"Error MusicBrainz: {e}")
+                    print(f"   MusicBrainz: {genre}")
+            except Exception as e:
+                print(f"   Error MusicBrainz: {e}")
     
     if genre_source == "chunked_analysis" and id3_genre:
         genre = id3_genre
@@ -827,7 +1495,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
             title_name = parsed.get('title')
     
     if artist_name and title_name:
-        logger.info(f"BEATPORT: Buscando {artist_name} - {title_name}")
+        print(f"  BEATPORT: Buscando {artist_name} - {title_name}")
         try:
             beatport_data = search_beatport(artist_name, title_name)
             if beatport_data:
@@ -836,19 +1504,20 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                 if bp_bpm:
                     corrected = smart_bpm_correction(bpm, bp_bpm)
                     if corrected is None:
-                        logger.warning(f"[Beatport] MATCH RECHAZADO: BPM {bp_bpm} vs local {bpm:.1f} (sin match half/double)")
+                        print(f"  [Beatport] MATCH RECHAZADO: BPM {bp_bpm} vs local {bpm:.1f} (sin match half/double)")
                         beatport_data = None
                     elif corrected != bp_bpm:
-                        logger.info(f"[Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
-
+                        print(f"  [Beatport] BPM half/double: local {bpm:.1f} -> Beatport {bp_bpm}")
+                    beatport_data = None
+                
                 if beatport_data:
                     # BPM validado
                     if beatport_data.get('bpm'):
-                        logger.info(f"[Beatport] BPM: {beatport_data['bpm']} (local: {bpm:.1f})")
+                        print(f"  [Beatport] BPM: {beatport_data['bpm']} (local: {bpm:.1f})")
                         bpm = beatport_data['bpm']
                         bpm_source = 'beatport'
                         bpm_confidence = 0.99
-
+                    
                     # Key
                     if beatport_data.get('key'):
                         bp_key = beatport_data['key']
@@ -858,37 +1527,29 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                             camelot = bp_camelot
                             key_source = 'beatport'
                             key_confidence = 0.99
-                            logger.info(f"[Beatport] Key: {key} ({camelot})")
+                            print(f"  [Beatport] Key: {key} ({camelot})")
                         else:
-                            logger.warning(f"[Beatport] Key '{bp_key}' no mapeada a Camelot")
-
+                            print(f"  [Beatport] Key '{bp_key}' no mapeada a Camelot")
+                    
                     # Genero (proteger Discogs/MusicBrainz)
                     if beatport_data.get('genre'):
                         bp_genre = beatport_data['genre']
                         generic_genres = ['Electronic', 'Dance', 'Unknown', 'electronic', 'dance']
                         if genre_source in ['discogs', 'musicbrainz']:
-                            logger.debug(f"[Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
+                            print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
                         elif genre in generic_genres or genre_source in ['spectral_analysis', 'chunked_analysis', 'id3']:
                             genre = bp_genre
                             genre_source = 'beatport'
-                            logger.info(f"[Beatport] Genre: {genre}")
+                            print(f"  [Beatport] Genre: {genre}")
                         else:
-                            logger.debug(f"[Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-
-                    # Track type hint (si tienes clean_beatport_genre)
-                    if beatport_data.get('track_type_hint'):
-                        tt_hint = beatport_data['track_type_hint']
-                        old_type = track_type
-                        track_type = tt_hint
-                        track_type_source = 'beatport'
-                        logger.info(f"[Beatport] Track type hint: {tt_hint}")
-                        if old_type != tt_hint:
-                            logger.info(f"[Beatport] Track type override: {old_type} -> {tt_hint}")
+                            print(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
+                    
+                    # Track type hint se aplica más abajo después de definir track_type
             else:
-                logger.debug(f"[Beatport] No encontrado")
-        except (requests.RequestException, ConnectionError, TimeoutError) as e:
-            logger.error(f"[Beatport] Error: {e}")
-
+                print(f"  [Beatport] No encontrado")
+        except Exception as e:
+            print(f"  [Beatport] Error: {e}")
+    
     # ==================== ARTWORK ====================
     artwork_embedded = False
     artwork_url = None
@@ -900,7 +1561,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
             artwork_embedded = True
             save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
             artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-            logger.debug(f"Artwork ID3: {artwork_info.get('size', 0)} bytes")
+            print(f"   Artwork ID3: {artwork_info.get('size', 0)} bytes")
         else:
             if artist_name and title_name:
                 try:
@@ -908,9 +1569,9 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                     if online_artwork and online_artwork.get('data'):
                         save_artwork_to_cache(fingerprint, online_artwork['data'], online_artwork['mime_type'])
                         artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-                        logger.info(f"Artwork online: {online_artwork.get('size', 0)} bytes")
-                except (requests.RequestException, ConnectionError, TimeoutError) as e:
-                    logger.error(f"Error artwork online: {e}")
+                        print(f"   Artwork online: {online_artwork.get('size', 0)} bytes")
+                except Exception as e:
+                    print(f"   Error artwork online: {e}")
     
     # ==================== TRACK TYPE: BEATPORT OVERRIDE ====================
     track_type = result['track_type']
@@ -919,12 +1580,12 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         try:
             if beatport_data and beatport_data.get('track_type_hint'):
                 bp_type = beatport_data['track_type_hint']
-                logger.info(f"[Beatport] Track type override: {track_type} -> {bp_type}")
+                print(f"  [Beatport] Track type override: {track_type} -> {bp_type}")
                 track_type = bp_type
                 track_type_source = 'beatport'
         except NameError:
             pass
-
+    
     # ==================== RESULTADO ====================
     return AnalysisResult(
         title=id3_data.get('title'),
@@ -976,13 +1637,10 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
 async def analyze_track(
     request: Request, 
     file: UploadFile = File(...),
-    force: bool = Query(False, description="Forzar reanalisis ignorando cache"),
+    force: bool = Query(False, description="Forzar reanalisis ignorando cache")
 ):
-    # Leer path original del cliente (enviado como header)
-    original_path = request.headers.get('x-original-path')
-    # Rate limiting
-    if RATE_LIMIT_ENABLED:
-        check_rate_limit(get_client_ip(request))
+    #  Rate limiting (opcional - descomenta si quieres)
+    # check_rate_limit(get_client_ip(request))
     
     #  Validacin mejorada de archivo
     if not file.filename:
@@ -1007,30 +1665,6 @@ async def analyze_track(
         existing = db.get_track_by_filename(file.filename)
         if existing:
             analysis_json = json.loads(existing[11]) if len(existing) > 11 else {}
-            
-            # Si no tiene preview, intentar generarlo ahora
-            fp = analysis_json.get('fingerprint') or (existing[13] if len(existing) > 13 else None)
-            if fp:
-                preview_file = os.path.join(PREVIEWS_DIR, f"{fp}.mp3")
-                if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
-                    logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
-                    try:
-                        generate_preview_snippet(
-                            file_path=original_path,
-                            fingerprint=fp,
-                            drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
-                            duration=analysis_json.get('duration', 180.0),
-                        )
-                    except (FileNotFoundError, IOError, OSError) as e:
-                        logger.error(f"[Preview] Error generando desde cache: {e}")
-                
-                # Asegurar que el original_path se guarda para futuras peticiones
-                if original_path and not analysis_json.get('original_file_path'):
-                    analysis_json['original_file_path'] = original_path
-                    existing_dict = db._row_to_dict(existing) or {}
-                    existing_dict['analysis_json'] = json.dumps(analysis_json)
-                    # Re-save no es trivial, pero al menos guardamos el path
-            
             return AnalysisResult(**analysis_json)
     
     # Guardar archivo temporal para calcular fingerprint
@@ -1042,15 +1676,15 @@ async def analyze_track(
         import warnings
         warnings.filterwarnings('ignore')
         
-        # Calcular fingerprint del archivo (Chromaprint basado en audio real)
-        fingerprint, chromaprint_raw = calculate_fingerprint(tmp_path)
+        # Calcular fingerprint del archivo
+        fingerprint = calculate_fingerprint(tmp_path)
         
         # NUEVO: Buscar por fingerprint si no se encontro por filename
         # Esto recupera datos de AudD guardados previamente
         if not force:
             existing_by_fp = db.get_track_by_fingerprint(fingerprint)
             if existing_by_fp:
-                logger.info(f"[Cache] Track encontrado por fingerprint: {existing_by_fp.get('artist')} - {existing_by_fp.get('title')}")
+                print(f"[Cache] Track encontrado por fingerprint: {existing_by_fp.get('artist')} - {existing_by_fp.get('title')}")
                 
                 # Actualizar el filename en la BD para futuras busquedas
                 existing_by_fp['filename'] = file.filename
@@ -1060,28 +1694,12 @@ async def analyze_track(
                 if existing_by_fp.get('analysis_json'):
                     try:
                         analysis_data = json.loads(existing_by_fp['analysis_json'])
-                        
-                        # Si no tiene preview, generarlo con el archivo temporal
-                        preview_file = os.path.join(PREVIEWS_DIR, f"{fingerprint}.mp3")
-                        if not os.path.exists(preview_file):
-                            src = original_path if (original_path and os.path.exists(original_path)) else tmp_path
-                            logger.debug(f"[Preview] Cache FP hit sin snippet, generando para {fingerprint[:8]}...")
-                            try:
-                                generate_preview_snippet(
-                                    file_path=src,
-                                    fingerprint=fingerprint,
-                                    drop_timestamp=analysis_data.get('drop_timestamp', 30.0),
-                                    duration=analysis_data.get('duration', 180.0),
-                                )
-                            except (FileNotFoundError, IOError, OSError) as e:
-                                logger.error(f"[Preview] Error: {e}")
-
                         # Limpiar archivo temporal antes de retornar
                         if os.path.exists(tmp_path):
                             os.unlink(tmp_path)
                         return AnalysisResult(**analysis_data)
-                    except (json.JSONDecodeError, TypeError, KeyError) as e:
-                        logger.error(f"[Cache] Error parseando analysis_json: {e}")
+                    except Exception as e:
+                        print(f"[Cache] Error parseando analysis_json: {e}")
                 
                 # Si no hay analysis_json valido, construir desde los campos
                 try:
@@ -1131,8 +1749,8 @@ async def analyze_track(
                         os.unlink(tmp_path)
                     result.fingerprint = fingerprint
                     return result
-                except (ValueError, TypeError, KeyError) as e:
-                    logger.error(f"[Cache] Error construyendo resultado desde cache: {e}")
+                except Exception as e:
+                    print(f"[Cache] Error construyendo resultado desde cache: {e}")
                     # Continuar con analisis normal si falla
         
         collective_genre = db.get_collective_genre(fingerprint)
@@ -1179,17 +1797,10 @@ async def analyze_track(
         track_data['id'] = fingerprint
         track_data['filename'] = file.filename
         track_data['fingerprint'] = fingerprint
-        if chromaprint_raw:
-            track_data['chromaprint'] = chromaprint_raw
-        # Guardar path original del cliente para preview on-the-fly
-        if original_path:
-            track_data['original_file_path'] = original_path
         db.save_track(track_data)
         
         # Generar preview snippet (no bloquea si falla)
         try:
-            logger.debug(f"[Preview] Generando snippet para {fingerprint[:8]}... (tmp={tmp_path})")
-            logger.debug(f"[Preview] PREVIEWS_DIR={PREVIEWS_DIR}, drop={result.drop_timestamp:.1f}s, dur={result.duration:.1f}s")
             preview_path = generate_preview_snippet(
                 file_path=tmp_path,
                 fingerprint=fingerprint,
@@ -1198,29 +1809,25 @@ async def analyze_track(
             )
             if preview_path:
                 result.preview_url = f"{BASE_URL}/preview/{fingerprint}"
-                logger.info(f"[Preview] OK: {preview_path}")
-            else:
-                logger.warning(f"[Preview] generate_preview_snippet retorno None")
-        except (FileNotFoundError, IOError, OSError) as preview_err:
-            logger.error(f"[Preview] Error (no critico): {preview_err}", exc_info=True)
+        except Exception as preview_err:
+            print(f"  [Preview] Error (no crítico): {preview_err}")
         
         result.fingerprint = fingerprint
         return result
-    except (ValueError, TypeError, KeyError, IndexError, IOError, OSError,
-            json.JSONDecodeError) as e:
+    except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
-        logger.error(f"ERROR en anlisis de audio:\n{error_detail}")
-
+        print(f"ERROR en anlisis de audio:\n{error_detail}")
+        
         # ==================== FALLBACK: Track corrupto ====================
         # Intentar crear resultado bsico con ID3 y/o filename
-        logger.warning(f"Intentando fallback para: {file.filename}")
+        print(f" Intentando fallback para: {file.filename}")
         
         try:
             # Intentar fingerprint del contenido primero
             try:
-                fingerprint, _ = calculate_fingerprint(tmp_path)
-            except (FileNotFoundError, IOError, OSError, ValueError) as e:
+                fingerprint = calculate_fingerprint(tmp_path)
+            except Exception:
                 # Si falla (archivo muy corrupto), usar md5 del nombre
                 fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
             
@@ -1229,7 +1836,7 @@ async def analyze_track(
             if ARTWORK_ENABLED:
                 try:
                     id3_data = extract_id3_metadata(tmp_path)
-                except (ValueError, TypeError, KeyError, IOError, OSError):
+                except:
                     pass
             
             # Parsear filename
@@ -1287,13 +1894,13 @@ async def analyze_track(
             track_data['analysis_status'] = 'failed'  # Marcador especial
             db.save_track(track_data)
             
-            logger.info(f"Fallback creado: {artist} - {title} (anlisis pendiente)")
+            print(f"Fallback creado: {artist} - {title} (anlisis pendiente)")
             
             result.fingerprint = fingerprint
             return result
             
-        except (ValueError, TypeError, KeyError) as fallback_error:
-            logger.error(f"Fallback tambi(c)n fall: {fallback_error}")
+        except Exception as fallback_error:
+            print(f"Fallback tambi(c)n fall: {fallback_error}")
             raise HTTPException(500, f"Error analizando: {str(e)}")
     finally:
         if os.path.exists(tmp_path):
@@ -1347,11 +1954,11 @@ async def identify_track(file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
         
-        logger.info(f"Identificando track: {file.filename}")
+        print(f"Identificando track: {file.filename}")
         
         # Calcular fingerprint del CONTENIDO del archivo (igual que en /analyze)
-        fingerprint, _ = calculate_fingerprint(tmp_path)
-        logger.debug(f"Fingerprint (contenido): {fingerprint[:12]}...")
+        fingerprint = calculate_fingerprint(tmp_path)
+        print(f"  Fingerprint (contenido): {fingerprint[:12]}...")
         
         # ==================== PASO 1: IDENTIFICAR CON AUDD ====================
         audio_to_send = tmp_path
@@ -1362,9 +1969,9 @@ async def identify_track(file: UploadFile = File(...)):
             fragment_path = tmp_path + "_fragment.wav"
             sf.write(fragment_path, y, sr)
             audio_to_send = fragment_path
-            logger.debug(f"Fragmento extrado: 20 seg desde 0:30")
-        except (ValueError, TypeError, RuntimeError) as e:
-            logger.warning(f"No se pudo extraer fragmento, usando archivo completo: {e}")
+            print(f"Fragmento extrado: 20 seg desde 0:30")
+        except Exception as e:
+            print(f"No se pudo extraer fragmento, usando archivo completo: {e}")
         
         with open(audio_to_send, 'rb') as audio_file:
             audd_response = requests.post(
@@ -1399,14 +2006,14 @@ async def identify_track(file: UploadFile = File(...)):
         release_date = track_data.get('release_date')
         year = release_date[:4] if release_date and len(release_date) >= 4 else None
         
-        logger.info(f"AudD identifico: {artist} - {title}")
+        print(f"  AudD identifico: {artist} - {title}")
         
         # ==================== PASO 2: BUSCAR GENERO EN DISCOGS ====================
         genre = "Electronic"
         genre_source = "default"
         
         if GENRE_DETECTOR_ENABLED and genre_detector and artist and title:
-            logger.info(f"Buscando genero: {artist} - {title}")
+            print(f"Buscando g(c)nero: {artist} - {title}")
             try:
                 discogs_result = genre_detector.get_discogs_genre(artist, title)
                 if discogs_result and discogs_result.get('genre'):
@@ -1416,19 +2023,19 @@ async def identify_track(file: UploadFile = File(...)):
                         label = discogs_result['label']
                     if not year and discogs_result.get('year'):
                         year = str(discogs_result['year'])
-                    logger.info(f"Discogs: {genre} | {label} ({year})")
-            except (requests.RequestException, ConnectionError, TimeoutError) as e:
-                logger.error(f"Error Discogs: {e}")
-
+                    print(f"Discogs: {genre} | {label} ({year})")
+            except Exception as e:
+                print(f"Error Discogs: {e}")
+            
             if genre_source != "discogs":
                 try:
                     mb_result = genre_detector.get_musicbrainz_info(artist, title)
                     if mb_result and mb_result.get('genre'):
                         genre = mb_result['genre']
                         genre_source = "musicbrainz"
-                        logger.info(f"MusicBrainz: {genre}")
-                except (requests.RequestException, ConnectionError, TimeoutError) as e:
-                    logger.error(f"Error MusicBrainz: {e}")
+                        print(f"MusicBrainz: {genre}")
+                except Exception as e:
+                    print(f"Error MusicBrainz: {e}")
         
         # ==================== PASO 3: RE-ANALIZAR AUDIO ====================
         bpm = None
@@ -1441,7 +2048,7 @@ async def identify_track(file: UploadFile = File(...)):
         key_source = 'pending'
         beatport_data = None
         
-        logger.info(f"Re-analizando audio...")
+        print(f"Re-analizando audio...")
         try:
             # Local: sr=44100 para maxima precision. Render: sr=22050 para ahorrar RAM.
             analysis_sr = 44100 if IS_LOCAL_ENGINE else 22050
@@ -1462,7 +2069,7 @@ async def identify_track(file: UploadFile = File(...)):
             # MEJORA 3: Auto-correccion half/double
             onset_env_re = librosa.onset.onset_strength(y=y_full, sr=sr_full)
             bpm = try_bpm_double_half(y_full, sr_full, bpm, bpm_confidence, onset_env=onset_env_re)
-            logger.info(f"BPM: {bpm} (confianza: {bpm_confidence:.2f})")
+            print(f"BPM: {bpm} (confianza: {bpm_confidence:.2f})")
             
             # MEJORA 1: Key con Krumhansl-Kessler (mismo codigo que analisis principal)
             chroma = librosa.feature.chroma_cqt(y=y_full, sr=sr_full, n_chroma=12, n_octaves=7)
@@ -1491,7 +2098,7 @@ async def identify_track(file: UploadFile = File(...)):
             key = best_key_re + ('m' if best_scale_re == 'minor' else '')
             camelot = get_camelot(key)
             key_source = 'analysis'
-            logger.info(f"Key: {key} ({camelot})")
+            print(f"Key: {key} ({camelot})")
             
             # MEJORA 2: Energy con power curve
             rms = librosa.feature.rms(y=y_full)[0]
@@ -1505,33 +2112,33 @@ async def identify_track(file: UploadFile = File(...)):
                 powered = normalized ** 0.55
                 energy_dj = int(round(1 + powered * 9))
                 energy_dj = max(1, min(10, energy_dj))
-            logger.info(f"Energy: {energy_dj} (raw: {avg_rms:.4f})")
+            print(f"Energy: {energy_dj} (raw: {avg_rms:.4f})")
             
         except Exception as e:
-            logger.error(f"Re-anlisis fall: {e}")
+            print(f"Re-anlisis fall: {e}")
             # FALLBACK 1: Buscar en BD colectiva
             if artist and title:
-                logger.info(f"Buscando en BD colectiva...")
+                print(f"Buscando en BD colectiva...")
                 collective_data = search_collective_db(artist, title)
                 if collective_data:
                     if collective_data.get('bpm'):
                         bpm = collective_data['bpm']
                         bpm_confidence = 0.9
                         bpm_source = 'collective'
-                        logger.info(f"BD Colectiva BPM: {bpm}")
+                        print(f"BD Colectiva BPM: {bpm}")
                     if collective_data.get('key'):
                         key = collective_data['key']
                         camelot = collective_data.get('camelot') or get_camelot(key)
                         key_source = 'collective'
-                        logger.info(f"BD Colectiva Key: {key} ({camelot})")
+                        print(f"BD Colectiva Key: {key} ({camelot})")
                     if collective_data.get('duration') and collective_data['duration'] > 0:
                         duration = collective_data['duration']
                 else:
-                    logger.debug(f"No encontrado en BD colectiva")
+                    print(f"No encontrado en BD colectiva")
         
         # BEATPORT: SIEMPRE intentar (fuera del except)
         if artist and title:
-            logger.info(f"BEATPORT: Buscando {artist} - {title}")
+            print(f"  BEATPORT: Buscando {artist} - {title}")
             try:
                 beatport_data = search_beatport(artist, title)
                 if beatport_data:
@@ -1539,7 +2146,7 @@ async def identify_track(file: UploadFile = File(...)):
                         bpm = beatport_data['bpm']
                         bpm_confidence = 0.99
                         bpm_source = 'beatport'
-                        logger.info(f"[Beatport] BPM: {bpm}")
+                        print(f"  [Beatport] BPM: {bpm}")
                     if beatport_data.get('key'):
                         bp_key = beatport_data['key']
                         bp_camelot = KEY_TO_CAMELOT.get(bp_key, None)
@@ -1547,41 +2154,41 @@ async def identify_track(file: UploadFile = File(...)):
                             key = bp_key
                             camelot = bp_camelot
                             key_source = 'beatport'
-                            logger.info(f"[Beatport] Key: {key} ({camelot})")
+                            print(f"  [Beatport] Key: {key} ({camelot})")
                     if beatport_data.get('genre') and genre_source != 'corrections':
                         bp_genre = beatport_data['genre']
                         is_junk = beatport_data.get('is_junk_genre', False)
                         if not is_junk:
                             genre = bp_genre
                             genre_source = 'beatport'
-                            logger.info(f"[Beatport] Genre: {genre}")
+                            print(f"  [Beatport] Genre: {genre}")
                         else:
-                            logger.debug(f"[Beatport] Genre '{beatport_data.get('genre_raw', bp_genre)}' descartado (categoria comercial)")
+                            print(f"  [Beatport] Genre '{beatport_data.get('genre_raw', bp_genre)}' descartado (categoria comercial)")
                     if beatport_data.get('track_type_hint'):
-                        logger.info(f"[Beatport] Track type hint: {beatport_data['track_type_hint']}")
+                        print(f"  [Beatport] Track type hint: {beatport_data['track_type_hint']}")
                     if beatport_data.get('duration') and (not duration or duration == 0):
                         duration = beatport_data['duration']
                 else:
-                    logger.debug(f"[Beatport] No encontrado")
-            except (requests.RequestException, ConnectionError, TimeoutError) as e:
-                logger.error(f"[Beatport] Error: {e}")
-
+                    print(f"  [Beatport] No encontrado")
+            except Exception as e:
+                print(f"  [Beatport] Error: {e}")
+        
         # ==================== PASO 4: BUSCAR ARTWORK ====================
         artwork_url = None
         artwork_source = None
         
         if artist and title and search_artwork_online:
-            logger.info(f"Buscando artwork...")
+            print(f"   Buscando artwork...")
             artwork_info = search_artwork_online(artist, title)
             if artwork_info:
                 save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
                 artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
                 artwork_source = artwork_info.get('source', 'online')
-                logger.info(f"Artwork: {artwork_source} ({artwork_info['size']} bytes)")
+                print(f"Artwork: {artwork_source} ({artwork_info['size']} bytes)")
             else:
-                logger.debug(f"No se encontr artwork")
+                print(f"No se encontr artwork")
         elif not search_artwork_online:
-            logger.warning(f"search_artwork_online no disponible")
+            print(f"search_artwork_online no disponible")
         
         # ==================== PASO 5: ACTUALIZAR BD ====================
         track_db_data = {
@@ -1633,7 +2240,7 @@ async def identify_track(file: UploadFile = File(...)):
         }
         
         db.save_track(track_db_data)
-        logger.info(f"Guardado en BD con fingerprint: {fingerprint[:12]}...")
+        print(f"  Guardado en BD con fingerprint: {fingerprint[:12]}...")
         
         # ==================== RESPUESTA ====================
         return {
@@ -1658,18 +2265,10 @@ async def identify_track(file: UploadFile = File(...)):
             "reanalyzed": True,
         }
         
-    except (ValueError, TypeError, KeyError, IOError, OSError,
-            json.JSONDecodeError, sqlite3.DatabaseError) as e:
-        import traceback
-        logger.error(f"Error identificando: {traceback.format_exc()}")
-        raise HTTPException(500, f"Error: {str(e)}")
-    except requests.RequestException as e:
-        logger.error(f"Error de red identificando: {e}")
-        raise HTTPException(502, f"Error de red: {str(e)}")
     except Exception as e:
         import traceback
-        logger.error(f"Error inesperado identificando: {traceback.format_exc()}")
-        raise HTTPException(500, f"Error inesperado: {str(e)}")
+        print(f"Error identificando: {traceback.format_exc()}")
+        raise HTTPException(500, f"Error: {str(e)}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -1700,7 +2299,7 @@ async def recognize_audio(file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
         
-        logger.info(f"Reconociendo audio: {file.filename} ({len(content)} bytes)")
+        print(f"Reconociendo audio: {file.filename} ({len(content)} bytes)")
         
         # Enviar a AudD API
         with open(tmp_path, 'rb') as audio_file:
@@ -1715,20 +2314,20 @@ async def recognize_audio(file: UploadFile = File(...)):
             )
         
         if audd_response.status_code != 200:
-            logger.error(f"AudD error: {audd_response.status_code}")
+            print(f" AudD error: {audd_response.status_code}")
             raise HTTPException(500, f"Error AudD API: {audd_response.status_code}")
         
         result = audd_response.json()
         
         if result.get('status') != 'success':
             error_msg = result.get('error', {}).get('error_message', 'Unknown error')
-            logger.error(f"AudD error: {error_msg}")
+            print(f"AudD error: {error_msg}")
             return {"status": "error", "message": error_msg}
         
         track_data = result.get('result')
         
         if not track_data:
-            logger.info("No se reconoci ninguna cancin")
+            print("No se reconoci ninguna cancin")
             return {"status": "not_found", "message": "No se pudo identificar la cancin"}
         
         # Extraer datos
@@ -1744,7 +2343,7 @@ async def recognize_audio(file: UploadFile = File(...)):
         deezer_data = track_data.get('deezer')
         apple_music_data = track_data.get('apple_music')
         
-        logger.info(f"Reconocido: {artist} - {title}")
+        print(f"Reconocido: {artist} - {title}")
         
         # Buscar si ya tenemos anlisis de este track en la BD
         backend_analysis = None
@@ -1752,7 +2351,7 @@ async def recognize_audio(file: UploadFile = File(...)):
         for track in existing_tracks:
             if track.get('title', '').lower() == title.lower():
                 backend_analysis = track
-                logger.info(f"Encontrado en biblioteca: {track.get('id')}")
+                print(f"Encontrado en biblioteca: {track.get('id')}")
                 break
         
         response = {
@@ -1775,24 +2374,336 @@ async def recognize_audio(file: UploadFile = File(...)):
         return response
         
     except requests.Timeout:
-        logger.warning("AudD timeout")
+        print("AudD timeout")
         raise HTTPException(504, "Timeout conectando con AudD")
-    except requests.RequestException as e:
-        logger.error(f"Error de red en reconocimiento: {e}")
-        raise HTTPException(502, f"Error de red: {str(e)}")
-    except (ValueError, TypeError, KeyError, IOError, OSError,
-            json.JSONDecodeError) as e:
+    except Exception as e:
         import traceback
-        logger.error(f"Error reconocimiento: {traceback.format_exc()}")
+        print(f"Error reconocimiento: {traceback.format_exc()}")
         raise HTTPException(500, f"Error: {str(e)}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-# ==================== EXTRACTED TO ROUTE MODULES ====================
-# /check-analyzed, /analysis/{filename}, /artwork/{track_id} → routes/media.py
-# /preview/{track_id}, /preview/generate, /previews/check → routes/preview.py
-# /search/*, /library/*, /admin/*, /community/* → routes/search.py, library.py, admin.py, community.py
+@app.post("/check-analyzed")
+async def check_analyzed(filenames: list[str]):
+    """Verificar cules tracks ya estn analizados"""
+    analyzed = []
+    not_analyzed = []
+    
+    for filename in filenames:
+        existing = db.get_track_by_filename(filename)
+        if existing:
+            analyzed.append(filename)
+        else:
+            not_analyzed.append(filename)
+    
+    return {
+        "analyzed": analyzed,
+        "not_analyzed": not_analyzed,
+        "total": len(filenames),
+        "analyzed_count": len(analyzed),
+        "not_analyzed_count": len(not_analyzed)
+    }
+
+# ==================== ENDPOINTS DE ARTWORK ====================
+
+@app.get("/analysis/{filename:path}")
+async def get_analysis(filename: str):
+    """Obtener anlisis guardado de un track por filename"""
+    # Decodificar filename si viene con URL encoding
+    from urllib.parse import unquote
+    import json
+    filename = unquote(filename)
+    
+    existing = db.get_track_by_filename(filename)
+    if existing:
+        # existing es una tupla, convertir a diccionario
+        # Columnas: id, filename, artist, title, duration, bpm, key, camelot, 
+        #           energy_dj, genre, track_type, analysis_json, analyzed_at, fingerprint
+        try:
+            # Si hay analysis_json guardado, usarlo directamente
+            analysis_json = existing[11]  # ndice de analysis_json
+            if analysis_json:
+                return json.loads(analysis_json)
+        except:
+            pass
+        
+        # Fallback: construir respuesta bsica
+        return {
+            "id": existing[0],
+            "filename": existing[1],
+            "artist": existing[2],
+            "title": existing[3],
+            "duration": existing[4],
+            "bpm": existing[5],
+            "key": existing[6],
+            "camelot": existing[7],
+            "energy_dj": existing[8],
+            "genre": existing[9],
+            "track_type": existing[10],
+            "fingerprint": existing[13] if len(existing) > 13 else None,
+        }
+    
+    raise HTTPException(404, f"Anlisis no encontrado para: {filename}")
+
+@app.get("/artwork/{track_id}")
+async def get_artwork(track_id: str):
+    """Devuelve el artwork de un track como imagen"""
+    for ext in ['jpg', 'png', 'jpeg']:
+        cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
+        if os.path.exists(cache_path):
+            media_type = "image/jpeg" if ext in ['jpg', 'jpeg'] else "image/png"
+            return FileResponse(cache_path, media_type=media_type)
+    
+    raise HTTPException(404, "Artwork no encontrado")
+
+# ==================== ENDPOINTS DE BUSQUEDA ====================
+
+@app.get("/search/artist/{artist}")
+async def search_by_artist(artist: str, limit: int = Query(50, ge=1, le=200)):
+    """Buscar tracks por artista"""
+    results = db.search_by_artist(artist, limit)
+    return {"query": artist, "count": len(results), "tracks": results}
+
+@app.get("/search/genre/{genre}")
+async def search_by_genre(genre: str, limit: int = Query(100, ge=1, le=500)):
+    #  Sanitizar g(c)nero
+    genre = validate_genre(genre)
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_genre(genre, limit)}
+
+@app.get("/search/bpm")
+async def search_by_bpm(
+    request: Request,
+    min_bpm: Optional[float] = None,
+    max_bpm: Optional[float] = None,
+    limit: int = Query(100, ge=1, le=500)
+):
+    #  Validar rangos
+    min_bpm, max_bpm = validate_bpm_range(min_bpm, max_bpm)
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_bpm(min_bpm, max_bpm, limit)}
+
+@app.get("/search/energy")
+async def search_by_energy(
+    request: Request,
+    min_energy: Optional[int] = None,
+    max_energy: Optional[int] = None,
+    limit: int = Query(100, ge=1, le=500)
+):
+    #  Validar rangos
+    min_energy, max_energy = validate_energy_range(min_energy, max_energy)
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_energy(min_energy, max_energy, limit)}
+
+@app.get("/search/key/{key}")
+async def search_by_key(key: str, limit: int = Query(100, ge=1, le=500)):
+    #  Validar tonalidad
+    try:
+        key = validate_key(key)
+    except ValidationError:
+        # Si no es vlido como key, intentar como est
+        key = sanitize_string(key, max_length=10)
+    
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_key(key, limit)}
+
+@app.get("/search/compatible/{camelot}")
+async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=200)):
+    #  Validar Camelot
+    camelot = validate_camelot(camelot)
+    limit = validate_limit(limit, max_limit=200)
+    
+    # Obtener keys compatibles
+    compatible = CAMELOT_COMPATIBLE.get(camelot, [camelot])
+    
+    return {
+        "camelot": camelot,
+        "compatible_keys": compatible,
+        "tracks": db.search_by_compatible_keys(compatible, limit)
+    }
+@app.get("/search-analyzed")
+async def search_analyzed_track(
+    artist: str = Query(..., description="Nombre del artista"),
+    title: str = Query(..., description="Ttulo del track")
+):
+    """
+    Busca si un track ya fue analizado por algn usuario.
+    Devuelve TODA la informacin del anlisis si existe.
+    
+    Returns:
+        - found: bool - Si se encontr el track
+        - track: dict - Toda la informacin del anlisis (si existe)
+        - in_collective: bool - Si est en la memoria colectiva
+    """
+    import re
+    
+    # Validar y sanitizar entrada
+    artist_clean = sanitize_string(artist, max_length=200, allow_empty=False, field_name="artist")
+    title_clean = sanitize_string(title, max_length=200, allow_empty=False, field_name="title")
+    
+    # Normalizar para bsqueda
+    artist_normalized = artist_clean.lower().strip()
+    title_normalized = re.sub(
+        r'\s*\(?(Original Mix|Extended Mix|Radio Edit|Remix|Club Mix|Dub Mix)\)?', 
+        '', 
+        title_clean, 
+        flags=re.IGNORECASE
+    ).lower().strip()
+    
+    try:
+        conn = db.conn
+        cursor = conn.cursor()
+        
+        # Bsqueda exacta primero
+        cursor.execute("""
+            SELECT * FROM tracks 
+            WHERE LOWER(artist) = ? AND LOWER(title) LIKE ?
+            AND bpm IS NOT NULL AND bpm > 0
+            ORDER BY analyzed_at DESC
+            LIMIT 1
+        """, (artist_normalized, f"%{title_normalized}%"))
+        
+        row = cursor.fetchone()
+        
+        if not row:
+            # Bsqueda ms flexible
+            cursor.execute("""
+                SELECT * FROM tracks 
+                WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
+                AND bpm IS NOT NULL AND bpm > 0
+                ORDER BY analyzed_at DESC
+                LIMIT 1
+            """, (f"%{artist_normalized}%", f"%{title_normalized}%"))
+            row = cursor.fetchone()
+        
+        if row:
+            # Convertir a dict usando el m(c)todo existente
+            track_dict = db._row_to_dict(row)
+            
+            # Si hay analysis_json, parsear para obtener todos los campos
+            if track_dict and track_dict.get('analysis_json'):
+                try:
+                    full_analysis = json.loads(track_dict['analysis_json'])
+                    # Combinar con los campos bsicos
+                    track_dict.update(full_analysis)
+                except:
+                    pass
+            
+            # Eliminar el JSON crudo del response
+            if track_dict and 'analysis_json' in track_dict:
+                del track_dict['analysis_json']
+            
+            return {
+                "found": True,
+                "in_collective": True,
+                "track": track_dict
+            }
+        
+        return {
+            "found": False,
+            "in_collective": False,
+            "track": None
+        }
+        
+    except Exception as e:
+        print(f"Error en search-analyzed: {e}")
+        return {
+            "found": False,
+            "in_collective": False,
+            "track": None,
+            "error": str(e)
+        }
+
+@app.get("/search/track-type/{track_type}")
+async def search_by_track_type(track_type: str, limit: int = Query(100, ge=1, le=500)):
+    #  Validar tipo de track
+    track_type = validate_track_type(track_type)
+    limit = validate_limit(limit, max_limit=500)
+    
+    return {"tracks": db.search_by_track_type(track_type, limit)}
+
+@app.post("/search/advanced")
+async def search_advanced(search_request: SearchRequest):
+    #  Validar y sanitizar todos los campos
+    filters = {}
+    
+    if search_request.artist:
+        filters['artist'] = sanitize_string(search_request.artist, max_length=100)
+    
+    if search_request.genre:
+        filters['genre'] = validate_genre(search_request.genre)
+    
+    if search_request.min_bpm is not None or search_request.max_bpm is not None:
+        filters['min_bpm'], filters['max_bpm'] = validate_bpm_range(
+            search_request.min_bpm, 
+            search_request.max_bpm
+        )
+    
+    if search_request.min_energy is not None or search_request.max_energy is not None:
+        filters['min_energy'], filters['max_energy'] = validate_energy_range(
+            search_request.min_energy,
+            search_request.max_energy
+        )
+    
+    if search_request.key:
+        try:
+            filters['key'] = validate_key(search_request.key)
+        except ValidationError:
+            filters['key'] = sanitize_string(search_request.key, max_length=10)
+    
+    if search_request.track_type:
+        filters['track_type'] = validate_track_type(search_request.track_type)
+    
+    filters['limit'] = validate_limit(search_request.limit, max_limit=500)
+    
+    return {"tracks": db.search_advanced(**filters)}
+
+# ==================== ENDPOINTS DE BIBLIOTECA ====================
+
+@app.get("/library/all")
+async def get_all_tracks(limit: int = Query(1000, ge=1, le=5000)):
+    #  Validar lmite
+    limit = validate_limit(limit, max_limit=5000)
+    
+    return {"tracks": db.get_all_tracks(limit)}
+
+@app.get("/library/artists")
+async def get_unique_artists():
+    """Obtener lista de artistas nicos"""
+    artists = db.get_unique_artists()
+    return {"count": len(artists), "artists": artists}
+
+@app.get("/library/genres")
+async def get_unique_genres():
+    """Obtener lista de g(c)neros nicos"""
+    genres = db.get_unique_genres()
+    return {"count": len(genres), "genres": genres}
+
+@app.get("/library/stats")
+async def get_library_stats():
+    """Obtener estadsticas de la biblioteca"""
+    return db.get_stats()
+
+@app.get("/track/{track_id}")
+async def get_track(track_id: str):
+    """Obtener informacin de un track especfico"""
+    track = db.get_track_by_id(track_id)
+    if not track:
+        raise HTTPException(404, "Track no encontrado")
+    return track
+
+@app.delete("/track/{track_id}")
+async def delete_track(track_id: str):
+    """Eliminar un track de la base de datos"""
+    deleted = db.delete_track(track_id)
+    if not deleted:
+        raise HTTPException(404, "Track no encontrado")
+    return {"status": "ok", "message": "Track eliminado"}
 
 # ==================== ENDPOINTS SIMILAR TRACKS ====================
 
@@ -1871,4 +2782,188 @@ if SIMILAR_TRACKS_ENABLED:
         
         return results[:limit]
 
-# Preview + media endpoints extracted to routes/preview.py and routes/media.py
+# ==================== INFO ====================
+
+@app.get("/preview/{track_id}")
+async def get_preview(track_id: str):
+    """
+    Sirve el snippet de preview de un track (MP3 6s mono 64kbps).
+    
+    El track_id es el fingerprint (MD5 hash del archivo).
+    Cache agresivo: el snippet no cambia una vez generado.
+    """
+    # Validar formato de track_id (MD5 = 32 chars hexadecimales)
+    if not track_id or len(track_id) > 64:
+        raise HTTPException(400, "track_id inválido")
+    
+    # Sanitizar para evitar path traversal
+    safe_id = re.sub(r'[^a-fA-F0-9]', '', track_id)
+    if safe_id != track_id:
+        raise HTTPException(400, "track_id contiene caracteres inválidos")
+    
+    preview_path = os.path.join(PREVIEWS_DIR, f"{safe_id}.mp3")
+    
+    if not os.path.exists(preview_path):
+        raise HTTPException(status_code=404, detail="Preview not available")
+    
+    return FileResponse(
+        preview_path,
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "public, max-age=31536000",  # Cache 1 año
+            "Content-Disposition": f"inline; filename={safe_id}_preview.mp3",
+        }
+    )
+
+
+class PreviewCheckRequest(BaseModel):
+    track_ids: List[str]
+
+@app.post("/previews/check")
+async def check_previews(request: PreviewCheckRequest):
+    """
+    Devuelve qué track_ids tienen preview snippet disponible.
+    
+    Útil para que el cliente sepa de antemano cuáles puede preescuchar
+    sin tener que intentar reproducir y fallar.
+    
+    Máximo 500 IDs por petición.
+    """
+    track_ids = request.track_ids
+    
+    if len(track_ids) > 500:
+        raise HTTPException(400, "Máximo 500 track_ids por petición")
+    
+    available = []
+    for tid in track_ids:
+        safe_id = re.sub(r'[^a-fA-F0-9]', '', tid)
+        if safe_id and os.path.exists(os.path.join(PREVIEWS_DIR, f"{safe_id}.mp3")):
+            available.append(tid)
+    
+    return {
+        "available": available,
+        "total_checked": len(track_ids),
+        "total_available": len(available),
+    }
+
+
+# ==================== INFO ====================
+
+@app.get("/")
+async def root():
+    return {
+        "name": "DJ Analyzer Pro API",
+        "version": "2.3.0",
+        "status": "running",
+        "modules": {
+            "artwork": ARTWORK_ENABLED,
+            "genre_detector": GENRE_DETECTOR_ENABLED,
+            "similar_tracks": SIMILAR_TRACKS_ENABLED,
+            "preview_snippets": True,
+        },
+        "features": [
+            "BPM detection (ID3 + analysis)",
+            "Key & Camelot (ID3 + analysis)",
+            "Energy analysis (1-10 scale)",
+            "Structure analysis (intro/drop/breakdown/outro)",
+            "Cue points detection",
+            "Beat grid detection",
+            "Artwork extraction (ID3)",
+            "Genre detection (ID3/AcousticBrainz/spectral)",
+            "Collective memory",
+            "Similar tracks search",
+            "Advanced search filters",
+            "Preview snippets (6s streaming)",
+        ]
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": "2.3.0"}
+
+# ==================== ADMIN / RESET ====================
+
+@app.delete("/admin/reset-database")
+async def reset_database(confirm: str = Query(..., description="Escribe 'CONFIRMAR' para borrar")):
+    """
+    PELIGROSO: Borra TODA la base de datos.
+    Requiere confirmar escribiendo 'CONFIRMAR' como parmetro.
+    """
+    if confirm != "CONFIRMAR":
+        raise HTTPException(400, "Debes escribir 'CONFIRMAR' para borrar la base de datos")
+    
+    try:
+        import shutil
+        
+        # Borrar artwork cache
+        if os.path.exists(ARTWORK_CACHE_DIR):
+            shutil.rmtree(ARTWORK_CACHE_DIR)
+            os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+        
+        # Borrar y recrear BD
+        conn = sqlite3.connect(db.db_path)
+        c = conn.cursor()
+        c.execute("DELETE FROM tracks")
+        c.execute("DELETE FROM corrections")
+        c.execute("DELETE FROM dj_notes")
+        conn.commit()
+        conn.close()
+        
+        return {
+            "status": "ok",
+            "message": "Base de datos reseteada completamente",
+            "artwork_cache": "limpiado",
+            "tracks": "eliminados",
+            "corrections": "eliminadas"
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Error reseteando: {str(e)}")
+
+@app.delete("/admin/clear-artwork-cache")
+async def clear_artwork_cache():
+    """Limpia solo el cach(c) de artwork"""
+    import shutil
+    try:
+        if os.path.exists(ARTWORK_CACHE_DIR):
+            shutil.rmtree(ARTWORK_CACHE_DIR)
+            os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+        return {"status": "ok", "message": "Cach(c) de artwork limpiado"}
+    except Exception as e:
+        raise HTTPException(500, f"Error: {str(e)}")
+
+# ==================== COMMUNITY BEAT GRID ====================
+
+class BeatGridCorrectionRequest(BaseModel):
+    fingerprint: str
+    device_id: str
+    bpm_adjust: float = 0.0
+    beat_offset: float = 0.0
+    original_bpm: float = 0.0
+
+@app.post("/community/beat-grid")
+async def submit_beat_grid_correction(request: BeatGridCorrectionRequest):
+    """Recibe correccion de beat grid de un DJ"""
+    try:
+        db.submit_beat_grid_correction(
+            fingerprint=request.fingerprint,
+            device_id=request.device_id,
+            bpm_adjust=request.bpm_adjust,
+            beat_offset=request.beat_offset,
+            original_bpm=request.original_bpm,
+        )
+        print(f"[Community] Beat grid correction: fp={request.fingerprint[:8]}... "
+              f"BPM+{request.bpm_adjust:.2f} OFF+{request.beat_offset*1000:.1f}ms")
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"[Community] Error saving beat grid: {e}")
+        raise HTTPException(500, f"Error: {str(e)}")
+
+@app.get("/community/beat-grid/{fingerprint}")
+async def get_community_beat_grid(fingerprint: str):
+    """Obtiene la correccion promedio de la comunidad"""
+    try:
+        result = db.get_community_beat_grid(fingerprint)
+        return result
+    except Exception as e:
+        print(f"[Community] Error fetching beat grid: {e}")
+        return {"bpm_adjust": 0.0, "beat_offset": 0.0, "contributors": 0, "validated": False}
