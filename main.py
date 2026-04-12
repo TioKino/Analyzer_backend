@@ -1782,11 +1782,55 @@ async def recognize_audio(file: UploadFile = File(...)):
             "deezer": deezer_data,
             "apple_music": apple_music_data,
         }
-        
+
         # Si tenemos anlisis previo, incluirlo
         if backend_analysis:
             response["backend_analysis"] = backend_analysis
-        
+
+        # Guardar reconocimiento en BD colectiva para enriquecer futuras consultas
+        # (artwork, genero, label, etc. disponibles para todos los usuarios)
+        if not backend_analysis and artist and title:
+            try:
+                # Buscar artwork del track detectado
+                artwork_url = None
+                if search_artwork_online:
+                    artwork_info = search_artwork_online(artist, title)
+                    if artwork_info:
+                        # Generar un ID estable basado en artist+title
+                        detect_id = hashlib.md5(f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
+                        save_artwork_to_cache(detect_id, artwork_info['data'], artwork_info['mime_type'])
+                        artwork_url = f"{BASE_URL}/artwork/{detect_id}"
+                        response["artwork_url"] = artwork_url
+                        logger.info(f"Artwork guardado para deteccion: {detect_id[:12]}")
+
+                # Guardar datos basicos en BD colectiva
+                detect_id = hashlib.md5(f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
+                detect_data = {
+                    'id': detect_id,
+                    'filename': f"{artist} - {title}",
+                    'fingerprint': detect_id,
+                    'title': title,
+                    'artist': artist,
+                    'album': album,
+                    'label': label,
+                    'duration': 0,
+                    'bpm': 0,
+                    'key': None,
+                    'camelot': None,
+                    'energy_dj': 5,
+                    'genre': 'Electronic',
+                    'track_type': 'peak_time',
+                    'bpm_source': 'pending',
+                    'key_source': 'pending',
+                }
+                # Solo guardar si no existe ya (no sobreescribir datos mejores)
+                existing = db.get_track(detect_id)
+                if not existing:
+                    db.save_track(detect_data)
+                    logger.info(f"Deteccion guardada en BD colectiva: {detect_id[:12]}")
+            except Exception as e:
+                logger.error(f"Error guardando deteccion en BD: {e}")
+
         return response
         
     except requests.Timeout:
