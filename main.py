@@ -2570,7 +2570,7 @@ async def search_by_bpm(
     min_bpm, max_bpm = validate_bpm_range(min_bpm, max_bpm)
     limit = validate_limit(limit, max_limit=500)
     
-    return {"tracks": db.search_by_bpm(min_bpm, max_bpm, limit)}
+    return {"tracks": db.search_by_bpm_range(min_bpm, max_bpm, limit)}
 
 @app.get("/search/energy")
 async def search_by_energy(
@@ -2610,7 +2610,7 @@ async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=2
     return {
         "camelot": camelot,
         "compatible_keys": compatible,
-        "tracks": db.search_by_compatible_keys(compatible, limit)
+        "tracks": db.search_compatible_keys(camelot, limit)
     }
 @app.get("/search-analyzed")
 async def search_analyzed_track(
