@@ -2287,83 +2287,197 @@ async def identify_track(file: UploadFile = File(...)):
 
 # ==================== RECONOCIMIENTO DE AUDIO (SHAZAM-LIKE) ====================
 
+def _preprocess_audio_for_recognition(input_path: str, output_path: str, strategy: str = "normalize") -> bool:
+    """
+    Preprocesa audio para mejorar la detección por AudD.
+    Convierte a WAV 44.1kHz mono y aplica filtros según la estrategia.
+
+    Estrategias:
+    - "normalize": Normalización de volumen + high-pass filter (elimina ruido grave ambiente)
+    - "aggressive": Normalización agresiva + filtro de ruido más fuerte + compresión
+    - "raw_wav": Solo conversión a WAV sin procesamiento (fallback)
+    """
+    import subprocess
+    try:
+        if strategy == "normalize":
+            # Normalizar volumen + filtro high-pass a 80Hz (elimina ruido de ambiente/aire acondicionado)
+            # + limitar frecuencias altas innecesarias para fingerprinting
+            cmd = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-af', 'highpass=f=80,lowpass=f=16000,loudnorm=I=-16:TP=-1.5:LRA=11,silenceremove=start_periods=1:start_silence=0.5:start_threshold=-40dB:stop_periods=-1:stop_silence=0.3:stop_threshold=-40dB',
+                '-ar', '44100', '-ac', '1',
+                '-acodec', 'pcm_s16le',
+                output_path
+            ]
+        elif strategy == "aggressive":
+            # Filtrado más agresivo: banda 200-8000Hz (rango vocal/melódico principal),
+            # compresión dinámica fuerte para igualar volúmenes, normalización
+            cmd = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-af', 'highpass=f=200,lowpass=f=8000,acompressor=threshold=-20dB:ratio=6:attack=5:release=50,loudnorm=I=-14:TP=-1:LRA=7,silenceremove=start_periods=1:start_silence=0.3:start_threshold=-35dB:stop_periods=-1:stop_silence=0.2:stop_threshold=-35dB',
+                '-ar', '44100', '-ac', '1',
+                '-acodec', 'pcm_s16le',
+                output_path
+            ]
+        else:  # raw_wav
+            # Solo convertir a WAV sin procesamiento
+            cmd = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-ar', '44100', '-ac', '1',
+                '-acodec', 'pcm_s16le',
+                output_path
+            ]
+
+        run_kwargs = {
+            'capture_output': True, 'timeout': 15,
+        }
+        if os.name == 'nt':
+            run_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+
+        result = subprocess.run(cmd, **run_kwargs)
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8', errors='replace')
+            print(f"  [Recognize] ffmpeg {strategy} error: {stderr[:200]}")
+            return False
+
+        # Verificar que el archivo resultante tiene contenido útil
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            return True
+
+        print(f"  [Recognize] ffmpeg {strategy}: archivo resultante muy pequeño o vacío")
+        return False
+
+    except subprocess.TimeoutExpired:
+        print(f"  [Recognize] ffmpeg {strategy} timeout")
+        return False
+    except Exception as e:
+        print(f"  [Recognize] ffmpeg {strategy} error: {e}")
+        return False
+
+
+def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> dict | None:
+    """
+    Envía audio a AudD y devuelve track_data si se identifica, None si no.
+    """
+    with open(audio_path, 'rb') as audio_file:
+        audd_response = requests.post(
+            'https://api.audd.io/',
+            data={
+                'api_token': api_token,
+                'return': 'spotify,deezer,apple_music,musicbrainz',
+            },
+            files={'file': audio_file},
+            timeout=timeout
+        )
+
+    if audd_response.status_code != 200:
+        print(f"  [AudD] HTTP error: {audd_response.status_code}")
+        return None
+
+    result = audd_response.json()
+
+    if result.get('status') != 'success':
+        error_msg = result.get('error', {}).get('error_message', 'Unknown error')
+        print(f"  [AudD] API error: {error_msg}")
+        return None
+
+    track_data = result.get('result')
+    if track_data:
+        print(f"  [AudD] ✓ Identificado: {track_data.get('artist')} - {track_data.get('title')}")
+
+    return track_data
+
+
 @app.post("/recognize")
 async def recognize_audio(file: UploadFile = File(...)):
     """
-    Reconoce una cancin a partir de audio grabado usando AudD API.
-    Similar a Shazam - graba audio ambiente y lo identifica.
+    Reconoce una canción a partir de audio grabado usando AudD API.
+    Preprocesa el audio (normalización, filtrado de ruido) y reintenta
+    con diferentes estrategias si el primer intento falla.
     """
     try:
         from api_config import AUDD_API_TOKEN
     except ImportError:
         AUDD_API_TOKEN = None
-    
+
     if not AUDD_API_TOKEN:
         raise HTTPException(500, "AudD API token no configurado en api_config.py")
-    
-    # Guardar archivo temporal
+
     tmp_path = None
+    processed_paths = []
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.aac') as tmp:
+        # Guardar archivo temporal original
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.m4a') as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
-        
-        print(f"Reconociendo audio: {file.filename} ({len(content)} bytes)")
-        
-        # Enviar a AudD API
-        with open(tmp_path, 'rb') as audio_file:
-            audd_response = requests.post(
-                'https://api.audd.io/',
-                data={
-                    'api_token': AUDD_API_TOKEN,
-                    'return': 'spotify,deezer,apple_music,musicbrainz',
-                },
-                files={'file': audio_file},
-                timeout=30
-            )
-        
-        if audd_response.status_code != 200:
-            print(f" AudD error: {audd_response.status_code}")
-            raise HTTPException(500, f"Error AudD API: {audd_response.status_code}")
-        
-        result = audd_response.json()
-        
-        if result.get('status') != 'success':
-            error_msg = result.get('error', {}).get('error_message', 'Unknown error')
-            print(f"AudD error: {error_msg}")
-            return {"status": "error", "message": error_msg}
-        
-        track_data = result.get('result')
-        
+
+        print(f"[Recognize] Audio recibido: {file.filename} ({len(content)} bytes)")
+
+        if len(content) < 1000:
+            return {"status": "not_found", "message": "Audio demasiado corto o vacío"}
+
+        # ── Estrategia multi-intento ──
+        # Intento 1: Audio normalizado + filtro de ruido ambiente
+        # Intento 2: Filtrado agresivo (banda vocal/melódica) + compresión
+        # Intento 3: WAV sin procesar (por si los filtros eliminaron info útil)
+        strategies = ["normalize", "aggressive", "raw_wav"]
+        track_data = None
+
+        for i, strategy in enumerate(strategies):
+            processed_path = tmp_path.replace('.m4a', f'_processed_{strategy}.wav')
+            processed_paths.append(processed_path)
+
+            print(f"[Recognize] Intento {i+1}/3 - estrategia: {strategy}")
+
+            if _preprocess_audio_for_recognition(tmp_path, processed_path, strategy):
+                processed_size = os.path.getsize(processed_path)
+                print(f"  Procesado: {processed_size} bytes")
+
+                track_data = _send_to_audd(processed_path, AUDD_API_TOKEN, timeout=30)
+                if track_data:
+                    print(f"[Recognize] ✓ Éxito en intento {i+1} ({strategy})")
+                    break
+                else:
+                    print(f"  Intento {i+1} ({strategy}): no identificado")
+            else:
+                print(f"  Intento {i+1} ({strategy}): preprocesamiento falló")
+                # Si normalize falla, intentar enviar el original directamente
+                if strategy == "normalize":
+                    print(f"  Intentando enviar archivo original sin procesar...")
+                    track_data = _send_to_audd(tmp_path, AUDD_API_TOKEN, timeout=30)
+                    if track_data:
+                        print(f"[Recognize] ✓ Éxito con archivo original")
+                        break
+
         if not track_data:
-            print("No se reconoci ninguna cancin")
-            return {"status": "not_found", "message": "No se pudo identificar la cancin"}
-        
-        # Extraer datos
+            print("[Recognize] ✗ No identificado tras todos los intentos")
+            return {"status": "not_found", "message": "No se pudo identificar la canción"}
+
+        # ── Extraer datos del resultado ──
         artist = track_data.get('artist', 'Unknown Artist')
         title = track_data.get('title', 'Unknown Title')
         album = track_data.get('album')
         release_date = track_data.get('release_date')
         label = track_data.get('label')
         isrc = track_data.get('isrc')
-        
-        # Datos de servicios
+
         spotify_data = track_data.get('spotify')
         deezer_data = track_data.get('deezer')
         apple_music_data = track_data.get('apple_music')
-        
-        print(f"Reconocido: {artist} - {title}")
-        
-        # Buscar si ya tenemos anlisis de este track en la BD
+
+        print(f"[Recognize] Resultado: {artist} - {title}")
+
+        # ── Buscar análisis existente en BD ──
         backend_analysis = None
         existing_tracks = db.search_by_artist(artist, limit=50)
         for track in existing_tracks:
             if track.get('title', '').lower() == title.lower():
                 backend_analysis = track
-                print(f"Encontrado en biblioteca: {track.get('id')}")
+                print(f"  Encontrado en biblioteca: {track.get('id')}")
                 break
-        
+
         response = {
             "status": "found",
             "artist": artist,
@@ -2377,27 +2491,22 @@ async def recognize_audio(file: UploadFile = File(...)):
             "apple_music": apple_music_data,
         }
 
-        # Si tenemos anlisis previo, incluirlo
         if backend_analysis:
             response["backend_analysis"] = backend_analysis
 
         # Guardar reconocimiento en BD colectiva para enriquecer futuras consultas
-        # (artwork, genero, label, etc. disponibles para todos los usuarios)
         if not backend_analysis and artist and title:
             try:
-                # Buscar artwork del track detectado
                 artwork_url = None
                 if search_artwork_online:
                     artwork_info = search_artwork_online(artist, title)
                     if artwork_info:
-                        # Generar un ID estable basado en artist+title
                         detect_id = hashlib.md5(f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
                         save_artwork_to_cache(detect_id, artwork_info['data'], artwork_info['mime_type'])
                         artwork_url = f"{BASE_URL}/artwork/{detect_id}"
                         response["artwork_url"] = artwork_url
                         logger.info(f"Artwork guardado para deteccion: {detect_id[:12]}")
 
-                # Guardar datos basicos en BD colectiva
                 detect_id = hashlib.md5(f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
                 detect_data = {
                     'id': detect_id,
@@ -2417,7 +2526,6 @@ async def recognize_audio(file: UploadFile = File(...)):
                     'bpm_source': 'pending',
                     'key_source': 'pending',
                 }
-                # Solo guardar si no existe ya (no sobreescribir datos mejores)
                 existing = db.get_track(detect_id)
                 if not existing:
                     db.save_track(detect_data)
@@ -2426,17 +2534,22 @@ async def recognize_audio(file: UploadFile = File(...)):
                 logger.error(f"Error guardando deteccion en BD: {e}")
 
         return response
-        
+
     except requests.Timeout:
-        print("AudD timeout")
+        print("[Recognize] AudD timeout")
         raise HTTPException(504, "Timeout conectando con AudD")
     except Exception as e:
         import traceback
-        print(f"Error reconocimiento: {traceback.format_exc()}")
+        print(f"[Recognize] Error: {traceback.format_exc()}")
         raise HTTPException(500, f"Error: {str(e)}")
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        # Limpiar todos los archivos temporales
+        for path in [tmp_path] + processed_paths:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 
 @app.post("/check-analyzed")
 async def check_analyzed(filenames: list[str]):
