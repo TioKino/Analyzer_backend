@@ -17,25 +17,28 @@ import sys
 import os
 import signal
 
+# Determinar directorio base antes de configurar logging
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+    os.chdir(BASE_DIR)
+    sys.path.insert(0, sys._MEIPASS)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(BASE_DIR)
+
+# Configurar logging: archivo + consola (si hay)
+log_file = os.path.join(BASE_DIR, 'engine.log')
+handlers = [logging.FileHandler(log_file, encoding='utf-8')]
+if not getattr(sys, 'frozen', False):
+    handlers.append(logging.StreamHandler())
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S',
+    handlers=handlers,
 )
 logger = logging.getLogger(__name__)
-
-# Asegurar que el directorio del script está en el path
-# (necesario cuando PyInstaller empaqueta todo)
-if getattr(sys, 'frozen', False):
-    # Ejecutando como .exe compilado
-    BASE_DIR = os.path.dirname(sys.executable)
-    os.chdir(BASE_DIR)
-    # PyInstaller descomprime en _MEIPASS
-    sys.path.insert(0, sys._MEIPASS)
-else:
-    # Ejecutando como script normal
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(BASE_DIR)
 
 # Configurar variables de entorno ANTES de importar main
 os.environ['PORT'] = '8000'
