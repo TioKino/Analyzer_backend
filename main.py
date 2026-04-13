@@ -936,12 +936,10 @@ def generate_preview_snippet(
             output_path
         ]
         
-        proc_result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=15,
-            check=True,
-        )
+        run_kwargs = dict(capture_output=True, timeout=15, check=True)
+        if sys.platform == 'win32':
+            run_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        proc_result = subprocess.run(cmd, **run_kwargs)
         
         # Verificar que el archivo se generó y tiene tamaño razonable
         if os.path.exists(output_path):

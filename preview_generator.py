@@ -2,6 +2,7 @@
 Preview snippet generator — creates 6-second MP3 previews from tracks.
 """
 import os
+import sys
 import subprocess
 import logging
 from typing import Optional
@@ -53,7 +54,10 @@ def generate_preview_snippet(
             output_path
         ]
 
-        subprocess.run(cmd, capture_output=True, timeout=15, check=True)
+        kwargs = {'capture_output': True, 'timeout': 15, 'check': True}
+        if sys.platform == 'win32':
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        subprocess.run(cmd, **kwargs)
 
         if os.path.exists(output_path):
             size = os.path.getsize(output_path)
