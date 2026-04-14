@@ -1857,6 +1857,12 @@ async def analyze_track(
         track_data['fingerprint'] = fingerprint
         db.save_track(track_data)
 
+        # Incrementar contador de popularidad
+        try:
+            db.increment_popularity(fingerprint)
+        except Exception:
+            pass
+
         # Generar preview snippet (no bloquea si falla)
         try:
             preview_path = generate_preview_snippet(
