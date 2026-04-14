@@ -273,6 +273,120 @@ async def user_sessions(device_id: str, request: Request):
 
 # ── GET /admin/stats ────────────────────────────────────────
 
+# ── GET /admin/all-tracks ───────────────────────────────────
+# Admin endpoint: devuelve TODOS los análisis de TODOS los usuarios
+
+@admin_panel_router.get("/all-tracks")
+async def all_tracks(request: Request):
+    """Return all analyzed tracks from all users (for admin user)."""
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        analysis_rows = conn.execute(
+            "SELECT last_device_id, device_type, payload FROM sync_items WHERE data_type = 'analysis'"
+        ).fetchall()
+
+        base_url = os.environ.get("BASE_URL", "").rstrip("/")
+        result = []
+        seen_fingerprints = set()  # Deduplicar por fingerprint
+
+        for arow in analysis_rows:
+            device_id = arow["last_device_id"]
+            device_type = arow["device_type"] or "unknown"
+            tracks = _parse_analysis_payload(arow["payload"])
+
+            for track_id, t in tracks.items():
+                if not isinstance(t, dict):
+                    continue
+                fingerprint = t.get("fingerprint", "")
+
+                # Deduplicar: si ya vimos este fingerprint, skip
+                if fingerprint and fingerprint in seen_fingerprints:
+                    continue
+                if fingerprint:
+                    seen_fingerprints.add(fingerprint)
+
+                has_preview = _preview_exists(fingerprint)
+                artwork_url = t.get("artworkUrl", "")
+                if not artwork_url and fingerprint and base_url:
+                    artwork_url = f"{base_url}/artwork/{fingerprint}"
+
+                track_info = t.get("track", t)
+                tempo_info = t.get("tempo", t)
+                key_info = t.get("key", t)
+                energy_info = t.get("energy", t)
+
+                result.append({
+                    "track_id": track_id,
+                    "fingerprint": fingerprint,
+                    "file_name": track_info.get("fileName", t.get("fileName", "")),
+                    "artist": track_info.get("artist", t.get("artist", "")),
+                    "title": track_info.get("title", t.get("title", "")),
+                    "bpm": tempo_info.get("bpm", t.get("bpm")),
+                    "key": key_info.get("key", t.get("key", "")),
+                    "camelot": key_info.get("camelot", t.get("camelot", "")),
+                    "genre": t.get("genre", ""),
+                    "energy": energy_info.get("energy_dj", t.get("energy_dj", t.get("energy"))),
+                    "track_type": t.get("trackType", t.get("track_type", "")),
+                    "analyzed_at": t.get("analyzedAt", t.get("analyzed_at", "")),
+                    "has_preview": has_preview,
+                    "artwork_url": artwork_url,
+                    "preview_url": f"{base_url}/preview/{fingerprint}" if has_preview and base_url else "",
+                    "owner_device": device_id,
+                    "owner_device_type": device_type,
+                })
+
+        return {"tracks": result, "total": len(result)}
+    finally:
+        conn.close()
+
+
+# ── GET /admin/all-previews ────────────────────────────────
+
+@admin_panel_router.get("/all-previews")
+async def all_previews(request: Request):
+    """Return all available previews from all users (for admin user)."""
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        analysis_rows = conn.execute(
+            "SELECT last_device_id, payload FROM sync_items WHERE data_type = 'analysis'"
+        ).fetchall()
+
+        base_url = os.environ.get("BASE_URL", "").rstrip("/")
+        result = []
+        seen_fingerprints = set()
+
+        for arow in analysis_rows:
+            tracks = _parse_analysis_payload(arow["payload"])
+
+            for track_id, t in tracks.items():
+                if not isinstance(t, dict):
+                    continue
+                fingerprint = t.get("fingerprint", "")
+                if not fingerprint or fingerprint in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(fingerprint)
+
+                if not _preview_exists(fingerprint):
+                    continue
+
+                track_info = t.get("track", t)
+                result.append({
+                    "track_id": track_id,
+                    "fingerprint": fingerprint,
+                    "artist": track_info.get("artist", t.get("artist", "")),
+                    "title": track_info.get("title", t.get("title", "")),
+                    "preview_url": f"{base_url}/preview/{fingerprint}" if base_url else "",
+                })
+
+        return {"previews": result, "total": len(result)}
+    finally:
+        conn.close()
+
+
+# ── GET /admin/stats ────────────────────────────────────────
+
 @admin_panel_router.get("/stats")
 async def global_stats(request: Request):
     await _verify_admin_secret(request)

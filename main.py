@@ -95,6 +95,54 @@ if IS_LOCAL_ENGINE:
 CHUNK_ANALYSIS_THRESHOLD = 240  # 4 minutos
 
 
+# ==================== AUTO-UPLOAD A RENDER (modo local) ====================
+
+RENDER_BACKEND_URL = os.environ.get('RENDER_BACKEND_URL', 'https://dj-analyzer-api.onrender.com')
+
+def _upload_to_render_cache(track_data: dict):
+    """
+    Sube resultado de análisis local a Render como cache comunitario.
+    Fire & forget: no bloquea si falla.
+    """
+    import threading
+    def _do_upload():
+        try:
+            payload = {
+                'fingerprint': track_data.get('fingerprint', track_data.get('id', '')),
+                'filename': track_data.get('filename', ''),
+                'artist': track_data.get('artist', ''),
+                'title': track_data.get('title', ''),
+                'album': track_data.get('album', ''),
+                'label': track_data.get('label', ''),
+                'duration': track_data.get('duration', 0),
+                'bpm': track_data.get('bpm', 0),
+                'key': track_data.get('key'),
+                'camelot': track_data.get('camelot'),
+                'energy_dj': track_data.get('energy_dj', 5),
+                'genre': track_data.get('genre', ''),
+                'track_type': track_data.get('track_type', ''),
+                'bpm_source': track_data.get('bpm_source', 'local_engine'),
+                'key_source': track_data.get('key_source', 'local_engine'),
+                'genre_source': track_data.get('genre_source', 'local_engine'),
+                'analysis_json': track_data.get('analysis_json', {}),
+            }
+            resp = requests.post(
+                f"{RENDER_BACKEND_URL}/cache-analysis",
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                print(f"  [Cache→Render] ✓ Subido: {track_data.get('artist', '?')} - {track_data.get('title', '?')}")
+            else:
+                print(f"  [Cache→Render] Error {resp.status_code}: {resp.text[:100]}")
+        except requests.Timeout:
+            print(f"  [Cache→Render] Timeout (Render dormido?)")
+        except Exception as e:
+            print(f"  [Cache→Render] Error: {e}")
+
+    threading.Thread(target=_do_upload, daemon=True).start()
+
+
 # ==================== IMPORTS LOCALES ====================
 from database import AnalysisDB
 
@@ -1808,7 +1856,7 @@ async def analyze_track(
         track_data['filename'] = file.filename
         track_data['fingerprint'] = fingerprint
         db.save_track(track_data)
-        
+
         # Generar preview snippet (no bloquea si falla)
         try:
             preview_path = generate_preview_snippet(
@@ -1821,7 +1869,11 @@ async def analyze_track(
                 result.preview_url = f"{BASE_URL}/preview/{fingerprint}"
         except Exception as preview_err:
             print(f"  [Preview] Error (no crítico): {preview_err}")
-        
+
+        # Auto-upload a Render como cache comunitario (solo en modo local)
+        if IS_LOCAL_ENGINE:
+            _upload_to_render_cache(track_data)
+
         result.fingerprint = fingerprint
         return result
     except Exception as e:
@@ -2550,6 +2602,69 @@ async def recognize_audio(file: UploadFile = File(...)):
                     os.unlink(path)
                 except Exception:
                     pass
+
+# ==================== CACHE COMUNITARIO (LOCAL ENGINE → RENDER) ====================
+
+@app.post("/cache-analysis")
+async def cache_analysis(request: Request):
+    """
+    Recibe resultado de análisis desde motor local y lo guarda como cache comunitario.
+    Esto permite que tracks analizados localmente estén disponibles para todos los usuarios
+    en las búsquedas por artist/title (e.g. desde /recognize o /search-analyzed).
+
+    El motor local envía esto automáticamente tras cada análisis exitoso.
+    No sobreescribe datos existentes con mejor calidad.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON inválido")
+
+    fingerprint = data.get('fingerprint')
+    if not fingerprint:
+        raise HTTPException(400, "fingerprint requerido")
+
+    # No sobreescribir si ya existe con análisis completo
+    existing = db.get_track(fingerprint)
+    if existing:
+        existing_json = existing.get('analysis_json')
+        if existing_json:
+            try:
+                ej = json.loads(existing_json) if isinstance(existing_json, str) else existing_json
+                # Si el existente tiene BPM real (no 0, no pending), no sobreescribir
+                if ej.get('bpm', 0) > 0 and ej.get('bpm_source') != 'pending':
+                    logger.info(f"[Cache] {fingerprint[:12]} ya existe con análisis completo, skip")
+                    return {"status": "exists", "fingerprint": fingerprint}
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Construir datos para guardar
+    track_data = {
+        'id': fingerprint,
+        'fingerprint': fingerprint,
+        'filename': data.get('filename', ''),
+        'artist': data.get('artist', ''),
+        'title': data.get('title', ''),
+        'album': data.get('album', ''),
+        'label': data.get('label', ''),
+        'duration': data.get('duration', 0),
+        'bpm': data.get('bpm', 0),
+        'key': data.get('key'),
+        'camelot': data.get('camelot'),
+        'energy_dj': data.get('energy_dj', 5),
+        'genre': data.get('genre', ''),
+        'track_type': data.get('track_type', ''),
+        'bpm_source': data.get('bpm_source', 'local_engine'),
+        'key_source': data.get('key_source', 'local_engine'),
+        'genre_source': data.get('genre_source', 'local_engine'),
+        'analysis_json': json.dumps(data.get('analysis_json', {})) if isinstance(data.get('analysis_json'), dict) else data.get('analysis_json', '{}'),
+    }
+
+    db.save_track(track_data)
+    logger.info(f"[Cache] Análisis local cacheado: {data.get('artist', '?')} - {data.get('title', '?')} ({fingerprint[:12]})")
+
+    return {"status": "cached", "fingerprint": fingerprint}
+
 
 @app.post("/check-analyzed")
 async def check_analyzed(filenames: list[str]):
