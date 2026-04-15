@@ -12,7 +12,7 @@ Exporta:
 - search_artwork_online()
 - ARTWORK_CACHE_DIR
 """
-from config import LASTFM_API_KEY
+from config import LASTFM_API_KEY, ARTWORK_CACHE_DIR
 import logging
 import os
 import base64
@@ -22,8 +22,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Constante para el directorio de cache
-ARTWORK_CACHE_DIR = "/data/artwork_cache"
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
 
 # ==================== 0. BUSQUEDA DE ARTWORK ONLINE ====================
