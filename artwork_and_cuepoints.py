@@ -23,7 +23,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # Constante para el directorio de cache
-ARTWORK_CACHE_DIR = "/data/artwork_cache"
+ARTWORK_CACHE_DIR = os.getenv("ARTWORK_CACHE_DIR", "/data/artwork_cache")
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
 
 # ==================== 0. BUSQUEDA DE ARTWORK ONLINE ====================

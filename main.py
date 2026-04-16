@@ -114,7 +114,7 @@ try:
 except ImportError:
     print("artwork_and_cuepoints.py no encontrado - funciones deshabilitadas")
     ARTWORK_ENABLED = False
-    ARTWORK_CACHE_DIR = "/data/artwork_cache"
+    ARTWORK_CACHE_DIR = os.getenv("ARTWORK_CACHE_DIR", "/data/artwork_cache")
     search_artwork_online = None
 
 # Importar clasificador de géneros

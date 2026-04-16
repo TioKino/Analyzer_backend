@@ -1,10 +1,13 @@
 import sqlite3
+import os
 from datetime import datetime
 import json
 from typing import List, Dict, Optional
 
 class AnalysisDB:
-    def __init__(self, db_path="/data/analysis.db"):
+    def __init__(self, db_path=None):
+        if db_path is None:
+            db_path = os.getenv("DATABASE_PATH", "/data/analysis.db")
         self.db_path = db_path
         self._conn = None  # Conexin persistente
         self.init_db()
