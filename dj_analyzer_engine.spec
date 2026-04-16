@@ -68,6 +68,13 @@ for mod in route_modules:
     if os.path.exists(mod):
         datas.append((mod, 'routes' if 'routes/' in mod else '.'))
 
+# Agregar archivos de datos del proyecto
+if os.path.isdir('data'):
+    for f in os.listdir('data'):
+        fpath = os.path.join('data', f)
+        if os.path.isfile(fpath):
+            datas.append((fpath, 'data'))
+
 # Agregar datas de librosa, scipy, soundfile
 datas += librosa_datas
 datas += scipy_datas
