@@ -217,39 +217,90 @@ class AnalysisDB:
         conn.commit()
         conn.close()
     
-    def save_correction(self, track_id, field, old_value, new_value, fingerprint=None):
+    def save_correction(self, track_id, field, old_value, new_value, fingerprint=None, device_id=None):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        
+
+        if device_id and fingerprint:
+            c.execute('''
+                DELETE FROM corrections
+                WHERE fingerprint = ? AND field = ? AND track_id = ?
+                AND corrected_at IN (
+                    SELECT corrected_at FROM corrections
+                    WHERE fingerprint = ? AND field = ? AND track_id = ?
+                    ORDER BY corrected_at DESC LIMIT 1
+                )
+            ''', (fingerprint, field, track_id, fingerprint, field, track_id))
+
         c.execute('''
-            INSERT INTO corrections 
+            INSERT INTO corrections
             (track_id, field, old_value, new_value, corrected_at, fingerprint)
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (track_id, field, old_value, new_value, datetime.now().isoformat(), fingerprint))
-        
+
         conn.commit()
         conn.close()
-    
-    def get_collective_genre(self, fingerprint):
+
+    def get_consensus(self, fingerprint, field, min_votes=1):
+        """
+        Obtiene el valor con mas votos para un campo de un track.
+        Devuelve (value, vote_count) o (None, 0) si no hay consenso suficiente.
+        """
         if not fingerprint:
-            return None
-        
+            return None, 0
+
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        
+
         c.execute('''
-            SELECT new_value, COUNT(*) as count
+            SELECT new_value, COUNT(DISTINCT track_id || corrected_at) as vote_count
             FROM corrections
-            WHERE fingerprint = ? AND field = 'genre'
+            WHERE fingerprint = ? AND field = ?
             GROUP BY new_value
-            ORDER BY count DESC
+            ORDER BY vote_count DESC
             LIMIT 1
-        ''', (fingerprint,))
-        
+        ''', (fingerprint, field))
+
         result = c.fetchone()
         conn.close()
-        
-        return result[0] if result else None
+
+        if result and result[1] >= min_votes:
+            return result[0], result[1]
+        return None, 0
+
+    def get_collective_genre(self, fingerprint):
+        """Legacy: usa get_consensus con minimo 3 votos."""
+        value, count = self.get_consensus(fingerprint, 'genre', min_votes=3)
+        return value
+
+    def get_all_consensus(self, fingerprint):
+        """
+        Obtiene consenso para todos los campos de un track.
+        Devuelve dict con {field: (value, vote_count)} para campos con votos.
+        """
+        if not fingerprint:
+            return {}
+
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+
+        c.execute('''
+            SELECT field, new_value, COUNT(DISTINCT track_id || corrected_at) as vote_count
+            FROM corrections
+            WHERE fingerprint = ?
+            GROUP BY field, new_value
+            ORDER BY field, vote_count DESC
+        ''', (fingerprint,))
+
+        rows = c.fetchall()
+        conn.close()
+
+        result = {}
+        for field, value, count in rows:
+            if field not in result or count > result[field][1]:
+                result[field] = (value, count)
+
+        return result
     
     # ==================== BSQUEDAS ====================
     
