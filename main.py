@@ -114,7 +114,7 @@ try:
 except ImportError:
     print("artwork_and_cuepoints.py no encontrado - funciones deshabilitadas")
     ARTWORK_ENABLED = False
-    ARTWORK_CACHE_DIR = "/data/artwork_cache"
+    ARTWORK_CACHE_DIR = os.getenv("ARTWORK_CACHE_DIR", "/data/artwork_cache")
     search_artwork_online = None
 
 # Importar clasificador de géneros
@@ -714,6 +714,7 @@ class CorrectionRequest(BaseModel):
     old_value: str
     new_value: str
     fingerprint: Optional[str] = None
+    device_id: Optional[str] = None
 
 class SearchRequest(BaseModel):
     artist: Optional[str] = None
@@ -1763,10 +1764,10 @@ async def analyze_track(
                     print(f"[Cache] Error construyendo resultado desde cache: {e}")
                     # Continuar con analisis normal si falla
         
-        collective_genre = db.get_collective_genre(fingerprint)
-        
+        consensus = db.get_all_consensus(fingerprint)
+
         result = analyze_audio(tmp_path, fingerprint)
-        
+
         # Parsear nombre si falta metadata
         if not result.artist or not result.title:
             parsed = parse_filename(file.filename)
@@ -1774,7 +1775,7 @@ async def analyze_track(
                 result.artist = parsed['artist']
             if not result.title:
                 result.title = parsed['title']
-        
+
         # Intentar AcousticBrainz (SOLO si no tenemos Discogs/MusicBrainz)
         ab_genre = None
         if result.genre_source not in ["discogs", "musicbrainz"]:
@@ -1783,24 +1784,72 @@ async def analyze_track(
                 artist=result.artist,
                 title=result.title
             )
-        
-        # Prioridad: Memoria colectiva > Discogs > MusicBrainz > ID3 > AcousticBrainz > Anlisis
-        if collective_genre:
-            result.genre = collective_genre
-            result.genre_source = "collective_memory"
+
+        # ================================================================
+        # PRIORIDAD DE GENERO:
+        #   Consenso >=3 > Discogs > MusicBrainz > ID3 > AcousticBrainz > Analisis
+        # ================================================================
+        genre_consensus = consensus.get('genre')
+        if genre_consensus and genre_consensus[1] >= 3:
+            result.genre = genre_consensus[0]
+            result.genre_source = f"consensus_{genre_consensus[1]}"
         elif result.genre_source in ["discogs", "musicbrainz"]:
-            # Ya tenemos buen g(c)nero, mantenerlo
             pass
+        elif genre_consensus and genre_consensus[1] >= 2:
+            result.genre = genre_consensus[0]
+            result.genre_source = f"suggestion_{genre_consensus[1]}"
         elif result.genre_source == "id3":
-            # ID3 est bien, pero si hay AcousticBrainz especfico, usarlo
             if ab_genre and ab_genre.lower() not in ["electronic", "dance"]:
                 result.subgenre = result.genre
                 result.genre = ab_genre
                 result.genre_source = "acousticbrainz"
         elif ab_genre:
-            # Fallback a AcousticBrainz
             result.genre = ab_genre
             result.genre_source = "acousticbrainz"
+
+        # ================================================================
+        # CONSENSO PROGRESIVO PARA BPM, KEY, ENERGY
+        # ================================================================
+        # 1 usuario  = se guarda, no se aplica
+        # 2 usuarios = sugerencia (no sobreescribe Rekordbox/Beatport)
+        # 3+ usuarios = se aplica automaticamente
+        # 5+ usuarios = sobreescribe todo incluido Rekordbox/Beatport
+        # ================================================================
+
+        bpm_consensus = consensus.get('bpm')
+        if bpm_consensus:
+            votes = bpm_consensus[1]
+            try:
+                consensus_bpm = float(bpm_consensus[0])
+                if votes >= 5:
+                    result.bpm = consensus_bpm
+                    result.bpm_source = f"consensus_{votes}"
+                elif votes >= 3 and result.bpm_source not in ["rekordbox", "traktor", "beatport"]:
+                    result.bpm = consensus_bpm
+                    result.bpm_source = f"consensus_{votes}"
+            except (ValueError, TypeError):
+                pass
+
+        key_consensus = consensus.get('key')
+        if key_consensus:
+            votes = key_consensus[1]
+            if votes >= 5:
+                result.key = key_consensus[0]
+                result.key_source = f"consensus_{votes}"
+            elif votes >= 3 and result.key_source not in ["rekordbox", "traktor"]:
+                result.key = key_consensus[0]
+                result.key_source = f"consensus_{votes}"
+
+        energy_consensus = consensus.get('energy')
+        if energy_consensus:
+            votes = energy_consensus[1]
+            try:
+                consensus_energy = float(energy_consensus[0])
+                if votes >= 3:
+                    result.energy_dj = int(consensus_energy)
+                    result.energy_source = f"consensus_{votes}"
+            except (ValueError, TypeError):
+                pass
         
         # Guardar en BD
         track_data = result.dict()
@@ -1929,8 +1978,27 @@ async def save_correction(request: CorrectionRequest):
     if field not in allowed_fields:
         raise HTTPException(400, f"Campo no permitido: {field}. Permitidos: {', '.join(allowed_fields)}")
     
-    db.save_correction(track_id, field, old_value, new_value, request.fingerprint)
-    return {"status": "ok", "message": "Correccin guardada"}
+    db.save_correction(track_id, field, old_value, new_value, request.fingerprint, request.device_id)
+
+    votes = 0
+    status = "saved"
+    if request.fingerprint:
+        _, votes = db.get_consensus(request.fingerprint, field)
+        if votes >= 5:
+            status = "applied_override"
+        elif votes >= 3:
+            status = "applied"
+        elif votes >= 2:
+            status = "suggestion"
+        else:
+            status = "saved"
+
+    return {
+        "status": "ok",
+        "consensus_status": status,
+        "votes": votes,
+        "message": f"Correccion guardada ({votes} votos, {status})",
+    }
 
 # ==================== IDENTIFICAR TRACK CON AUDD ====================
 

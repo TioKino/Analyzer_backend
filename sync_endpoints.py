@@ -403,7 +403,6 @@ async def sync_link_join(req: LinkJoinRequest):
     existing_user = _get_user_id_for_device(conn, req.device_id)
     if existing_user == target_user_id:
         # Ya vinculado al mismo usuario
-        conn.execute("DELETE FROM link_codes WHERE code = ?", (req.code.upper(),))
         conn.commit()
         devices = _get_all_devices_for_user(conn, target_user_id)
         return {
@@ -425,8 +424,8 @@ async def sync_link_join(req: LinkJoinRequest):
     # Migrar datos huérfanos
     _assign_orphan_data(conn, req.device_id, target_user_id)
 
-    # Consumir código
-    conn.execute("DELETE FROM link_codes WHERE code = ?", (req.code.upper(),))
+    # No consumir el código: se mantiene válido hasta que expire (10 min)
+    # para permitir vincular múltiples dispositivos con el mismo código.
     conn.commit()
 
     devices = _get_all_devices_for_user(conn, target_user_id)
