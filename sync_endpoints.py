@@ -33,6 +33,15 @@ from config import SYNC_AUTH_SECRET, ADMIN_TOKEN
 logger = logging.getLogger(__name__)
 
 
+# ── LIMITES ─────────────────────────────────────────────────
+# Soft cap de dispositivos por usuario. Evita abuso (alguien registrando
+# miles de device_ids contra el mismo user_id) y mantiene la UI manejable.
+# 20 cubre uso normal con margen (2-3 desktops + movil + tablet + trabajo
+# + sobra). Si se alcanza, /sync/link/join devuelve 409 con code
+# "MAX_DEVICES_REACHED" y el cliente muestra mensaje claro al usuario.
+MAX_DEVICES_PER_USER = 20
+
+
 # ── HMAC-SHA256 Auth ─────────────────────────────────────────
 # Si SYNC_AUTH_SECRET está configurado, todos los endpoints de sync
 # requieren header X-Signature con HMAC-SHA256(secret, body).
@@ -289,6 +298,7 @@ async def sync_register(req: RegisterRequest):
             "device_id": req.device_id,
             "already_registered": True,
             "linked_devices": devices,
+            "max_devices": MAX_DEVICES_PER_USER,
         }
 
     # Crear usuario nuevo
@@ -316,6 +326,7 @@ async def sync_register(req: RegisterRequest):
         "device_id": req.device_id,
         "already_registered": False,
         "linked_devices": devices,
+        "max_devices": MAX_DEVICES_PER_USER,
     }
 
 
@@ -410,11 +421,38 @@ async def sync_link_join(req: LinkJoinRequest):
             "device_id": req.device_id,
             "already_linked": True,
             "linked_devices": devices,
+            "max_devices": MAX_DEVICES_PER_USER,
         }
 
     if existing_user:
         # Re-vincular de un usuario a otro
         conn.execute("DELETE FROM user_devices WHERE device_id = ?", (req.device_id,))
+
+    # Soft cap: max dispositivos por usuario.
+    # Si el user ya tiene MAX_DEVICES_PER_USER, bloquear el join.
+    # Si el device venia re-vinculandose desde otro user, ya hicimos DELETE
+    # arriba asi que el count refleja el estado sin el nuevo device.
+    current_count = conn.execute(
+        "SELECT COUNT(*) FROM user_devices WHERE user_id = ?",
+        (target_user_id,),
+    ).fetchone()[0]
+    if current_count >= MAX_DEVICES_PER_USER:
+        # Si hicimos DELETE antes, restaurar para no corromper estado.
+        if existing_user:
+            conn.execute(
+                "INSERT INTO user_devices (device_id, user_id, device_type, device_name, linked_at) VALUES (?, ?, ?, ?, ?)",
+                (req.device_id, existing_user, req.device_type, req.device_name, now),
+            )
+            conn.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MAX_DEVICES_REACHED",
+                "message": f"Max {MAX_DEVICES_PER_USER} devices per user. Unlink one to add another.",
+                "current": current_count,
+                "max": MAX_DEVICES_PER_USER,
+            },
+        )
 
     conn.execute(
         "INSERT INTO user_devices (device_id, user_id, device_type, device_name, linked_at) VALUES (?, ?, ?, ?, ?)",
@@ -436,6 +474,7 @@ async def sync_link_join(req: LinkJoinRequest):
         "device_id": req.device_id,
         "already_linked": False,
         "linked_devices": devices,
+        "max_devices": MAX_DEVICES_PER_USER,
     }
 
 
