@@ -882,10 +882,61 @@ def get_acousticbrainz_genre(fingerprint=None, artist=None, title=None):
 # ==================== PREVIEW SNIPPET ====================
 
 import subprocess
+import threading
 from pathlib import Path as PathLib
 
 # Asegurar directorio de previews
 PathLib(PREVIEWS_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def _push_preview_to_render(fingerprint: str, local_path: str) -> None:
+    """
+    Sube el snippet MP3 al Render remoto en cuanto lo genera el engine local.
+    Patrón "push at source": evita que el cliente tenga que escanear carpetas
+    locales y saltar al sync para que otros dispositivos puedan reproducir.
+
+    Activo solo cuando:
+      - LOCAL_ENGINE=true (somos el engine de usuario, no el Render)
+      - RENDER_SYNC_URL y SYNC_AUTH_SECRET están configurados (Flutter los
+        pasa al lanzar el proceso vía LocalEngineService.start()).
+
+    Silencioso si falla: el siguiente sync manual del cliente lo recuperará
+    mediante CloudSyncService._uploadLocalPreviews() (red de seguridad).
+    """
+    try:
+        if not os.getenv('LOCAL_ENGINE'):
+            return
+        render_url = (os.getenv('RENDER_SYNC_URL') or '').rstrip('/')
+        if not render_url:
+            return
+        if not os.path.exists(local_path):
+            return
+        # El endpoint /preview/upload no requiere HMAC (preview_router no
+        # lleva dependency de _verify_sync_auth). Se autentica por existencia
+        # del fingerprint en la petición — bastante para nuestro uso.
+        with open(local_path, 'rb') as fp:
+            files = {'file': (f'{fingerprint}.mp3', fp, 'audio/mpeg')}
+            resp = requests.post(
+                f'{render_url}/preview/upload/{fingerprint}',
+                files=files,
+                timeout=15,
+            )
+        if resp.status_code == 200:
+            print(f'[Preview] Push -> Render OK: {fingerprint[:8]}')
+        else:
+            print(f'[Preview] Push -> Render {resp.status_code}: {fingerprint[:8]}')
+    except Exception as push_err:
+        # Fire-and-forget: no queremos reventar el analyze por esto.
+        print(f'[Preview] Push -> Render error ({fingerprint[:8]}): {push_err}')
+
+
+def _push_preview_async(fingerprint: str, local_path: str) -> None:
+    """Lanza `_push_preview_to_render` en un thread daemon (no bloquea)."""
+    threading.Thread(
+        target=_push_preview_to_render,
+        args=(fingerprint, local_path),
+        daemon=True,
+    ).start()
 
 def generate_preview_snippet(
     file_path: str,
@@ -1661,12 +1712,14 @@ async def analyze_track(
                 if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
                     logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
                     try:
-                        generate_preview_snippet(
+                        regen_path = generate_preview_snippet(
                             file_path=original_path,
                             fingerprint=fp,
                             drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
                             duration=analysis_json.get('duration', 180.0),
                         )
+                        if regen_path:
+                            _push_preview_async(fp, regen_path)
                     except (FileNotFoundError, IOError, OSError) as e:
                         logger.error(f"[Preview] Error generando desde cache: {e}")
 
@@ -1868,6 +1921,9 @@ async def analyze_track(
             )
             if preview_path:
                 result.preview_url = f"{BASE_URL}/preview/{fingerprint}"
+                # Si somos engine local, empuja el snippet al Render remoto
+                # para que otros dispositivos puedan reproducirlo al instante.
+                _push_preview_async(fingerprint, preview_path)
         except Exception as preview_err:
             print(f"  [Preview] Error (no crítico): {preview_err}")
         
