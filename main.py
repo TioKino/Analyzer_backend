@@ -882,10 +882,80 @@ def get_acousticbrainz_genre(fingerprint=None, artist=None, title=None):
 # ==================== PREVIEW SNIPPET ====================
 
 import subprocess
+import threading
+import logging as _logging
 from pathlib import Path as PathLib
+
+# Logger dedicado para el módulo de previews. Usa handlers heredados de
+# local_engine.py (fichero engine.log junto al binario) cuando corremos
+# como engine local detached; en Render van a stdout.
+_preview_logger = _logging.getLogger('preview_push')
+_preview_logger.setLevel(_logging.INFO)
 
 # Asegurar directorio de previews
 PathLib(PREVIEWS_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def _push_preview_to_render(fingerprint: str, local_path: str) -> None:
+    """
+    Sube el snippet MP3 al Render remoto en cuanto lo genera el engine local.
+    Patrón "push at source": evita que el cliente tenga que escanear carpetas
+    locales y saltar al sync para que otros dispositivos puedan reproducir.
+
+    Activo solo cuando:
+      - LOCAL_ENGINE=true (somos el engine de usuario, no el Render)
+      - RENDER_SYNC_URL y SYNC_AUTH_SECRET están configurados (Flutter los
+        pasa al lanzar el proceso vía LocalEngineService.start()).
+
+    Silencioso si falla: el siguiente sync manual del cliente lo recuperará
+    mediante CloudSyncService._uploadLocalPreviews() (red de seguridad).
+
+    Los logs van vía `_preview_logger` → cuando corremos bajo
+    local_engine.py, el handler global escribe en `engine.log` junto al
+    binario (Flutter no captura el stdout del engine porque lo lanza
+    detached, así que `print` se perdería).
+    """
+    short_fp = fingerprint[:8] if fingerprint else '--------'
+    try:
+        if not os.getenv('LOCAL_ENGINE'):
+            _preview_logger.debug('[Preview] Push skip: LOCAL_ENGINE no set')
+            return
+        render_url = (os.getenv('RENDER_SYNC_URL') or '').rstrip('/')
+        if not render_url:
+            _preview_logger.warning('[Preview] Push skip: RENDER_SYNC_URL vacío')
+            return
+        if not os.path.exists(local_path):
+            _preview_logger.warning(f'[Preview] Push skip: archivo inexistente {local_path}')
+            return
+        # El endpoint /preview/upload no requiere HMAC (preview_router no
+        # lleva dependency de _verify_sync_auth). Se autentica por existencia
+        # del fingerprint en la petición — bastante para nuestro uso.
+        with open(local_path, 'rb') as fp:
+            files = {'file': (f'{fingerprint}.mp3', fp, 'audio/mpeg')}
+            resp = requests.post(
+                f'{render_url}/preview/upload/{fingerprint}',
+                files=files,
+                timeout=15,
+            )
+        if resp.status_code == 200:
+            _preview_logger.info(f'[Preview] Push -> Render OK: {short_fp}')
+        else:
+            body = (resp.text or '')[:200]
+            _preview_logger.warning(
+                f'[Preview] Push -> Render {resp.status_code}: {short_fp} | {body}'
+            )
+    except Exception as push_err:
+        # Fire-and-forget: no queremos reventar el analyze por esto.
+        _preview_logger.error(f'[Preview] Push -> Render error ({short_fp}): {push_err}')
+
+
+def _push_preview_async(fingerprint: str, local_path: str) -> None:
+    """Lanza `_push_preview_to_render` en un thread daemon (no bloquea)."""
+    threading.Thread(
+        target=_push_preview_to_render,
+        args=(fingerprint, local_path),
+        daemon=True,
+    ).start()
 
 def generate_preview_snippet(
     file_path: str,
@@ -1661,12 +1731,14 @@ async def analyze_track(
                 if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
                     logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
                     try:
-                        generate_preview_snippet(
+                        regen_path = generate_preview_snippet(
                             file_path=original_path,
                             fingerprint=fp,
                             drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
                             duration=analysis_json.get('duration', 180.0),
                         )
+                        if regen_path:
+                            _push_preview_async(fp, regen_path)
                     except (FileNotFoundError, IOError, OSError) as e:
                         logger.error(f"[Preview] Error generando desde cache: {e}")
 
@@ -1868,6 +1940,9 @@ async def analyze_track(
             )
             if preview_path:
                 result.preview_url = f"{BASE_URL}/preview/{fingerprint}"
+                # Si somos engine local, empuja el snippet al Render remoto
+                # para que otros dispositivos puedan reproducirlo al instante.
+                _push_preview_async(fingerprint, preview_path)
         except Exception as preview_err:
             print(f"  [Preview] Error (no crítico): {preview_err}")
         
@@ -2967,6 +3042,42 @@ async def check_previews(request: PreviewCheckRequest):
         "total_checked": len(track_ids),
         "total_available": len(available),
     }
+
+
+@app.post("/preview/upload/{track_id}")
+async def upload_preview(track_id: str, file: UploadFile = File(...)):
+    """
+    Recibe un snippet MP3 desde un engine local o desde el cliente Flutter
+    y lo guarda en PREVIEWS_DIR para que el resto de dispositivos puedan
+    reproducirlo via GET /preview/{track_id}.
+
+    Autenticación: ninguna (por ahora) — el endpoint acepta cualquier MP3
+    dentro de los límites de tamaño. El track_id se sanitiza para evitar
+    path traversal. Si luego se considera necesario, se puede proteger con
+    HMAC o rate-limit.
+
+    Límites:
+      - mínimo 100B (filtro de uploads vacíos/corruptos)
+      - máximo 500KB (un snippet de 6s a 64kbps son ~48KB; 500KB da
+        margen de sobra para compresiones laxas).
+    """
+    safe_id = re.sub(r'[^a-fA-F0-9]', '', track_id)
+    if not safe_id or len(safe_id) > 64:
+        raise HTTPException(400, "track_id inválido")
+
+    content = await file.read()
+    if len(content) < 100:
+        raise HTTPException(400, "Archivo demasiado pequeño")
+    if len(content) > 500_000:
+        raise HTTPException(400, "Archivo demasiado grande")
+
+    preview_path = os.path.join(PREVIEWS_DIR, f"{safe_id}.mp3")
+    os.makedirs(PREVIEWS_DIR, exist_ok=True)
+
+    with open(preview_path, 'wb') as f:
+        f.write(content)
+
+    return {"status": "ok", "track_id": safe_id, "size": len(content)}
 
 
 # ==================== INFO ====================
