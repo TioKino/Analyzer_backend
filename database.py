@@ -116,7 +116,48 @@ class AnalysisDB:
                 UNIQUE(fingerprint, device_id)
             )
         ''')
-        
+
+        # Notas comunitarias (tipo SoundCloud - todos los DJs ven las notas de todos)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                display_name TEXT DEFAULT 'DJ',
+                note_text TEXT NOT NULL,
+                note_type TEXT DEFAULT 'general',
+                upvotes INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(fingerprint, device_id, note_text)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_cnotes_fp ON community_notes(fingerprint)')
+
+        # Popularidad de tracks (cuántos DJs lo tienen / han analizado)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS track_popularity (
+                fingerprint TEXT PRIMARY KEY,
+                analysis_count INTEGER DEFAULT 1,
+                dj_count INTEGER DEFAULT 1,
+                avg_rating REAL DEFAULT 0,
+                total_ratings INTEGER DEFAULT 0,
+                last_analyzed TEXT
+            )
+        ''')
+
+        # Ratings individuales por DJ
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS track_ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+                rated_at TEXT NOT NULL,
+                UNIQUE(fingerprint, device_id)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_tr_fp ON track_ratings(fingerprint)')
+
         conn.commit()
         conn.close()
 
@@ -604,6 +645,108 @@ class AnalysisDB:
         conn.commit()
         conn.close()
         return deleted
+
+    # ==================== COMMUNITY NOTES ====================
+
+    def save_community_note(self, fingerprint: str, device_id: str,
+                            note_text: str, display_name: str = 'DJ',
+                            note_type: str = 'general') -> int:
+        from datetime import datetime
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            INSERT OR REPLACE INTO community_notes
+            (fingerprint, device_id, display_name, note_text, note_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (fingerprint, device_id, display_name, note_text, note_type,
+              datetime.utcnow().isoformat()))
+        note_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return note_id
+
+    def get_community_notes(self, fingerprint: str) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            SELECT id, device_id, display_name, note_text, note_type, upvotes, created_at
+            FROM community_notes WHERE fingerprint = ?
+            ORDER BY upvotes DESC, created_at DESC
+        ''', (fingerprint,))
+        results = [{
+            'id': r[0], 'device_id': r[1][:8] + '...', 'display_name': r[2],
+            'note_text': r[3], 'note_type': r[4], 'upvotes': r[5], 'created_at': r[6],
+        } for r in c.fetchall()]
+        conn.close()
+        return results
+
+    def upvote_community_note(self, note_id: int):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('UPDATE community_notes SET upvotes = upvotes + 1 WHERE id = ?', (note_id,))
+        conn.commit()
+        conn.close()
+
+    # ==================== TRACK POPULARITY & RATINGS ====================
+
+    def increment_popularity(self, fingerprint: str, device_id: str = ''):
+        from datetime import datetime
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('SELECT analysis_count FROM track_popularity WHERE fingerprint = ?', (fingerprint,))
+        row = c.fetchone()
+        now = datetime.utcnow().isoformat()
+        if row:
+            c.execute('''UPDATE track_popularity
+                         SET analysis_count = analysis_count + 1, last_analyzed = ?
+                         WHERE fingerprint = ?''', (now, fingerprint))
+        else:
+            c.execute('''INSERT INTO track_popularity (fingerprint, analysis_count, dj_count, last_analyzed)
+                         VALUES (?, 1, 1, ?)''', (fingerprint, now))
+        conn.commit()
+        conn.close()
+
+    def rate_track(self, fingerprint: str, device_id: str, rating: int) -> Dict:
+        from datetime import datetime
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO track_ratings (fingerprint, device_id, rating, rated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(fingerprint, device_id) DO UPDATE SET rating = ?, rated_at = ?
+        ''', (fingerprint, device_id, rating, datetime.utcnow().isoformat(),
+              rating, datetime.utcnow().isoformat()))
+        # Recalcular media
+        c.execute('SELECT AVG(rating), COUNT(*) FROM track_ratings WHERE fingerprint = ?', (fingerprint,))
+        avg, count = c.fetchone()
+        c.execute('''
+            INSERT INTO track_popularity (fingerprint, avg_rating, total_ratings, last_analyzed)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(fingerprint) DO UPDATE SET avg_rating = ?, total_ratings = ?
+        ''', (fingerprint, avg or 0, count or 0, datetime.utcnow().isoformat(), avg or 0, count or 0))
+        conn.commit()
+        conn.close()
+        return {'avg_rating': round(avg or 0, 1), 'total_ratings': count or 0}
+
+    def get_track_popularity(self, fingerprint: str) -> Dict:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('SELECT analysis_count, dj_count, avg_rating, total_ratings FROM track_popularity WHERE fingerprint = ?',
+                  (fingerprint,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {'analysis_count': row[0], 'dj_count': row[1],
+                    'avg_rating': round(row[2] or 0, 1), 'total_ratings': row[3] or 0}
+        return {'analysis_count': 0, 'dj_count': 0, 'avg_rating': 0, 'total_ratings': 0}
+
+    def get_my_rating(self, fingerprint: str, device_id: str) -> int:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('SELECT rating FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
+                  (fingerprint, device_id))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else 0
 
     # ==================== COMMUNITY BEAT GRID ====================
 
