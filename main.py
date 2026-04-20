@@ -1783,15 +1783,40 @@ async def analyze_track(
     
     if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg')):
         raise HTTPException(400, "Formato no soportado. Permitidos: mp3, wav, flac, m4a, aac, ogg")
-    
-    # Leer contenido y validar tama+/-o
-    content = await file.read()
+
+    # Upload streaming a disco en bloques de 1 MB. ANTES hacíamos
+    # `content = await file.read()` que chupaba hasta 100 MB en RAM de golpe
+    # — con 512 MB de Render + librosa + chunked_analyzer nos llevaba a OOM
+    # en tracks largos. Ahora el pico en memoria durante el upload es ~1 MB.
+    # El análisis posterior ya usa chunked_analyzer para tracks >4 min.
     max_size = 100 * 1024 * 1024  # 100 MB
-    if len(content) > max_size:
-        raise HTTPException(400, f"Archivo demasiado grande. Mximo: 100 MB")
-    if len(content) < 1000:
-        raise HTTPException(400, "Archivo demasiado peque+/-o o corrupto")
-    
+    min_size = 1000
+    total_bytes = 0
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=os.path.splitext(file.filename)[1],
+    ) as tmp:
+        tmp_path = tmp.name
+        while True:
+            chunk = await file.read(1024 * 1024)  # 1 MB
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > max_size:
+                tmp.close()
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise HTTPException(400, "Archivo demasiado grande. Máximo: 100 MB")
+            tmp.write(chunk)
+    if total_bytes < min_size:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise HTTPException(400, "Archivo demasiado pequeño o corrupto")
+
     # Si force=true, eliminar registro antiguo para reanalisis completo
     if force:
         db.delete_track_by_filename(file.filename)
@@ -1825,13 +1850,16 @@ async def analyze_track(
                     existing_dict = db._row_to_dict(existing) or {}
                     existing_dict['analysis_json'] = json.dumps(analysis_json)
                     # Re-save no es trivial, pero al menos guardamos el path
+            # Limpiar el tmp_path creado durante el upload streaming: este
+            # cache-hit no necesita el archivo subido. (No reventamos si ya
+            # no existe — race improbable con otro handler.)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             return AnalysisResult(**analysis_json)
-    
-    # Guardar archivo temporal para calcular fingerprint
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    
+
+    # tmp_path ya fue creado arriba por el upload streaming. Seguimos.
     try:
         import warnings
         warnings.filterwarnings('ignore')
@@ -2191,14 +2219,18 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
     fragment_path = None
     
     try:
-        # Guardar archivo temporal
+        # Upload streaming a disco en bloques de 1 MB (mismo patrón que /analyze)
+        # para no cargar el archivo entero en RAM de Render.
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-            content = await file.read()
-            tmp.write(content)
             tmp_path = tmp.name
-        
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+
         print(f"Identificando track: {file.filename}")
-        
+
         # Calcular fingerprint del CONTENIDO del archivo (igual que en /analyze)
         fingerprint = calculate_fingerprint(tmp_path)
         print(f"  Fingerprint (contenido): {fingerprint[:12]}...")
@@ -2643,15 +2675,20 @@ async def recognize_audio(request: Request, file: UploadFile = File(...)):
     tmp_path = None
     processed_paths = []
     try:
-        # Guardar archivo temporal original
+        # Upload streaming a disco (1 MB por bloque) para no saturar RAM.
+        total_bytes = 0
         with tempfile.NamedTemporaryFile(delete=False, suffix='.m4a') as tmp:
-            content = await file.read()
-            tmp.write(content)
             tmp_path = tmp.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                tmp.write(chunk)
 
-        print(f"[Recognize] Audio recibido: {file.filename} ({len(content)} bytes)")
+        print(f"[Recognize] Audio recibido: {file.filename} ({total_bytes} bytes)")
 
-        if len(content) < 1000:
+        if total_bytes < 1000:
             return {"status": "not_found", "message": "Audio demasiado corto o vacío"}
 
         # ── Estrategia multi-intento ──
