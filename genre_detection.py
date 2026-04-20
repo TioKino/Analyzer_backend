@@ -7,13 +7,15 @@ Sistema UNIVERSAL de detección y normalización de géneros.
 Cubre todos los estilos musicales del mundo.
 Integra Discogs, MusicBrainz y análisis espectral.
 
-Total: 914 géneros mapeados (cargados desde data/genre_mappings.json)
+Total: ~400+ géneros mapeados
 """
 
 import json
 import logging
+import os
 import requests
 import time
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -27,14 +29,20 @@ except ImportError:
 
 
 # ============================================================
-# MAPEO UNIVERSAL DE GÉNEROS
+# MAPEO UNIVERSAL DE GÉNEROS (cargado desde data/genre_mappings.json)
 # ============================================================
 
-# Load genre mappings from JSON file
-import os as _os
-_genre_map_path = _os.path.join(_os.path.dirname(__file__), 'data', 'genre_mappings.json')
-with open(_genre_map_path, 'r', encoding='utf-8') as _f:
-    GENRE_MAP = json.load(_f)
+_GENRE_MAP_PATH = Path(os.path.dirname(os.path.abspath(__file__))) / 'data' / 'genre_mappings.json'
+
+def _load_genre_map() -> dict:
+    try:
+        return json.loads(_GENRE_MAP_PATH.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        logger.error(f"Genre mappings file not found: {_GENRE_MAP_PATH}")
+        return {}
+
+GENRE_MAP = _load_genre_map()
+
 
 
 
@@ -58,9 +66,11 @@ class GenreDetector:
             return None
         
         try:
+            # Buscar release
             query = f"{artist} {title}"
             results = self.discogs_client.search(query, type='release')
             
+            # Iterar sobre resultados (evita el error de slicing)
             release = None
             for r in results:
                 release = r
@@ -69,9 +79,11 @@ class GenreDetector:
             if not release:
                 return None
             
+            # Obtener géneros
             genres = getattr(release, 'genres', None)
             styles = getattr(release, 'styles', None)
             
+            # Obtener label y year si están disponibles
             label = None
             year = None
             try:
@@ -83,6 +95,7 @@ class GenreDetector:
                 pass
             
             if styles:
+                # Usar estilo (más específico)
                 return {
                     'genre': self._normalize_genre(styles[0]),
                     'confidence': 0.85,
@@ -112,6 +125,7 @@ class GenreDetector:
             return None
         
         try:
+            # Buscar en MusicBrainz
             search_url = "https://musicbrainz.org/ws/2/recording/"
             params = {
                 'query': f'artist:"{artist}" AND recording:"{title}"',
@@ -133,12 +147,15 @@ class GenreDetector:
             
             recording = recordings[0]
             
+            # Extraer tags como género
             tags = recording.get('tags', [])
             genre = None
             if tags:
+                # Ordenar por count y tomar el primero
                 sorted_tags = sorted(tags, key=lambda x: x.get('count', 0), reverse=True)
                 genre = self._normalize_genre(sorted_tags[0].get('name', ''))
             
+            # Rate limit para MusicBrainz (1 req/sec)
             time.sleep(1)
             
             return {
@@ -158,13 +175,16 @@ class GenreDetector:
             
         genre_lower = genre.lower().strip()
         
+        # Buscar coincidencia exacta primero
         if genre_lower in GENRE_MAP:
             return GENRE_MAP[genre_lower]
         
+        # Buscar coincidencias parciales
         for key, value in GENRE_MAP.items():
             if key in genre_lower:
                 return value
         
+        # Si no hay match, capitalizar
         return genre.title()
     
     def detect_genre(self, artist: str, title: str, 
@@ -180,6 +200,7 @@ class GenreDetector:
         4. Análisis espectral
         """
         
+        # 1. Memoria colectiva (máxima prioridad)
         if collective_genre:
             return {
                 'genre': collective_genre,
@@ -187,14 +208,17 @@ class GenreDetector:
                 'source': 'collective_memory'
             }
         
+        # 2. Discogs (mejor para electrónica)
         discogs_result = self.get_discogs_genre(artist, title)
         if discogs_result:
             return discogs_result
         
+        # 3. MusicBrainz
         mb_result = self.get_musicbrainz_info(artist, title)
         if mb_result and mb_result.get('genre'):
             return mb_result
         
+        # 4. Fallback: Análisis espectral
         return {
             'genre': spectral_genre,
             'confidence': 0.5,

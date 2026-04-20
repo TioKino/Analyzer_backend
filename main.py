@@ -26,15 +26,16 @@ import re
 import json
 import hashlib
 import requests
+import shutil
 import sqlite3
+import time
 from typing import Dict, List, Optional
-from pydantic import BaseModel
 from pydantic import BaseModel
 from spectral_genre_classifier import classify_genre_advanced
 from config import (
-    AUDD_API_TOKEN, 
-    DISCOGS_TOKEN, 
-    print_config, 
+    AUDD_API_TOKEN,
+    DISCOGS_TOKEN,
+    print_config,
     BASE_URL,
     CORS_ORIGINS,
     DEBUG,
@@ -42,6 +43,7 @@ from config import (
     ADMIN_TOKEN,
     RATE_LIMIT_ENABLED,
     DATABASE_PATH,
+    ARTWORK_CACHE_DIR as _CONFIG_ARTWORK_CACHE_DIR,
 )
 
 #  Importar mdulo de validacin
@@ -162,7 +164,7 @@ try:
 except ImportError:
     print("artwork_and_cuepoints.py no encontrado - funciones deshabilitadas")
     ARTWORK_ENABLED = False
-    ARTWORK_CACHE_DIR = os.getenv("ARTWORK_CACHE_DIR", "/data/artwork_cache")
+    ARTWORK_CACHE_DIR = _CONFIG_ARTWORK_CACHE_DIR
     search_artwork_online = None
 
 # Importar clasificador de géneros
@@ -316,6 +318,7 @@ def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset
 # ==================== APP ====================
 
 app = FastAPI(title="DJ Analyzer Pro API", version="2.3.0", default_response_class=SafeJSONResponse)
+_startup_time = time.time()
 app.include_router(sync_router)
 app.include_router(admin_panel_router)
 
@@ -1972,7 +1975,7 @@ async def analyze_track(
                 pass
         
         # Guardar en BD
-        track_data = result.dict()
+        track_data = result.model_dump()
         track_data['id'] = fingerprint
         track_data['filename'] = file.filename
         track_data['fingerprint'] = fingerprint
@@ -2079,7 +2082,7 @@ async def analyze_track(
             )
             
             # Guardar en BD (marcado como pendiente de anlisis real)
-            track_data = result.dict()
+            track_data = result.model_dump()
             track_data['id'] = fingerprint
             track_data['filename'] = file.filename
             track_data['fingerprint'] = fingerprint
@@ -3346,7 +3349,47 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "2.3.0"}
+    # Database check
+    db_status = "ok"
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.execute("SELECT 1")
+        conn.close()
+    except Exception as e:
+        db_status = f"error: {e}"
+
+    # FFmpeg check
+    ffmpeg_status = "not_found"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        ffmpeg_status = "available"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Disk space
+    try:
+        disk_usage = shutil.disk_usage("/")
+        disk_space_mb = round(disk_usage.free / (1024 * 1024), 1)
+    except OSError:
+        disk_space_mb = -1
+
+    uptime_seconds = round(time.time() - _startup_time, 1)
+
+    return {
+        "status": "ok",
+        "version": "2.6.0",
+        "uptime_seconds": uptime_seconds,
+        "checks": {
+            "database": db_status,
+            "ffmpeg": ffmpeg_status,
+            "disk_space_mb": disk_space_mb,
+        },
+    }
 
 # ==================== ADMIN / RESET ====================
 

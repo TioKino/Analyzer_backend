@@ -407,63 +407,99 @@ def validate_track_id(track_id: str) -> str:
 
 
 # ============================================================================
-# MIDDLEWARE DE RATE LIMITING (Simple)
+# MIDDLEWARE DE RATE LIMITING
 # ============================================================================
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+import time
 import threading
 
-class SimpleRateLimiter:
-    """
-    Rate limiter simple en memoria.
-    Para producción, usar Redis.
-    """
-    
-    def __init__(self, requests_per_minute: int = 60):
-        self.requests_per_minute = requests_per_minute
-        self.requests = defaultdict(list)
-        self.lock = threading.Lock()
-    
+
+class MemoryRateLimiterBackend:
+    """In-memory rate limiter (single worker only)."""
+
+    def __init__(self):
+        self._requests = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def check_and_increment(self, key: str, max_requests: int, window: int) -> bool:
+        now = time.time()
+        with self._lock:
+            self._requests[key] = [t for t in self._requests[key] if now - t < window]
+            if len(self._requests[key]) >= max_requests:
+                return False
+            self._requests[key].append(now)
+            return True
+
+    def count_recent(self, key: str, window: int) -> int:
+        now = time.time()
+        with self._lock:
+            recent = [t for t in self._requests[key] if now - t < window]
+            return len(recent)
+
+
+class RedisRateLimiterBackend:
+    """Redis-backed rate limiter (multi-worker safe)."""
+
+    def __init__(self, redis_url: str, default_window: int = 60):
+        import redis as _redis
+        self._redis = _redis.from_url(redis_url)
+        self._default_window = default_window
+
+    def check_and_increment(self, key: str, max_requests: int, window: int) -> bool:
+        redis_key = f"ratelimit:{key}"
+        pipe = self._redis.pipeline()
+        now = time.time()
+        pipe.zremrangebyscore(redis_key, 0, now - window)
+        pipe.zcard(redis_key)
+        pipe.zadd(redis_key, {str(now): now})
+        pipe.expire(redis_key, window)
+        results = pipe.execute()
+        current_count = results[1]
+        return current_count < max_requests
+
+    def count_recent(self, key: str, window: int) -> int:
+        redis_key = f"ratelimit:{key}"
+        now = time.time()
+        self._redis.zremrangebyscore(redis_key, 0, now - window)
+        return self._redis.zcard(redis_key)
+
+
+class RateLimiter:
+    """Rate limiter with pluggable backend (memory or Redis)."""
+
+    def __init__(self, max_requests: int = 10, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._backend = self._create_backend()
+
+    def _create_backend(self):
+        redis_url = os.getenv('REDIS_URL')
+        if redis_url:
+            try:
+                return RedisRateLimiterBackend(redis_url, self.window_seconds)
+            except (ImportError, Exception):
+                pass
+        return MemoryRateLimiterBackend()
+
     def is_allowed(self, client_id: str) -> bool:
         """Verifica si el cliente puede hacer request"""
-        now = datetime.now()
-        minute_ago = now - timedelta(minutes=1)
-        
-        with self.lock:
-            # Limpiar requests antiguos
-            self.requests[client_id] = [
-                req_time for req_time in self.requests[client_id]
-                if req_time > minute_ago
-            ]
-            
-            # Limpiar entrada si quedó vacía
-            if not self.requests[client_id]:
-                del self.requests[client_id]
+        return self._backend.check_and_increment(
+            client_id, self.max_requests, self.window_seconds
+        )
 
-            # Verificar límite
-            if len(self.requests.get(client_id, [])) >= self.requests_per_minute:
-                return False
-            
-            # Registrar request
-            self.requests[client_id].append(now)
-            return True
-    
     def get_remaining(self, client_id: str) -> int:
         """Obtiene requests restantes"""
-        now = datetime.now()
-        minute_ago = now - timedelta(minutes=1)
-        
-        with self.lock:
-            recent = [
-                req_time for req_time in self.requests[client_id]
-                if req_time > minute_ago
-            ]
-            return max(0, self.requests_per_minute - len(recent))
+        used = self._backend.count_recent(client_id, self.window_seconds)
+        return max(0, self.max_requests - used)
+
+
+# Backward-compat alias
+SimpleRateLimiter = RateLimiter
 
 
 # Instancia global del rate limiter
-rate_limiter = SimpleRateLimiter(requests_per_minute=60)
+rate_limiter = RateLimiter(max_requests=60, window_seconds=60)
 
 
 def check_rate_limit(client_ip: str) -> None:
