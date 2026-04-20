@@ -2560,7 +2560,7 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
         return False
 
 
-def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> dict | None:
+def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optional[dict]:
     """
     Envía audio a AudD y devuelve track_data si se identifica, None si no.
     """
