@@ -244,3 +244,21 @@ Ninguno bloquea el servicio actual, pero **B-H2 (rate limiting off)** es el mas
 urgente — un atacante con curl y un MP3 grande puede saturar la CPU del worker
 Render.
 
+## Fixes aplicados 2026-04-20 (misma sesion)
+
+| ID | Estado | Detalle |
+|----|--------|---------|
+| **B-H1** | ✅ FIXED | Admin token comparado con `hmac.compare_digest` en `sync_endpoints.py:1099`, `sync_endpoints.py:939` (`/sync/clear`), y `routes/admin.py:42` |
+| **B-H2** | ✅ FIXED | `check_rate_limit(get_client_ip(request))` reactivado en `/analyze`; añadido tambien a `/identify` y `/recognize` (antes sin limite). Usa el limiter por defecto 60req/60s — refinar con limite estricto es trabajo futuro |
+| **B-H3** | ✅ FIXED | `X-Original-Path` validado con `os.path.abspath()` + comprobacion `isfile()` + `access(R_OK)` en `/analyze`. Si el header trae basura, se descarta silenciosamente y `original_path=""` |
+| **B-M1** | ⏳ PENDING | 3× bare `except:` (main.py:2034, 2862, 3028) — mejora logging, no urgente |
+| **B-M2** | ⏳ PENDING | `database.py` conexiones duplicadas — refactor mayor |
+| **B-M3** | ⏳ PENDING | `SELECT *` fragil — refactor mayor |
+| **B-M4** | ⏳ PENDING | Sync endpoints sin rate limit post-auth — pendiente diseño |
+| **B-M5** | ⏳ PENDING | CORS wildcard+credentials DEBUG — fix pequeño pero requiere testeo |
+| **B-M6** | ⏳ PENDING | community cues endpoint devuelve tuples |
+| **B-L1..L5** | ⏳ PENDING | logging, startup checks, validation extra |
+
+**Resumen:** 3/14 findings resueltos (los 3 HIGH de seguridad).
+11 pendientes son mejoras de ingenieria, ninguna release-blocker.
+

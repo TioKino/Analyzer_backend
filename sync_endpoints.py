@@ -936,7 +936,9 @@ async def sync_clear(request: Request, device_id: Optional[str] = None):
     # Full clear requires valid ADMIN_TOKEN
     admin_key = request.headers.get("X-Admin-Key", "")
 
-    if not device_id and not (admin_key and ADMIN_TOKEN and admin_key == ADMIN_TOKEN):
+    # Constant-time comparison to prevent timing attacks on the admin key.
+    admin_ok = bool(admin_key and ADMIN_TOKEN and _hmac.compare_digest(admin_key, ADMIN_TOKEN))
+    if not device_id and not admin_ok:
         raise HTTPException(
             status_code=403,
             detail="Full clear requires valid X-Admin-Key header. Per-device clear requires device_id param."
@@ -1096,7 +1098,10 @@ async def _verify_admin(request: Request):
             raise HTTPException(status_code=500, detail="ADMIN_TOKEN required in production")
         return
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or auth[7:] != ADMIN_TOKEN:
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "Admin token required")
+    # Constant-time comparison to prevent timing attacks.
+    if not _hmac.compare_digest(auth[7:], ADMIN_TOKEN):
         raise HTTPException(401, "Admin token required")
 
 
