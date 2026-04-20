@@ -120,3 +120,127 @@ Additional backend fixes:
 - Backend: 3 test files exist (test_api.py, test_validation.py, test_beatport.py)
 - Frontend: No meaningful tests (placeholder only)
 - **Recommendation**: Add integration tests for all fixed endpoints
+
+---
+
+# Deep Re-Audit — 2026-04-20
+
+Findings **incremental** respecto al audit original 2026-04-11. Cambios en el
+backend desde entonces: admin endpoints, community notes/ratings/popularity,
+Redis rate limiter opcional, genre mappings externalizados a JSON,
+Pydantic v2 completo, `dict | None → Optional[dict]` para Python 3.9.
+
+Los findings historicos de la tabla "BUGS FIXED" estan verificados como
+cerrados. Los de "KNOWN ISSUES NOT FIXED" se revalidan abajo con su estado
+actual.
+
+## Nuevos hallazgos HIGH
+
+**B-H1 — `sync_endpoints.py:1099`, `routes/admin.py:42` — timing attack en admin token**
+Comparacion con `==` plano en lugar de `hmac.compare_digest()`. Las rutas de
+sync HMAC si usan `compare_digest` correctamente (linea 70); la inconsistencia
+afecta solo a endpoints admin.
+Fix:
+```python
+import hmac
+if not hmac.compare_digest(auth[7:], ADMIN_TOKEN):
+    raise HTTPException(403, "invalid admin token")
+```
+
+**B-H2 — `main.py:1749` — rate limiting DESACTIVADO en `/analyze`**
+`# check_rate_limit(get_client_ip(request))` comentado. El endpoint mas caro
+(hasta 100MB, minutos de CPU con librosa) esta expuesto sin limite. Mismo caso
+en `/identify` y `/recognize`. En Render Standard single-worker esto es un
+vector de DoS trivial. Reactivar con limites estrictos (5-10 req/min/IP para
+endpoints de analisis, 60 para los demas).
+
+**B-H3 — `main.py:1752` — header `X-Original-Path` sin validar**
+`original_path = request.headers.get("X-Original-Path", "")` se propaga a
+`generate_preview_snippet(file_path=original_path, ...)`. Hoy ffmpeg se invoca
+como subprocess con lista (no shell=True), asi que no hay RCE, pero es path
+traversal latente si algun codepath futuro concatena la ruta a un shell. Validar
+con `os.path.abspath()` y whitelist contra ARTWORK_CACHE_DIR / allowed roots.
+
+## Nuevos hallazgos MEDIUM
+
+**B-M1 — `main.py:2034, 2862, 3028` — tres bare `except:`**
+Capturan `SystemExit`, `KeyboardInterrupt`, errores de memoria. Enmascaran
+bugs y rompen shutdown grace. Cambiar a `except Exception as e: logger.warning(...)`.
+
+**B-M2 — `database.py:204-210+` — cada helper crea conexion nueva**
+`AnalysisDB.get_track_by_filename`, `get_analysis`, `save_*`, `update_*` hacen
+`sqlite3.connect(self.db_path)` en cada llamada en vez de usar `self.conn`
+(que si esta en WAL). Se pierde el beneficio de la conexion persistente y
+se duplica overhead en ~10 metodos. Refactor: usar `with self.conn:` para
+transacciones, o pool.
+
+**B-M3 — `SELECT *` fragil a column drift**
+`database.py:207,215,227,356-416` y `community_cues_endpoint.py:223,257`.
+`_row_to_dict` usa indices hardcodeados (0=id, 11=analysis_json, 14=chromaprint).
+Cualquier `ALTER TABLE ADD COLUMN` intermedio rompe el mapping. Refactor a
+`cursor.description` + dict lookup o Pydantic row models.
+
+**B-M4 — sync endpoints sin rate limiting post-auth**
+HMAC valida, pero una vez autenticado un device puede spam `/sync/push` sin
+limites. MAX_DEVICES_PER_USER=20 previene creacion masiva, no exfiltracion.
+Anadir limite por `device_id` (100 push/min).
+
+**B-M5 — CORS `["*"]` + `allow_credentials=True` en DEBUG**
+`main.py:327-328`. Los browsers modernos lo rechazan (RFC 6750). Si `DEBUG=true`
+llega a produccion por error, los requests cross-origin fallan silencio.
+Cambiar default DEBUG a `["http://localhost:3000", "http://localhost:8000"]`.
+
+**B-M6 — `community_cues_endpoint.py:223,257` — devuelve tuples sin validar**
+Queries retornan tuples crudos, response sin Pydantic. Si cambia el schema,
+unpack falla. Mapear a `CommunityResponse` model.
+
+## Nuevos hallazgos LOW
+
+**B-L1 — 151 ocurrencias de `print()` en `main.py`**
+Polutan stdout de Render, bypass del nivel de logger. Migrar a `logger.info/debug`.
+
+**B-L2 — `config.py:162` no falla al arranque si `ADMIN_TOKEN` vacio en prod**
+Print warning y sigue. En Render sin ADMIN_TOKEN, todos los admin endpoints
+devuelven 500 opaco. Fail-fast: `if os.environ.get("RENDER") and not ADMIN_TOKEN: sys.exit(1)`.
+
+**B-L3 — `/search/artist/{artist}`, `/search/genre/{genre}` — sin validate**
+`main.py:2896-2910` no pasan por `validation.sanitize_string()`. Los otros
+`/search/*` si. Anadir validacion por consistencia.
+
+**B-L4 — `preview_generator.py:57` — timeout 15s**
+En Render Standard con CPU compartida, archivos de 200+MB pueden fallar por
+timeout. Subir a 30-45s via env var `PREVIEW_TIMEOUT_SECONDS`.
+
+**B-L5 — `railway.toml` obsoleto vs CLAUDE.md**
+El proyecto despliega en Render (per CLAUDE.md). `railway.toml` sigue en repo
+con comentarios referenciando Railway. `.env.example` tambien menciona
+`tu-app.railway.app`. O se marca Railway como deploy alternativo (mantener) o
+se elimina (mas limpio).
+
+## Verificacion de "KNOWN ISSUES NOT FIXED" del audit 2026-04-11
+
+| # | Issue original | Estado 2026-04-20 |
+|---|----------------|-------------------|
+| Backend 1 | `has_heavy_bass` usa amplitud inicial | **Sin cambios** — sigue igual |
+| Backend 2 | Beatport `track_type_source` sobrescrito | **Sin cambios** |
+| Backend 3 | CORS wildcard+credentials en DEBUG | **Sin cambios** (documentado aqui B-M5) |
+| Backend 4 | Genero overlap BPM 120-130 | **Sin cambios** (spectral_genre_classifier.py) |
+| Backend 5 | `artwork_and_cuepoints.py` hardcodea `/data/artwork_cache` | **CORREGIDO** (commit 286cb49) |
+| Backend 6 | `search_analyzed_endpoint.py`, `endpoints_adicionales.py` dead | **ELIMINADOS** (commits 6320a5b, 8de1c10) |
+| Backend 7 | `test_beatport.py` no-pytest | **Sin cambios** |
+
+## Resumen por categoria (nuevos hallazgos)
+
+| Categoria | Count |
+|-----------|-------|
+| Security | 3 (HIGH) + 1 (MED) |
+| Database | 2 (MED) |
+| API Design | 2 (MED) + 1 (LOW) |
+| Logging/Config | 1 (LOW) |
+| Dead/obsolete config | 1 (LOW) |
+
+**Total 2026-04-20:** 3 HIGH + 6 MED + 5 LOW = **14 nuevos findings**.
+Ninguno bloquea el servicio actual, pero **B-H2 (rate limiting off)** es el mas
+urgente — un atacante con curl y un MP3 grande puede saturar la CPU del worker
+Render.
+
