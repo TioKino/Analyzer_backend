@@ -1,6 +1,7 @@
 """
 Admin route handlers for DJ Analyzer Pro API.
 """
+import hmac
 import os
 import sqlite3
 import logging
@@ -39,7 +40,10 @@ async def _verify_admin_token(request: Request):
             raise HTTPException(status_code=500, detail="ADMIN_TOKEN required in production")
         return  # Dev mode local: sin token
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or auth[7:] != ADMIN_TOKEN:
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "Admin token requerido")
+    # Constant-time comparison to prevent timing attacks.
+    if not hmac.compare_digest(auth[7:], ADMIN_TOKEN):
         raise HTTPException(401, "Admin token requerido")
 
 

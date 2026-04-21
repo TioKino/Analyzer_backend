@@ -1741,15 +1741,30 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
 
 @app.post("/analyze", response_model=AnalysisResult)
 async def analyze_track(
-    request: Request, 
+    request: Request,
     file: UploadFile = File(...),
     force: bool = Query(False, description="Forzar reanalisis ignorando cache")
 ):
-    #  Rate limiting (opcional - descomenta si quieres)
-    # check_rate_limit(get_client_ip(request))
-    
-    # Obtener path original del cliente (para generacion de previews)
-    original_path = request.headers.get("X-Original-Path", "")
+    # Rate limiting — /analyze es CPU-bound (librosa) y acepta hasta 100MB,
+    # por lo que es un vector de DoS trivial sin limite. Ver AUDIT 2026-04-20 B-H2.
+    check_rate_limit(get_client_ip(request))
+
+    # Obtener path original del cliente (para generacion de previews).
+    # Validar para mitigar path traversal: solo aceptamos rutas absolutas
+    # normalizadas; si el cliente envia algo raro lo descartamos silenciosamente.
+    # Ver AUDIT 2026-04-20 B-H3.
+    raw_original_path = request.headers.get("X-Original-Path", "")
+    original_path = ""
+    if raw_original_path:
+        try:
+            normalized = os.path.abspath(raw_original_path)
+            # Solo usar la ruta si apunta a un fichero existente y legible.
+            # La unica razon para aceptarla es que el engine local la use para
+            # generar previews desde el mismo PC donde corren backend + app.
+            if os.path.isfile(normalized) and os.access(normalized, os.R_OK):
+                original_path = normalized
+        except (OSError, ValueError):
+            original_path = ""
 
     #  Validacin mejorada de archivo
     if not file.filename:
@@ -2139,10 +2154,10 @@ async def save_correction(request: CorrectionRequest):
 # ==================== IDENTIFICAR TRACK CON AUDD ====================
 
 @app.post("/identify")
-async def identify_track(file: UploadFile = File(...)):
+async def identify_track(request: Request, file: UploadFile = File(...)):
     """
     Identifica un track usando AudD y hace RE-ANALISIS COMPLETO.
-    
+
     Flujo:
     1. AudD identifica artista/ttulo
     2. Busca g(c)nero en Discogs con el nuevo nombre
@@ -2150,11 +2165,14 @@ async def identify_track(file: UploadFile = File(...)):
     4. Busca artwork online
     5. Actualiza todo en BD
     """
+    # Rate limiting — endpoint caro (AudD + Discogs + re-analisis).
+    check_rate_limit(get_client_ip(request))
+
     try:
         from api_config import AUDD_API_TOKEN
     except ImportError:
         AUDD_API_TOKEN = None
-    
+
     if not AUDD_API_TOKEN:
         raise HTTPException(500, "AudD API token no configurado")
     
@@ -2594,12 +2612,15 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optiona
 
 
 @app.post("/recognize")
-async def recognize_audio(file: UploadFile = File(...)):
+async def recognize_audio(request: Request, file: UploadFile = File(...)):
     """
     Reconoce una canción a partir de audio grabado usando AudD API.
     Preprocesa el audio (normalización, filtrado de ruido) y reintenta
     con diferentes estrategias si el primer intento falla.
     """
+    # Rate limiting — endpoint caro (preprocesado + AudD retries).
+    check_rate_limit(get_client_ip(request))
+
     try:
         from api_config import AUDD_API_TOKEN
     except ImportError:
