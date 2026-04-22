@@ -22,6 +22,15 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
     os.chdir(BASE_DIR)
     sys.path.insert(0, sys._MEIPASS)
+
+    # PyInstaller en modo windowed (runw.exe) deja sys.stdout/sys.stderr como
+    # None porque no hay consola. Cualquier print() legacy o cualquier libreria
+    # que llame a sys.stderr.isatty() revienta con AttributeError. Redirigimos
+    # a devnull (los logs utiles van al engine.log via FileHandler).
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w')
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w')
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     os.chdir(BASE_DIR)
@@ -76,12 +85,17 @@ def main():
     signal.signal(signal.SIGTERM, handle_exit)
 
     # Arrancar servidor
+    # log_config=None: le decimos a uvicorn que NO configure su propio logging.
+    # En PyInstaller windowed su default llama a sys.stderr.isatty() al
+    # construir el formatter y revienta porque stderr es None. Con None,
+    # uvicorn usa el logging ya configurado arriba (FileHandler -> engine.log).
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=8000,
         log_level="info",
         access_log=True,
+        log_config=None,
     )
 
 
