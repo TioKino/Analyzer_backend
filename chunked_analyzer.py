@@ -136,6 +136,17 @@ class ChunkedAudioAnalyzer:
     
     def analyze_chunk_key(self, y: np.ndarray, sr: int) -> Dict:
         """Analiza key/tonalidad de un chunk."""
+        # Guard contra chunks vacios o demasiado cortos. chroma_cqt necesita
+        # minimo ~2^7 muestras para 7 octavas; con <1 segundo suele fallar
+        # con librosa.ParameterError. Pasa en tracks largos cuando el ultimo
+        # chunk queda partido por el boundary.
+        min_samples = sr  # 1 segundo como minimo razonable
+        if y is None or len(y) < min_samples:
+            logger.warning(
+                f"Chunk key skip: len={len(y) if y is not None else 'None'} "
+                f"< min={min_samples} (sr={sr})"
+            )
+            return {'key': 'C', 'scale': 'major', 'confidence': 0.0, 'chroma_vector': []}
         try:
             chroma = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12)
             chroma_mean = np.mean(chroma, axis=1)
@@ -170,8 +181,11 @@ class ChunkedAudioAnalyzer:
                 'confidence': max(0, min(1, best_corr)),
                 'chroma_vector': chroma_mean.tolist()
             }
-        except (ValueError, TypeError, RuntimeError) as e:
-            logger.warning(f"Error Key chunk: {e}")
+        except Exception as e:
+            # Capturamos generico porque librosa levanta ParameterError
+            # (subclase de Exception) y otras excepciones propias que no
+            # estaban cubiertas por la tripleta original.
+            logger.warning(f"Error Key chunk: {type(e).__name__}: {e}")
             return {'key': 'C', 'scale': 'major', 'confidence': 0.0, 'chroma_vector': []}
     
     def analyze_chunk_energy(self, y: np.ndarray, sr: int, chunk_start: float) -> Dict:
