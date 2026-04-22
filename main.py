@@ -322,9 +322,20 @@ _startup_time = time.time()
 app.include_router(sync_router)
 app.include_router(admin_panel_router)
 
+# CORS: en DEBUG permitimos los origins tipicos de dev local (Flutter web,
+# desktop con file://, localhost). "*" + allow_credentials es invalido por
+# RFC 6750 — los browsers modernos lo rechazan silencio. Ver AUDIT 2026-04-20 B-M5.
+_DEBUG_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:8000",
+    "http://localhost:8080",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8080",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS if not DEBUG else ["*"],
+    allow_origins=CORS_ORIGINS if not DEBUG else _DEBUG_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Signature", "X-Device-Id", "X-Original-Path", "X-Admin-Secret"],
@@ -2046,8 +2057,8 @@ async def analyze_track(
             if ARTWORK_ENABLED:
                 try:
                     id3_data = extract_id3_metadata(tmp_path)
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning("ID3 extract fallo en %s: %s", file.filename, e)
             
             # Parsear filename
             parsed = parse_filename(file.filename)
@@ -2880,8 +2891,8 @@ async def get_analysis(filename: str):
             analysis_json = existing[11]  # ndice de analysis_json
             if analysis_json:
                 return json.loads(analysis_json)
-        except:
-            pass
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning("analysis_json cacheado corrupto, fallback a respuesta basica: %s", e)
         
         # Fallback: construir respuesta bsica
         return {
@@ -3046,8 +3057,9 @@ async def search_analyzed_track(
                     full_analysis = json.loads(track_dict['analysis_json'])
                     # Combinar con los campos bsicos
                     track_dict.update(full_analysis)
-                except:
-                    pass
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning("analysis_json corrupto en track %s: %s",
+                                   track_dict.get('id'), e)
             
             # Eliminar el JSON crudo del response
             if track_dict and 'analysis_json' in track_dict:
