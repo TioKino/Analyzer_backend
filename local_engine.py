@@ -55,11 +55,17 @@ logger = logging.getLogger(__name__)
 # en todas sus subprocess.run. La ruta absoluta evita WinError 448 en
 # Windows 11 24H2+ cuando el PATH contiene reparse points (OneDrive,
 # junctions, symlinks). El .spec empaqueta ffmpeg.exe junto al engine.
+#
+# PyInstaller 6+ pone los binaries en `_internal/` dentro del bundle
+# one-folder, no en la raiz. Por eso la primera candidatura que miramos
+# tras el cwd es `BASE_DIR/_internal/ffmpeg.exe`.
 _ffmpeg_candidates = [
-    os.path.join(BASE_DIR, 'ffmpeg.exe'),   # Windows (bundle PyInstaller)
-    os.path.join(BASE_DIR, 'ffmpeg'),        # Linux/Mac (bundle PyInstaller)
-    shutil.which('ffmpeg.exe'),              # PATH Windows
-    shutil.which('ffmpeg'),                  # PATH Linux/Mac
+    os.path.join(BASE_DIR, '_internal', 'ffmpeg.exe'),   # PyInstaller 6+ Windows
+    os.path.join(BASE_DIR, '_internal', 'ffmpeg'),        # PyInstaller 6+ Linux/Mac
+    os.path.join(BASE_DIR, 'ffmpeg.exe'),                 # PyInstaller <6 o manual
+    os.path.join(BASE_DIR, 'ffmpeg'),
+    shutil.which('ffmpeg.exe'),                           # PATH Windows
+    shutil.which('ffmpeg'),                               # PATH Linux/Mac
 ]
 for _c in _ffmpeg_candidates:
     if _c and os.path.isfile(_c):
