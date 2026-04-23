@@ -42,8 +42,13 @@ def generate_preview_snippet(
         start = 0
 
     try:
+        # Usar FFMPEG_BIN absoluto si esta seteado (lo pone local_engine.py).
+        # En Windows 11 24H2+ pasar solo 'ffmpeg' hace que CreateProcessW
+        # recorra el PATH y dispare WinError 448 si hay reparse points
+        # (OneDrive/junctions/symlinks) en alguno de los dirs del PATH.
+        ffmpeg_bin = os.environ.get('FFMPEG_BIN', 'ffmpeg')
         cmd = [
-            'ffmpeg', '-y',
+            ffmpeg_bin, '-y',
             '-ss', str(round(start, 2)),
             '-i', file_path,
             '-t', '6',

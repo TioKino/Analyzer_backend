@@ -1058,8 +1058,13 @@ def generate_preview_snippet(
         start = 0
     
     try:
+        # FFmpeg con ruta absoluta cuando FFMPEG_BIN esta seteado (lo pone
+        # local_engine.py). Evita WinError 448 en Windows 11 24H2+ cuando
+        # hay reparse points en el PATH. Fallback a 'ffmpeg' para produccion
+        # Render donde esta en PATH limpio.
+        ffmpeg_bin = os.environ.get('FFMPEG_BIN', 'ffmpeg')
         cmd = [
-            'ffmpeg', '-y',
+            ffmpeg_bin, '-y',
             '-ss', str(round(start, 2)),
             '-i', file_path,
             '-t', '6',
@@ -2565,11 +2570,13 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
     """
     import subprocess
     try:
+        # Ver comentario en generate_preview_snippet sobre FFMPEG_BIN.
+        ffmpeg_bin = os.environ.get('FFMPEG_BIN', 'ffmpeg')
         if strategy == "normalize":
             # Normalizar volumen + filtro high-pass a 80Hz (elimina ruido de ambiente/aire acondicionado)
             # + limitar frecuencias altas innecesarias para fingerprinting
             cmd = [
-                'ffmpeg', '-y', '-i', input_path,
+                ffmpeg_bin, '-y', '-i', input_path,
                 '-af', 'highpass=f=80,lowpass=f=16000,loudnorm=I=-16:TP=-1.5:LRA=11,silenceremove=start_periods=1:start_silence=0.5:start_threshold=-40dB:stop_periods=-1:stop_silence=0.3:stop_threshold=-40dB',
                 '-ar', '44100', '-ac', '1',
                 '-acodec', 'pcm_s16le',
@@ -2579,7 +2586,7 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
             # Filtrado más agresivo: banda 200-8000Hz (rango vocal/melódico principal),
             # compresión dinámica fuerte para igualar volúmenes, normalización
             cmd = [
-                'ffmpeg', '-y', '-i', input_path,
+                ffmpeg_bin, '-y', '-i', input_path,
                 '-af', 'highpass=f=200,lowpass=f=8000,acompressor=threshold=-20dB:ratio=6:attack=5:release=50,loudnorm=I=-14:TP=-1:LRA=7,silenceremove=start_periods=1:start_silence=0.3:start_threshold=-35dB:stop_periods=-1:stop_silence=0.2:stop_threshold=-35dB',
                 '-ar', '44100', '-ac', '1',
                 '-acodec', 'pcm_s16le',
@@ -2588,7 +2595,7 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
         else:  # raw_wav
             # Solo convertir a WAV sin procesamiento
             cmd = [
-                'ffmpeg', '-y', '-i', input_path,
+                ffmpeg_bin, '-y', '-i', input_path,
                 '-ar', '44100', '-ac', '1',
                 '-acodec', 'pcm_s16le',
                 output_path
@@ -3429,18 +3436,17 @@ async def health():
     except Exception as e:
         db_status = f"error: {e}"
 
-    # FFmpeg check
-    ffmpeg_status = "not_found"
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
+    # FFmpeg check: solo verificar que es accesible como archivo.
+    # NO usamos subprocess.run porque en Windows 11 24H2+ lanza WinError 448
+    # si algun dir del PATH tiene un reparse point (OneDrive/junctions/symlinks).
+    # Basta con saber que el binario existe para el health check.
+    ffmpeg_bin = os.environ.get('FFMPEG_BIN')
+    if ffmpeg_bin and os.path.isfile(ffmpeg_bin):
         ffmpeg_status = "available"
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    elif shutil.which('ffmpeg'):
+        ffmpeg_status = "available"
+    else:
+        ffmpeg_status = "not_found"
 
     # Disk space
     try:

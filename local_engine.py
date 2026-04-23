@@ -16,6 +16,7 @@ import logging
 import sys
 import os
 import signal
+import shutil
 
 # Determinar directorio base antes de configurar logging
 if getattr(sys, 'frozen', False):
@@ -48,6 +49,25 @@ logging.basicConfig(
     handlers=handlers,
 )
 logger = logging.getLogger(__name__)
+
+# Resolver FFmpeg a ruta absoluta antes de importar main.
+# main.py y preview_generator.py usan `os.environ.get('FFMPEG_BIN', 'ffmpeg')`
+# en todas sus subprocess.run. La ruta absoluta evita WinError 448 en
+# Windows 11 24H2+ cuando el PATH contiene reparse points (OneDrive,
+# junctions, symlinks). El .spec empaqueta ffmpeg.exe junto al engine.
+_ffmpeg_candidates = [
+    os.path.join(BASE_DIR, 'ffmpeg.exe'),   # Windows (bundle PyInstaller)
+    os.path.join(BASE_DIR, 'ffmpeg'),        # Linux/Mac (bundle PyInstaller)
+    shutil.which('ffmpeg.exe'),              # PATH Windows
+    shutil.which('ffmpeg'),                  # PATH Linux/Mac
+]
+for _c in _ffmpeg_candidates:
+    if _c and os.path.isfile(_c):
+        os.environ['FFMPEG_BIN'] = _c
+        logger.info(f"FFmpeg resuelto a: {_c}")
+        break
+else:
+    logger.warning("ffmpeg no encontrado — previews y waveforms fallaran")
 
 # Configurar variables de entorno ANTES de importar main
 os.environ['PORT'] = '8000'
