@@ -25,7 +25,10 @@ _PREVIEWS_DIR = os.environ.get("PREVIEWS_DIR", "previews_cache")
 # ── Auth dependency ─────────────────────────────────────────
 
 def _get_admin_secret() -> str:
-    return os.environ.get("ADMIN_SECRET", "")
+    # Preferencia: ADMIN_TOKEN (env var unica para todos los admin endpoints).
+    # Fallback a ADMIN_SECRET para compat legacy — los deploys mas viejos la
+    # tenian. Si los dos estan, gana ADMIN_TOKEN.
+    return os.environ.get("ADMIN_TOKEN") or os.environ.get("ADMIN_SECRET") or ""
 
 
 async def _verify_admin_secret(request: Request):
