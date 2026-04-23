@@ -7,6 +7,7 @@ users, tracks, previews, sessions, and global statistics.
 Auth: X-Admin-Secret header checked against ADMIN_SECRET env var.
 """
 
+import hmac
 import json
 import logging
 import os
@@ -35,7 +36,10 @@ async def _verify_admin_secret(request: Request):
             raise HTTPException(500, "ADMIN_SECRET required in production")
         return  # Dev mode: no auth
     header = request.headers.get("X-Admin-Secret", "")
-    if header != secret:
+    # Constant-time comparison para evitar timing attack (finding B-H1 que
+    # se habia pasado por alto en este router; sync_endpoints y routes/admin
+    # si lo tenian aplicado desde el AUDIT 2026-04-20).
+    if not hmac.compare_digest(header, secret):
         raise HTTPException(401, "Invalid or missing X-Admin-Secret")
 
 
