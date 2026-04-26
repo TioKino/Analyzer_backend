@@ -955,6 +955,9 @@ from pathlib import Path as PathLib
 _preview_logger = _logging.getLogger('preview_push')
 _preview_logger.setLevel(_logging.INFO)
 
+logger = _logging.getLogger('dj_analyzer')
+logger.setLevel(_logging.INFO)
+
 # Asegurar directorio de previews
 PathLib(PREVIEWS_DIR).mkdir(parents=True, exist_ok=True)
 
