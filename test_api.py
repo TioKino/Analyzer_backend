@@ -396,7 +396,7 @@ class TestAnalysisResultModel:
 
 class TestCheckAnalyzedEndpoint:
     """Tests para endpoint check-analyzed"""
-    
+
     def test_check_analyzed_returns_dict(self, client):
         response = client.post("/check-analyzed", json=[
             "track1.mp3",
@@ -404,10 +404,65 @@ class TestCheckAnalyzedEndpoint:
         ])
         assert response.status_code == 200
         assert isinstance(response.json(), dict)
-    
+
     def test_check_analyzed_empty_list(self, client):
         response = client.post("/check-analyzed", json=[])
         assert response.status_code == 200
+
+
+# ============================================================================
+# CHECK-ANALYZED-BY-FINGERPRINT (#23: dedup multi-dispositivo)
+# ============================================================================
+
+class TestCheckAnalyzedByFingerprintEndpoint:
+    """Endpoint añadido para que el cliente verifique dedup por contenido
+    (MD5) antes de subir un archivo grande. Útil cuando un track analizado
+    en PC se intenta subir desde móvil con otro nombre."""
+
+    def test_returns_correct_shape(self, client):
+        response = client.post(
+            "/check-analyzed-by-fingerprint",
+            json={"fingerprints": ["a" * 32, "b" * 32]},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body.keys()) >= {
+            "analyzed", "not_analyzed", "total",
+            "analyzed_count", "not_analyzed_count",
+        }
+        # Total cuadra con la entrada
+        assert body["total"] == 2
+
+    def test_empty_list_returns_200(self, client):
+        response = client.post(
+            "/check-analyzed-by-fingerprint",
+            json={"fingerprints": []},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 0
+        assert body["analyzed"] == []
+        assert body["not_analyzed"] == []
+
+    def test_unknown_fingerprint_goes_to_not_analyzed(self, client):
+        # Hash que no debería existir en la BD de tests.
+        unknown = "deadbeef" * 4  # 32 chars hex
+        response = client.post(
+            "/check-analyzed-by-fingerprint",
+            json={"fingerprints": [unknown]},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert unknown in body["not_analyzed"]
+        assert unknown not in body["analyzed"]
+
+    def test_rejects_more_than_500_fingerprints(self, client):
+        too_many = ["a" * 32] * 501
+        response = client.post(
+            "/check-analyzed-by-fingerprint",
+            json={"fingerprints": too_many},
+        )
+        assert response.status_code == 400
 
 
 # ============================================================================
