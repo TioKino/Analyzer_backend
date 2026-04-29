@@ -1881,7 +1881,15 @@ async def analyze_track(
         if not force:
             existing_by_fp = db.get_track_by_fingerprint(fingerprint)
             if existing_by_fp:
-                print(f"[Cache] Track encontrado por fingerprint: {existing_by_fp.get('artist')} - {existing_by_fp.get('title')}")
+                # Log dedup multi-dispositivo: si un track sube desde móvil
+                # con nombre distinto al que tenía en PC, este log permite
+                # verificar que NO se reanaliza.
+                print(
+                    f"[Dedup] Match por fingerprint {fingerprint[:8]}... — "
+                    f"{existing_by_fp.get('artist')} - {existing_by_fp.get('title')} "
+                    f"(filename original en BD: {existing_by_fp.get('filename')!r}, "
+                    f"recibido: {file.filename!r}); reutilizando análisis sin reprocesar."
+                )
                 
                 # Actualizar el filename en la BD para futuras busquedas
                 existing_by_fp['filename'] = file.filename
@@ -2903,20 +2911,61 @@ async def check_analyzed(filenames: list[str]):
     """Verificar cules tracks ya estn analizados"""
     analyzed = []
     not_analyzed = []
-    
+
     for filename in filenames:
         existing = db.get_track_by_filename(filename)
         if existing:
             analyzed.append(filename)
         else:
             not_analyzed.append(filename)
-    
+
     return {
         "analyzed": analyzed,
         "not_analyzed": not_analyzed,
         "total": len(filenames),
         "analyzed_count": len(analyzed),
         "not_analyzed_count": len(not_analyzed)
+    }
+
+
+class CheckAnalyzedByFingerprintRequest(BaseModel):
+    fingerprints: List[str]
+
+
+@app.post("/check-analyzed-by-fingerprint")
+async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintRequest):
+    """
+    Dedup multi-dispositivo: dado un lote de fingerprints (MD5 del contenido
+    del archivo) devuelve cuáles ya están analizados en Render. Esto
+    permite que el cliente (especialmente móvil) evite subir y re-analizar
+    tracks que ya fueron procesados desde otro dispositivo aunque el nombre
+    del fichero sea distinto.
+
+    Máximo 500 IDs por petición.
+    """
+    fps = request.fingerprints or []
+    if len(fps) > 500:
+        raise HTTPException(400, "Máximo 500 fingerprints por petición")
+
+    analyzed: list[str] = []
+    not_analyzed: list[str] = []
+    for fp in fps:
+        if not fp:
+            continue
+        # `get_track_by_fingerprint` ya cubre el caso `id == fingerprint`
+        # para registros antiguos donde el id legacy es el propio MD5.
+        existing = db.get_track_by_fingerprint(fp)
+        if existing:
+            analyzed.append(fp)
+        else:
+            not_analyzed.append(fp)
+
+    return {
+        "analyzed": analyzed,
+        "not_analyzed": not_analyzed,
+        "total": len(fps),
+        "analyzed_count": len(analyzed),
+        "not_analyzed_count": len(not_analyzed),
     }
 
 # ==================== ENDPOINTS DE ARTWORK ====================
