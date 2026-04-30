@@ -2968,6 +2968,43 @@ async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintReque
         "not_analyzed_count": len(not_analyzed),
     }
 
+
+@app.get("/analysis/by-fingerprint/{fingerprint}")
+async def get_analysis_by_fingerprint(fingerprint: str):
+    """Devuelve el análisis cacheado de un track por su fingerprint
+    (MD5 del contenido). El cliente puede usar este endpoint tras
+    `/check-analyzed-by-fingerprint` para hidratar su cache local sin
+    subir el archivo otra vez."""
+    safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
+    if not safe_fp:
+        raise HTTPException(400, "fingerprint inválido")
+    existing = db.get_track_by_fingerprint(safe_fp)
+    if not existing:
+        raise HTTPException(404, "fingerprint no encontrado")
+    raw = existing.get('analysis_json')
+    if raw:
+        try:
+            import json
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    # Fallback: construir desde columnas
+    return {
+        "id": existing.get('id'),
+        "filename": existing.get('filename'),
+        "artist": existing.get('artist'),
+        "title": existing.get('title'),
+        "duration": existing.get('duration') or 0,
+        "bpm": existing.get('bpm') or 0,
+        "key": existing.get('key'),
+        "camelot": existing.get('camelot'),
+        "energy_dj": existing.get('energy_dj') or 5,
+        "genre": existing.get('genre'),
+        "track_type": existing.get('track_type'),
+        "fingerprint": existing.get('fingerprint'),
+    }
+
+
 # ==================== ENDPOINTS DE ARTWORK ====================
 
 @app.get("/analysis/{filename:path}")
