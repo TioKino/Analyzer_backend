@@ -1023,6 +1023,52 @@ def _push_preview_async(fingerprint: str, local_path: str) -> None:
         daemon=True,
     ).start()
 
+
+def _push_artwork_to_render(fingerprint: str, local_path: str) -> None:
+    """Sube el artwork extraído al Render remoto cuando el engine local
+    acaba de cachearlo. Sin esto, los devices que sincronicen desde
+    Render verían 404 al pedir `/artwork/{fingerprint}` (las portadas
+    se quedaban en el disco local del PC).
+
+    Mismo patrón que `_push_preview_to_render`. Silencioso si falla.
+    """
+    short_fp = fingerprint[:8] if fingerprint else '--------'
+    try:
+        if not os.getenv('LOCAL_ENGINE'):
+            return
+        render_url = (os.getenv('RENDER_SYNC_URL') or '').rstrip('/')
+        if not render_url:
+            return
+        if not os.path.exists(local_path):
+            return
+        ext = os.path.splitext(local_path)[1].lstrip('.') or 'jpg'
+        mime = 'image/jpeg' if ext.lower() in ('jpg', 'jpeg') else 'image/png'
+        with open(local_path, 'rb') as fp:
+            files = {'file': (f'{fingerprint}.{ext}', fp, mime)}
+            resp = requests.post(
+                f'{render_url}/artwork/upload/{fingerprint}',
+                files=files,
+                timeout=15,
+            )
+        if resp.status_code == 200:
+            logger.info(f'[Artwork] Push -> Render OK: {short_fp}')
+        else:
+            body = (resp.text or '')[:200]
+            logger.warning(
+                f'[Artwork] Push -> Render {resp.status_code}: {short_fp} | {body}'
+            )
+    except Exception as push_err:
+        logger.error(f'[Artwork] Push -> Render error ({short_fp}): {push_err}')
+
+
+def _push_artwork_async(fingerprint: str, local_path: str) -> None:
+    """Lanza `_push_artwork_to_render` en un thread daemon."""
+    threading.Thread(
+        target=_push_artwork_to_render,
+        args=(fingerprint, local_path),
+        daemon=True,
+    ).start()
+
 def generate_preview_snippet(
     file_path: str,
     fingerprint: str,
@@ -1440,8 +1486,11 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
             artwork_embedded = True
             artwork_source = "id3"
             # Guardar en cach(c)
-            save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
+            saved_filename = save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
             artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
+            # Si somos local engine, push a Render para que otros devices
+            # puedan ver la portada vía sync (sin esto, móvil veía 404).
+            _push_artwork_async(fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename))
             print(f"   Artwork ID3: {artwork_info.get('size', 0)} bytes")
         else:
             # Fallback: buscar online (iTunes/Deezer)
@@ -1461,8 +1510,9 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                 if online_artwork and online_artwork.get('data'):
                     artwork_embedded = False  # No est embebido, viene de online
                     artwork_source = online_artwork.get('source', 'online')
-                    save_artwork_to_cache(fingerprint, online_artwork['data'], online_artwork['mime_type'])
+                    saved_filename = save_artwork_to_cache(fingerprint, online_artwork['data'], online_artwork['mime_type'])
                     artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
+                    _push_artwork_async(fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename))
                     print(f"   Artwork {artwork_source}: {online_artwork.get('size', 0)} bytes")
                 else:
                     print(f" No se encontr artwork online")
@@ -1685,8 +1735,11 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         
         if artwork_info and artwork_info.get('size', 0) > 10000:
             artwork_embedded = True
-            save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
+            saved_filename = save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
             artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
+            # Si somos local engine, push a Render para que otros devices
+            # puedan ver la portada vía sync (sin esto, móvil veía 404).
+            _push_artwork_async(fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename))
             print(f"   Artwork ID3: {artwork_info.get('size', 0)} bytes")
         else:
             if artist_name and title_name:
@@ -2473,9 +2526,10 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             print(f"   Buscando artwork...")
             artwork_info = search_artwork_online(artist, title)
             if artwork_info:
-                save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
+                saved_filename = save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
                 artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
                 artwork_source = artwork_info.get('source', 'online')
+                _push_artwork_async(fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename))
                 print(f"Artwork: {artwork_source} ({artwork_info['size']} bytes)")
             else:
                 print(f"No se encontr artwork")
@@ -3048,14 +3102,87 @@ async def get_analysis(filename: str):
 
 @app.get("/artwork/{track_id}")
 async def get_artwork(track_id: str):
-    """Devuelve el artwork de un track como imagen"""
+    """Devuelve el artwork de un track como imagen.
+
+    Cascade:
+      1. Cache local (`{ARTWORK_CACHE_DIR}/{track_id}.{ext}`).
+      2. Si la BD tiene el track pero falta el archivo (típicamente
+         tracks analizados con motor local cuyo PUSH a Render falló o
+         no se hizo), buscamos artwork online (iTunes/Deezer) usando
+         artist+title de la BD y lo cacheamos para futuras peticiones.
+      3. 404 si nada de lo anterior funciona.
+    """
     for ext in ['jpg', 'png', 'jpeg']:
         cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
         if os.path.exists(cache_path):
             media_type = "image/jpeg" if ext in ['jpg', 'jpeg'] else "image/png"
             return FileResponse(cache_path, media_type=media_type)
-    
+
+    # Fallback: buscar online por artist+title si tenemos el track en BD.
+    try:
+        existing = db.get_track_by_fingerprint(track_id) or db.get_track_by_id(track_id)
+        if existing:
+            artist = existing.get('artist')
+            title = existing.get('title')
+            if artist and title and search_artwork_online:
+                logger.info(f"[Artwork] Cache MISS para {track_id[:8]}, buscando online...")
+                online = search_artwork_online(artist, title)
+                if online and online.get('data'):
+                    saved = save_artwork_to_cache(
+                        track_id, online['data'], online['mime_type'])
+                    saved_path = os.path.join(ARTWORK_CACHE_DIR, saved)
+                    media_type = online['mime_type']
+                    return FileResponse(saved_path, media_type=media_type)
+    except Exception as e:
+        logger.warning(f"[Artwork] Fallback online error: {e}")
+
     raise HTTPException(404, "Artwork no encontrado")
+
+
+@app.post("/artwork/upload/{fingerprint}")
+async def upload_artwork(fingerprint: str, file: UploadFile = File(...)):
+    """Recibe artwork desde el local engine para que Render lo sirva
+    también a otros devices vía `/artwork/{fingerprint}`. Sin esto,
+    cuando el local engine analiza un track el artwork se queda en
+    disco PC y los móviles ven placeholder.
+
+    Sanitiza el fingerprint (solo hex 32 chars). Acepta JPEG/PNG.
+    Idempotente: re-subir el mismo fp sobreescribe.
+    """
+    safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
+    if not safe_fp or len(safe_fp) > 64:
+        raise HTTPException(400, "fingerprint inválido")
+
+    content = await file.read()
+    if not content or len(content) < 100:
+        raise HTTPException(400, "archivo vacío o demasiado pequeño")
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(400, "artwork demasiado grande (max 5MB)")
+
+    # Detectar tipo por bytes mágicos. Defaults a jpg si no clarifica.
+    if content[:3] == b'\xff\xd8\xff':
+        ext = 'jpg'
+    elif content[:8] == b'\x89PNG\r\n\x1a\n':
+        ext = 'png'
+    else:
+        # No reconocido — rechazar para no llenar el disco con basura.
+        raise HTTPException(400, "formato no soportado (sólo JPEG/PNG)")
+
+    # Eliminar versiones previas con otra extensión para evitar dos
+    # archivos del mismo fingerprint en el cache.
+    for prev_ext in ('jpg', 'jpeg', 'png'):
+        prev = os.path.join(ARTWORK_CACHE_DIR, f"{safe_fp}.{prev_ext}")
+        if os.path.exists(prev):
+            try:
+                os.unlink(prev)
+            except OSError:
+                pass
+
+    cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{safe_fp}.{ext}")
+    with open(cache_path, 'wb') as f:
+        f.write(content)
+
+    return {"status": "ok", "fingerprint": safe_fp, "size": len(content), "ext": ext}
 
 # ==================== ENDPOINTS DE BUSQUEDA ====================
 
