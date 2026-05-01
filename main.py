@@ -3107,6 +3107,28 @@ async def get_analysis(filename: str):
     
     raise HTTPException(404, f"Anlisis no encontrado para: {filename}")
 
+@app.head("/artwork/{track_id}")
+async def head_artwork(track_id: str):
+    """HEAD para /artwork/{track_id} - el cliente desktop pre-comprueba
+    existencia antes de subir su propio artwork (evita re-upload). Solo
+    mira el cache local del disco; NO dispara el fallback online del GET
+    (search_artwork_online tiene side effects: red + escritura a cache).
+    Devuelve 200 con Content-Type/Content-Length, o 404 sin body.
+    """
+    for ext in ('jpg', 'png', 'jpeg'):
+        cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
+        if os.path.exists(cache_path):
+            media_type = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
+            return Response(
+                status_code=200,
+                headers={
+                    "Content-Type": media_type,
+                    "Content-Length": str(os.path.getsize(cache_path)),
+                },
+            )
+    raise HTTPException(404, "Artwork no encontrado")
+
+
 @app.get("/artwork/{track_id}")
 async def get_artwork(track_id: str):
     """Devuelve el artwork de un track como imagen.
