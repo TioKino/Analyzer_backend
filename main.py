@@ -1030,16 +1030,20 @@ def _push_artwork_to_render(fingerprint: str, local_path: str) -> None:
     Render verían 404 al pedir `/artwork/{fingerprint}` (las portadas
     se quedaban en el disco local del PC).
 
-    Mismo patrón que `_push_preview_to_render`. Silencioso si falla.
+    Mismo patrón que `_push_preview_to_render`. Silencioso si falla,
+    pero loguea el motivo para diagnosticar (engine.log).
     """
     short_fp = fingerprint[:8] if fingerprint else '--------'
     try:
         if not os.getenv('LOCAL_ENGINE'):
+            logger.debug('[Artwork] Push skip: LOCAL_ENGINE no set')
             return
         render_url = (os.getenv('RENDER_SYNC_URL') or '').rstrip('/')
         if not render_url:
+            logger.warning('[Artwork] Push skip: RENDER_SYNC_URL vacío')
             return
         if not os.path.exists(local_path):
+            logger.warning(f'[Artwork] Push skip: archivo inexistente {local_path}')
             return
         ext = os.path.splitext(local_path)[1].lstrip('.') or 'jpg'
         mime = 'image/jpeg' if ext.lower() in ('jpg', 'jpeg') else 'image/png'

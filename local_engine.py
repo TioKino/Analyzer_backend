@@ -84,6 +84,14 @@ os.environ['DATABASE_PATH'] = os.path.join(BASE_DIR, 'local_analysis.db')
 os.environ['ARTWORK_CACHE_DIR'] = os.path.join(BASE_DIR, 'artwork_cache')
 os.environ['PREVIEWS_DIR'] = os.path.join(BASE_DIR, 'previews_cache')
 
+# RENDER_SYNC_URL: el motor local lo usa para hacer push de previews/artwork
+# al Render. Flutter (LocalEngineService) lo pasa cuando lanza el engine,
+# pero si el engine arranca standalone (usuario hace doble click en el .exe,
+# o el proceso queda corriendo de una sesión anterior), no llegaría. Default
+# al Render de producción para que push funcione siempre.
+if not os.environ.get('RENDER_SYNC_URL'):
+    os.environ['RENDER_SYNC_URL'] = 'https://dj-analyzer-api.onrender.com'
+
 # Crear directorios si no existen
 os.makedirs(os.environ['ARTWORK_CACHE_DIR'], exist_ok=True)
 os.makedirs(os.environ['PREVIEWS_DIR'], exist_ok=True)
