@@ -10,22 +10,41 @@ class AnalysisDB:
         if db_path is None:
             db_path = os.getenv("DATABASE_PATH", "/data/analysis.db")
         self.db_path = db_path
-        self._conn = None  # Conexin persistente
+        self._conn = None  # Conexion persistente
         self.init_db()
+
+    def _open_conn(self):
+        """Abre conexion nueva con row_factory = sqlite3.Row.
+
+        Habilita acceso a columnas por NOMBRE (row['artist'], row.keys())
+        ademas del acceso por indice tradicional (row[2]). El nuevo
+        acceso por nombre es robusto frente a ALTER TABLE ADD COLUMN
+        y elimina la fragilidad que documentaba B-M3 del AUDIT 2026-04-20
+        (indices hardcodeados en _row_to_dict).
+
+        Las funciones existentes que usan row[N] siguen funcionando
+        sin cambios porque sqlite3.Row soporta ambas formas de acceso.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     @property
     def conn(self):
-        """Propiedad que retorna una conexin a la BD (lazy loading)"""
+        """Conexion persistente con WAL + row_factory (lazy)."""
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.row_factory = sqlite3.Row
         return self._conn
 
     def init_db(self):
+        # En init_db no consultamos columnas, solo creamos tablas/indices,
+        # asi que no hace falta row_factory.
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
 
-        # Tabla de anlisis
+        # Tabla de analisis
         c.execute('''
             CREATE TABLE IF NOT EXISTS tracks (
                 id TEXT PRIMARY KEY,
@@ -46,13 +65,13 @@ class AnalysisDB:
             )
         ''')
 
-        # Migración: añadir columna chromaprint si no existe (BD existentes)
+        # Migracion: anadir columna chromaprint si no existe (BDs antiguas)
         try:
             c.execute('ALTER TABLE tracks ADD COLUMN chromaprint TEXT')
         except sqlite3.OperationalError:
             pass  # Ya existe
 
-        # Crear ndices para bsquedas rpidas
+        # Indices para busquedas rapidas
         c.execute('CREATE INDEX IF NOT EXISTS idx_artist ON tracks(artist)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_genre ON tracks(genre)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_bpm ON tracks(bpm)')
@@ -61,7 +80,7 @@ class AnalysisDB:
         c.execute('CREATE INDEX IF NOT EXISTS idx_camelot ON tracks(camelot)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_chromaprint ON tracks(chromaprint)')
 
-        # Tabla de correcciones manuales (memoria colectiva)
+        # Correcciones manuales (memoria colectiva)
         c.execute('''
             CREATE TABLE IF NOT EXISTS corrections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +94,7 @@ class AnalysisDB:
             )
         ''')
 
-        # Tabla de notas DJ
+        # Notas DJ
         c.execute('''
             CREATE TABLE IF NOT EXISTS dj_notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +106,7 @@ class AnalysisDB:
             )
         ''')
 
-        # Community cues table (for community_cues_endpoint.py)
+        # Community cues (community_cues_endpoint.py)
         c.execute('''
             CREATE TABLE IF NOT EXISTS community_cues (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,7 +137,7 @@ class AnalysisDB:
             )
         ''')
 
-        # Notas comunitarias (tipo SoundCloud - todos los DJs ven las notas de todos)
+        # Notas comunitarias (todos los DJs ven las notas de todos)
         conn.execute('''
             CREATE TABLE IF NOT EXISTS community_notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,7 +153,7 @@ class AnalysisDB:
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_cnotes_fp ON community_notes(fingerprint)')
 
-        # Popularidad de tracks (cuántos DJs lo tienen / han analizado)
+        # Popularidad de tracks
         conn.execute('''
             CREATE TABLE IF NOT EXISTS track_popularity (
                 fingerprint TEXT PRIMARY KEY,
@@ -177,32 +196,26 @@ class AnalysisDB:
         conn.close()
 
     def _row_to_dict(self, row) -> Optional[Dict]:
+        """Convierte una sqlite3.Row de la tabla `tracks` a dict.
+
+        Antes (pre B-M3): indices hardcodeados (row[0]=id, row[11]=analysis_json,
+        row[14]=chromaprint). Cualquier ALTER TABLE intermedio rompia el
+        mapping silenciosamente. Ahora iteramos por `row.keys()`, asi que
+        si manana se anade una columna se incluye automaticamente sin
+        tocar este metodo.
+        """
         if not row:
             return None
 
-        base_dict = {
-            'id': row[0],
-            'filename': row[1],
-            'artist': row[2],
-            'title': row[3],
-            'duration': row[4],
-            'bpm': row[5],
-            'key': row[6],
-            'camelot': row[7],
-            'energy_dj': row[8],
-            'genre': row[9],
-            'track_type': row[10],
-            'analysis_json': row[11],
-            'analyzed_at': row[12],
-            'fingerprint': row[13],
-            'chromaprint': row[14] if len(row) > 14 else None
-        }
+        # sqlite3.Row.keys() devuelve los nombres de las columnas del SELECT.
+        base_dict = {k: row[k] for k in row.keys()}
 
-        # Extraer campos adicionales del analysis_json (artwork_url, label, etc.)
-        if row[11]:  # analysis_json
+        # Enriquecer con campos guardados dentro de analysis_json (artwork_url,
+        # label, year, etc.) que no estan como columnas propias.
+        analysis_json = base_dict.get('analysis_json')
+        if analysis_json:
             try:
-                full_analysis = json.loads(row[11])
-                # A+/-adir campos importantes que no estn en las columnas
+                full_analysis = json.loads(analysis_json)
                 for key in ['artwork_url', 'artwork_embedded', 'label', 'year', 'album',
                            'isrc', 'bpm_source', 'key_source', 'genre_source',
                            'cue_points', 'first_beat', 'beat_interval', 'drop_timestamp']:
@@ -217,7 +230,7 @@ class AnalysisDB:
         return [self._row_to_dict(row) for row in rows if row]
 
     def get_track_by_filename(self, filename):
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT * FROM tracks WHERE filename = ?', (filename,))
         result = c.fetchone()
@@ -225,7 +238,7 @@ class AnalysisDB:
         return result
 
     def get_track_by_id(self, track_id: str) -> Optional[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT * FROM tracks WHERE id = ?', (track_id,))
         result = c.fetchone()
@@ -236,7 +249,7 @@ class AnalysisDB:
         """Busca un track por su fingerprint de audio (memoria colectiva)"""
         if not fingerprint:
             return None
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         # Buscar por fingerprint O por id (que a veces es el fingerprint)
         c.execute('SELECT * FROM tracks WHERE fingerprint = ? OR id = ?', (fingerprint, fingerprint))
@@ -245,7 +258,7 @@ class AnalysisDB:
         return self._row_to_dict(result)
 
     def save_track(self, track_data):
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -274,7 +287,7 @@ class AnalysisDB:
         conn.close()
 
     def save_correction(self, track_id, field, old_value, new_value, fingerprint=None, device_id=None):
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         if device_id and fingerprint:
@@ -305,7 +318,7 @@ class AnalysisDB:
         if not fingerprint:
             return None, 0
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -320,8 +333,8 @@ class AnalysisDB:
         result = c.fetchone()
         conn.close()
 
-        if result and result[1] >= min_votes:
-            return result[0], result[1]
+        if result and result['vote_count'] >= min_votes:
+            return result['new_value'], result['vote_count']
         return None, 0
 
     def get_collective_genre(self, fingerprint):
@@ -337,7 +350,7 @@ class AnalysisDB:
         if not fingerprint:
             return {}
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -352,16 +365,19 @@ class AnalysisDB:
         conn.close()
 
         result = {}
-        for field, value, count in rows:
+        for row in rows:
+            field = row['field']
+            value = row['new_value']
+            count = row['vote_count']
             if field not in result or count > result[field][1]:
                 result[field] = (value, count)
 
         return result
 
-    # ==================== BSQUEDAS ====================
+    # ==================== BUSQUEDAS ====================
 
     def search_by_artist_title(self, artist: str, title: str):
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         artist_pattern = f"%{artist.lower()}%"
@@ -379,7 +395,7 @@ class AnalysisDB:
         return results
 
     def search_by_artist(self, artist: str, limit: int = 50) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -394,7 +410,7 @@ class AnalysisDB:
         return self._rows_to_list(results)
 
     def search_by_genre(self, genre: str, limit: int = 100) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -409,7 +425,7 @@ class AnalysisDB:
         return self._rows_to_list(results)
 
     def search_by_bpm_range(self, min_bpm: float, max_bpm: float, limit: int = 100) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -424,7 +440,7 @@ class AnalysisDB:
         return self._rows_to_list(results)
 
     def search_by_energy(self, min_energy: int, max_energy: int = 10, limit: int = 100) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -439,7 +455,7 @@ class AnalysisDB:
         return self._rows_to_list(results)
 
     def search_by_key(self, key: str, limit: int = 100) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -471,7 +487,7 @@ class AnalysisDB:
         other_letter = 'B' if letter == 'A' else 'A'
         compatible.append(f'{number}{other_letter}')
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         placeholders = ','.join(['?' for _ in compatible])
@@ -487,7 +503,7 @@ class AnalysisDB:
         return self._rows_to_list(results)
 
     def search_by_track_type(self, track_type: str, limit: int = 100) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
         c.execute('''
@@ -501,7 +517,7 @@ class AnalysisDB:
         conn.close()
         return self._rows_to_list(results)
 
-    # Columnas válidas para búsquedas — whitelist de seguridad
+    # Columnas validas para busquedas - whitelist de seguridad
     _VALID_COLUMNS = frozenset({
         'artist', 'genre', 'bpm', 'energy_dj', 'key', 'camelot', 'track_type',
         'title', 'filename', 'duration', 'fingerprint'
@@ -509,10 +525,10 @@ class AnalysisDB:
 
     def search_advanced(self, artist=None, genre=None, min_bpm=None, max_bpm=None,
                        min_energy=None, max_energy=None, key=None, track_type=None, limit=100):
-        """Búsqueda avanzada con múltiples filtros.
+        """Busqueda avanzada con multiples filtros.
         SEGURIDAD: Las condiciones WHERE usan columnas hardcoded (no de user input).
-        Los valores siempre van por parámetros '?' (nunca interpolados)."""
-        conn = sqlite3.connect(self.db_path)
+        Los valores siempre van por parametros '?' (nunca interpolados)."""
+        conn = self._open_conn()
         c = conn.cursor()
 
         conditions = []
@@ -557,7 +573,7 @@ class AnalysisDB:
         return self._rows_to_list(results)
 
     def get_all_tracks(self, limit: int = 1000) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT * FROM tracks ORDER BY analyzed_at DESC LIMIT ?', (limit,))
         results = c.fetchall()
@@ -565,50 +581,50 @@ class AnalysisDB:
         return self._rows_to_list(results)
 
     def get_unique_artists(self) -> List[str]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
             SELECT DISTINCT artist FROM tracks
             WHERE artist IS NOT NULL AND artist != ''
             ORDER BY artist COLLATE NOCASE
         ''')
-        results = [row[0] for row in c.fetchall()]
+        results = [row['artist'] for row in c.fetchall()]
         conn.close()
         return results
 
     def get_unique_genres(self) -> List[str]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
             SELECT DISTINCT genre FROM tracks
             WHERE genre IS NOT NULL AND genre != ''
             ORDER BY genre COLLATE NOCASE
         ''')
-        results = [row[0] for row in c.fetchall()]
+        results = [row['genre'] for row in c.fetchall()]
         conn.close()
         return results
 
     def get_stats(self) -> Dict:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
 
-        c.execute('SELECT COUNT(*) FROM tracks')
-        total_tracks = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) AS n FROM tracks')
+        total_tracks = c.fetchone()['n']
 
-        c.execute('SELECT COUNT(DISTINCT artist) FROM tracks WHERE artist IS NOT NULL')
-        unique_artists = c.fetchone()[0]
+        c.execute('SELECT COUNT(DISTINCT artist) AS n FROM tracks WHERE artist IS NOT NULL')
+        unique_artists = c.fetchone()['n']
 
-        c.execute('SELECT COUNT(DISTINCT genre) FROM tracks WHERE genre IS NOT NULL')
-        unique_genres = c.fetchone()[0]
+        c.execute('SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre IS NOT NULL')
+        unique_genres = c.fetchone()['n']
 
-        c.execute('SELECT AVG(bpm) FROM tracks')
-        avg_bpm = c.fetchone()[0] or 0
+        c.execute('SELECT AVG(bpm) AS v FROM tracks')
+        avg_bpm = c.fetchone()['v'] or 0
 
-        c.execute('SELECT AVG(energy_dj) FROM tracks')
-        avg_energy = c.fetchone()[0] or 0
+        c.execute('SELECT AVG(energy_dj) AS v FROM tracks')
+        avg_energy = c.fetchone()['v'] or 0
 
-        c.execute('SELECT SUM(duration) FROM tracks')
-        total_duration = c.fetchone()[0] or 0
+        c.execute('SELECT SUM(duration) AS v FROM tracks')
+        total_duration = c.fetchone()['v'] or 0
 
         conn.close()
 
@@ -622,7 +638,7 @@ class AnalysisDB:
         }
 
     def save_dj_note(self, track_id: str, note: str, fingerprint: Optional[str] = None):
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
             INSERT INTO dj_notes (track_id, fingerprint, note, created_at)
@@ -632,18 +648,18 @@ class AnalysisDB:
         conn.close()
 
     def get_dj_notes(self, track_id: str) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
             SELECT note, created_at FROM dj_notes
             WHERE track_id = ? ORDER BY created_at DESC
         ''', (track_id,))
-        results = [{'note': row[0], 'created_at': row[1]} for row in c.fetchall()]
+        results = [{'note': row['note'], 'created_at': row['created_at']} for row in c.fetchall()]
         conn.close()
         return results
 
     def delete_track(self, track_id: str) -> bool:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('DELETE FROM tracks WHERE id = ?', (track_id,))
         deleted = c.rowcount > 0
@@ -653,7 +669,7 @@ class AnalysisDB:
 
     def delete_track_by_filename(self, filename: str) -> bool:
         """Elimina un track por su filename para permitir reanalisis completo"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('DELETE FROM tracks WHERE filename = ?', (filename,))
         deleted = c.rowcount > 0
@@ -667,7 +683,7 @@ class AnalysisDB:
                             note_text: str, display_name: str = 'DJ',
                             note_type: str = 'general') -> int:
         from datetime import datetime
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
             INSERT OR REPLACE INTO community_notes
@@ -681,7 +697,7 @@ class AnalysisDB:
         return note_id
 
     def get_community_notes(self, fingerprint: str) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
             SELECT id, device_id, display_name, note_text, note_type, upvotes, created_at
@@ -689,14 +705,19 @@ class AnalysisDB:
             ORDER BY upvotes DESC, created_at DESC
         ''', (fingerprint,))
         results = [{
-            'id': r[0], 'device_id': r[1][:8] + '...', 'display_name': r[2],
-            'note_text': r[3], 'note_type': r[4], 'upvotes': r[5], 'created_at': r[6],
+            'id': r['id'],
+            'device_id': r['device_id'][:8] + '...',
+            'display_name': r['display_name'],
+            'note_text': r['note_text'],
+            'note_type': r['note_type'],
+            'upvotes': r['upvotes'],
+            'created_at': r['created_at'],
         } for r in c.fetchall()]
         conn.close()
         return results
 
     def upvote_community_note(self, note_id: int):
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         conn.execute('UPDATE community_notes SET upvotes = upvotes + 1 WHERE id = ?', (note_id,))
         conn.commit()
         conn.close()
@@ -705,7 +726,7 @@ class AnalysisDB:
 
     def increment_popularity(self, fingerprint: str, device_id: str = ''):
         from datetime import datetime
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT analysis_count FROM track_popularity WHERE fingerprint = ?', (fingerprint,))
         row = c.fetchone()
@@ -722,7 +743,7 @@ class AnalysisDB:
 
     def rate_track(self, fingerprint: str, device_id: str, rating: int) -> Dict:
         from datetime import datetime
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
             INSERT INTO track_ratings (fingerprint, device_id, rating, rated_at)
@@ -731,8 +752,10 @@ class AnalysisDB:
         ''', (fingerprint, device_id, rating, datetime.utcnow().isoformat(),
               rating, datetime.utcnow().isoformat()))
         # Recalcular media
-        c.execute('SELECT AVG(rating), COUNT(*) FROM track_ratings WHERE fingerprint = ?', (fingerprint,))
-        avg, count = c.fetchone()
+        c.execute('SELECT AVG(rating) AS avg, COUNT(*) AS cnt FROM track_ratings WHERE fingerprint = ?', (fingerprint,))
+        agg = c.fetchone()
+        avg = agg['avg']
+        count = agg['cnt']
         c.execute('''
             INSERT INTO track_popularity (fingerprint, avg_rating, total_ratings, last_analyzed)
             VALUES (?, ?, ?, ?)
@@ -743,25 +766,29 @@ class AnalysisDB:
         return {'avg_rating': round(avg or 0, 1), 'total_ratings': count or 0}
 
     def get_track_popularity(self, fingerprint: str) -> Dict:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT analysis_count, dj_count, avg_rating, total_ratings FROM track_popularity WHERE fingerprint = ?',
                   (fingerprint,))
         row = c.fetchone()
         conn.close()
         if row:
-            return {'analysis_count': row[0], 'dj_count': row[1],
-                    'avg_rating': round(row[2] or 0, 1), 'total_ratings': row[3] or 0}
+            return {
+                'analysis_count': row['analysis_count'],
+                'dj_count': row['dj_count'],
+                'avg_rating': round(row['avg_rating'] or 0, 1),
+                'total_ratings': row['total_ratings'] or 0,
+            }
         return {'analysis_count': 0, 'dj_count': 0, 'avg_rating': 0, 'total_ratings': 0}
 
     def get_my_rating(self, fingerprint: str, device_id: str) -> int:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT rating FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
                   (fingerprint, device_id))
         row = c.fetchone()
         conn.close()
-        return row[0] if row else 0
+        return row['rating'] if row else 0
 
     # ==================== COMMUNITY BEAT GRID ====================
 
@@ -771,7 +798,7 @@ class AnalysisDB:
         """Guarda o actualiza la correccion de beat grid de un DJ"""
         from datetime import datetime
         now = datetime.utcnow().isoformat()
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
             INSERT INTO beat_grid_corrections (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, created_at, updated_at)
@@ -787,25 +814,26 @@ class AnalysisDB:
 
     def get_community_beat_grid(self, fingerprint: str) -> Dict:
         """Obtiene la correccion promedio de la comunidad para un track"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
-            SELECT AVG(bpm_adjust), AVG(beat_offset), COUNT(*), AVG(original_bpm)
+            SELECT AVG(bpm_adjust) AS bpm_adj, AVG(beat_offset) AS beat_off,
+                   COUNT(*) AS contributors, AVG(original_bpm) AS orig_bpm
             FROM beat_grid_corrections
             WHERE fingerprint = ?
         ''', (fingerprint,))
         row = c.fetchone()
         conn.close()
-        if row and row[2] > 0:
-            contributors = row[2]
+        if row and row['contributors'] and row['contributors'] > 0:
+            contributors = row['contributors']
             # Validado si >= 2 DJs con ajustes similares
             validated = contributors >= 2
             return {
-                'bpm_adjust': round(row[0] or 0.0, 4),
-                'beat_offset': round(row[1] or 0.0, 6),
+                'bpm_adjust': round(row['bpm_adj'] or 0.0, 4),
+                'beat_offset': round(row['beat_off'] or 0.0, 6),
                 'contributors': contributors,
                 'validated': validated,
-                'original_bpm': round(row[3] or 0.0, 2),
+                'original_bpm': round(row['orig_bpm'] or 0.0, 2),
             }
         return {
             'bpm_adjust': 0.0,
@@ -822,7 +850,7 @@ class AnalysisDB:
         """Registra una llamada AudD (incluso fallidas) para honrar cooldown y cap."""
         if not fingerprint:
             return
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         try:
             conn.execute(
                 'INSERT INTO audd_call_log (fingerprint, called_at, success, artist, title) '
@@ -837,15 +865,15 @@ class AnalysisDB:
         """Devuelve timestamp UNIX de la ultima llamada AudD para este fingerprint, o None."""
         if not fingerprint:
             return None
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute(
-                'SELECT MAX(called_at) FROM audd_call_log WHERE fingerprint = ?',
+                'SELECT MAX(called_at) AS last FROM audd_call_log WHERE fingerprint = ?',
                 (fingerprint,),
             )
             row = c.fetchone()
-            return row[0] if row and row[0] else None
+            return row['last'] if row and row['last'] else None
         finally:
             conn.close()
 
@@ -854,14 +882,14 @@ class AnalysisDB:
         today_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp()
-        conn = sqlite3.connect(self.db_path)
+        conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute(
-                'SELECT COUNT(*) FROM audd_call_log WHERE called_at >= ?',
+                'SELECT COUNT(*) AS n FROM audd_call_log WHERE called_at >= ?',
                 (today_start,),
             )
             row = c.fetchone()
-            return row[0] if row else 0
+            return row['n'] if row else 0
         finally:
             conn.close()
