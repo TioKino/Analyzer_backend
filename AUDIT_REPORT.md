@@ -140,82 +140,58 @@ actual.
 Comparacion con `==` plano en lugar de `hmac.compare_digest()`. Las rutas de
 sync HMAC si usan `compare_digest` correctamente (linea 70); la inconsistencia
 afecta solo a endpoints admin.
-Fix:
-```python
-import hmac
-if not hmac.compare_digest(auth[7:], ADMIN_TOKEN):
-    raise HTTPException(403, "invalid admin token")
-```
 
 **B-H2 — `main.py:1749` — rate limiting DESACTIVADO en `/analyze`**
 `# check_rate_limit(get_client_ip(request))` comentado. El endpoint mas caro
-(hasta 100MB, minutos de CPU con librosa) esta expuesto sin limite. Mismo caso
-en `/identify` y `/recognize`. En Render Standard single-worker esto es un
-vector de DoS trivial. Reactivar con limites estrictos (5-10 req/min/IP para
-endpoints de analisis, 60 para los demas).
+(hasta 100MB, minutos de CPU con librosa) esta expuesto sin limite.
 
 **B-H3 — `main.py:1752` — header `X-Original-Path` sin validar**
 `original_path = request.headers.get("X-Original-Path", "")` se propaga a
-`generate_preview_snippet(file_path=original_path, ...)`. Hoy ffmpeg se invoca
-como subprocess con lista (no shell=True), asi que no hay RCE, pero es path
-traversal latente si algun codepath futuro concatena la ruta a un shell. Validar
-con `os.path.abspath()` y whitelist contra ARTWORK_CACHE_DIR / allowed roots.
+`generate_preview_snippet(file_path=original_path, ...)`. Path traversal latente.
 
 ## Nuevos hallazgos MEDIUM
 
 **B-M1 — `main.py:2034, 2862, 3028` — tres bare `except:`**
-Capturan `SystemExit`, `KeyboardInterrupt`, errores de memoria. Enmascaran
-bugs y rompen shutdown grace. Cambiar a `except Exception as e: logger.warning(...)`.
+Capturan `SystemExit`, `KeyboardInterrupt`, errores de memoria. Enmascaran bugs.
 
 **B-M2 — `database.py:204-210+` — cada helper crea conexion nueva**
-`AnalysisDB.get_track_by_filename`, `get_analysis`, `save_*`, `update_*` hacen
-`sqlite3.connect(self.db_path)` en cada llamada en vez de usar `self.conn`
-(que si esta en WAL). Se pierde el beneficio de la conexion persistente y
-se duplica overhead en ~10 metodos. Refactor: usar `with self.conn:` para
-transacciones, o pool.
+~37 métodos hacen `sqlite3.connect(self.db_path)` en cada llamada en vez de
+usar `self.conn` (que ya está en WAL). Refactor: pool / `with self.conn:`.
 
 **B-M3 — `SELECT *` fragil a column drift**
-`database.py:207,215,227,356-416` y `community_cues_endpoint.py:223,257`.
-`_row_to_dict` usa indices hardcodeados (0=id, 11=analysis_json, 14=chromaprint).
-Cualquier `ALTER TABLE ADD COLUMN` intermedio rompe el mapping. Refactor a
-`cursor.description` + dict lookup o Pydantic row models.
+`database.py:_row_to_dict` con índices hardcodeados (0=id, 11=analysis_json,
+14=chromaprint). `community_cues_endpoint.py:223,257` con tuples crudos.
 
 **B-M4 — sync endpoints sin rate limiting post-auth**
-HMAC valida, pero una vez autenticado un device puede spam `/sync/push` sin
-limites. MAX_DEVICES_PER_USER=20 previene creacion masiva, no exfiltracion.
-Anadir limite por `device_id` (100 push/min).
+HMAC valida, pero un device autenticado puede spam `/sync/push,pull,pending`
+sin límite. Añadir limite por `device_id` (ej. 100 push/min).
 
 **B-M5 — CORS `["*"]` + `allow_credentials=True` en DEBUG**
-`main.py:327-328`. Los browsers modernos lo rechazan (RFC 6750). Si `DEBUG=true`
-llega a produccion por error, los requests cross-origin fallan silencio.
-Cambiar default DEBUG a `["http://localhost:3000", "http://localhost:8000"]`.
+`main.py:327-328`. Browsers modernos lo rechazan (RFC 6750).
 
 **B-M6 — `community_cues_endpoint.py:223,257` — devuelve tuples sin validar**
-Queries retornan tuples crudos, response sin Pydantic. Si cambia el schema,
-unpack falla. Mapear a `CommunityResponse` model.
+Queries retornan tuples crudos. Aunque ya hay `CommunityResponse` model, la
+conversión interna en `aggregate_cues_into_zones()` mantiene tuples.
 
 ## Nuevos hallazgos LOW
 
-**B-L1 — 151 ocurrencias de `print()` en `main.py`**
-Polutan stdout de Render, bypass del nivel de logger. Migrar a `logger.info/debug`.
+**B-L1 — ~150 ocurrencias de `print()` en `main.py`**
+Migrar a `logger.info/debug/warning` (logger global ya definido, ver
+commit `c664b45` de 2026-04-26).
 
-**B-L2 — `config.py:162` no falla al arranque si `ADMIN_TOKEN` vacio en prod**
-Print warning y sigue. En Render sin ADMIN_TOKEN, todos los admin endpoints
-devuelven 500 opaco. Fail-fast: `if os.environ.get("RENDER") and not ADMIN_TOKEN: sys.exit(1)`.
+**B-L2 — `config.py` no falla al arranque si `ADMIN_TOKEN` vacio en prod**
+Print warning y sigue. En Render sin ADMIN_TOKEN los endpoints admin
+tiran 500 opaco. Fail-fast: `sys.exit(1)` si `RENDER` y no token.
 
-**B-L3 — `/search/artist/{artist}`, `/search/genre/{genre}` — sin validate**
-`main.py:2896-2910` no pasan por `validation.sanitize_string()`. Los otros
-`/search/*` si. Anadir validacion por consistencia.
+**B-L3 — `/search/artist/{artist}` sin sanitize**
+`/search/genre` sí pasa por `validate_genre()` + `validate_limit()`,
+`/search/artist` no pasa por `sanitize_string()`. Inconsistencia.
 
-**B-L4 — `preview_generator.py:57` — timeout 15s**
-En Render Standard con CPU compartida, archivos de 200+MB pueden fallar por
-timeout. Subir a 30-45s via env var `PREVIEW_TIMEOUT_SECONDS`.
+**B-L4 — `preview_generator.py` timeout 15s hardcodeado**
+En Render Standard con CPU compartida, archivos de 200+MB pueden fallar.
 
-**B-L5 — `railway.toml` obsoleto vs CLAUDE.md**
-El proyecto despliega en Render (per CLAUDE.md). `railway.toml` sigue en repo
-con comentarios referenciando Railway. `.env.example` tambien menciona
-`tu-app.railway.app`. O se marca Railway como deploy alternativo (mantener) o
-se elimina (mas limpio).
+**B-L5 — `railway.toml` obsoleto + `.env.example` menciona Railway**
+El proyecto despliega en Render. `railway.toml` está abandonado.
 
 ## Verificacion de "KNOWN ISSUES NOT FIXED" del audit 2026-04-11
 
@@ -223,7 +199,7 @@ se elimina (mas limpio).
 |---|----------------|-------------------|
 | Backend 1 | `has_heavy_bass` usa amplitud inicial | **Sin cambios** — sigue igual |
 | Backend 2 | Beatport `track_type_source` sobrescrito | **Sin cambios** |
-| Backend 3 | CORS wildcard+credentials en DEBUG | **Sin cambios** (documentado aqui B-M5) |
+| Backend 3 | CORS wildcard+credentials en DEBUG | **CORREGIDO** (commit `c247dd15`, B-M5) |
 | Backend 4 | Genero overlap BPM 120-130 | **Sin cambios** (spectral_genre_classifier.py) |
 | Backend 5 | `artwork_and_cuepoints.py` hardcodea `/data/artwork_cache` | **CORREGIDO** (commit 286cb49) |
 | Backend 6 | `search_analyzed_endpoint.py`, `endpoints_adicionales.py` dead | **ELIMINADOS** (commits 6320a5b, 8de1c10) |
@@ -240,25 +216,39 @@ se elimina (mas limpio).
 | Dead/obsolete config | 1 (LOW) |
 
 **Total 2026-04-20:** 3 HIGH + 6 MED + 5 LOW = **14 nuevos findings**.
-Ninguno bloquea el servicio actual, pero **B-H2 (rate limiting off)** es el mas
-urgente — un atacante con curl y un MP3 grande puede saturar la CPU del worker
-Render.
+Ninguno bloquea el servicio actual.
 
-## Fixes aplicados 2026-04-20 (misma sesion)
+## Estado de fixes (revalidado 2026-05-01)
 
 | ID | Estado | Detalle |
 |----|--------|---------|
-| **B-H1** | ✅ FIXED | Admin token comparado con `hmac.compare_digest` en `sync_endpoints.py:1099`, `sync_endpoints.py:939` (`/sync/clear`), y `routes/admin.py:42` |
-| **B-H2** | ✅ FIXED | `check_rate_limit(get_client_ip(request))` reactivado en `/analyze`; añadido tambien a `/identify` y `/recognize` (antes sin limite). Usa el limiter por defecto 60req/60s — refinar con limite estricto es trabajo futuro |
-| **B-H3** | ✅ FIXED | `X-Original-Path` validado con `os.path.abspath()` + comprobacion `isfile()` + `access(R_OK)` en `/analyze`. Si el header trae basura, se descarta silenciosamente y `original_path=""` |
-| **B-M1** | ⏳ PENDING | 3× bare `except:` (main.py:2034, 2862, 3028) — mejora logging, no urgente |
-| **B-M2** | ⏳ PENDING | `database.py` conexiones duplicadas — refactor mayor |
-| **B-M3** | ⏳ PENDING | `SELECT *` fragil — refactor mayor |
-| **B-M4** | ⏳ PENDING | Sync endpoints sin rate limit post-auth — pendiente diseño |
-| **B-M5** | ⏳ PENDING | CORS wildcard+credentials DEBUG — fix pequeño pero requiere testeo |
-| **B-M6** | ⏳ PENDING | community cues endpoint devuelve tuples |
-| **B-L1..L5** | ⏳ PENDING | logging, startup checks, validation extra |
+| **B-H1** | ✅ FIXED | Admin token con `hmac.compare_digest` en `sync_endpoints.py:1099, 939` y `routes/admin.py:42`. `admin_panel.py` cerrado en commit `f7c90b81` (2026-04-23). |
+| **B-H2** | ✅ FIXED | `check_rate_limit(get_client_ip(request))` reactivado en `/analyze`, `/identify`, `/recognize`. |
+| **B-H3** | ✅ FIXED | `X-Original-Path` validado con `os.path.abspath()` + `isfile()` + `access(R_OK)` en `/analyze`. |
+| **B-M1** | ✅ FIXED | 3 bare except cerrados en commits `c247dd15` + merge `10224a86` (2026-04-22). |
+| **B-M2** | ⏳ PENDING | 37 métodos en `database.py` siguen creando `sqlite3.connect()` en vez de usar `self.conn`. Refactor mayor. |
+| **B-M3** | ⏳ PENDING | `_row_to_dict` con índices hardcodeados. Refactor mayor a `cursor.description`/Pydantic. |
+| **B-M4** | ⏳ PENDING | Sync endpoints sin rate limit post-auth. Pendiente decisión de límite por device_id. |
+| **B-M5** | ✅ FIXED | CORS DEBUG cerrado en commit `c247dd15` (2026-04-22). Default DEBUG ahora con origins explícitos. |
+| **B-M6** | 🟡 PARCIAL | `CommunityResponse` Pydantic model existe + `response_model=CommunityResponse` en `@app.get`. La conversión interna en `aggregate_cues_into_zones()` sigue con tuples crudos pero el contrato externo es seguro. Aceptable. |
+| **B-L1** | ⏳ PENDING | 164 prints en `main.py` (vs 151 histórico). Logger global ya existe (`commit c664b45` 2026-04-26). Bulk migration pendiente. |
+| **B-L2** | ⏳ PENDING | `config.py` warning solamente, sin `sys.exit(1)` en prod si ADMIN_TOKEN vacío. Riesgo bajo (Render ya tiene ADMIN_TOKEN configurado). |
+| **B-L3** | ⏳ PENDING | `/search/artist/{artist}` sin sanitize. `/search/genre` sí. Pendiente patch en `main.py`. |
+| **B-L4** | ✅ FIXED | `preview_generator.py` lee `PREVIEW_TIMEOUT_SECONDS` env var con fallback a 15s. Cerrado 2026-05-01. |
+| **B-L5** | ✅ FIXED | `railway.toml` eliminado + `.env.example` limpiado de referencias a Railway. Cerrado 2026-05-01. |
 
-**Resumen:** 3/14 findings resueltos (los 3 HIGH de seguridad).
-11 pendientes son mejoras de ingenieria, ninguna release-blocker.
+**Resumen 2026-05-01:** 8/14 findings cerrados (3 HIGH + 2 MED + 1 PARCIAL
+MED + 2 LOW). 6 pendientes son refactors de ingeniería (B-M2/M3/M4/L1/L2/L3),
+ninguno release-blocker.
 
+## Items completados fuera del audit (2026-04-25 — 2026-05-01)
+
+- **C2 AUDD auto-trigger** (sprint propio): commits `ba9902dd`, `c9bfc76c`,
+  `8618af16`, `956bb044` + merge `01512559` (2026-05-01). Módulo
+  `audd_helper.py` con detección de ID3 garbage + cooldown 7d/fingerprint
+  + cap diario 50 llamadas. Integrado en `analyze_audio()` y `analyze_audio_chunked()`.
+- **B1 HEAD `/artwork/{track_id}`**: commit `97cf3bb9` (PR #3, 2026-05-01).
+  Cierra los 405 que el cliente desktop veía al pre-comprobar existencia.
+- **B2 POST `/artwork/upload/{fingerprint}`**: commit `f5a1ce085` (2026-04-30).
+- **B3 `GET /sync/pending` 401 device-específico**: re-clasificado como
+  diagnóstico operacional (ver `analyzer/PENDING_RELEASE_2.7.3.md`).

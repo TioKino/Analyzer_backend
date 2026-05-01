@@ -11,6 +11,25 @@ from pathlib import Path as PathLib
 logger = logging.getLogger(__name__)
 
 
+def _preview_timeout_seconds() -> int:
+    """Lee PREVIEW_TIMEOUT_SECONDS del env, default 15s.
+
+    En Render Standard con CPU compartida los tracks de 200+ MB pueden
+    sobrepasar 15s al pinchar el ffmpeg sin que sea un fallo real —
+    permite a operaciones subir el límite via env var sin tocar código.
+    """
+    raw = os.environ.get('PREVIEW_TIMEOUT_SECONDS')
+    if not raw:
+        return 15
+    try:
+        v = int(raw)
+        if v <= 0:
+            return 15
+        return v
+    except (TypeError, ValueError):
+        return 15
+
+
 def init_previews_dir(previews_dir: str):
     """Ensure previews directory exists."""
     PathLib(previews_dir).mkdir(parents=True, exist_ok=True)
@@ -59,7 +78,11 @@ def generate_preview_snippet(
             output_path
         ]
 
-        kwargs = {'capture_output': True, 'timeout': 15, 'check': True}
+        kwargs = {
+            'capture_output': True,
+            'timeout': _preview_timeout_seconds(),
+            'check': True,
+        }
         if sys.platform == 'win32':
             kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
         subprocess.run(cmd, **kwargs)
