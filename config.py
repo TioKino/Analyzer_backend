@@ -9,7 +9,7 @@ SETUP LOCAL:
     2. Edita .env con tus tokens
     3. python main.py
 
-PRODUCCIÓN (Railway/Render):
+PRODUCCIÓN (Render):
     Configura las variables en el dashboard del hosting.
 """
 
@@ -70,7 +70,7 @@ PREVIEWS_DIR: str = os.getenv('PREVIEWS_DIR', _default_previews)
 # Host - 0.0.0.0 para aceptar conexiones externas
 HOST: str = os.getenv('HOST', '0.0.0.0')
 
-# Puerto - Railway/Render lo configuran automáticamente
+# Puerto - Render lo configura automaticamente
 PORT: int = int(os.getenv('PORT', '8000'))
 
 # Modo debug
@@ -84,17 +84,12 @@ def _get_base_url() -> str:
     if env_url:
         return env_url.rstrip('/')
 
-    # 2. Railway proporciona RAILWAY_PUBLIC_DOMAIN
-    railway_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN')
-    if railway_domain:
-        return f'https://{railway_domain}'
-
-    # 3. Render proporciona RENDER_EXTERNAL_URL
+    # 2. Render proporciona RENDER_EXTERNAL_URL
     render_url = os.getenv('RENDER_EXTERNAL_URL')
     if render_url:
         return render_url.rstrip('/')
 
-    # 4. Fallback a localhost
+    # 3. Fallback a localhost
     return f'http://localhost:{PORT}'
 
 BASE_URL: str = _get_base_url()
@@ -165,8 +160,8 @@ def validate_config() -> tuple[bool, list[str], list[str]]:
     except OSError as e:
         errors.append(f"No se pudo crear {PREVIEWS_DIR}: {e}")
 
-    # Seguridad en producción
-    is_production = bool(os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'))
+    # Seguridad en produccion
+    is_production = bool(os.getenv('RENDER'))
 
     if not DEBUG and BASE_URL.startswith('http://localhost'):
         warnings.append("BASE_URL apunta a localhost en modo producción")
@@ -175,6 +170,8 @@ def validate_config() -> tuple[bool, list[str], list[str]]:
         warnings.append("SYNC_AUTH_SECRET no configurado - sync sin autenticación")
 
     if is_production and not ADMIN_TOKEN:
+        # Esto se duplica con _check_admin_token_in_production() que hace
+        # fail-hard al import. Lo dejamos aqui por completitud del reporte.
         warnings.append("ADMIN_TOKEN no configurado - endpoints admin sin protección")
 
     if is_production and CORS_ORIGINS == ['*']:
@@ -244,3 +241,44 @@ def get_config_dict() -> dict:
 # Crear directorios necesarios al importar
 Path(ARTWORK_CACHE_DIR).mkdir(parents=True, exist_ok=True)
 Path(PREVIEWS_DIR).mkdir(parents=True, exist_ok=True)
+
+
+# B-L2: fail-hard en produccion si ADMIN_TOKEN esta vacio.
+#
+# Sin ADMIN_TOKEN, los endpoints `/admin/*` (sync_endpoints, admin_panel,
+# routes/admin) tiran 500 opaco al primer request, dificultando
+# diagnosticar por que el panel no funciona en Render. Mejor fallar al
+# arrancar el worker con un mensaje claro.
+#
+# Escape-hatch: definir `ADMIN_TOKEN_OPTIONAL=true` permite arrancar sin
+# token (util si te quedas bloqueado en un deploy y necesitas investigar
+# - los endpoints admin seguiran rotos pero el resto funciona).
+def _check_admin_token_in_production() -> None:
+    is_render = bool(os.getenv('RENDER'))
+    if not is_render:
+        return
+    if ADMIN_TOKEN:
+        return
+    if os.getenv('ADMIN_TOKEN_OPTIONAL', '').lower() in ('true', '1', 'yes'):
+        # Escape-hatch activo: solo logueamos.
+        import logging
+        logging.getLogger(__name__).error(
+            "ADMIN_TOKEN vacio en Render pero ADMIN_TOKEN_OPTIONAL=true. "
+            "Los endpoints /admin/* devolveran 500 opaco hasta que se "
+            "configure el token. Define ADMIN_TOKEN en el dashboard."
+        )
+        return
+    # Sin token y sin escape-hatch: fail-hard.
+    import sys as _sys
+    print("=" * 60, file=_sys.stderr)
+    print("FATAL: ADMIN_TOKEN no configurado en Render.", file=_sys.stderr)
+    print("", file=_sys.stderr)
+    print("Configura la env var ADMIN_TOKEN en el dashboard de Render", file=_sys.stderr)
+    print("para que los endpoints /admin/* funcionen. Si quieres", file=_sys.stderr)
+    print("arrancar el backend SIN proteccion admin (no recomendado),", file=_sys.stderr)
+    print("define ADMIN_TOKEN_OPTIONAL=true.", file=_sys.stderr)
+    print("=" * 60, file=_sys.stderr)
+    _sys.exit(1)
+
+
+_check_admin_token_in_production()
