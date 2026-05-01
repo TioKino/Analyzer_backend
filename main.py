@@ -35,6 +35,11 @@ from pydantic import BaseModel
 from spectral_genre_classifier import classify_genre_advanced
 from config import (
     AUDD_API_TOKEN,
+    AUDD_AUTO_ENABLED,
+    AUDD_DAILY_CAP,
+    AUDD_COOLDOWN_DAYS,
+    AUDD_MIN_DURATION,
+    AUDD_MAX_DURATION,
     DISCOGS_TOKEN,
     print_config,
     BASE_URL,
@@ -1410,7 +1415,63 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
             artist_name = parsed.get('artist')
         if not title_name:
             title_name = parsed.get('title')
-    
+
+    # ==================== AUDD AUTO-TRIGGER ====================
+    # Si tras ID3 + filename seguimos sin artist/title utilizable, AudD como
+    # ultimo recurso (con presupuesto y cooldown). Toda la cascada externa
+    # (Beatport/Discogs/iTunes) requiere artist+title para arrancar, asi que
+    # recuperar la identidad aqui desbloquea el resto.
+    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+        try:
+            from audd_helper import enrich_with_audd_if_needed
+            audd_track = enrich_with_audd_if_needed(
+                file_path=file_path,
+                fingerprint=fingerprint,
+                duration=duration,
+                artist=artist_name,
+                title=title_name,
+                api_token=AUDD_API_TOKEN,
+                db=db,
+                min_duration=AUDD_MIN_DURATION,
+                max_duration=AUDD_MAX_DURATION,
+                daily_cap=AUDD_DAILY_CAP,
+                cooldown_days=AUDD_COOLDOWN_DAYS,
+            )
+            if audd_track:
+                if audd_track.get('artist'):
+                    artist_name = audd_track['artist']
+                if audd_track.get('title'):
+                    title_name = audd_track['title']
+                if not label and audd_track.get('label'):
+                    label = audd_track['label']
+                if not year and audd_track.get('release_date'):
+                    year = audd_track['release_date'][:4]
+                # Re-correr Discogs/MusicBrainz si la cascada anterior no aporto
+                # genero (sigue siendo el default analitico).
+                if (genre_source in ('spectral_analysis', 'chunked_analysis')
+                        and GENRE_DETECTOR_ENABLED and genre_detector):
+                    try:
+                        discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
+                        if discogs_result and discogs_result.get('genre'):
+                            genre = discogs_result['genre']
+                            genre_source = 'discogs'
+                            if not label and discogs_result.get('label'):
+                                label = discogs_result['label']
+                            if not year and discogs_result.get('year'):
+                                year = str(discogs_result['year'])
+                    except Exception as e:
+                        print(f"  [AudD-auto] re-run Discogs error: {e}")
+                    if genre_source in ('spectral_analysis', 'chunked_analysis'):
+                        try:
+                            mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
+                            if mb_result and mb_result.get('genre'):
+                                genre = mb_result['genre']
+                                genre_source = 'musicbrainz'
+                        except Exception as e:
+                            print(f"  [AudD-auto] re-run MusicBrainz error: {e}")
+        except Exception as e:
+            print(f"  [AudD-auto] error: {e}")
+
     if artist_name and title_name:
         print(f"  BEATPORT: Buscando {artist_name} - {title_name}")
         try:
@@ -1463,7 +1524,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                 print(f"  [Beatport] No encontrado")
         except Exception as e:
             print(f"  [Beatport] Error: {e}")
-    
+
     drop_time = find_drop_timestamp(y, sr, segments)
     
     # ==================== CUE POINTS ====================
@@ -1686,7 +1747,59 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
             artist_name = parsed.get('artist')
         if not title_name:
             title_name = parsed.get('title')
-    
+
+    # ==================== AUDD AUTO-TRIGGER ====================
+    # Mismo trigger que en analyze_audio: si tras ID3+filename seguimos sin
+    # artist/title utilizable, AudD como ultimo recurso.
+    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+        try:
+            from audd_helper import enrich_with_audd_if_needed
+            audd_track = enrich_with_audd_if_needed(
+                file_path=file_path,
+                fingerprint=fingerprint,
+                duration=duration,
+                artist=artist_name,
+                title=title_name,
+                api_token=AUDD_API_TOKEN,
+                db=db,
+                min_duration=AUDD_MIN_DURATION,
+                max_duration=AUDD_MAX_DURATION,
+                daily_cap=AUDD_DAILY_CAP,
+                cooldown_days=AUDD_COOLDOWN_DAYS,
+            )
+            if audd_track:
+                if audd_track.get('artist'):
+                    artist_name = audd_track['artist']
+                if audd_track.get('title'):
+                    title_name = audd_track['title']
+                if not label and audd_track.get('label'):
+                    label = audd_track['label']
+                if not year and audd_track.get('release_date'):
+                    year = audd_track['release_date'][:4]
+                if (genre_source in ('spectral_analysis', 'chunked_analysis')
+                        and GENRE_DETECTOR_ENABLED and genre_detector):
+                    try:
+                        discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
+                        if discogs_result and discogs_result.get('genre'):
+                            genre = discogs_result['genre']
+                            genre_source = 'discogs'
+                            if not label and discogs_result.get('label'):
+                                label = discogs_result['label']
+                            if not year and discogs_result.get('year'):
+                                year = str(discogs_result['year'])
+                    except Exception as e:
+                        print(f"  [AudD-auto] re-run Discogs error: {e}")
+                    if genre_source in ('spectral_analysis', 'chunked_analysis'):
+                        try:
+                            mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
+                            if mb_result and mb_result.get('genre'):
+                                genre = mb_result['genre']
+                                genre_source = 'musicbrainz'
+                        except Exception as e:
+                            print(f"  [AudD-auto] re-run MusicBrainz error: {e}")
+        except Exception as e:
+            print(f"  [AudD-auto] error: {e}")
+
     if artist_name and title_name:
         print(f"  BEATPORT: Buscando {artist_name} - {title_name}")
         try:
