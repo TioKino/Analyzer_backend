@@ -31,6 +31,13 @@ import shutil
 import sqlite3
 import time
 from typing import Dict, List, Optional
+
+# Logger global del modulo, definido temprano para que las llamadas
+# logger.info/warning/error en el codigo de inicializacion no fallen
+# con NameError. Antes habia prints aqui; B-L1 los migro a logger.
+import logging
+logger = logging.getLogger('dj_analyzer')
+logger.setLevel(logging.INFO)
 from pydantic import BaseModel
 from spectral_genre_classifier import classify_genre_advanced
 from config import (
