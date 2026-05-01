@@ -3331,6 +3331,8 @@ async def upload_artwork(fingerprint: str, file: UploadFile = File(...)):
 @app.get("/search/artist/{artist}")
 async def search_by_artist(artist: str, limit: int = Query(50, ge=1, le=200)):
     """Buscar tracks por artista"""
+    artist = sanitize_string(artist, max_length=200, allow_empty=False, field_name="artist")
+    limit = validate_limit(limit, max_limit=200)
     results = db.search_by_artist(artist, limit)
     return {"query": artist, "count": len(results), "tracks": results}
 
