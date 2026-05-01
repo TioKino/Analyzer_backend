@@ -2872,7 +2872,7 @@ async def recognize_audio(request: Request, file: UploadFile = File(...)):
                     'bpm_source': 'pending',
                     'key_source': 'pending',
                 }
-                existing = db.get_track(detect_id)
+                existing = db.get_track_by_fingerprint(detect_id)
                 if not existing:
                     db.save_track(detect_data)
                     logger.info(f"Deteccion guardada en BD colectiva: {detect_id[:12]}")
@@ -2918,8 +2918,11 @@ async def cache_analysis(request: Request):
     if not fingerprint:
         raise HTTPException(400, "fingerprint requerido")
 
-    # No sobreescribir si ya existe con análisis completo
-    existing = db.get_track(fingerprint)
+    # No sobreescribir si ya existe con análisis completo. El método
+    # correcto es `get_track_by_fingerprint` — `db.get_track` nunca
+    # existió y rompía el endpoint con 500 cuando el motor local
+    # intentaba subir el resultado a Render.
+    existing = db.get_track_by_fingerprint(fingerprint)
     if existing:
         existing_json = existing.get('analysis_json')
         if existing_json:
