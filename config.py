@@ -44,6 +44,18 @@ MUSICBRAINZ_USER_AGENT: str = os.getenv(
 )
 
 
+# ==================== AUDD AUTO-TRIGGER ====================
+# Disparo automatico de AudD durante /analyze cuando ID3 + filename no
+# permiten arrancar la cascada externa (Beatport/Discogs/iTunes...).
+# Ver audd_helper.py para la logica de decision.
+
+AUDD_AUTO_ENABLED: bool = os.getenv('AUDD_AUTO_ENABLED', 'true').lower() in ('true', '1', 'yes')
+AUDD_DAILY_CAP: int = int(os.getenv('AUDD_DAILY_CAP', '50'))
+AUDD_COOLDOWN_DAYS: int = int(os.getenv('AUDD_COOLDOWN_DAYS', '7'))
+AUDD_MIN_DURATION: float = float(os.getenv('AUDD_MIN_DURATION', '30'))
+AUDD_MAX_DURATION: float = float(os.getenv('AUDD_MAX_DURATION', '720'))
+
+
 # ==================== BASE DE DATOS ====================
 
 DATABASE_PATH: str = os.getenv('DATABASE_PATH', 'analysis.db')
@@ -71,17 +83,17 @@ def _get_base_url() -> str:
     env_url = os.getenv('BASE_URL')
     if env_url:
         return env_url.rstrip('/')
-    
+
     # 2. Railway proporciona RAILWAY_PUBLIC_DOMAIN
     railway_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN')
     if railway_domain:
         return f'https://{railway_domain}'
-    
+
     # 3. Render proporciona RENDER_EXTERNAL_URL
     render_url = os.getenv('RENDER_EXTERNAL_URL')
     if render_url:
         return render_url.rstrip('/')
-    
+
     # 4. Fallback a localhost
     return f'http://localhost:{PORT}'
 
@@ -125,20 +137,23 @@ CORS_ORIGINS: list = _cors_env.split(',') if _cors_env else ['*']
 def validate_config() -> tuple[bool, list[str], list[str]]:
     """
     Valida la configuración.
-    
+
     Returns:
         tuple: (is_valid, errors, warnings)
     """
     errors = []
     warnings = []
-    
+
     # Tokens
     if not AUDD_API_TOKEN:
         warnings.append("AUDD_API_TOKEN no configurado - identificación deshabilitada")
-    
+
     if not DISCOGS_TOKEN:
         warnings.append("DISCOGS_TOKEN no configurado - detección de género limitada")
-    
+
+    if AUDD_AUTO_ENABLED and not AUDD_API_TOKEN:
+        warnings.append("AUDD_AUTO_ENABLED=true pero sin AUDD_API_TOKEN - auto-trigger sin efecto")
+
     # Directorios
     try:
         Path(ARTWORK_CACHE_DIR).mkdir(parents=True, exist_ok=True)
@@ -149,7 +164,7 @@ def validate_config() -> tuple[bool, list[str], list[str]]:
         Path(PREVIEWS_DIR).mkdir(parents=True, exist_ok=True)
     except OSError as e:
         errors.append(f"No se pudo crear {PREVIEWS_DIR}: {e}")
-    
+
     # Seguridad en producción
     is_production = bool(os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'))
 
@@ -172,7 +187,7 @@ def validate_config() -> tuple[bool, list[str], list[str]]:
 def print_config():
     """Imprime la configuración actual (para debugging)."""
     is_valid, errors, warnings = validate_config()
-    
+
     print("\n" + "=" * 55)
     print("  🎧 DJ ANALYZER - CONFIGURACIÓN")
     print("=" * 55)
@@ -184,21 +199,23 @@ def print_config():
     print(f"  🔊 Previews:   {PREVIEWS_DIR}")
     print("-" * 55)
     print(f"  🔑 AudD:       {'✓ Configurado' if AUDD_API_TOKEN else '✗ No configurado'}")
+    print(f"  🤖 AudD auto:  {'✓ ON' if AUDD_AUTO_ENABLED else '○ OFF'} "
+          f"(cap={AUDD_DAILY_CAP}/dia, cooldown={AUDD_COOLDOWN_DAYS}d)")
     print(f"  🔑 Discogs:    {'✓ Configurado' if DISCOGS_TOKEN else '✗ No configurado'}")
     print(f"  📦 dotenv:     {'✓ Cargado' if _DOTENV_LOADED else '○ No disponible'}")
-    
+
     if warnings:
         print("-" * 55)
         print("  ⚠️  ADVERTENCIAS:")
         for w in warnings:
             print(f"     • {w}")
-    
+
     if errors:
         print("-" * 55)
         print("  ❌ ERRORES:")
         for e in errors:
             print(f"     • {e}")
-    
+
     print("=" * 55 + "\n")
     return is_valid
 
@@ -213,6 +230,9 @@ def get_config_dict() -> dict:
         'artwork_cache': ARTWORK_CACHE_DIR,
         'previews_cache': PREVIEWS_DIR,
         'audd_configured': bool(AUDD_API_TOKEN),
+        'audd_auto_enabled': AUDD_AUTO_ENABLED,
+        'audd_daily_cap': AUDD_DAILY_CAP,
+        'audd_cooldown_days': AUDD_COOLDOWN_DAYS,
         'discogs_configured': bool(DISCOGS_TOKEN),
         'max_file_size_mb': MAX_FILE_SIZE_MB,
         'rate_limit_enabled': RATE_LIMIT_ENABLED,
