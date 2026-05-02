@@ -1203,7 +1203,8 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     
     # BPM
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
-    bpm = float(tempo)
+    # librosa >= 0.10 devuelve tempo como np.ndarray (1-d). Convertir robusto.
+    bpm = float(tempo) if not isinstance(tempo, np.ndarray) else float(tempo.flat[0])
     bpm_source = "analysis"
     
     # Usar BPM de ID3 si existe y es razonable
@@ -2304,7 +2305,10 @@ async def analyze_track(
                 energy_raw=0,
                 energy_normalized=0,
                 energy_dj=5,  # Valor medio por defecto
-                genre=id3_data.get('genre', 'Unknown'),
+                # `id3_data` siempre tiene la clave 'genre' (con valor None
+                # cuando no hay tag). El default de dict.get() no aplica;
+                # usar `or` para sustituir None por 'Unknown'.
+                genre=(id3_data.get('genre') or 'Unknown'),
                 genre_source="pending",
                 track_type="unknown",
                 has_intro=False,

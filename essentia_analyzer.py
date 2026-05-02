@@ -72,7 +72,12 @@ class ImprovedLibrosaAnalyzer:
         try:
             # Metodo 1: Beat tracking estandar
             tempo_standard, beats = librosa.beat.beat_track(y=y, sr=sr)
-            tempo_standard = float(tempo_standard)
+            # librosa >= 0.10 devuelve ndarray (1-d). Convertir robusto.
+            tempo_standard = (
+                float(tempo_standard)
+                if not isinstance(tempo_standard, np.ndarray)
+                else float(tempo_standard.flat[0])
+            )
             
             # Metodo 2: Onset + autocorrelacion
             onset_env = librosa.onset.onset_strength(y=y, sr=sr)

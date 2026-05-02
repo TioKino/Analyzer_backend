@@ -263,6 +263,36 @@ def _require_user_id(conn: sqlite3.Connection, device_id: str) -> str:
     return user_id
 
 
+def _auto_register_user_id(conn: sqlite3.Connection, device_id: str) -> str:
+    """Para endpoints read-only (pull/pending): si el device ya está
+    registrado devuelve su user_id; si no, crea un user nuevo y lo vincula
+    silenciosamente con device_type='unknown'. Esto evita que apps recién
+    instaladas reciban 403 antes de poder llamar a /sync/register, lo cual
+    además contamina logs y enmascara errores reales en producción.
+    El cliente seguirá llamando a /sync/register con su device_type/name
+    reales; el endpoint de registro debe actualizar esos campos si el
+    device ya existía con valores placeholder.
+    """
+    user_id = _get_user_id_for_device(conn, device_id)
+    if user_id:
+        return user_id
+
+    user_id = str(uuid.uuid4())
+    now = _now_iso()
+    conn.execute(
+        "INSERT INTO users (user_id, created_at) VALUES (?, ?)",
+        (user_id, now),
+    )
+    conn.execute(
+        "INSERT INTO user_devices (device_id, user_id, device_type, device_name, linked_at) VALUES (?, ?, ?, ?, ?)",
+        (device_id, user_id, "unknown", "", now),
+    )
+    _assign_orphan_data(conn, device_id, user_id)
+    conn.commit()
+    logger.info(f"Auto-registered device on read-only endpoint: {device_id} -> {user_id}")
+    return user_id
+
+
 def _generate_link_code() -> str:
     """Genera un código alfanumérico de 6 caracteres (sin ambigüedades)."""
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I
@@ -292,6 +322,23 @@ async def sync_register(req: RegisterRequest):
 
     existing = _get_user_id_for_device(conn, req.device_id)
     if existing:
+        # Si el device fue auto-registrado con type='unknown' (porque llamó
+        # antes a /sync/pull o /sync/pending), aprovechar este register
+        # para actualizar device_type y device_name reales. Esto se
+        # detecta por type='unknown' y device_name='' en BD.
+        row = conn.execute(
+            "SELECT device_type, device_name FROM user_devices WHERE device_id = ?",
+            (req.device_id,),
+        ).fetchone()
+        if row and (row[0] == "unknown" or not row[1]):
+            new_type = req.device_type if req.device_type and req.device_type != "unknown" else row[0]
+            new_name = req.device_name if req.device_name else (row[1] or "")
+            if new_type != row[0] or new_name != (row[1] or ""):
+                conn.execute(
+                    "UPDATE user_devices SET device_type = ?, device_name = ? WHERE device_id = ?",
+                    (new_type, new_name, req.device_id),
+                )
+                conn.commit()
         devices = _get_all_devices_for_user(conn, existing)
         return {
             "user_id": existing,
@@ -639,9 +686,12 @@ async def sync_pull(
 
     Multi-tenant: solo devuelve items del MISMO usuario + colectivos.
     Filtra por user_id (no por device_id como antes).
+
+    Auto-registra el device si es la primera vez que lo vemos (apps recién
+    instaladas a menudo llaman a /sync/pull antes de /sync/register).
     """
     conn = _get_conn()
-    user_id = _require_user_id(conn, device_id)
+    user_id = _auto_register_user_id(conn, device_id)
 
     # Items del mismo usuario + colectivos, que NO subió este device
     rows = conn.execute(
@@ -705,9 +755,13 @@ async def sync_pending(device_id: str, since: Optional[str] = None):
     """Desglose detallado: añadidos, eliminados, modificados por tipo.
 
     Multi-tenant: solo cuenta items del MISMO usuario + colectivos.
+
+    Auto-registra el device si es la primera vez (apps recién instaladas
+    suelen llamar /sync/pending antes que /sync/register; antes esto
+    devolvía 403 y contaminaba logs).
     """
     conn = _get_conn()
-    user_id = _require_user_id(conn, device_id)
+    user_id = _auto_register_user_id(conn, device_id)
 
     # Items remotos del mismo usuario + colectivos
     remote_rows = conn.execute(
