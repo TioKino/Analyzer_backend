@@ -62,7 +62,9 @@ class AnalysisDB:
                 analyzed_at TEXT,
                 fingerprint TEXT,
                 chromaprint TEXT,
-                fingerprint_source TEXT DEFAULT 'md5_legacy'
+                fingerprint_source TEXT DEFAULT 'md5_legacy',
+                volume_id TEXT,
+                relative_path TEXT
             )
         ''')
 
@@ -80,6 +82,16 @@ class AnalysisDB:
         except sqlite3.OperationalError:
             pass  # Ya existe
 
+        # Migracion v2.8.0: volumenes portatiles. Tracks alojados en HDDs/USB
+        # externos guardan el UUID del volumen + relative_path para que cualquier
+        # device con el HDD montado pueda reproducir el archivo localmente.
+        # NULL para tracks en disco interno (comportamiento legacy).
+        for col in ('volume_id', 'relative_path'):
+            try:
+                c.execute(f"ALTER TABLE tracks ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass  # Ya existe
+
         # Indices para busquedas rapidas
         c.execute('CREATE INDEX IF NOT EXISTS idx_artist ON tracks(artist)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_genre ON tracks(genre)')
@@ -88,6 +100,7 @@ class AnalysisDB:
         c.execute('CREATE INDEX IF NOT EXISTS idx_key ON tracks(key)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_camelot ON tracks(camelot)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_chromaprint ON tracks(chromaprint)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_volume ON tracks(volume_id)')
 
         # Correcciones manuales (memoria colectiva)
         c.execute('''
@@ -274,8 +287,8 @@ class AnalysisDB:
             INSERT OR REPLACE INTO tracks
             (id, filename, artist, title, duration, bpm, key, camelot,
              energy_dj, genre, track_type, analysis_json, analyzed_at,
-             fingerprint, fingerprint_source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             fingerprint, fingerprint_source, volume_id, relative_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             track_data['id'],
             track_data['filename'],
@@ -292,6 +305,8 @@ class AnalysisDB:
             datetime.now().isoformat(),
             track_data.get('fingerprint'),
             track_data.get('fingerprint_source', 'md5_legacy'),
+            track_data.get('volume_id'),
+            track_data.get('relative_path'),
         ))
 
         conn.commit()
