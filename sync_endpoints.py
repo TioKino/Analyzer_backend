@@ -325,6 +325,60 @@ def _generate_link_code() -> str:
 
 # ── Analysis error log (publico, lo usa /analyze) ───────────
 
+def _anonymize_filename(filename: str) -> str:
+    """Anonimiza el filename para no filtrar PII en analysis_errors.
+
+    - Conserva la extension (util para debugging: .mp3 vs .flac vs .corrupt).
+    - Reemplaza el nombre por hash MD5(8) del nombre original.
+
+    Asi el dev ve "abc12345.mp3" en lugar de "Bad Bunny - Featuring Real Name.mp3"
+    o "C:/Users/juan.garcia/Music/unreleased.mp3". El hash sigue siendo
+    util para correlacionar errores del mismo archivo (mismo nombre =
+    mismo hash) sin exponer el nombre real.
+    """
+    if not filename:
+        return "(unknown)"
+    # Tomar solo la parte final si llegan paths
+    base = os.path.basename(filename)
+    if "." in base:
+        name, ext = base.rsplit(".", 1)
+        ext = "." + ext.lower()[:8]  # extension max 8 chars (.flac, .mp3)
+    else:
+        name, ext = base, ""
+    short = hashlib.md5(name.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    return f"{short}{ext}"
+
+
+def _strip_traceback_pii(traceback_str: str) -> str:
+    """Limpia rutas absolutas y nombres de usuario en tracebacks.
+
+    Tracebacks suelen incluir paths como /tmp/tmpXXX.mp3 o
+    C:\\Users\\juan\\AppData\\... Filtramos para que no entren en BD.
+    """
+    if not traceback_str:
+        return ""
+    import re as _re
+    # Reemplaza paths estilo Windows
+    cleaned = _re.sub(
+        r'[A-Z]:\\\\Users\\\\[^\\\\\s\'"]+',
+        r'C:\\\\Users\\\\<user>',
+        traceback_str,
+    )
+    # macOS/Linux home
+    cleaned = _re.sub(
+        r'/(?:home|Users)/[^/\s\'"]+',
+        '/<home>',
+        cleaned,
+    )
+    # /tmp/tmpXXX.<ext> con nombres aleatorios → mantenemos el patron
+    cleaned = _re.sub(
+        r'/tmp/tmp\w+\.\w+',
+        '/tmp/<tmpfile>',
+        cleaned,
+    )
+    return cleaned
+
+
 def log_analysis_error(
     *,
     filename: str,
@@ -339,6 +393,13 @@ def log_analysis_error(
     si la BD no esta disponible se ignora (no queremos romper el fallback
     de /analyze por un fallo al loggear).
 
+    Privacidad:
+    - filename se anonimiza (hash + extension). El nombre real NUNCA
+      se persiste, ni en filename ni en traceback. Esto cumple con
+      la posicion del proyecto: el panel admin ve operacional, no
+      contenido del usuario.
+    - traceback se limpia de paths con username/home antes de guardar.
+
     Returns: id del registro insertado, o None si fallo.
     """
     try:
@@ -351,12 +412,12 @@ def log_analysis_error(
             (
                 _now_iso(),
                 device_id or None,
-                filename or "(unknown)",
+                _anonymize_filename(filename),
                 fingerprint or None,
                 error_class,
                 # SQLite acepta TEXT pero limitamos para evitar abusos
                 (error_msg or "")[:2000],
-                (traceback_str or "")[:5000],
+                _strip_traceback_pii((traceback_str or "")[:5000]),
                 endpoint,
             ),
         )
@@ -365,6 +426,38 @@ def log_analysis_error(
     except Exception as e:  # noqa: BLE001
         logger.warning(f"log_analysis_error failed: {e}")
         return None
+
+
+def cleanup_old_errors(
+    *,
+    resolved_max_age_days: int = 30,
+    unresolved_max_age_days: int = 90,
+) -> int:
+    """Borra errores viejos para que la tabla analysis_errors no crezca
+    sin limite. Resueltos > 30d y sin resolver > 90d se purgan.
+
+    Returns: numero de filas borradas.
+    """
+    try:
+        conn = _get_conn()
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+        resolved_cutoff = (now - timedelta(days=resolved_max_age_days)).isoformat()
+        unresolved_cutoff = (now - timedelta(days=unresolved_max_age_days)).isoformat()
+        cur = conn.execute(
+            """DELETE FROM analysis_errors
+               WHERE (resolved = 1 AND timestamp < ?)
+                  OR (resolved = 0 AND timestamp < ?)""",
+            (resolved_cutoff, unresolved_cutoff),
+        )
+        conn.commit()
+        deleted = cur.rowcount or 0
+        if deleted:
+            logger.info(f"cleanup_old_errors: purged {deleted} entries")
+        return deleted
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"cleanup_old_errors failed: {e}")
+        return 0
 
 
 def _is_collective(data_type: str) -> bool:

@@ -1,10 +1,18 @@
 """
 Admin Panel endpoints for DJ Analyzer Pro.
 
-Provides read-only endpoints for the Flutter AdminScreen to view
-users, tracks, previews, sessions, and global statistics.
+Read-only endpoints para el panel de desarrollador del Flutter app.
+Politica de privacidad por diseño:
 
-Auth: X-Admin-Secret header checked against ADMIN_SECRET env var.
+- NO exponemos contenido del usuario (filenames, artist/title editados,
+  nombres de sesion, cue labels libres, ediciones manuales). Esos datos
+  viven en sync.db pero nunca salen por la API admin.
+- Exponemos counts agregados, estadisticas globales y errores de
+  analisis ya anonimizados (filename hashed por log_analysis_error).
+- Si un dia hace falta auditar datos concretos por soporte, debe ser
+  un endpoint con doble confirmacion + audit log, no abierto.
+
+Auth: X-Admin-Secret/ADMIN_TOKEN via header. constant-time comparison.
 """
 
 import hmac
@@ -12,6 +20,7 @@ import json
 import logging
 import os
 import sqlite3
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -25,23 +34,17 @@ _PREVIEWS_DIR = os.environ.get("PREVIEWS_DIR", "previews_cache")
 # ── Auth dependency ─────────────────────────────────────────
 
 def _get_admin_secret() -> str:
-    # Preferencia: ADMIN_TOKEN (env var unica para todos los admin endpoints).
-    # Fallback a ADMIN_SECRET para compat legacy — los deploys mas viejos la
-    # tenian. Si los dos estan, gana ADMIN_TOKEN.
+    # Preferencia: ADMIN_TOKEN. Fallback a ADMIN_SECRET para compat.
     return os.environ.get("ADMIN_TOKEN") or os.environ.get("ADMIN_SECRET") or ""
 
 
 async def _verify_admin_secret(request: Request):
-    """Verify X-Admin-Secret header against ADMIN_SECRET env var."""
     secret = _get_admin_secret()
     if not secret:
         if os.getenv("RENDER") or os.getenv("RAILWAY_ENVIRONMENT"):
             raise HTTPException(500, "ADMIN_SECRET required in production")
-        return  # Dev mode: no auth
+        return  # Dev mode local
     header = request.headers.get("X-Admin-Secret", "")
-    # Constant-time comparison para evitar timing attack (finding B-H1 que
-    # se habia pasado por alto en este router; sync_endpoints y routes/admin
-    # si lo tenian aplicado desde el AUDIT 2026-04-20).
     if not hmac.compare_digest(header, secret):
         raise HTTPException(401, "Invalid or missing X-Admin-Secret")
 
@@ -51,7 +54,7 @@ async def _verify_admin_secret(request: Request):
 admin_panel_router = APIRouter(
     prefix="/admin",
     tags=["admin-panel"],
-    dependencies=[],  # auth applied per-endpoint via _verify_admin_secret
+    dependencies=[],
 )
 
 
@@ -62,48 +65,82 @@ def _get_sync_conn() -> sqlite3.Connection:
     return conn
 
 
-# ── Helpers ─────────────────────────────────────────────────
+# ── Helpers (counts, no contenido) ──────────────────────────
 
-def _parse_analysis_payload(payload_str: str) -> dict:
-    """Parse an analysis payload, returning the tracks dict."""
+def _count_in_payload(payload_str: str, data_type: str) -> int:
+    """Cuenta items dentro de un payload de sync_items, sin extraer
+    nombres ni metadata sensible. Solo numero.
+    """
     try:
         payload = json.loads(payload_str)
-        if isinstance(payload, dict):
-            return payload.get("tracks", payload)
     except (json.JSONDecodeError, TypeError):
-        pass
-    return {}
-
-
-def _parse_session_payload(payload_str: str) -> list:
-    """Parse a session payload, returning the sessions list."""
-    try:
-        payload = json.loads(payload_str)
+        return 0
+    if data_type == "analysis":
         if isinstance(payload, dict):
-            return payload.get("sessions", [])
+            inner = payload.get("tracks", payload)
+            return len(inner) if isinstance(inner, dict) else 0
+        return 0
+    if data_type == "session":
+        if isinstance(payload, dict):
+            return len(payload.get("sessions", []))
         if isinstance(payload, list):
-            return payload
+            return len(payload)
+        return 0
+    if data_type == "cue":
+        # cuepoints viven anidados {trackId: [...]}
+        try:
+            inner = payload.get("cues", payload) if isinstance(payload, dict) else payload
+            if isinstance(inner, dict):
+                return sum(len(v) if isinstance(v, list) else 0 for v in inner.values())
+            if isinstance(inner, list):
+                return len(inner)
+        except Exception:  # noqa: BLE001
+            return 0
+        return 0
+    # Resto (folder, collection, favorite, override): conteo plano.
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict):
+        for key in ("items", "folders", "collections", "favorites", "overrides"):
+            if key in payload and isinstance(payload[key], (list, dict)):
+                inner = payload[key]
+                return len(inner) if isinstance(inner, (list, dict)) else 0
+        return len(payload)
+    return 0
+
+
+def _previews_count_for_payload(payload_str: str) -> int:
+    """Cuenta cuantos tracks de un payload analysis tienen preview.
+    No expone fingerprints, solo numero.
+    """
+    try:
+        payload = json.loads(payload_str)
     except (json.JSONDecodeError, TypeError):
-        pass
-    return []
-
-
-def _preview_exists(fingerprint: str) -> bool:
-    """Check if a preview MP3 exists for the given fingerprint."""
-    if not fingerprint:
-        return False
-    path = os.path.join(_PREVIEWS_DIR, f"{fingerprint}.mp3")
-    return os.path.isfile(path)
+        return 0
+    tracks = payload.get("tracks", payload) if isinstance(payload, dict) else {}
+    if not isinstance(tracks, dict):
+        return 0
+    n = 0
+    for t in tracks.values():
+        if not isinstance(t, dict):
+            continue
+        fp = t.get("fingerprint", "")
+        if fp and os.path.isfile(os.path.join(_PREVIEWS_DIR, f"{fp}.mp3")):
+            n += 1
+    return n
 
 
 # ── GET /admin/users ────────────────────────────────────────
 
 @admin_panel_router.get("/users")
 async def list_users(request: Request):
+    """Lista de devices (usuarios) con counts agregados.
+
+    NO expone contenido. Solo: device_id, device_type, counts por tipo.
+    """
     await _verify_admin_secret(request)
     conn = _get_sync_conn()
     try:
-        # Get all distinct devices from sync_items
         rows = conn.execute("""
             SELECT last_device_id, device_type,
                    MAX(updated_at) as last_sync_at,
@@ -115,31 +152,20 @@ async def list_users(request: Request):
         users = []
         for row in rows:
             device_id = row["last_device_id"]
-
-            # Count tracks from analysis payloads
-            analysis_row = conn.execute(
-                "SELECT payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
-                (device_id,),
-            ).fetchone()
             track_count = 0
             preview_count = 0
-            if analysis_row:
-                tracks = _parse_analysis_payload(analysis_row["payload"])
-                track_count = len(tracks)
-                for t in tracks.values():
-                    fp = t.get("fingerprint", "") if isinstance(t, dict) else ""
-                    if _preview_exists(fp):
-                        preview_count += 1
-
-            # Count sessions
-            session_row = conn.execute(
-                "SELECT payload FROM sync_items WHERE data_type = 'session' AND last_device_id = ?",
-                (device_id,),
-            ).fetchone()
             session_count = 0
-            if session_row:
-                sessions = _parse_session_payload(session_row["payload"])
-                session_count = len(sessions)
+
+            for item in conn.execute(
+                "SELECT data_type, payload FROM sync_items WHERE last_device_id = ?",
+                (device_id,),
+            ).fetchall():
+                dt = item["data_type"]
+                if dt == "analysis":
+                    track_count = _count_in_payload(item["payload"], "analysis")
+                    preview_count = _previews_count_for_payload(item["payload"])
+                elif dt == "session":
+                    session_count = _count_in_payload(item["payload"], "session")
 
             users.append({
                 "device_id": device_id,
@@ -156,508 +182,42 @@ async def list_users(request: Request):
         conn.close()
 
 
-# ── GET /admin/users/{device_id}/tracks ─────────────────────
-
-@admin_panel_router.get("/users/{device_id}/tracks")
-async def user_tracks(device_id: str, request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        # Get analysis data — could be uploaded by this device or by any device
-        # We search all analysis items and look for tracks belonging to this device
-        row = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
-            (device_id,),
-        ).fetchone()
-
-        if not row:
-            return {"tracks": [], "total": 0}
-
-        tracks_map = _parse_analysis_payload(row["payload"])
-        result = []
-        base_url = os.environ.get("BASE_URL", "").rstrip("/")
-
-        for track_id, t in tracks_map.items():
-            if not isinstance(t, dict):
-                continue
-            fingerprint = t.get("fingerprint", "")
-            has_preview = _preview_exists(fingerprint)
-
-            # Build artwork URL
-            artwork_url = t.get("artworkUrl", "")
-            if not artwork_url and fingerprint and base_url:
-                artwork_url = f"{base_url}/artwork/{fingerprint}"
-
-            # Extract nested fields
-            track_info = t.get("track", t)
-            tempo_info = t.get("tempo", t)
-            key_info = t.get("key", t)
-            energy_info = t.get("energy", t)
-
-            result.append({
-                "track_id": track_id,
-                "file_name": track_info.get("fileName", t.get("fileName", "")),
-                "artist": track_info.get("artist", t.get("artist", "")),
-                "title": track_info.get("title", t.get("title", "")),
-                "bpm": tempo_info.get("bpm", t.get("bpm")),
-                "key": key_info.get("key", t.get("key", "")),
-                "camelot": key_info.get("camelot", t.get("camelot", "")),
-                "genre": t.get("genre", ""),
-                "energy": energy_info.get("energy_dj", t.get("energy_dj", t.get("energy"))),
-                "track_type": t.get("trackType", t.get("track_type", "")),
-                "analyzed_at": t.get("analyzedAt", t.get("analyzed_at", "")),
-                "has_preview": has_preview,
-                "artwork_url": artwork_url,
-            })
-
-        return {"tracks": result, "total": len(result)}
-    finally:
-        conn.close()
-
-
-# ── GET /admin/users/{device_id}/previews ───────────────────
-
-@admin_panel_router.get("/users/{device_id}/previews")
-async def user_previews(device_id: str, request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        row = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
-            (device_id,),
-        ).fetchone()
-
-        if not row:
-            return {"previews": [], "total": 0}
-
-        tracks_map = _parse_analysis_payload(row["payload"])
-        base_url = os.environ.get("BASE_URL", "").rstrip("/")
-        result = []
-
-        for track_id, t in tracks_map.items():
-            if not isinstance(t, dict):
-                continue
-            fingerprint = t.get("fingerprint", "")
-            if not _preview_exists(fingerprint):
-                continue
-
-            track_info = t.get("track", t)
-            preview_url = f"{base_url}/preview/{fingerprint}" if base_url else ""
-
-            result.append({
-                "track_id": track_id,
-                "file_name": track_info.get("fileName", t.get("fileName", "")),
-                "artist": track_info.get("artist", t.get("artist", "")),
-                "title": track_info.get("title", t.get("title", "")),
-                "preview_url": preview_url,
-            })
-
-        return {"previews": result, "total": len(result)}
-    finally:
-        conn.close()
-
-
-# ── GET /admin/users/{device_id}/sessions ───────────────────
-
-@admin_panel_router.get("/users/{device_id}/sessions")
-async def user_sessions(device_id: str, request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        row = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'session' AND last_device_id = ?",
-            (device_id,),
-        ).fetchone()
-
-        if not row:
-            return {"sessions": [], "total": 0}
-
-        sessions = _parse_session_payload(row["payload"])
-        return {"sessions": sessions, "total": len(sessions)}
-    finally:
-        conn.close()
-
-
-# ── GET /admin/stats ────────────────────────────────────────
-
-# ── GET /admin/all-tracks ───────────────────────────────────
-# Admin endpoint: devuelve TODOS los análisis de TODOS los usuarios
-
-@admin_panel_router.get("/all-tracks")
-async def all_tracks(request: Request):
-    """Return all analyzed tracks from all users (for admin user)."""
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        analysis_rows = conn.execute(
-            "SELECT last_device_id, device_type, payload FROM sync_items WHERE data_type = 'analysis'"
-        ).fetchall()
-
-        base_url = os.environ.get("BASE_URL", "").rstrip("/")
-        result = []
-        seen_fingerprints = set()  # Deduplicar por fingerprint
-
-        for arow in analysis_rows:
-            device_id = arow["last_device_id"]
-            device_type = arow["device_type"] or "unknown"
-            tracks = _parse_analysis_payload(arow["payload"])
-
-            for track_id, t in tracks.items():
-                if not isinstance(t, dict):
-                    continue
-                fingerprint = t.get("fingerprint", "")
-
-                # Deduplicar: si ya vimos este fingerprint, skip
-                if fingerprint and fingerprint in seen_fingerprints:
-                    continue
-                if fingerprint:
-                    seen_fingerprints.add(fingerprint)
-
-                has_preview = _preview_exists(fingerprint)
-                artwork_url = t.get("artworkUrl", "")
-                if not artwork_url and fingerprint and base_url:
-                    artwork_url = f"{base_url}/artwork/{fingerprint}"
-
-                track_info = t.get("track", t)
-                tempo_info = t.get("tempo", t)
-                key_info = t.get("key", t)
-                energy_info = t.get("energy", t)
-
-                result.append({
-                    "track_id": track_id,
-                    "fingerprint": fingerprint,
-                    "file_name": track_info.get("fileName", t.get("fileName", "")),
-                    "artist": track_info.get("artist", t.get("artist", "")),
-                    "title": track_info.get("title", t.get("title", "")),
-                    "bpm": tempo_info.get("bpm", t.get("bpm")),
-                    "key": key_info.get("key", t.get("key", "")),
-                    "camelot": key_info.get("camelot", t.get("camelot", "")),
-                    "genre": t.get("genre", ""),
-                    "energy": energy_info.get("energy_dj", t.get("energy_dj", t.get("energy"))),
-                    "track_type": t.get("trackType", t.get("track_type", "")),
-                    "analyzed_at": t.get("analyzedAt", t.get("analyzed_at", "")),
-                    "has_preview": has_preview,
-                    "artwork_url": artwork_url,
-                    "preview_url": f"{base_url}/preview/{fingerprint}" if has_preview and base_url else "",
-                    "owner_device": device_id,
-                    "owner_device_type": device_type,
-                })
-
-        return {"tracks": result, "total": len(result)}
-    finally:
-        conn.close()
-
-
-# ── GET /admin/all-previews ────────────────────────────────
-
-@admin_panel_router.get("/all-previews")
-async def all_previews(request: Request):
-    """Return all available previews from all users (for admin user)."""
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        analysis_rows = conn.execute(
-            "SELECT last_device_id, payload FROM sync_items WHERE data_type = 'analysis'"
-        ).fetchall()
-
-        base_url = os.environ.get("BASE_URL", "").rstrip("/")
-        result = []
-        seen_fingerprints = set()
-
-        for arow in analysis_rows:
-            tracks = _parse_analysis_payload(arow["payload"])
-
-            for track_id, t in tracks.items():
-                if not isinstance(t, dict):
-                    continue
-                fingerprint = t.get("fingerprint", "")
-                if not fingerprint or fingerprint in seen_fingerprints:
-                    continue
-                seen_fingerprints.add(fingerprint)
-
-                if not _preview_exists(fingerprint):
-                    continue
-
-                track_info = t.get("track", t)
-                result.append({
-                    "track_id": track_id,
-                    "fingerprint": fingerprint,
-                    "artist": track_info.get("artist", t.get("artist", "")),
-                    "title": track_info.get("title", t.get("title", "")),
-                    "preview_url": f"{base_url}/preview/{fingerprint}" if base_url else "",
-                })
-
-        return {"previews": result, "total": len(result)}
-    finally:
-        conn.close()
-
-
-# ── GET /admin/stats ────────────────────────────────────────
-
-@admin_panel_router.get("/stats")
-async def global_stats(request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        # Distinct devices
-        device_rows = conn.execute("""
-            SELECT last_device_id, device_type
-            FROM sync_items
-            GROUP BY last_device_id
-        """).fetchall()
-
-        total_users = len(device_rows)
-        desktop_users = sum(1 for r in device_rows if (r["device_type"] or "").lower() in ("desktop", "macos", "windows", "linux"))
-        mobile_users = sum(1 for r in device_rows if (r["device_type"] or "").lower() in ("mobile", "ios", "android"))
-
-        # Count tracks and previews across all devices
-        total_tracks = 0
-        total_previews = 0
-        analysis_rows = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
-        ).fetchall()
-        for arow in analysis_rows:
-            tracks = _parse_analysis_payload(arow["payload"])
-            total_tracks += len(tracks)
-            for t in tracks.values():
-                fp = t.get("fingerprint", "") if isinstance(t, dict) else ""
-                if _preview_exists(fp):
-                    total_previews += 1
-
-        # Count sessions
-        total_sessions = 0
-        session_rows = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'session'"
-        ).fetchall()
-        for srow in session_rows:
-            sessions = _parse_session_payload(srow["payload"])
-            total_sessions += len(sessions)
-
-        return {
-            "total_users": total_users,
-            "total_tracks": total_tracks,
-            "total_previews": total_previews,
-            "total_sessions": total_sessions,
-            "desktop_users": desktop_users,
-            "mobile_users": mobile_users,
-        }
-    finally:
-        conn.close()
-
-
-# ── Helpers para tipos arbitrarios de sync ──────────────────
-
-def _generic_payload_count(payload_str: str) -> int:
-    """Cuenta items dentro de un payload generico (dict, list o nested).
-
-    Acepta tanto `{"items": [...]}`, `{"<id>": {...}, ...}` o `[...]`.
-    """
-    try:
-        payload = json.loads(payload_str)
-    except (json.JSONDecodeError, TypeError):
-        return 0
-
-    if isinstance(payload, list):
-        return len(payload)
-    if isinstance(payload, dict):
-        # Algunos data_types envuelven en sub-claves conocidas
-        for key in ("items", "folders", "collections", "cues",
-                    "favorites", "overrides", "sessions", "tracks"):
-            if key in payload and isinstance(payload[key], (list, dict)):
-                inner = payload[key]
-                return len(inner) if not isinstance(inner, dict) else len(inner)
-        # Si no, contamos las claves de primer nivel
-        return len(payload)
-    return 0
-
-
-def _fetch_user_sync_payload(conn: sqlite3.Connection, device_id: str,
-                             data_type: str) -> Optional[dict]:
-    """Obtiene el payload completo de un data_type para un device.
-
-    Devuelve el payload deserializado o None si no existe.
-    """
-    row = conn.execute(
-        "SELECT payload FROM sync_items "
-        "WHERE data_type = ? AND last_device_id = ?",
-        (data_type, device_id),
-    ).fetchone()
-    if not row:
-        return None
-    try:
-        return {"payload": json.loads(row["payload"])}
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-# ── GET /admin/users/{device_id}/{folders|collections|cues|favorites|overrides} ──
-
-@admin_panel_router.get("/users/{device_id}/folders")
-async def user_folders(device_id: str, request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        data = _fetch_user_sync_payload(conn, device_id, "folder")
-        if not data:
-            return {"folders": [], "total": 0}
-        payload = data["payload"]
-        folders = payload.get("folders", payload) if isinstance(payload, dict) else payload
-        if isinstance(folders, dict):
-            folders = list(folders.values())
-        if not isinstance(folders, list):
-            folders = []
-        return {"folders": folders, "total": len(folders)}
-    finally:
-        conn.close()
-
-
-@admin_panel_router.get("/users/{device_id}/collections")
-async def user_collections(device_id: str, request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        data = _fetch_user_sync_payload(conn, device_id, "collection")
-        if not data:
-            return {"collections": [], "total": 0}
-        payload = data["payload"]
-        cols = payload.get("collections", payload) if isinstance(payload, dict) else payload
-        if isinstance(cols, dict):
-            cols = list(cols.values())
-        if not isinstance(cols, list):
-            cols = []
-        return {"collections": cols, "total": len(cols)}
-    finally:
-        conn.close()
-
-
-@admin_panel_router.get("/users/{device_id}/cues")
-async def user_cues(device_id: str, request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        data = _fetch_user_sync_payload(conn, device_id, "cue")
-        if not data:
-            return {"cues": [], "total": 0}
-        payload = data["payload"]
-        cues = payload.get("cues", payload) if isinstance(payload, dict) else payload
-        # Cues puede venir como dict {trackId: [cuepoints]}
-        flat = []
-        if isinstance(cues, dict):
-            for track_id, items in cues.items():
-                if isinstance(items, list):
-                    for it in items:
-                        if isinstance(it, dict):
-                            flat.append({**it, "track_id": track_id})
-        elif isinstance(cues, list):
-            flat = [c for c in cues if isinstance(c, dict)]
-        return {"cues": flat, "total": len(flat)}
-    finally:
-        conn.close()
-
-
-@admin_panel_router.get("/users/{device_id}/favorites")
-async def user_favorites(device_id: str, request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        data = _fetch_user_sync_payload(conn, device_id, "favorite")
-        if not data:
-            return {"favorites": [], "total": 0}
-        payload = data["payload"]
-        favs = payload.get("favorites", payload) if isinstance(payload, dict) else payload
-        if isinstance(favs, dict):
-            favs = list(favs.keys())  # ids de tracks favoritos
-        if not isinstance(favs, list):
-            favs = []
-        return {"favorites": favs, "total": len(favs)}
-    finally:
-        conn.close()
-
-
-@admin_panel_router.get("/users/{device_id}/overrides")
-async def user_overrides(device_id: str, request: Request):
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        data = _fetch_user_sync_payload(conn, device_id, "override")
-        if not data:
-            return {"overrides": [], "total": 0}
-        payload = data["payload"]
-        overs = payload.get("overrides", payload) if isinstance(payload, dict) else payload
-        flat = []
-        if isinstance(overs, dict):
-            for track_id, fields in overs.items():
-                if isinstance(fields, dict):
-                    flat.append({"track_id": track_id, **fields})
-        elif isinstance(overs, list):
-            flat = [o for o in overs if isinstance(o, dict)]
-        return {"overrides": flat, "total": len(flat)}
-    finally:
-        conn.close()
-
-
 # ── GET /admin/users/{device_id}/summary ────────────────────
-# Devuelve los counts de cada data_type para construir el arbol
-# del panel admin sin tener que pedir cada endpoint individualmente.
 
 @admin_panel_router.get("/users/{device_id}/summary")
 async def user_summary(device_id: str, request: Request):
+    """Counts agregados para un device. NO expone contenido."""
     await _verify_admin_secret(request)
     conn = _get_sync_conn()
     try:
         rows = conn.execute(
-            """SELECT data_type, payload
-               FROM sync_items
-               WHERE last_device_id = ?""",
+            "SELECT data_type, payload FROM sync_items WHERE last_device_id = ?",
             (device_id,),
         ).fetchall()
 
         counts: dict = {
-            "tracks": 0,
-            "previews": 0,
-            "sessions": 0,
-            "folders": 0,
-            "collections": 0,
-            "cues": 0,
-            "favorites": 0,
-            "overrides": 0,
+            "tracks": 0, "previews": 0, "sessions": 0, "folders": 0,
+            "collections": 0, "cues": 0, "favorites": 0, "overrides": 0,
         }
 
         for r in rows:
             dt = r["data_type"]
             if dt == "analysis":
-                tracks = _parse_analysis_payload(r["payload"])
-                counts["tracks"] = len(tracks)
-                for t in tracks.values():
-                    fp = t.get("fingerprint", "") if isinstance(t, dict) else ""
-                    if _preview_exists(fp):
-                        counts["previews"] += 1
+                counts["tracks"] = _count_in_payload(r["payload"], "analysis")
+                counts["previews"] = _previews_count_for_payload(r["payload"])
             elif dt == "session":
-                counts["sessions"] = len(_parse_session_payload(r["payload"]))
+                counts["sessions"] = _count_in_payload(r["payload"], "session")
             elif dt == "folder":
-                counts["folders"] = _generic_payload_count(r["payload"])
+                counts["folders"] = _count_in_payload(r["payload"], "folder")
             elif dt == "collection":
-                counts["collections"] = _generic_payload_count(r["payload"])
+                counts["collections"] = _count_in_payload(r["payload"], "collection")
             elif dt == "cue":
-                # Para cues, contamos cuepoints totales no tracks
-                try:
-                    p = json.loads(r["payload"])
-                    inner = p.get("cues", p) if isinstance(p, dict) else p
-                    if isinstance(inner, dict):
-                        counts["cues"] = sum(
-                            len(v) if isinstance(v, list) else 0
-                            for v in inner.values()
-                        )
-                    elif isinstance(inner, list):
-                        counts["cues"] = len(inner)
-                except (json.JSONDecodeError, TypeError):
-                    pass
+                counts["cues"] = _count_in_payload(r["payload"], "cue")
             elif dt == "favorite":
-                counts["favorites"] = _generic_payload_count(r["payload"])
+                counts["favorites"] = _count_in_payload(r["payload"], "favorite")
             elif dt == "override":
-                counts["overrides"] = _generic_payload_count(r["payload"])
+                counts["overrides"] = _count_in_payload(r["payload"], "override")
 
-        # Errores no resueltos para este device
         err_row = conn.execute(
             "SELECT COUNT(*) as c FROM analysis_errors "
             "WHERE device_id = ? AND resolved = 0",
@@ -670,8 +230,81 @@ async def user_summary(device_id: str, request: Request):
         conn.close()
 
 
-# ── GET /admin/errors ───────────────────────────────────────
-# Lista global de errores. Filtrable por estado y limite.
+# ── GET /admin/stats ────────────────────────────────────────
+
+@admin_panel_router.get("/stats")
+async def global_stats(request: Request):
+    """Estadisticas globales agregadas. Sin contenido."""
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        device_rows = conn.execute("""
+            SELECT last_device_id, device_type
+            FROM sync_items
+            GROUP BY last_device_id
+        """).fetchall()
+
+        total_users = len(device_rows)
+        desktop_users = sum(
+            1 for r in device_rows
+            if (r["device_type"] or "").lower() in ("desktop", "macos", "windows", "linux")
+        )
+        mobile_users = sum(
+            1 for r in device_rows
+            if (r["device_type"] or "").lower() in ("mobile", "ios", "android")
+        )
+
+        total_tracks = 0
+        total_previews = 0
+        for arow in conn.execute(
+            "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
+        ).fetchall():
+            total_tracks += _count_in_payload(arow["payload"], "analysis")
+            total_previews += _previews_count_for_payload(arow["payload"])
+
+        total_sessions = 0
+        for srow in conn.execute(
+            "SELECT payload FROM sync_items WHERE data_type = 'session'"
+        ).fetchall():
+            total_sessions += _count_in_payload(srow["payload"], "session")
+
+        # Errores: counts globales para dashboard
+        err_unresolved = conn.execute(
+            "SELECT COUNT(*) as c FROM analysis_errors WHERE resolved = 0"
+        ).fetchone()
+        err_resolved = conn.execute(
+            "SELECT COUNT(*) as c FROM analysis_errors WHERE resolved = 1"
+        ).fetchone()
+
+        return {
+            "total_users": total_users,
+            "total_tracks": total_tracks,
+            "total_previews": total_previews,
+            "total_sessions": total_sessions,
+            "desktop_users": desktop_users,
+            "mobile_users": mobile_users,
+            "errors_unresolved": err_unresolved["c"] if err_unresolved else 0,
+            "errors_resolved": err_resolved["c"] if err_resolved else 0,
+        }
+    finally:
+        conn.close()
+
+
+# ── ANALYSIS ERRORS ─────────────────────────────────────────
+# Filename ya viene anonimizado desde log_analysis_error.
+
+def _opportunistic_cleanup():
+    """Llama al cleanup oportunisticamente (1 de cada 50 requests)
+    para que la tabla no crezca sin limite. Coste despreciable.
+    """
+    import random
+    if random.random() < 0.02:
+        try:
+            from sync_endpoints import cleanup_old_errors
+            cleanup_old_errors()
+        except Exception:  # noqa: BLE001
+            pass
+
 
 @admin_panel_router.get("/errors")
 async def list_errors(
@@ -680,7 +313,9 @@ async def list_errors(
     limit: int = 200,
     since: Optional[str] = None,
 ):
+    """Listado plano de errores ordenado por timestamp desc."""
     await _verify_admin_secret(request)
+    _opportunistic_cleanup()
     if limit < 1 or limit > 1000:
         limit = 200
 
@@ -700,7 +335,6 @@ async def list_errors(
         rows = conn.execute(query, params).fetchall()
         errors = [dict(r) for r in rows]
 
-        # Counts por estado para badges
         totals = conn.execute(
             "SELECT resolved, COUNT(*) as c FROM analysis_errors GROUP BY resolved"
         ).fetchall()
@@ -716,17 +350,92 @@ async def list_errors(
         conn.close()
 
 
+@admin_panel_router.get("/errors-grouped")
+async def list_errors_grouped(
+    request: Request,
+    resolved: Optional[int] = None,
+    limit: int = 100,
+):
+    """Errores agrupados por (error_class + primera linea de error_msg).
+
+    Cuando un bug afecta a 200 usuarios, el listado plano se vuelve ruido.
+    Aqui devolvemos N filas, una por bug distinto, con count y ultimo
+    timestamp. Es lo que el dev quiere ver primero.
+    """
+    await _verify_admin_secret(request)
+    _opportunistic_cleanup()
+    if limit < 1 or limit > 500:
+        limit = 100
+
+    conn = _get_sync_conn()
+    try:
+        # Agrupa por error_class + 80 primeros chars del msg (estable
+        # frente a paths o ids que cambien dentro del msg).
+        where = ""
+        params: list = []
+        if resolved is not None:
+            where = "WHERE resolved = ?"
+            params.append(int(bool(resolved)))
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                error_class,
+                substr(error_msg, 1, 80) as msg_short,
+                COUNT(*) as count,
+                COUNT(DISTINCT device_id) as devices_affected,
+                MAX(timestamp) as last_seen,
+                MIN(timestamp) as first_seen,
+                MAX(id) as latest_id,
+                SUM(CASE WHEN resolved = 0 THEN 1 ELSE 0 END) as unresolved_count
+            FROM analysis_errors
+            {where}
+            GROUP BY error_class, msg_short
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            params + [limit],
+        ).fetchall()
+
+        groups = []
+        for r in rows:
+            # Ejemplo del traceback del registro mas reciente (anonimo
+            # ya por log_analysis_error).
+            sample = conn.execute(
+                "SELECT traceback, error_msg, filename FROM analysis_errors WHERE id = ?",
+                (r["latest_id"],),
+            ).fetchone()
+            groups.append({
+                "error_class": r["error_class"],
+                "msg_short": r["msg_short"],
+                "count": r["count"],
+                "devices_affected": r["devices_affected"],
+                "first_seen": r["first_seen"],
+                "last_seen": r["last_seen"],
+                "latest_id": r["latest_id"],
+                "unresolved_count": r["unresolved_count"],
+                "sample_msg": sample["error_msg"] if sample else "",
+                "sample_traceback": sample["traceback"] if sample else "",
+                "sample_filename": sample["filename"] if sample else "",
+            })
+
+        return {"groups": groups, "total": len(groups)}
+    finally:
+        conn.close()
+
+
 @admin_panel_router.get("/users/{device_id}/errors")
 async def user_errors(device_id: str, request: Request,
                       resolved: Optional[int] = None,
                       limit: int = 200):
+    """Errores de un device concreto. Filename ya anonimizado en BD."""
     await _verify_admin_secret(request)
     if limit < 1 or limit > 1000:
         limit = 200
 
     conn = _get_sync_conn()
     try:
-        query = ("SELECT * FROM analysis_errors WHERE device_id = ?")
+        query = "SELECT * FROM analysis_errors WHERE device_id = ?"
         params: list = [device_id]
         if resolved is not None:
             query += " AND resolved = ?"
@@ -742,7 +451,7 @@ async def user_errors(device_id: str, request: Request,
 
 @admin_panel_router.post("/errors/{error_id}/resolve")
 async def resolve_error(error_id: int, request: Request):
-    """Toggle resolved flag de un error."""
+    """Toggle resolved flag de un error individual."""
     await _verify_admin_secret(request)
     conn = _get_sync_conn()
     try:
@@ -753,7 +462,6 @@ async def resolve_error(error_id: int, request: Request):
         if not row:
             raise HTTPException(404, f"Error {error_id} no encontrado")
         new_state = 0 if row["resolved"] else 1
-        from datetime import datetime, timezone
         now_iso = datetime.now(timezone.utc).isoformat()
         conn.execute(
             "UPDATE analysis_errors SET resolved = ?, resolved_at = ? WHERE id = ?",
@@ -762,5 +470,37 @@ async def resolve_error(error_id: int, request: Request):
         conn.commit()
         return {"id": error_id, "resolved": bool(new_state),
                 "resolved_at": now_iso if new_state else None}
+    finally:
+        conn.close()
+
+
+@admin_panel_router.post("/errors/group/resolve")
+async def resolve_error_group(request: Request):
+    """Resuelve todas las filas de un grupo (mismo error_class + msg_short).
+
+    Body JSON: {"error_class": "...", "msg_short": "..."}
+    Util cuando arreglas un bug y quieres cerrar las 200 ocurrencias
+    de un golpe.
+    """
+    await _verify_admin_secret(request)
+    body = await request.json()
+    error_class = body.get("error_class") or ""
+    msg_short = body.get("msg_short") or ""
+    if not error_class or not msg_short:
+        raise HTTPException(400, "error_class y msg_short requeridos")
+
+    conn = _get_sync_conn()
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            """UPDATE analysis_errors
+               SET resolved = 1, resolved_at = ?
+               WHERE error_class = ?
+                 AND substr(error_msg, 1, 80) = ?
+                 AND resolved = 0""",
+            (now_iso, error_class, msg_short),
+        )
+        conn.commit()
+        return {"resolved": cur.rowcount, "resolved_at": now_iso}
     finally:
         conn.close()
