@@ -443,3 +443,324 @@ async def global_stats(request: Request):
         }
     finally:
         conn.close()
+
+
+# ── Helpers para tipos arbitrarios de sync ──────────────────
+
+def _generic_payload_count(payload_str: str) -> int:
+    """Cuenta items dentro de un payload generico (dict, list o nested).
+
+    Acepta tanto `{"items": [...]}`, `{"<id>": {...}, ...}` o `[...]`.
+    """
+    try:
+        payload = json.loads(payload_str)
+    except (json.JSONDecodeError, TypeError):
+        return 0
+
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict):
+        # Algunos data_types envuelven en sub-claves conocidas
+        for key in ("items", "folders", "collections", "cues",
+                    "favorites", "overrides", "sessions", "tracks"):
+            if key in payload and isinstance(payload[key], (list, dict)):
+                inner = payload[key]
+                return len(inner) if not isinstance(inner, dict) else len(inner)
+        # Si no, contamos las claves de primer nivel
+        return len(payload)
+    return 0
+
+
+def _fetch_user_sync_payload(conn: sqlite3.Connection, device_id: str,
+                             data_type: str) -> Optional[dict]:
+    """Obtiene el payload completo de un data_type para un device.
+
+    Devuelve el payload deserializado o None si no existe.
+    """
+    row = conn.execute(
+        "SELECT payload FROM sync_items "
+        "WHERE data_type = ? AND last_device_id = ?",
+        (data_type, device_id),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        return {"payload": json.loads(row["payload"])}
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+# ── GET /admin/users/{device_id}/{folders|collections|cues|favorites|overrides} ──
+
+@admin_panel_router.get("/users/{device_id}/folders")
+async def user_folders(device_id: str, request: Request):
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        data = _fetch_user_sync_payload(conn, device_id, "folder")
+        if not data:
+            return {"folders": [], "total": 0}
+        payload = data["payload"]
+        folders = payload.get("folders", payload) if isinstance(payload, dict) else payload
+        if isinstance(folders, dict):
+            folders = list(folders.values())
+        if not isinstance(folders, list):
+            folders = []
+        return {"folders": folders, "total": len(folders)}
+    finally:
+        conn.close()
+
+
+@admin_panel_router.get("/users/{device_id}/collections")
+async def user_collections(device_id: str, request: Request):
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        data = _fetch_user_sync_payload(conn, device_id, "collection")
+        if not data:
+            return {"collections": [], "total": 0}
+        payload = data["payload"]
+        cols = payload.get("collections", payload) if isinstance(payload, dict) else payload
+        if isinstance(cols, dict):
+            cols = list(cols.values())
+        if not isinstance(cols, list):
+            cols = []
+        return {"collections": cols, "total": len(cols)}
+    finally:
+        conn.close()
+
+
+@admin_panel_router.get("/users/{device_id}/cues")
+async def user_cues(device_id: str, request: Request):
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        data = _fetch_user_sync_payload(conn, device_id, "cue")
+        if not data:
+            return {"cues": [], "total": 0}
+        payload = data["payload"]
+        cues = payload.get("cues", payload) if isinstance(payload, dict) else payload
+        # Cues puede venir como dict {trackId: [cuepoints]}
+        flat = []
+        if isinstance(cues, dict):
+            for track_id, items in cues.items():
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict):
+                            flat.append({**it, "track_id": track_id})
+        elif isinstance(cues, list):
+            flat = [c for c in cues if isinstance(c, dict)]
+        return {"cues": flat, "total": len(flat)}
+    finally:
+        conn.close()
+
+
+@admin_panel_router.get("/users/{device_id}/favorites")
+async def user_favorites(device_id: str, request: Request):
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        data = _fetch_user_sync_payload(conn, device_id, "favorite")
+        if not data:
+            return {"favorites": [], "total": 0}
+        payload = data["payload"]
+        favs = payload.get("favorites", payload) if isinstance(payload, dict) else payload
+        if isinstance(favs, dict):
+            favs = list(favs.keys())  # ids de tracks favoritos
+        if not isinstance(favs, list):
+            favs = []
+        return {"favorites": favs, "total": len(favs)}
+    finally:
+        conn.close()
+
+
+@admin_panel_router.get("/users/{device_id}/overrides")
+async def user_overrides(device_id: str, request: Request):
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        data = _fetch_user_sync_payload(conn, device_id, "override")
+        if not data:
+            return {"overrides": [], "total": 0}
+        payload = data["payload"]
+        overs = payload.get("overrides", payload) if isinstance(payload, dict) else payload
+        flat = []
+        if isinstance(overs, dict):
+            for track_id, fields in overs.items():
+                if isinstance(fields, dict):
+                    flat.append({"track_id": track_id, **fields})
+        elif isinstance(overs, list):
+            flat = [o for o in overs if isinstance(o, dict)]
+        return {"overrides": flat, "total": len(flat)}
+    finally:
+        conn.close()
+
+
+# ── GET /admin/users/{device_id}/summary ────────────────────
+# Devuelve los counts de cada data_type para construir el arbol
+# del panel admin sin tener que pedir cada endpoint individualmente.
+
+@admin_panel_router.get("/users/{device_id}/summary")
+async def user_summary(device_id: str, request: Request):
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        rows = conn.execute(
+            """SELECT data_type, payload
+               FROM sync_items
+               WHERE last_device_id = ?""",
+            (device_id,),
+        ).fetchall()
+
+        counts: dict = {
+            "tracks": 0,
+            "previews": 0,
+            "sessions": 0,
+            "folders": 0,
+            "collections": 0,
+            "cues": 0,
+            "favorites": 0,
+            "overrides": 0,
+        }
+
+        for r in rows:
+            dt = r["data_type"]
+            if dt == "analysis":
+                tracks = _parse_analysis_payload(r["payload"])
+                counts["tracks"] = len(tracks)
+                for t in tracks.values():
+                    fp = t.get("fingerprint", "") if isinstance(t, dict) else ""
+                    if _preview_exists(fp):
+                        counts["previews"] += 1
+            elif dt == "session":
+                counts["sessions"] = len(_parse_session_payload(r["payload"]))
+            elif dt == "folder":
+                counts["folders"] = _generic_payload_count(r["payload"])
+            elif dt == "collection":
+                counts["collections"] = _generic_payload_count(r["payload"])
+            elif dt == "cue":
+                # Para cues, contamos cuepoints totales no tracks
+                try:
+                    p = json.loads(r["payload"])
+                    inner = p.get("cues", p) if isinstance(p, dict) else p
+                    if isinstance(inner, dict):
+                        counts["cues"] = sum(
+                            len(v) if isinstance(v, list) else 0
+                            for v in inner.values()
+                        )
+                    elif isinstance(inner, list):
+                        counts["cues"] = len(inner)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif dt == "favorite":
+                counts["favorites"] = _generic_payload_count(r["payload"])
+            elif dt == "override":
+                counts["overrides"] = _generic_payload_count(r["payload"])
+
+        # Errores no resueltos para este device
+        err_row = conn.execute(
+            "SELECT COUNT(*) as c FROM analysis_errors "
+            "WHERE device_id = ? AND resolved = 0",
+            (device_id,),
+        ).fetchone()
+        counts["errors_unresolved"] = err_row["c"] if err_row else 0
+
+        return {"device_id": device_id, "counts": counts}
+    finally:
+        conn.close()
+
+
+# ── GET /admin/errors ───────────────────────────────────────
+# Lista global de errores. Filtrable por estado y limite.
+
+@admin_panel_router.get("/errors")
+async def list_errors(
+    request: Request,
+    resolved: Optional[int] = None,
+    limit: int = 200,
+    since: Optional[str] = None,
+):
+    await _verify_admin_secret(request)
+    if limit < 1 or limit > 1000:
+        limit = 200
+
+    conn = _get_sync_conn()
+    try:
+        query = "SELECT * FROM analysis_errors WHERE 1=1"
+        params: list = []
+        if resolved is not None:
+            query += " AND resolved = ?"
+            params.append(int(bool(resolved)))
+        if since:
+            query += " AND timestamp >= ?"
+            params.append(since)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(query, params).fetchall()
+        errors = [dict(r) for r in rows]
+
+        # Counts por estado para badges
+        totals = conn.execute(
+            "SELECT resolved, COUNT(*) as c FROM analysis_errors GROUP BY resolved"
+        ).fetchall()
+        by_state = {int(r["resolved"]): r["c"] for r in totals}
+
+        return {
+            "errors": errors,
+            "total": len(errors),
+            "unresolved_total": by_state.get(0, 0),
+            "resolved_total": by_state.get(1, 0),
+        }
+    finally:
+        conn.close()
+
+
+@admin_panel_router.get("/users/{device_id}/errors")
+async def user_errors(device_id: str, request: Request,
+                      resolved: Optional[int] = None,
+                      limit: int = 200):
+    await _verify_admin_secret(request)
+    if limit < 1 or limit > 1000:
+        limit = 200
+
+    conn = _get_sync_conn()
+    try:
+        query = ("SELECT * FROM analysis_errors WHERE device_id = ?")
+        params: list = [device_id]
+        if resolved is not None:
+            query += " AND resolved = ?"
+            params.append(int(bool(resolved)))
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        errors = [dict(r) for r in rows]
+        return {"device_id": device_id, "errors": errors, "total": len(errors)}
+    finally:
+        conn.close()
+
+
+@admin_panel_router.post("/errors/{error_id}/resolve")
+async def resolve_error(error_id: int, request: Request):
+    """Toggle resolved flag de un error."""
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        row = conn.execute(
+            "SELECT resolved FROM analysis_errors WHERE id = ?",
+            (error_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Error {error_id} no encontrado")
+        new_state = 0 if row["resolved"] else 1
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE analysis_errors SET resolved = ?, resolved_at = ? WHERE id = ?",
+            (new_state, now_iso if new_state else None, error_id),
+        )
+        conn.commit()
+        return {"id": error_id, "resolved": bool(new_state),
+                "resolved_at": now_iso if new_state else None}
+    finally:
+        conn.close()

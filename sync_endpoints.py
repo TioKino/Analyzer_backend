@@ -158,6 +158,30 @@ def _init_tables(conn: sqlite3.Connection):
             ON detected_tracks_sync(device_id);
         CREATE INDEX IF NOT EXISTS idx_dts_date
             ON detected_tracks_sync(detected_at);
+
+        -- Errores de analisis: persistencia para el panel admin.
+        -- Los logs de Render se queman en cada redeploy y son dificiles
+        -- de leer; aqui guardamos cada excepcion de /analyze con el
+        -- contexto suficiente para reproducir y arreglar.
+        CREATE TABLE IF NOT EXISTS analysis_errors (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL,
+            device_id   TEXT,
+            filename    TEXT NOT NULL,
+            fingerprint TEXT,
+            error_class TEXT NOT NULL,
+            error_msg   TEXT NOT NULL,
+            traceback   TEXT,
+            endpoint    TEXT NOT NULL DEFAULT '/analyze',
+            resolved    INTEGER NOT NULL DEFAULT 0,
+            resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_analysis_errors_device
+            ON analysis_errors(device_id, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_analysis_errors_time
+            ON analysis_errors(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_analysis_errors_resolved
+            ON analysis_errors(resolved);
     """)
 
     # Migration: add payload column to device_seen if missing
@@ -297,6 +321,50 @@ def _generate_link_code() -> str:
     """Genera un código alfanumérico de 6 caracteres (sin ambigüedades)."""
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I
     return "".join(random.choices(chars, k=6))
+
+
+# ── Analysis error log (publico, lo usa /analyze) ───────────
+
+def log_analysis_error(
+    *,
+    filename: str,
+    error_class: str,
+    error_msg: str,
+    device_id: Optional[str] = None,
+    fingerprint: Optional[str] = None,
+    traceback_str: Optional[str] = None,
+    endpoint: str = "/analyze",
+) -> Optional[int]:
+    """Persiste un error de analisis en analysis_errors. No lanza nunca:
+    si la BD no esta disponible se ignora (no queremos romper el fallback
+    de /analyze por un fallo al loggear).
+
+    Returns: id del registro insertado, o None si fallo.
+    """
+    try:
+        conn = _get_conn()
+        cur = conn.execute(
+            """INSERT INTO analysis_errors
+               (timestamp, device_id, filename, fingerprint,
+                error_class, error_msg, traceback, endpoint, resolved)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            (
+                _now_iso(),
+                device_id or None,
+                filename or "(unknown)",
+                fingerprint or None,
+                error_class,
+                # SQLite acepta TEXT pero limitamos para evitar abusos
+                (error_msg or "")[:2000],
+                (traceback_str or "")[:5000],
+                endpoint,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"log_analysis_error failed: {e}")
+        return None
 
 
 def _is_collective(data_type: str) -> bool:

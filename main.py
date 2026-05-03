@@ -1964,6 +1964,15 @@ async def analyze_track(
         except (OSError, ValueError):
             original_path = ""
 
+    # Device id del cliente — opcional. Sirve para asociar errores de
+    # analisis al usuario que los provoca (panel admin). Sanitizamos
+    # para que sea un id de los nuestros (alfanumerico + _).
+    raw_device_id = request.headers.get("X-Device-Id", "") or ""
+    device_id_for_log: Optional[str] = None
+    if raw_device_id and len(raw_device_id) <= 64:
+        if re.match(r'^[A-Za-z0-9_-]+$', raw_device_id):
+            device_id_for_log = raw_device_id
+
     #  Validacin mejorada de archivo
     if not file.filename:
         raise HTTPException(400, "No se proporcion archivo")
@@ -2262,7 +2271,23 @@ async def analyze_track(
         import traceback
         error_detail = traceback.format_exc()
         logger.error(f"ERROR en anlisis de audio:\n{error_detail}")
-        
+
+        # Persistir el error en analysis_errors para el panel admin.
+        # Best-effort: nunca lanza, no bloquea el fallback de abajo.
+        try:
+            from sync_endpoints import log_analysis_error
+            log_analysis_error(
+                filename=file.filename or "(unknown)",
+                error_class=type(e).__name__,
+                error_msg=str(e),
+                device_id=device_id_for_log,
+                fingerprint=locals().get("fingerprint"),
+                traceback_str=error_detail,
+                endpoint="/analyze",
+            )
+        except Exception as log_err:  # noqa: BLE001
+            logger.warning(f"log_analysis_error fallo: {log_err}")
+
         # ==================== FALLBACK: Track corrupto ====================
         # Intentar crear resultado bsico con ID3 y/o filename
         logger.info(f" Intentando fallback para: {file.filename}")
