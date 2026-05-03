@@ -820,10 +820,38 @@ def get_camelot(key: str) -> str:
 # ==================== HELPERS ====================
 
 def calculate_fingerprint(file_path):
-    """Calcular fingerprint simple del archivo"""
+    """Calcula fingerprint del archivo.
+
+    Devuelve tupla `(fingerprint, source)`:
+    - source='chromaprint' si fpcalc esta disponible y el audio es valido.
+      El fingerprint es el MD5 del array Chromaprint, estable cross-device
+      e independiente de filename/tags/re-codec.
+    - source='md5_legacy' si fpcalc no esta o el audio falla. Fallback al
+      MD5 del contenido del archivo (compat con BDs anteriores a v2.8.0).
+
+    Llamadas legacy que esperan un str pueden seguir usando `[0]` o
+    asignacion con tuple unpacking. Ver callers en `/analyze`, `/identify`.
+    """
+    try:
+        from chromaprint_helper import (
+            ChromaprintFailed,
+            ChromaprintUnavailable,
+            calculate_chromaprint_fingerprint,
+        )
+        try:
+            fp_md5, _fp_b64, _dur_ms = calculate_chromaprint_fingerprint(file_path)
+            return fp_md5, "chromaprint"
+        except (ChromaprintUnavailable, ChromaprintFailed) as exc:
+            logger.warning(
+                "Chromaprint fallo en %s (%s), usando MD5 legacy",
+                file_path, exc,
+            )
+    except ImportError as exc:
+        logger.warning("chromaprint_helper no importable (%s), usando MD5 legacy", exc)
+
     with open(file_path, 'rb') as f:
         file_hash = hashlib.md5(f.read()).hexdigest()
-    return file_hash
+    return file_hash, "md5_legacy"
 
 def parse_filename(filename: str) -> dict:
     name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
@@ -2060,9 +2088,9 @@ async def analyze_track(
         import warnings
         warnings.filterwarnings('ignore')
         
-        # Calcular fingerprint del archivo
-        fingerprint = calculate_fingerprint(tmp_path)
-        
+        # Calcular fingerprint del archivo (Chromaprint con fallback MD5)
+        fingerprint, fingerprint_source = calculate_fingerprint(tmp_path)
+
         # NUEVO: Buscar por fingerprint si no se encontro por filename
         # Esto recupera datos de AudD guardados previamente
         if not force:
@@ -2237,6 +2265,7 @@ async def analyze_track(
         track_data['id'] = fingerprint
         track_data['filename'] = file.filename
         track_data['fingerprint'] = fingerprint
+        track_data['fingerprint_source'] = fingerprint_source
         db.save_track(track_data)
 
         # Incrementar contador de popularidad
@@ -2295,10 +2324,11 @@ async def analyze_track(
         try:
             # Intentar fingerprint del contenido primero
             try:
-                fingerprint = calculate_fingerprint(tmp_path)
+                fingerprint, fingerprint_source = calculate_fingerprint(tmp_path)
             except Exception:
                 # Si falla (archivo muy corrupto), usar md5 del nombre
                 fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
+                fingerprint_source = "md5_legacy"
             
             # Intentar leer metadatos ID3 aunque el audio est(c) corrupto
             id3_data = {}
@@ -2363,6 +2393,7 @@ async def analyze_track(
             track_data['id'] = fingerprint
             track_data['filename'] = file.filename
             track_data['fingerprint'] = fingerprint
+            track_data['fingerprint_source'] = fingerprint_source
             track_data['analysis_status'] = 'failed'  # Marcador especial
             db.save_track(track_data)
             
@@ -2454,9 +2485,12 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
 
         logger.info(f"Identificando track: {file.filename}")
 
-        # Calcular fingerprint del CONTENIDO del archivo (igual que en /analyze)
-        fingerprint = calculate_fingerprint(tmp_path)
-        logger.info(f"  Fingerprint (contenido): {fingerprint[:12]}...")
+        # Calcular fingerprint del archivo (Chromaprint con fallback MD5)
+        fingerprint, fingerprint_source = calculate_fingerprint(tmp_path)
+        logger.info(
+            "  Fingerprint (%s): %s...",
+            fingerprint_source, fingerprint[:12],
+        )
         
         # ==================== PASO 1: IDENTIFICAR CON AUDD ====================
         audio_to_send = tmp_path
@@ -2694,6 +2728,7 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             'id': fingerprint,
             'filename': file.filename,
             'fingerprint': fingerprint,
+            'fingerprint_source': fingerprint_source,
             'title': title,
             'artist': artist,
             'album': album,

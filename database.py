@@ -61,13 +61,22 @@ class AnalysisDB:
                 analysis_json TEXT,
                 analyzed_at TEXT,
                 fingerprint TEXT,
-                chromaprint TEXT
+                chromaprint TEXT,
+                fingerprint_source TEXT DEFAULT 'md5_legacy'
             )
         ''')
 
         # Migracion: anadir columna chromaprint si no existe (BDs antiguas)
         try:
             c.execute('ALTER TABLE tracks ADD COLUMN chromaprint TEXT')
+        except sqlite3.OperationalError:
+            pass  # Ya existe
+
+        # Migracion v2.8.0: anadir columna fingerprint_source si no existe.
+        # Default 'md5_legacy' para que tracks pre-Chromaprint queden marcados
+        # como candidatos a re-procesado por scripts/migrate_to_chromaprint.py.
+        try:
+            c.execute("ALTER TABLE tracks ADD COLUMN fingerprint_source TEXT DEFAULT 'md5_legacy'")
         except sqlite3.OperationalError:
             pass  # Ya existe
 
@@ -264,8 +273,9 @@ class AnalysisDB:
         c.execute('''
             INSERT OR REPLACE INTO tracks
             (id, filename, artist, title, duration, bpm, key, camelot,
-             energy_dj, genre, track_type, analysis_json, analyzed_at, fingerprint)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             energy_dj, genre, track_type, analysis_json, analyzed_at,
+             fingerprint, fingerprint_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             track_data['id'],
             track_data['filename'],
@@ -280,7 +290,8 @@ class AnalysisDB:
             track_data['track_type'],
             json.dumps(track_data),
             datetime.now().isoformat(),
-            track_data.get('fingerprint')
+            track_data.get('fingerprint'),
+            track_data.get('fingerprint_source', 'md5_legacy'),
         ))
 
         conn.commit()
