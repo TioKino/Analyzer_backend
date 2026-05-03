@@ -3,7 +3,6 @@ Audio analysis helper functions: fingerprint, filename parsing, structure detect
 """
 import math
 import json
-import hashlib
 import re
 import logging
 import numpy as np
@@ -43,29 +42,11 @@ class SafeJSONResponse(JSONResponse):
 
 
 # ==================== HELPERS ====================
-
-def calculate_fingerprint(file_path):
-    """
-    Calcular fingerprint de audio usando Chromaprint (basado en el sonido real).
-    Mismo audio = mismo fingerprint, sin importar nombre, formato o bitrate.
-    Fallback a MD5 del contenido si Chromaprint no está disponible.
-
-    Returns: (short_id, chromaprint_raw) donde:
-      - short_id: MD5 del chromaprint hash (32 chars, compatible con IDs existentes)
-      - chromaprint_raw: fingerprint completo de Chromaprint (para matching futuro) o None
-    """
-    try:
-        import acoustid
-        duration, fp = acoustid.fingerprint_file(file_path)
-        fp_bytes = fp if isinstance(fp, bytes) else fp.encode()
-        short_id = hashlib.md5(fp_bytes).hexdigest()
-        logger.info(f"[Fingerprint] Chromaprint OK: {short_id} ({duration:.0f}s)")
-        return short_id, fp.decode() if isinstance(fp, bytes) else fp
-    except Exception as e:
-        logger.warning(f"[Fingerprint] Chromaprint falló ({e}), usando MD5 del archivo")
-        with open(file_path, 'rb') as f:
-            file_hash = hashlib.md5(f.read()).hexdigest()
-        return file_hash, None
+# La funcion `calculate_fingerprint` fue movida a `chromaprint_helper.py`
+# (PLAN_CHROMAPRINT.md, Sub-sprint 1). El callsite real en main.py usa la
+# nueva implementacion con tupla `(fingerprint, source)` y soporte para
+# `fingerprint_source` en BD. Este archivo conserva los demas helpers
+# de audio (parse_filename, detect_structure, etc).
 
 
 def parse_filename(filename: str) -> dict:
