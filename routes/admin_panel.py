@@ -39,6 +39,20 @@ def _get_admin_secret() -> str:
 
 
 async def _verify_admin_secret(request: Request):
+    # Rate limit ANTES de verificar secret: evita que un atacante use
+    # respuestas 401 como oraculo para tantear secretos a velocidad
+    # arbitraria, y limita el bandwidth disponible si el secret se
+    # filtrara alguna vez.
+    try:
+        from validation import check_admin_rate_limit, get_client_ip
+        check_admin_rate_limit(get_client_ip(request))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        # Fail-open si validation no esta importable (no queremos romper
+        # admin por un bug del rate limiter).
+        logger.warning(f"admin rate limit check failed: {e}")
+
     secret = _get_admin_secret()
     if not secret:
         if os.getenv("RENDER") or os.getenv("RAILWAY_ENVIRONMENT"):

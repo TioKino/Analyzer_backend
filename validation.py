@@ -501,11 +501,17 @@ SimpleRateLimiter = RateLimiter
 # Instancia global del rate limiter
 rate_limiter = RateLimiter(max_requests=60, window_seconds=60)
 
+# Instancia separada para endpoints admin. Defensa extra: si el
+# ADMIN_SECRET se filtrara, el atacante no podria volcar la BD a velocidad
+# arbitraria — 50 req/min es suficiente para uso normal del panel y
+# limita el bandwidth disponible para abuso.
+admin_rate_limiter = RateLimiter(max_requests=50, window_seconds=60)
+
 
 def check_rate_limit(client_ip: str) -> None:
     """
-    Verifica rate limit para un cliente.
-    
+    Verifica rate limit GENERAL (60/min) para un cliente.
+
     Raises:
         HTTPException: Si se excede el límite
     """
@@ -514,6 +520,22 @@ def check_rate_limit(client_ip: str) -> None:
         raise HTTPException(
             status_code=429,
             detail="Demasiadas solicitudes. Intenta de nuevo en un minuto.",
+            headers={"Retry-After": "60", "X-RateLimit-Remaining": str(remaining)}
+        )
+
+
+def check_admin_rate_limit(client_ip: str) -> None:
+    """Verifica rate limit ESPECIFICO para endpoints admin (50/min/IP).
+
+    Independiente del rate limit general — el dev usando el panel no
+    consume cuota de /analyze, pero un atacante con secret filtrado
+    tampoco puede hacer 1000 req/min para volcar la BD.
+    """
+    if not admin_rate_limiter.is_allowed(client_ip):
+        remaining = admin_rate_limiter.get_remaining(client_ip)
+        raise HTTPException(
+            status_code=429,
+            detail="Admin rate limit exceeded.",
             headers={"Retry-After": "60", "X-RateLimit-Remaining": str(remaining)}
         )
 
