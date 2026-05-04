@@ -1,5 +1,5 @@
 """
-DJ Analyzer Pro API v2.3.0
+DJ Analyzer Pro API v2.8.0
 ==========================
 Backend principal - Importa funcionalidad de mdulos separados
 
