@@ -76,6 +76,16 @@ def _get_sync_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(_SYNC_DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
+    # Asegurar que las tablas existen. Si el primer hit al backend es a
+    # /admin/* antes que a /sync/*, sync_endpoints._init_tables no se
+    # ejecuto todavia y las queries sobre analysis_errors petan con
+    # "no such table". _init_tables es idempotente (CREATE TABLE IF NOT
+    # EXISTS), asi que llamarla aqui es seguro y barato.
+    try:
+        from sync_endpoints import _init_tables
+        _init_tables(conn)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"admin_panel: no se pudo init_tables: {e}")
     return conn
 
 
