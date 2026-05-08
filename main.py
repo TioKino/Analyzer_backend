@@ -1203,6 +1203,10 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     
     # BPM
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+    # librosa >=0.10 puede devolver tempo como np.ndarray (ej. array([120.5]))
+    # en lugar de un escalar. Normalizar antes de convertir a float.
+    if hasattr(tempo, '__iter__'):
+        tempo = tempo[0] if len(tempo) > 0 else 0.0
     bpm = float(tempo)
     bpm_source = "analysis"
     
@@ -2304,7 +2308,7 @@ async def analyze_track(
                 energy_raw=0,
                 energy_normalized=0,
                 energy_dj=5,  # Valor medio por defecto
-                genre=id3_data.get('genre', 'Unknown'),
+                genre=id3_data.get('genre') or 'Unknown',
                 genre_source="pending",
                 track_type="unknown",
                 has_intro=False,
