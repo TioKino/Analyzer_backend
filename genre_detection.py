@@ -43,6 +43,14 @@ def _load_genre_map() -> dict:
 
 GENRE_MAP = _load_genre_map()
 
+# Pre-computado al cargar el modulo: claves de GENRE_MAP ordenadas por
+# longitud descendente. Usado en _normalize_genre para que las claves mas
+# especificas ("industrial techno", 17 chars) ganen sobre las genericas
+# ("techno", 6 chars) en el match parcial. Sin esto, el primer match en
+# el dict (orden de insercion) ganaba arbitrariamente y se perdia
+# especificidad de genero. Cierra A6 del audit 2026-05-08.
+_GENRE_KEYS_BY_SPECIFICITY = sorted(GENRE_MAP.keys(), key=len, reverse=True)
+
 
 
 
@@ -91,7 +99,9 @@ class GenreDetector:
                     label = release.labels[0].name if hasattr(release.labels[0], 'name') else str(release.labels[0])
                 if hasattr(release, 'year'):
                     year = release.year
-            except:
+            except (AttributeError, IndexError):
+                # Pre-A6: era 'except: pass' (capturaba SystemExit/KeyboardInterrupt).
+                # Ahora solo los errores plausibles del API de discogs_client.
                 pass
             
             if styles:
@@ -169,22 +179,32 @@ class GenreDetector:
             return None
 
     def _normalize_genre(self, genre: str) -> str:
-        """Normalizar géneros a categorías consistentes usando el mapeo universal"""
+        """Normalizar géneros a categorías consistentes usando el mapeo universal.
+
+        Estrategia:
+        1. Match exacto contra GENRE_MAP (O(1) dict lookup).
+        2. Match parcial (substring) iterando claves ordenadas por longitud
+           descendente: las claves mas especificas ("industrial techno",
+           17 chars) ganan sobre las genericas ("techno", 6 chars).
+           Antes el orden era el de insercion del dict y "techno" ganaba
+           arbitrariamente, perdiendo especificidad.
+        3. Sin match: capitalizar el input crudo.
+        """
         if not genre:
             return 'Electronic'
-            
+
         genre_lower = genre.lower().strip()
-        
-        # Buscar coincidencia exacta primero
+
+        # 1. Match exacto
         if genre_lower in GENRE_MAP:
             return GENRE_MAP[genre_lower]
-        
-        # Buscar coincidencias parciales
-        for key, value in GENRE_MAP.items():
+
+        # 2. Match parcial — las claves mas especificas ganan
+        for key in _GENRE_KEYS_BY_SPECIFICITY:
             if key in genre_lower:
-                return value
-        
-        # Si no hay match, capitalizar
+                return GENRE_MAP[key]
+
+        # 3. Sin match
         return genre.title()
     
     def detect_genre(self, artist: str, title: str, 

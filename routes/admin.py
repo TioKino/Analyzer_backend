@@ -87,8 +87,27 @@ async def health():
 @admin_router.delete("/admin/reset-database", dependencies=[Depends(_verify_admin_token)])
 async def reset_database(confirm: str = Query(..., description="Escribe 'CONFIRMAR' para borrar")):
     """
-    PELIGROSO: Borra TODA la base de datos.
+    PELIGROSO: Borra TODA la base de datos (wipe brutal).
+
     Requiere confirmar escribiendo 'CONFIRMAR' como parámetro.
+
+    Tablas borradas en analysis.db:
+        tracks, corrections, dj_notes,
+        community_cues, community_notes,
+        track_ratings, track_popularity,
+        beat_grid_corrections, audd_call_log
+
+    Tablas borradas en sync.db:
+        sync_items, device_seen, users, user_devices,
+        link_codes, detected_tracks_sync
+
+    Tras este reset los devices vinculados pierden su user_id y deben
+    volver a /sync/register desde la app. La memoria colectiva (cues,
+    notes, ratings, popularity, beat-grid) tambien se borra.
+
+    Si en el futuro se quiere un "soft reset" que preserve la memoria
+    colectiva o las vinculaciones, anadir un endpoint nuevo
+    (ej. /admin/soft-reset) en lugar de modificar este.
     """
     if confirm != "CONFIRMAR":
         raise HTTPException(400, "Debes escribir 'CONFIRMAR' para borrar la base de datos")
@@ -96,37 +115,57 @@ async def reset_database(confirm: str = Query(..., description="Escribe 'CONFIRM
     try:
         import shutil
 
-        # Borrar artwork cache
+        # ── Borrar artwork cache ──
         if ARTWORK_CACHE_DIR and os.path.exists(ARTWORK_CACHE_DIR):
             shutil.rmtree(ARTWORK_CACHE_DIR)
             os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
 
-        # Borrar y recrear BD
+        # ── Wipe analysis DB ──
+        analysis_tables = (
+            "tracks", "corrections", "dj_notes",
+            "community_cues", "community_notes",
+            "track_ratings", "track_popularity",
+            "beat_grid_corrections", "audd_call_log",
+        )
         conn = sqlite3.connect(db.db_path)
         c = conn.cursor()
-        c.execute("DELETE FROM tracks")
-        c.execute("DELETE FROM corrections")
-        c.execute("DELETE FROM dj_notes")
+        cleared_analysis = []
+        for table in analysis_tables:
+            try:
+                c.execute(f"DELETE FROM {table}")
+                cleared_analysis.append(table)
+            except sqlite3.OperationalError:
+                # Tabla no existe en BDs antiguas — skip silencioso
+                pass
         conn.commit()
         conn.close()
 
-        # Borrar sync DB también
+        # ── Wipe sync DB ──
         sync_db_path = os.environ.get("SYNC_DB_PATH", "/data/sync.db")
+        sync_tables = (
+            "sync_items", "device_seen", "users", "user_devices",
+            "link_codes", "detected_tracks_sync",
+        )
+        cleared_sync = []
         sync_cleared = False
         if os.path.exists(sync_db_path):
             sync_conn = sqlite3.connect(sync_db_path)
-            sync_conn.execute("DELETE FROM sync_items")
+            for table in sync_tables:
+                try:
+                    sync_conn.execute(f"DELETE FROM {table}")
+                    cleared_sync.append(table)
+                except sqlite3.OperationalError:
+                    pass
             sync_conn.commit()
             sync_conn.close()
             sync_cleared = True
 
         return {
             "status": "ok",
-            "message": "Base de datos reseteada completamente",
+            "message": "Base de datos reseteada completamente (wipe brutal)",
             "artwork_cache": "limpiado",
-            "tracks": "eliminados",
-            "corrections": "eliminadas",
-            "sync": "limpiado" if sync_cleared else "no encontrado",
+            "analysis_tables_cleared": cleared_analysis,
+            "sync_tables_cleared": cleared_sync if sync_cleared else "no encontrado",
         }
     except (sqlite3.DatabaseError, OSError, PermissionError) as e:
         raise HTTPException(500, f"Error reseteando: {str(e)}")
