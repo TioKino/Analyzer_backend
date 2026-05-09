@@ -67,12 +67,10 @@ local_modules = [
     'precision_analyzer.py',
     'preview_generator.py',
     'similar_tracks_endpoint.py',
-    'search_analyzed_endpoint.py',
     'sync_endpoints.py',
     'api_config.py',
     'essentia_analyzer.py',
     'community_cues_endpoint.py',
-    'chromaprint_helper.py',
 ]
 
 route_modules = [
@@ -166,7 +164,6 @@ a = Analysis(
         'starlette.middleware',
         'pydantic',
         'multipart',
-        'python_multipart',
 
         # Audio
         'librosa',
@@ -230,11 +227,9 @@ a = Analysis(
         'precision_analyzer',
         'preview_generator',
         'similar_tracks_endpoint',
-        'search_analyzed_endpoint',
         'sync_endpoints',
         'api_config',
         'community_cues_endpoint',
-        'chromaprint_helper',
 
         # Routes
         'routes',
