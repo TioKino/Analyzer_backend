@@ -284,9 +284,14 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    # Universal2 = arm64 + x86_64 fat binary. Requiere que las wheels Python
-    # instaladas tambien sean universal2 (o que tengas ambas arquitecturas).
-    target_arch='universal2',
+    # Por defecto = host arch (arm64 en Apple Silicon, x86_64 en Intel).
+    # Para shippear a ambos hay que:
+    #   ENGINE_TARGET_ARCH=universal2 pyinstaller dj_analyzer_engine_macos.spec
+    # pero esto requiere wheels Python universal2 + ffmpeg universal2 (no
+    # los de Homebrew, que son arm64-only en Apple Silicon). Si no las
+    # tenes la build falla con "incompatible architecture" en lipo.
+    # Plan razonable: shippear arm64 inicial, agregar x86_64 si hay demanda.
+    target_arch=os.environ.get('ENGINE_TARGET_ARCH') or None,
     # codesign aplicado fuera de PyInstaller en sign_engine.sh para tener
     # control granular sobre orden de firmas y hashes de framework.
     codesign_identity=None,
