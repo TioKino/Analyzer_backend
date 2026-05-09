@@ -32,7 +32,7 @@ import requests
 import shutil
 import sqlite3
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 # Logger global del modulo, definido temprano para que las llamadas
 # logger.info/warning/error en el codigo de inicializacion no fallen
@@ -762,6 +762,13 @@ class AnalysisResult(BaseModel):
     structure_sections: List[Dict]
     track_type: str
     track_type_source: str = "waveform"
+    # Fase 1 Track Type v2: confianza algoritmica (0..1) + top-3 alternativas.
+    # Permite a la UI mostrar honestidad sobre tracks ambiguos. Cuando
+    # `track_type_source == 'beatport'`, confidence=1.0 (señal externa).
+    # Cuando viene de la heuristica spectral, confidence depende del margin
+    # entre el winner y el segundo. Ver classify_track_type.
+    track_type_confidence: float = 0.5
+    track_type_alternatives: List[Dict[str, Any]] = []
     genre: str = "unknown"
     subgenre: Optional[str] = None
     genre_source: str = "spectral_analysis"
@@ -919,23 +926,65 @@ def find_drop_timestamp(y, sr, segments: dict) -> float:
     duration = segments['sections'][-1]['end'] if segments['sections'] else 180
     return duration / 3
 
-def classify_track_type(energy: float, segments: dict, duration: float) -> str:
-    # Heuristica simple, 4 condiciones en cascada. La PRIMERA que matchea
-    # gana. Detalles del diseño + opciones de mejora futura en
-    # Analyzer/PENDING_TRACKTYPE_CLASSIFIER.md.
+def classify_track_type(energy: float, segments: dict, duration: float) -> dict:
+    # Fase 1 Track Type v2: pasamos de cascada de returns simples a scoring
+    # con margin top-1 vs top-2 -> confidence (0..1). Permite a la UI mostrar
+    # honestidad sobre tracks ambiguos en lugar de mentir con un tipo forzado.
+    # Plan completo en Analyzer/PENDING_NEXT_SESSION_TRACKTYPE_V2.md.
     #
-    # Notar: tracks con `has_intro=True` y `energy<0.5` se van a 'warmup'
-    # antes de llegar a la regla de closing. Para tracks largos sin intro
-    # detectado (ej. Oxia - Domino: has_intro=False, has_outro=True,
-    # duration=433) la cascada cae limpia a 'closing' sin necesidad de
-    # condiciones adicionales.
+    # Mismas señales que la cascada original (has_intro/has_drop/has_outro +
+    # energy + duration), pero acumulamos en lugar de decidir inmediato.
+    # Ej. Oxia - Domino (energy=0.7, has_outro=True, duration=433): closing
+    # acumula 1.0 + 0.3 = 1.3, peak_time solo 0.2 (energy>0.6 soft signal),
+    # warmup 0. Margin grande -> confidence ~0.85.
+    scores = {'warmup': 0.0, 'peak_time': 0.0, 'closing': 0.0}
+
     if energy < 0.5 and segments['has_intro']:
-        return "warmup"
+        scores['warmup'] += 1.0
+    if energy < 0.4 and segments['has_intro']:
+        scores['warmup'] += 0.5
     if energy > 0.7 and segments['has_drop']:
-        return "peak_time"
+        scores['peak_time'] += 1.0
+    if energy > 0.8 and segments['has_drop']:
+        scores['peak_time'] += 0.5
     if segments['has_outro'] and duration > 300:
-        return "closing"
-    return "peak_time" if energy > 0.6 else "warmup"
+        scores['closing'] += 1.0
+    if segments['has_outro'] and duration > 420:
+        scores['closing'] += 0.3
+    # Soft signals para desempates: cualquier track con energia alta
+    # tira hacia peak_time, cualquiera con energia baja hacia warmup.
+    if energy > 0.6:
+        scores['peak_time'] += 0.2
+    elif energy < 0.5:
+        scores['warmup'] += 0.2
+
+    sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
+    winner_type, winner_score = sorted_scores[0]
+    second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+
+    if winner_score == 0.0:
+        # Track sin señales claras: caer al fallback de la cascada original
+        # (energy>0.6 -> peak_time, sino warmup) y reportar confidence 0
+        # para que la UI muestre el badge como "incierto".
+        winner_type = 'peak_time' if energy > 0.6 else 'warmup'
+        confidence = 0.0
+    else:
+        margin = winner_score - second_score
+        confidence = min(1.0, margin / max(winner_score, 0.5))
+
+    return {
+        'type': winner_type,
+        'confidence': round(confidence, 2),
+        'alternatives': [
+            {'type': t, 'score': round(s, 2)} for t, s in sorted_scores
+        ],
+        'reason': (
+            f"energy={energy:.2f} duration={duration:.0f} "
+            f"intro={segments['has_intro']} drop={segments['has_drop']} "
+            f"outro={segments['has_outro']}"
+        ),
+        'source': 'waveform',
+    }
 
 def detect_vocals_improved(y, sr, spectral_centroid):
     try:
@@ -1362,8 +1411,13 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     
     # Classification
     track_type = 'peak_time'  # default seguro
+    track_type_confidence = 0.5  # neutral si la clasificacion falla
+    track_type_alternatives: List[Dict[str, Any]] = []
     try:
-        track_type = classify_track_type(energy_normalized, segments, duration)
+        classification = classify_track_type(energy_normalized, segments, duration)
+        track_type = classification['type']
+        track_type_confidence = classification['confidence']
+        track_type_alternatives = classification['alternatives']
     except Exception as e:
         logger.error(f"  [TrackType] Error clasificando: {e}")
     genre = classify_genre_advanced(
@@ -1539,6 +1593,8 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                     old_type = track_type
                     track_type = tt_hint
                     track_type_source = 'beatport'
+                    track_type_confidence = 1.0
+                    track_type_alternatives = [{'type': tt_hint, 'score': 1.0}]
                     logger.info(f"  [Beatport] Track type hint: {tt_hint}")
                     if old_type != tt_hint:
                         logger.info(f"  [Beatport] Track type override: {old_type} -> {tt_hint}")
@@ -1609,11 +1665,20 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     # ==================== TRACK TYPE: BEATPORT OVERRIDE ====================
     # Si Beatport dio un track_type_hint, tiene prioridad sobre waveform
     track_type_source = 'waveform'
-    # Guard: asegurar que track_type existe (por si classify_track_type falló)
+    # Guard: asegurar que track_type / confidence / alternatives existen
+    # (por si classify_track_type fallo arriba).
     try:
         track_type
     except NameError:
         track_type = 'peak_time'
+    try:
+        track_type_confidence
+    except NameError:
+        track_type_confidence = 0.5
+    try:
+        track_type_alternatives
+    except NameError:
+        track_type_alternatives = []
     if artist_name and title_name:
         try:
             if beatport_data and beatport_data.get('track_type_hint'):
@@ -1621,6 +1686,8 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                 logger.info(f"  [Beatport] Track type override: {track_type} -> {bp_type}")
                 track_type = bp_type
                 track_type_source = 'beatport'
+                track_type_confidence = 1.0
+                track_type_alternatives = [{'type': bp_type, 'score': 1.0}]
         except NameError:
             pass  # beatport_data no existe si no se ejecuto el bloque
     
@@ -1652,6 +1719,8 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         structure_sections=segments['sections'],
         track_type=track_type,
         track_type_source=track_type_source,
+        track_type_confidence=track_type_confidence,
+        track_type_alternatives=track_type_alternatives,
         genre=genre,
         genre_source=genre_source,
         has_vocals=has_vocals,
@@ -1894,6 +1963,10 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
     # ==================== TRACK TYPE: BEATPORT OVERRIDE ====================
     track_type = result['track_type']
     track_type_source = 'waveform'
+    # Chunked analyzer (chunked_analyzer.py) ya devuelve confidence + alternatives
+    # con el mismo shape Fase 1; si por algún motivo no estan, default a neutro.
+    track_type_confidence = result.get('track_type_confidence', 0.5)
+    track_type_alternatives = result.get('track_type_alternatives', [])
     if artist_name and title_name:
         try:
             if beatport_data and beatport_data.get('track_type_hint'):
@@ -1901,6 +1974,8 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                 logger.info(f"  [Beatport] Track type override: {track_type} -> {bp_type}")
                 track_type = bp_type
                 track_type_source = 'beatport'
+                track_type_confidence = 1.0
+                track_type_alternatives = [{'type': bp_type, 'score': 1.0}]
         except NameError:
             pass
     
@@ -1933,6 +2008,8 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         structure_sections=result['structure_sections'],
         track_type=track_type,
         track_type_source=track_type_source,
+        track_type_confidence=track_type_confidence,
+        track_type_alternatives=track_type_alternatives,
         genre=genre,
         genre_source=genre_source,
         has_vocals=result['has_vocals'],
