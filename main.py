@@ -26,6 +26,7 @@ import os
 import re
 import json
 import hashlib
+import hmac
 import requests
 import shutil
 import sqlite3
@@ -3841,52 +3842,132 @@ async def health():
 
 # ==================== ADMIN / RESET ====================
 
+def _verify_admin_bearer(request: Request):
+    """Auth Bearer para endpoints admin destructivos. Mismo esquema que
+    routes/admin.py — header `Authorization: Bearer <ADMIN_TOKEN>`. En dev
+    local sin ADMIN_TOKEN configurado se permite sin auth; en Render/Railway
+    sin token se rechaza con 500 para fallar fast."""
+    if not ADMIN_TOKEN:
+        if os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'):
+            raise HTTPException(500, "ADMIN_TOKEN required in production")
+        return  # Dev local: sin token
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "Admin token requerido")
+    if not hmac.compare_digest(auth[7:], ADMIN_TOKEN):
+        raise HTTPException(401, "Admin token requerido")
+
+
 @app.delete("/admin/reset-database")
-async def reset_database(confirm: str = Query(..., description="Escribe 'CONFIRMAR' para borrar")):
+async def reset_database(
+    request: Request,
+    confirm: str = Query(..., description="Escribe 'CONFIRMAR' para borrar"),
+):
     """
-    PELIGROSO: Borra TODA la base de datos.
-    Requiere confirmar escribiendo 'CONFIRMAR' como parmetro.
+    PELIGROSO: Borra TODA la base de datos (wipe brutal).
+
+    Requiere `Authorization: Bearer $ADMIN_TOKEN` y `?confirm=CONFIRMAR`.
+
+    Borra:
+        analysis.db: tracks, corrections, dj_notes, community_cues,
+            community_notes, track_ratings, track_popularity,
+            beat_grid_corrections, audd_call_log
+        sync.db: sync_items, device_seen, users, user_devices,
+            link_codes, detected_tracks_sync
+        Filesystem: ARTWORK_CACHE_DIR, PREVIEWS_DIR (.mp3 cacheados)
+
+    Tras este reset los devices vinculados pierden su user_id y deben
+    volver a /sync/register desde la app. La memoria colectiva (cues,
+    notes, ratings, popularity, beat-grid) tambien se borra.
     """
+    _verify_admin_bearer(request)
     if confirm != "CONFIRMAR":
         raise HTTPException(400, "Debes escribir 'CONFIRMAR' para borrar la base de datos")
-    
+
     try:
-        import shutil
-        
-        # Borrar artwork cache
-        if os.path.exists(ARTWORK_CACHE_DIR):
+        # ── Borrar artwork cache (filesystem) ──
+        artwork_cleared = False
+        if ARTWORK_CACHE_DIR and os.path.exists(ARTWORK_CACHE_DIR):
             shutil.rmtree(ARTWORK_CACHE_DIR)
             os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
-        
-        # Borrar y recrear BD
+            artwork_cleared = True
+
+        # ── Borrar previews cache (filesystem, .mp3 cacheados) ──
+        previews_cleared = False
+        previews_count = 0
+        if PREVIEWS_DIR and os.path.exists(PREVIEWS_DIR):
+            try:
+                previews_count = sum(1 for _ in os.scandir(PREVIEWS_DIR))
+            except OSError:
+                previews_count = 0
+            shutil.rmtree(PREVIEWS_DIR)
+            os.makedirs(PREVIEWS_DIR, exist_ok=True)
+            previews_cleared = True
+
+        # ── Wipe analysis DB ──
+        analysis_tables = (
+            "tracks", "corrections", "dj_notes",
+            "community_cues", "community_notes",
+            "track_ratings", "track_popularity",
+            "beat_grid_corrections", "audd_call_log",
+        )
         conn = sqlite3.connect(db.db_path)
         c = conn.cursor()
-        c.execute("DELETE FROM tracks")
-        c.execute("DELETE FROM corrections")
-        c.execute("DELETE FROM dj_notes")
+        cleared_analysis = []
+        for table in analysis_tables:
+            try:
+                c.execute(f"DELETE FROM {table}")
+                cleared_analysis.append(table)
+            except sqlite3.OperationalError:
+                pass  # Tabla no existe en BDs antiguas — skip silencioso
         conn.commit()
         conn.close()
-        
+
+        # ── Wipe sync DB ──
+        sync_db_path = os.environ.get("SYNC_DB_PATH", "/data/sync.db")
+        sync_tables = (
+            "sync_items", "device_seen", "users", "user_devices",
+            "link_codes", "detected_tracks_sync",
+        )
+        cleared_sync = []
+        sync_cleared = False
+        if os.path.exists(sync_db_path):
+            sync_conn = sqlite3.connect(sync_db_path)
+            for table in sync_tables:
+                try:
+                    sync_conn.execute(f"DELETE FROM {table}")
+                    cleared_sync.append(table)
+                except sqlite3.OperationalError:
+                    pass
+            sync_conn.commit()
+            sync_conn.close()
+            sync_cleared = True
+
         return {
             "status": "ok",
-            "message": "Base de datos reseteada completamente",
-            "artwork_cache": "limpiado",
-            "tracks": "eliminados",
-            "corrections": "eliminadas"
+            "message": "Base de datos reseteada completamente (wipe brutal)",
+            "artwork_cache": "limpiado" if artwork_cleared else "no encontrado",
+            "previews_cache": {
+                "cleared": previews_cleared,
+                "files_deleted": previews_count,
+            },
+            "analysis_tables_cleared": cleared_analysis,
+            "sync_tables_cleared": cleared_sync if sync_cleared else "no encontrado",
         }
-    except Exception as e:
+    except (sqlite3.DatabaseError, OSError, PermissionError) as e:
         raise HTTPException(500, f"Error reseteando: {str(e)}")
 
+
 @app.delete("/admin/clear-artwork-cache")
-async def clear_artwork_cache():
-    """Limpia solo el cach(c) de artwork"""
-    import shutil
+async def clear_artwork_cache(request: Request):
+    """Limpia solo el caché de artwork. Auth Bearer requerida."""
+    _verify_admin_bearer(request)
     try:
         if os.path.exists(ARTWORK_CACHE_DIR):
             shutil.rmtree(ARTWORK_CACHE_DIR)
             os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
-        return {"status": "ok", "message": "Cach(c) de artwork limpiado"}
-    except Exception as e:
+        return {"status": "ok", "message": "Caché de artwork limpiado"}
+    except (OSError, PermissionError) as e:
         raise HTTPException(500, f"Error: {str(e)}")
 
 # ==================== COMMUNITY BEAT GRID ====================
