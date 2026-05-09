@@ -252,3 +252,62 @@ ninguno release-blocker.
 - **B2 POST `/artwork/upload/{fingerprint}`**: commit `f5a1ce085` (2026-04-30).
 - **B3 `GET /sync/pending` 401 device-específico**: re-clasificado como
   diagnóstico operacional (ver `analyzer/PENDING_RELEASE_2.7.3.md`).
+
+---
+
+# Hotfix HIGH 2026-05-09 — `/admin/reset-database` sin auth + wipe incompleto
+
+**Encontrado durante:** sesión `claude/review-info-files-We3A9` (revisión de archivos
+informativos previa a un reset operacional de la BD solicitado por el owner).
+
+**B-H4 — `main.py:3844` — `/admin/reset-database` sin auth + wipe parcial (HIGH, FIXED)**
+
+El audit 2026-05-08 (A5) documentó que el endpoint hacía wipe brutal de TODAS
+las tablas. El fix vivía en `routes/admin.py:87` con `Depends(_verify_admin_token)`
+y borraba 9 tablas analysis + 6 tablas sync. **Pero ese router nunca se registró
+en `main.py`** — solo `admin_panel_router` está incluido (`main.py:336`).
+
+En producción seguía activo el endpoint duplicado `main.py:3844` con dos
+problemas críticos:
+
+1. **Sin autenticación.** Cualquier cliente con la URL podía ejecutar el reset:
+   no había `Depends`, ni `Authorization` header, ni comprobación de
+   `ADMIN_TOKEN`. Risk: data wipe remoto vía URL guess o leak en logs/
+   client-side.
+2. **Wipe incompleto.** Solo borraba `tracks`, `corrections`, `dj_notes` y
+   el `ARTWORK_CACHE_DIR`. Quedaban intactas: `community_cues`,
+   `community_notes`, `track_ratings`, `track_popularity`,
+   `beat_grid_corrections`, `audd_call_log`, las 6 tablas de `sync.db`,
+   y los `.mp3` cacheados en `PREVIEWS_DIR` (`/data/previews/`).
+
+**Impacto:** dos bugs en uno. El de seguridad (sin auth) era HIGH abierto
+sin que nadie lo supiera. El de funcionalidad (wipe parcial) hacía que el
+"reset brutal" documentado en `CLAUDE.md` no fuera real — la memoria
+colectiva y los previews se quedaban tras llamarlo.
+
+**Fix aplicado:** PR #6 / commit `b1bf7a26` (2026-05-09). Reescrito el
+endpoint `main.py:3844` con:
+- Auth Bearer (`hmac.compare_digest` contra `ADMIN_TOKEN`, mismo esquema
+  que `routes/admin.py` y `sync_endpoints.py`).
+- Wipe completo: 9 tablas de `analysis.db` + 6 tablas de `sync.db` +
+  `ARTWORK_CACHE_DIR` + `PREVIEWS_DIR` (recreados tras el `rmtree` para
+  no romper la app en escrituras siguientes).
+- `clear-artwork-cache` también pasado a auth Bearer (antes tampoco la
+  tenía).
+- Import `hmac` añadido al top-level.
+
+**Verificación end-to-end (2026-05-09):**
+- `DELETE /admin/reset-database?confirm=CONFIRMAR` sin header → 401
+  `Admin token requerido`.
+- Mismo endpoint con `Authorization: Bearer $ADMIN_TOKEN` → 200 con
+  `previews_cache.files_deleted = 194`, las 9 tablas analysis + 6 tablas
+  sync devueltas en el JSON.
+
+**Por qué `routes/admin.py` sigue ahí sin registrar:** además de
+`/admin/reset-database` y `/admin/clear-artwork-cache`, define `GET /` y
+`GET /health` que colisionarían con los handlers existentes en
+`main.py:3771` y `main.py:3799`. Como split del router para evitar la
+colisión es trabajo adicional sin beneficio inmediato, la decisión fue
+copiar la lógica completa al endpoint que SÍ está activo. Cleanup futuro:
+o bien borrar `routes/admin.py` (queda muerto), o bien refactorizar para
+quitar root/health y registrarlo en `main.py`. No urgente.
