@@ -13,7 +13,8 @@ Estructura:
 - api_config.py / config.py - Configuracin
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sync_endpoints import sync_router
 from routes.admin_panel import admin_panel_router
 from fastapi.middleware.cors import CORSMiddleware
@@ -3861,25 +3862,32 @@ async def health():
 
 # ==================== ADMIN / RESET ====================
 
-def _verify_admin_bearer(request: Request):
+# HTTPBearer security scheme declarado para que Swagger UI (`/docs`) muestre
+# el boton "Authorize" y mande el header `Authorization: Bearer <token>`
+# automaticamente. `auto_error=False` deja que `_verify_admin_bearer` devuelva
+# nuestro 401 con mensaje consistente en lugar del 403 default de FastAPI.
+bearer_scheme = HTTPBearer(auto_error=False, description="ADMIN_TOKEN")
+
+
+def _verify_admin_bearer(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+):
     """Auth Bearer para endpoints admin destructivos. Mismo esquema que
-    routes/admin.py — header `Authorization: Bearer <ADMIN_TOKEN>`. En dev
-    local sin ADMIN_TOKEN configurado se permite sin auth; en Render/Railway
-    sin token se rechaza con 500 para fallar fast."""
+    routes/admin.py y sync_endpoints.py. En dev local sin ADMIN_TOKEN
+    configurado se permite sin auth; en Render/Railway sin token se rechaza
+    con 500 para fallar fast."""
     if not ADMIN_TOKEN:
         if os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'):
             raise HTTPException(500, "ADMIN_TOKEN required in production")
         return  # Dev local: sin token
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(401, "Admin token requerido")
-    if not hmac.compare_digest(auth[7:], ADMIN_TOKEN):
+    if not hmac.compare_digest(credentials.credentials, ADMIN_TOKEN):
         raise HTTPException(401, "Admin token requerido")
 
 
-@app.delete("/admin/reset-database")
+@app.delete("/admin/reset-database", dependencies=[Depends(_verify_admin_bearer)])
 async def reset_database(
-    request: Request,
     confirm: str = Query(..., description="Escribe 'CONFIRMAR' para borrar"),
 ):
     """
@@ -3899,7 +3907,6 @@ async def reset_database(
     volver a /sync/register desde la app. La memoria colectiva (cues,
     notes, ratings, popularity, beat-grid) tambien se borra.
     """
-    _verify_admin_bearer(request)
     if confirm != "CONFIRMAR":
         raise HTTPException(400, "Debes escribir 'CONFIRMAR' para borrar la base de datos")
 
@@ -3977,10 +3984,9 @@ async def reset_database(
         raise HTTPException(500, f"Error reseteando: {str(e)}")
 
 
-@app.delete("/admin/clear-artwork-cache")
-async def clear_artwork_cache(request: Request):
+@app.delete("/admin/clear-artwork-cache", dependencies=[Depends(_verify_admin_bearer)])
+async def clear_artwork_cache():
     """Limpia solo el caché de artwork. Auth Bearer requerida."""
-    _verify_admin_bearer(request)
     try:
         if os.path.exists(ARTWORK_CACHE_DIR):
             shutil.rmtree(ARTWORK_CACHE_DIR)
