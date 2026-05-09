@@ -920,31 +920,21 @@ def find_drop_timestamp(y, sr, segments: dict) -> float:
     return duration / 3
 
 def classify_track_type(energy: float, segments: dict, duration: float) -> str:
-    # ORDEN IMPORTANTE: las condiciones se evaluan en cascada, la primera
-    # que matchea gana. El orden refleja prioridad por especificidad:
+    # Heuristica simple, 4 condiciones en cascada. La PRIMERA que matchea
+    # gana. Detalles del diseño + opciones de mejora futura en
+    # Analyzer/PENDING_TRACKTYPE_CLASSIFIER.md.
     #
-    # 1. CLOSING primero — track largo (>5 min) con outro detectado y
-    #    energia no-alta es casi siempre un closer (Oxia - Domino, deep
-    #    techno largo, etc). Antes esta regla iba al FINAL y los closers
-    #    caian en "warmup" porque la regla de warmup (energy<0.5 +
-    #    has_intro) los pillaba primero. has_intro lo tienen casi todos
-    #    los tracks asi que la condicion era demasiado laxa.
-    #
-    # 2. PEAK_TIME — energia alta + drop. Especifica.
-    #
-    # 3. WARMUP — energia baja + intro. Ahora solo aplica a tracks NO
-    #    largos o sin outro (los largos ya fueron a closing arriba).
-    #
-    # 4. FALLBACK — peak_time si energia razonable, warmup si no.
-    #
-    # Ver PENDING_TRACKTYPE_CLASSIFIER.md (Analyzer/) para el debate del
-    # clasificador ideal (scoring hibrido + ML con corrections de users).
-    if segments['has_outro'] and duration > 300 and energy < 0.6:
-        return "closing"
-    if energy > 0.7 and segments['has_drop']:
-        return "peak_time"
+    # Notar: tracks con `has_intro=True` y `energy<0.5` se van a 'warmup'
+    # antes de llegar a la regla de closing. Para tracks largos sin intro
+    # detectado (ej. Oxia - Domino: has_intro=False, has_outro=True,
+    # duration=433) la cascada cae limpia a 'closing' sin necesidad de
+    # condiciones adicionales.
     if energy < 0.5 and segments['has_intro']:
         return "warmup"
+    if energy > 0.7 and segments['has_drop']:
+        return "peak_time"
+    if segments['has_outro'] and duration > 300:
+        return "closing"
     return "peak_time" if energy > 0.6 else "warmup"
 
 def detect_vocals_improved(y, sr, spectral_centroid):
