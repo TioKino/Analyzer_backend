@@ -1690,7 +1690,30 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                 track_type_alternatives = [{'type': bp_type, 'score': 1.0}]
         except NameError:
             pass  # beatport_data no existe si no se ejecuto el bloque
-    
+
+    # ==================== TRACK TYPE: COMMUNITY CONSENSUS (Fase 2) ====================
+    # Si NO hay Beatport hint, probar consensus comunitario. Si motor local,
+    # pregunta a Render via HTTP (timeout 2s). Si Render no responde o no hay
+    # consensus, fallback al algoritmico que ya estaba.
+    if track_type_source != 'beatport' and fingerprint:
+        try:
+            community = (_fetch_community_track_type(fingerprint)
+                         if IS_LOCAL_ENGINE
+                         else db.get_track_type_consensus(fingerprint))
+            if community:
+                logger.info(
+                    f"  [Community] Track type consensus override: "
+                    f"{track_type} -> {community['type']} ({community['votes']} votos)"
+                )
+                track_type = community['type']
+                track_type_source = 'community'
+                track_type_confidence = 1.0
+                track_type_alternatives = [
+                    {'type': community['type'], 'score': float(community['votes'])}
+                ]
+        except Exception as e:
+            logger.debug(f"  [Community] Consensus check fallo: {e}")
+
     return AnalysisResult(
         title=id3_data.get('title'),
         artist=id3_data.get('artist'),
@@ -1978,7 +2001,28 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                 track_type_alternatives = [{'type': bp_type, 'score': 1.0}]
         except NameError:
             pass
-    
+
+    # ==================== TRACK TYPE: COMMUNITY CONSENSUS (Fase 2) ====================
+    # Ver flujo no-chunked para detalle. Mismo patron aqui.
+    if track_type_source != 'beatport' and fingerprint:
+        try:
+            community = (_fetch_community_track_type(fingerprint)
+                         if IS_LOCAL_ENGINE
+                         else db.get_track_type_consensus(fingerprint))
+            if community:
+                logger.info(
+                    f"  [Community] Track type consensus override: "
+                    f"{track_type} -> {community['type']} ({community['votes']} votos)"
+                )
+                track_type = community['type']
+                track_type_source = 'community'
+                track_type_confidence = 1.0
+                track_type_alternatives = [
+                    {'type': community['type'], 'score': float(community['votes'])}
+                ]
+        except Exception as e:
+            logger.debug(f"  [Community] Consensus check fallo: {e}")
+
     # ==================== RESULTADO ====================
     return AnalysisResult(
         title=id3_data.get('title'),
@@ -4098,3 +4142,117 @@ async def get_community_beat_grid(fingerprint: str):
     except Exception as e:
         logger.error(f"[Community] Error fetching beat grid: {e}")
         return {"bpm_adjust": 0.0, "beat_offset": 0.0, "contributors": 0, "validated": False}
+
+# ==================== COMMUNITY TRACK TYPE (Fase 2) ====================
+
+# Tipos validos para un voto comunitario. Subset estricto de VALID_TRACK_TYPES
+# (validation.py:75): excluye 'all' (valor especial para filtros) y 'peak'
+# (alias legacy de 'peak_time'). Si el cliente envia 'peak' lo normalizamos.
+COMMUNITY_TRACK_TYPES = {
+    'warmup', 'peak_time', 'closing', 'opener', 'builder', 'anthem', 'cooldown',
+}
+
+class TrackTypeOverrideRequest(BaseModel):
+    fingerprint: str
+    device_id: str
+    track_type: str
+
+@app.post("/community/track-type")
+async def submit_track_type_override(request: TrackTypeOverrideRequest):
+    """Recibe un voto de un DJ sobre el track_type real de un fingerprint.
+
+    Un device puede votar 1 vez por fingerprint (PK compuesta). El segundo POST
+    sobreescribe el primero — el DJ puede cambiar de opinion. Cuando hay >=3
+    votos al winner y supera al 2do por >=2, la respuesta de /analyze para ese
+    fingerprint devuelve track_type_source='community' con confidence=1.0.
+    """
+    try:
+        if not request.fingerprint or not request.device_id:
+            raise HTTPException(400, "fingerprint y device_id requeridos")
+        normalized = (request.track_type or '').strip().lower()
+        if normalized == 'peak':
+            normalized = 'peak_time'
+        if normalized not in COMMUNITY_TRACK_TYPES:
+            raise HTTPException(
+                400,
+                f"track_type invalido: {request.track_type}. "
+                f"Permitidos: {', '.join(sorted(COMMUNITY_TRACK_TYPES))}",
+            )
+        db.submit_track_type_override(
+            fingerprint=request.fingerprint,
+            device_id=request.device_id,
+            track_type=normalized,
+        )
+        consensus = db.get_track_type_consensus(request.fingerprint)
+        votes = db.get_track_type_votes(request.fingerprint)
+        logger.info(
+            f"[Community] Track type override: fp={request.fingerprint[:8]}... "
+            f"device={request.device_id[:8]}... -> {validated} (votes={votes})"
+        )
+        return {
+            "status": "ok",
+            "votes": votes,
+            "consensus": consensus['type'] if consensus else None,
+            "consensus_votes": consensus['votes'] if consensus else 0,
+        }
+    except ValidationError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error(f"[Community] Error saving track type override: {e}")
+        raise HTTPException(500, f"Error: {str(e)}")
+
+@app.get("/community/track-type/{fingerprint}")
+async def get_community_track_type(fingerprint: str):
+    """Devuelve el consensus comunitario + distribucion de votos.
+
+    Esta es la ruta que consume el motor local cuando corre /analyze: si hay
+    consensus, lo aplica overriding el algoritmico.
+    """
+    try:
+        consensus = db.get_track_type_consensus(fingerprint)
+        votes = db.get_track_type_votes(fingerprint)
+        return {
+            "fingerprint": fingerprint,
+            "consensus": consensus['type'] if consensus else None,
+            "consensus_votes": consensus['votes'] if consensus else 0,
+            "votes": votes,
+            "total_voters": sum(votes.values()),
+        }
+    except Exception as e:
+        logger.error(f"[Community] Error fetching track type consensus: {e}")
+        return {
+            "fingerprint": fingerprint,
+            "consensus": None,
+            "consensus_votes": 0,
+            "votes": {},
+            "total_voters": 0,
+        }
+
+
+def _fetch_community_track_type(fingerprint: str) -> Optional[Dict]:
+    """Si somos motor local, pregunta a Render por consensus comunitario.
+
+    Si no somos motor local (estamos en Render), devuelve None — el caller
+    consultara db.get_track_type_consensus directo. Si Render no responde,
+    skip (fail open: caemos al algoritmico).
+    """
+    if not IS_LOCAL_ENGINE or not fingerprint:
+        return None
+    render_url = (os.getenv('RENDER_SYNC_URL') or '').rstrip('/')
+    if not render_url:
+        return None
+    try:
+        r = requests.get(
+            f"{render_url}/community/track-type/{fingerprint}",
+            timeout=2.0,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data.get('consensus'):
+                return {
+                    'type': data['consensus'],
+                    'votes': data.get('consensus_votes', 0),
+                }
+    except (requests.RequestException, ValueError):
+        pass
+    return None

@@ -137,6 +137,21 @@ class AnalysisDB:
             )
         ''')
 
+        # Track type community overrides (Fase 2 v2).
+        # Un device_id puede votar 1 vez por fingerprint. Si N>=3 votos y el
+        # winner supera al 2do por >=2, ese tipo gana sobre el algoritmico.
+        # Implementacion en `get_track_type_consensus`.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_track_type_overrides (
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                track_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, device_id)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_cttov_fp ON community_track_type_overrides(fingerprint)')
+
         # Notas comunitarias (todos los DJs ven las notas de todos)
         conn.execute('''
             CREATE TABLE IF NOT EXISTS community_notes (
@@ -841,6 +856,103 @@ class AnalysisDB:
             'contributors': 0,
             'validated': False,
         }
+
+    # ==================== COMMUNITY TRACK TYPE OVERRIDES (Fase 2) ====================
+
+    def submit_track_type_override(self, fingerprint: str, device_id: str, track_type: str) -> None:
+        """Guarda/actualiza el voto de un DJ sobre el track_type de un fingerprint.
+
+        Un device_id solo puede tener 1 voto activo por fingerprint (PK compuesta).
+        El segundo POST del mismo device sobreescribe el primero — el DJ puede
+        cambiar de opinion.
+        """
+        from datetime import datetime
+        now = datetime.utcnow().isoformat()
+        conn = self._open_conn()
+        try:
+            conn.execute('''
+                INSERT INTO community_track_type_overrides
+                    (fingerprint, device_id, track_type, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(fingerprint, device_id) DO UPDATE SET
+                    track_type = excluded.track_type,
+                    created_at = excluded.created_at
+            ''', (fingerprint, device_id, track_type, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_track_type_consensus(self, fingerprint: str) -> Optional[Dict]:
+        """Devuelve el consensus comunitario si los votos son inequivocos.
+
+        Reglas:
+          - >= 3 votos totales al winner.
+          - winner supera al 2do mas votado por >= 2 votos (evita empates).
+        Si no se cumplen ambas, devuelve None (no hay consensus, fallback al
+        algoritmico).
+
+        Devuelve dict con:
+          type: str — el winner.
+          votes: int — votos al winner.
+          total: int — total de votos sobre este fingerprint.
+          distribution: dict[str,int] — votos por tipo.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT track_type, COUNT(*) AS votes
+                FROM community_track_type_overrides
+                WHERE fingerprint = ?
+                GROUP BY track_type
+                ORDER BY votes DESC
+            ''', (fingerprint,))
+            rows = c.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return None
+
+        distribution = {r['track_type']: r['votes'] for r in rows}
+        total = sum(distribution.values())
+        winner_type = rows[0]['track_type']
+        winner_votes = rows[0]['votes']
+        second_votes = rows[1]['votes'] if len(rows) > 1 else 0
+
+        if winner_votes < 3:
+            return None
+        if winner_votes - second_votes < 2:
+            return None
+
+        return {
+            'type': winner_type,
+            'votes': winner_votes,
+            'total': total,
+            'distribution': distribution,
+        }
+
+    def get_track_type_votes(self, fingerprint: str) -> Dict:
+        """Devuelve distribucion bruta de votos para un fingerprint.
+
+        A diferencia de get_track_type_consensus, esta funcion siempre devuelve
+        algo (aunque sea {}). Usada por el endpoint GET para mostrar el
+        breakdown completo al cliente, no solo el winner.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT track_type, COUNT(*) AS votes
+                FROM community_track_type_overrides
+                WHERE fingerprint = ?
+                GROUP BY track_type
+                ORDER BY votes DESC
+            ''', (fingerprint,))
+            rows = c.fetchall()
+        finally:
+            conn.close()
+        return {r['track_type']: r['votes'] for r in rows}
 
     # ==================== AUDD AUTO-TRIGGER LOG ====================
 
