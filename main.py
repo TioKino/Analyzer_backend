@@ -1409,7 +1409,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     # onset_env ya calculado arriba (antes de BPM correction) - reusar
     percussion_density = min(float(np.mean(onset_env)) / 10, 1.0)
     
-    # Classification
+    # Classification (heuristic, Fase 1 v2)
     track_type = 'peak_time'  # default seguro
     track_type_confidence = 0.5  # neutral si la clasificacion falla
     track_type_alternatives: List[Dict[str, Any]] = []
@@ -1420,6 +1420,34 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         track_type_alternatives = classification['alternatives']
     except Exception as e:
         logger.error(f"  [TrackType] Error clasificando: {e}")
+        classification = None
+
+    # Spectral + ensemble (Fase 3 v2): metrics FFT + scoring 7 tipos
+    # (vs 3 del heuristic). El spectral pesa β=1.5 vs α=1.0 del heuristic.
+    # Refina tambien has_heavy_bass con bassRatio normalizado per-band.
+    try:
+        from spectral_classifier import (
+            compute_spectral_metrics,
+            classify_track_type_spectral,
+            detect_heavy_bass as _spectral_detect_heavy_bass,
+            ensemble_classify,
+        )
+        spectral_metrics = compute_spectral_metrics(y, sr)
+        spectral_classification = classify_track_type_spectral(
+            spectral_metrics, bpm, duration
+        )
+        ensemble = ensemble_classify(classification, spectral_classification)
+        track_type = ensemble['type']
+        track_type_confidence = ensemble['confidence']
+        track_type_alternatives = ensemble['alternatives']
+        # Heavy bass refinado (per-band ratio > heuristic crudo de low_freq_energy)
+        has_heavy_bass = _spectral_detect_heavy_bass(spectral_metrics)
+        logger.info(
+            f"  [Spectral+Ensemble] {ensemble['type']} "
+            f"conf={ensemble['confidence']:.2f} | {ensemble['reason']}"
+        )
+    except Exception as e:
+        logger.warning(f"  [Spectral] Failed, usando solo heuristic: {e}")
     genre = classify_genre_advanced(
         bpm, energy_normalized, has_heavy_bass,
         y, sr, percussion_density,
