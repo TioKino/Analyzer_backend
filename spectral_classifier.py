@@ -407,13 +407,25 @@ def ensemble_classify(
     heuristic: Dict[str, Any],
     spectral: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Combina los 'alternatives' de heuristic + spectral con pesos α/β.
+    """Combina heuristic (Fase 1) + spectral (Fase 3) en una decision final.
 
-    Returns dict con el mismo shape que classify_track_type (Fase 1):
+    Politica (validada con Oxia - Domino + tracks ground truth):
+
+      1. Si el heuristic esta muy seguro (confidence >= 0.70) -> heuristic gana.
+         El heuristic usa señales binarias claras (has_outro + duration>300
+         para closing, has_intro + energy<0.5 para warmup) que el spectral no
+         puede replicar facilmente desde solo FFT metrics. Si esas señales
+         disparan con alta confianza, hay que respetarlas.
+
+      2. Si el heuristic esta incierto (<0.70) -> ensemble ponderado con
+         pesos alpha/beta. Aqui el spectral aporta los 4 tipos extra
+         (opener, builder, anthem, cooldown) que el heuristic no discrimina.
+
+      3. Si una de las dos clasificaciones falla/esta vacia -> devolver la
+         otra intacta.
+
+    Returns dict con la misma shape que classify_track_type (Fase 1):
       {type, confidence, alternatives, reason, source='ensemble'}.
-
-    Si una de las dos clasificaciones esta vacia o falla, devuelve la otra
-    intacta.
     """
     h_alts = heuristic.get('alternatives', []) if heuristic else []
     s_alts = spectral.get('alternatives', []) if spectral else []
@@ -425,7 +437,31 @@ def ensemble_classify(
             'reason': 'sin datos',
             'source': 'ensemble',
         }
+    if not h_alts and spectral:
+        return {**spectral, 'source': 'ensemble'}
+    if not s_alts and heuristic:
+        return {**heuristic, 'source': 'ensemble'}
 
+    h_conf = float(heuristic.get('confidence', 0.0)) if heuristic else 0.0
+    h_winner = heuristic.get('type') if heuristic else None
+    s_winner = spectral.get('type') if spectral else None
+
+    # Politica 1: heuristic muy seguro -> heuristic gana sin mezclar.
+    if h_conf >= 0.70:
+        agreed = h_winner == s_winner
+        reason = (
+            f"heuristic confident ({h_conf:.2f}) -> {h_winner}"
+            + (f" [spectral confirma: {s_winner}]" if agreed else f" [spectral sugirio: {s_winner}, descartado]")
+        )
+        return {
+            'type': h_winner,
+            'confidence': heuristic.get('confidence', 0.0),
+            'alternatives': h_alts,
+            'reason': reason,
+            'source': 'ensemble',
+        }
+
+    # Politica 2: heuristic incierto -> ensemble ponderado con alpha/beta.
     h_scores = {a['type']: float(a.get('score', 0.0)) for a in h_alts}
     s_scores = {a['type']: float(a.get('score', 0.0)) for a in s_alts}
 
@@ -441,8 +477,7 @@ def ensemble_classify(
     second_score = sorted_items[1][1] if len(sorted_items) > 1 else 0.0
 
     if winner_score <= 0:
-        # Caso degenerate: todos los scores son 0 o negativos. Caer al spectral
-        # winner (que ya tiene un fallback razonable).
+        # Caso degenerate: todos los scores son 0 o negativos.
         if spectral and spectral.get('type'):
             return {**spectral, 'source': 'ensemble'}
         return {**heuristic, 'source': 'ensemble'}
@@ -458,10 +493,8 @@ def ensemble_classify(
         ],
         'reason': (
             f"ensemble α={ENSEMBLE_ALPHA}/β={ENSEMBLE_BETA} "
-            f"| h={heuristic.get('type') if heuristic else 'n/a'}"
-            f"/{heuristic.get('confidence') if heuristic else 'n/a'} "
-            f"| s={spectral.get('type') if spectral else 'n/a'}"
-            f"/{spectral.get('confidence') if spectral else 'n/a'}"
+            f"(heuristic uncertain {h_conf:.2f}) "
+            f"| h={h_winner} | s={s_winner}"
         ),
         'source': 'ensemble',
     }
