@@ -4187,7 +4187,7 @@ async def submit_track_type_override(request: TrackTypeOverrideRequest):
         votes = db.get_track_type_votes(request.fingerprint)
         logger.info(
             f"[Community] Track type override: fp={request.fingerprint[:8]}... "
-            f"device={request.device_id[:8]}... -> {validated} (votes={votes})"
+            f"device={request.device_id[:8]}... -> {normalized} (votes={votes})"
         )
         return {
             "status": "ok",
@@ -4195,8 +4195,8 @@ async def submit_track_type_override(request: TrackTypeOverrideRequest):
             "consensus": consensus['type'] if consensus else None,
             "consensus_votes": consensus['votes'] if consensus else 0,
         }
-    except ValidationError as e:
-        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise  # 400 ya formateado arriba
     except Exception as e:
         logger.error(f"[Community] Error saving track type override: {e}")
         raise HTTPException(500, f"Error: {str(e)}")
