@@ -1742,6 +1742,47 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         except Exception as e:
             logger.debug(f"  [Community] Consensus check fallo: {e}")
 
+    # ==================== GENRE / KEY: COMMUNITY CONSENSUS (Fase 4) ====================
+    # Solo aplica si la fuente no es ya autoritativa (beatport / id3 fuerte).
+    # Cascada general: beatport > id3 > community > algoritmico/spectral.
+    # Si community consensus existe y la fuente actual no es beatport, override.
+    if fingerprint:
+        # Genre
+        if genre_source != 'beatport':
+            try:
+                cm_genre = (_fetch_community_override(fingerprint, 'genre')
+                            if IS_LOCAL_ENGINE
+                            else db.get_community_consensus(fingerprint, 'genre'))
+                if cm_genre:
+                    logger.info(
+                        f"  [Community] Genre consensus override: "
+                        f"{genre} -> {cm_genre['value']} ({cm_genre['votes']} votos)"
+                    )
+                    genre = cm_genre['value']
+                    genre_source = 'community'
+            except Exception as e:
+                logger.debug(f"  [Community] Genre consensus fallo: {e}")
+        # Key + camelot (derivado de key via KEY_TO_CAMELOT)
+        if key_source != 'beatport' and key_source != 'id3':
+            try:
+                cm_key = (_fetch_community_override(fingerprint, 'key')
+                          if IS_LOCAL_ENGINE
+                          else db.get_community_consensus(fingerprint, 'key'))
+                if cm_key:
+                    new_key = cm_key['value']
+                    new_camelot = KEY_TO_CAMELOT.get(new_key)
+                    if new_camelot:  # Solo override si la key es mapeable
+                        logger.info(
+                            f"  [Community] Key consensus override: "
+                            f"{key} -> {new_key} ({new_camelot}) ({cm_key['votes']} votos)"
+                        )
+                        key = new_key
+                        camelot = new_camelot
+                        key_source = 'community'
+                        key_confidence = 1.0
+            except Exception as e:
+                logger.debug(f"  [Community] Key consensus fallo: {e}")
+
     return AnalysisResult(
         title=id3_data.get('title'),
         artist=id3_data.get('artist'),
@@ -2050,6 +2091,41 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                 ]
         except Exception as e:
             logger.debug(f"  [Community] Consensus check fallo: {e}")
+
+    # ==================== GENRE / KEY: COMMUNITY CONSENSUS (Fase 4, chunked) ====================
+    if fingerprint:
+        if genre_source != 'beatport':
+            try:
+                cm_genre = (_fetch_community_override(fingerprint, 'genre')
+                            if IS_LOCAL_ENGINE
+                            else db.get_community_consensus(fingerprint, 'genre'))
+                if cm_genre:
+                    logger.info(
+                        f"  [Community] Genre consensus override (chunked): "
+                        f"{genre} -> {cm_genre['value']} ({cm_genre['votes']} votos)"
+                    )
+                    genre = cm_genre['value']
+                    genre_source = 'community'
+            except Exception as e:
+                logger.debug(f"  [Community] Genre consensus fallo: {e}")
+        if key_source != 'beatport' and key_source != 'id3':
+            try:
+                cm_key = (_fetch_community_override(fingerprint, 'key')
+                          if IS_LOCAL_ENGINE
+                          else db.get_community_consensus(fingerprint, 'key'))
+                if cm_key:
+                    new_key = cm_key['value']
+                    new_camelot = KEY_TO_CAMELOT.get(new_key)
+                    if new_camelot:
+                        logger.info(
+                            f"  [Community] Key consensus override (chunked): "
+                            f"{key} -> {new_key} ({new_camelot})"
+                        )
+                        key = new_key
+                        camelot = new_camelot
+                        key_source = 'community'
+            except Exception as e:
+                logger.debug(f"  [Community] Key consensus fallo: {e}")
 
     # ==================== RESULTADO ====================
     return AnalysisResult(
@@ -4171,14 +4247,138 @@ async def get_community_beat_grid(fingerprint: str):
         logger.error(f"[Community] Error fetching beat grid: {e}")
         return {"bpm_adjust": 0.0, "beat_offset": 0.0, "contributors": 0, "validated": False}
 
-# ==================== COMMUNITY TRACK TYPE (Fase 2) ====================
+# ==================== COMMUNITY OVERRIDES (Fase 4 - generico) ====================
+# Sistema unificado de votos comunitarios para CUALQUIER campo categorico:
+# track_type, key, camelot, genre, subgenre. Mismas reglas de consensus
+# (>=3 votos al winner, supera al 2do por >=2). Whitelist por campo aplicada
+# en el endpoint POST.
 
-# Tipos validos para un voto comunitario. Subset estricto de VALID_TRACK_TYPES
-# (validation.py:75): excluye 'all' (valor especial para filtros) y 'peak'
-# (alias legacy de 'peak_time'). Si el cliente envia 'peak' lo normalizamos.
+# Whitelist por campo. Valores validos por field. None = string libre con
+# normalizacion (genre/subgenre — el cliente envia normalizado).
 COMMUNITY_TRACK_TYPES = {
     'warmup', 'peak_time', 'closing', 'opener', 'builder', 'anthem', 'cooldown',
 }
+COMMUNITY_KEYS = {
+    'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B',
+    'Cm', 'C#m', 'Dm', 'D#m', 'Em', 'Fm', 'F#m', 'Gm', 'G#m', 'Am', 'A#m', 'Bm',
+}
+COMMUNITY_CAMELOT = {f'{n}{l}' for n in range(1, 13) for l in 'AB'}
+
+# Validacion + normalizacion por field. Devuelve (normalized_value, error)
+# donde error es None si OK, o un mensaje 400 si invalido.
+def _validate_community_field(field: str, value: str):
+    if not value:
+        return None, "value requerido"
+    normalized = value.strip()
+    if field == 'track_type':
+        normalized = normalized.lower()
+        if normalized == 'peak':
+            normalized = 'peak_time'
+        if normalized not in COMMUNITY_TRACK_TYPES:
+            return None, (
+                f"track_type invalido: {value}. "
+                f"Permitidos: {', '.join(sorted(COMMUNITY_TRACK_TYPES))}"
+            )
+        return normalized, None
+    if field == 'key':
+        # Normalizacion key: preservar mayuscula raiz + 'm' minuscula para minor.
+        if normalized.endswith('m') or normalized.endswith('M'):
+            base = normalized[:-1].upper().replace('B', '#').replace('b', '#') if False else normalized[:-1]
+            base = base[0].upper() + base[1:] if len(base) > 1 else base.upper()
+            normalized = base + 'm'
+        else:
+            normalized = normalized[0].upper() + (normalized[1:] if len(normalized) > 1 else '')
+        if normalized not in COMMUNITY_KEYS:
+            return None, f"key invalida: {value}. Esperado p.ej. 'C', 'C#', 'Dm', 'D#m'"
+        return normalized, None
+    if field == 'camelot':
+        normalized = normalized.upper()
+        if normalized not in COMMUNITY_CAMELOT:
+            return None, f"camelot invalida: {value}. Esperado p.ej. '1A', '12B'"
+        return normalized, None
+    if field in ('genre', 'subgenre'):
+        # Strings libres con normalizacion suave: capitalize palabras.
+        # Limite longitud para evitar abuso.
+        if len(normalized) > 100:
+            return None, f"{field} demasiado largo (max 100 caracteres)"
+        # Capitalize each word (Title Case).
+        normalized = ' '.join(w[0].upper() + w[1:].lower() if len(w) > 1 else w.upper()
+                              for w in normalized.split())
+        return normalized, None
+    return None, f"field no soportado: {field}"
+
+
+class CommunityOverrideRequest(BaseModel):
+    fingerprint: str
+    device_id: str
+    field: str
+    value: str
+
+
+def _community_override_response(fingerprint: str, field: str) -> dict:
+    """Helper compartido: distribucion + consensus de un (fp, field)."""
+    consensus = db.get_community_consensus(fingerprint, field)
+    votes = db.get_community_votes(fingerprint, field)
+    return {
+        "fingerprint": fingerprint,
+        "field": field,
+        "consensus": consensus['value'] if consensus else None,
+        "consensus_votes": consensus['votes'] if consensus else 0,
+        "votes": votes,
+        "total_voters": sum(votes.values()),
+    }
+
+
+@app.post("/community/override")
+async def submit_community_override(request: CommunityOverrideRequest):
+    """Recibe un voto de un DJ sobre cualquier campo categorico de un track.
+
+    Campos soportados: track_type, key, camelot, genre, subgenre.
+    Un device puede votar 1 campo 1 vez por track; segundo POST sobreescribe.
+    Cuando >=3 votos al winner Y supera al 2do por >=2, la respuesta de
+    /analyze para ese fingerprint devuelve {field}_source='community'.
+    """
+    try:
+        if not request.fingerprint or not request.device_id or not request.field:
+            raise HTTPException(400, "fingerprint, device_id y field requeridos")
+        normalized, error = _validate_community_field(request.field, request.value)
+        if error:
+            raise HTTPException(400, error)
+        db.submit_community_override(
+            fingerprint=request.fingerprint,
+            device_id=request.device_id,
+            field=request.field,
+            value=normalized,
+        )
+        logger.info(
+            f"[Community] {request.field}: fp={request.fingerprint[:8]}... "
+            f"device={request.device_id[:8]}... -> {normalized}"
+        )
+        return {"status": "ok", **_community_override_response(request.fingerprint, request.field)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Community] Error saving override: {e}")
+        raise HTTPException(500, f"Error: {str(e)}")
+
+
+@app.get("/community/override/{field}/{fingerprint}")
+async def get_community_override(field: str, fingerprint: str):
+    """Devuelve consensus + distribucion de votos para (field, fingerprint)."""
+    try:
+        return _community_override_response(fingerprint, field)
+    except Exception as e:
+        logger.error(f"[Community] Error fetching {field} consensus: {e}")
+        return {
+            "fingerprint": fingerprint, "field": field,
+            "consensus": None, "consensus_votes": 0,
+            "votes": {}, "total_voters": 0,
+        }
+
+
+# ==================== COMMUNITY TRACK TYPE (Fase 2 backwards-compat) ====================
+# Mantenidos para no romper clientes Fase 2 que no se actualizaron al
+# endpoint generico. Internamente delegan al generico via DB.
 
 class TrackTypeOverrideRequest(BaseModel):
     fingerprint: str
@@ -4187,82 +4387,42 @@ class TrackTypeOverrideRequest(BaseModel):
 
 @app.post("/community/track-type")
 async def submit_track_type_override(request: TrackTypeOverrideRequest):
-    """Recibe un voto de un DJ sobre el track_type real de un fingerprint.
-
-    Un device puede votar 1 vez por fingerprint (PK compuesta). El segundo POST
-    sobreescribe el primero — el DJ puede cambiar de opinion. Cuando hay >=3
-    votos al winner y supera al 2do por >=2, la respuesta de /analyze para ese
-    fingerprint devuelve track_type_source='community' con confidence=1.0.
-    """
-    try:
-        if not request.fingerprint or not request.device_id:
-            raise HTTPException(400, "fingerprint y device_id requeridos")
-        normalized = (request.track_type or '').strip().lower()
-        if normalized == 'peak':
-            normalized = 'peak_time'
-        if normalized not in COMMUNITY_TRACK_TYPES:
-            raise HTTPException(
-                400,
-                f"track_type invalido: {request.track_type}. "
-                f"Permitidos: {', '.join(sorted(COMMUNITY_TRACK_TYPES))}",
-            )
-        db.submit_track_type_override(
-            fingerprint=request.fingerprint,
-            device_id=request.device_id,
-            track_type=normalized,
-        )
-        consensus = db.get_track_type_consensus(request.fingerprint)
-        votes = db.get_track_type_votes(request.fingerprint)
-        logger.info(
-            f"[Community] Track type override: fp={request.fingerprint[:8]}... "
-            f"device={request.device_id[:8]}... -> {normalized} (votes={votes})"
-        )
-        return {
-            "status": "ok",
-            "votes": votes,
-            "consensus": consensus['type'] if consensus else None,
-            "consensus_votes": consensus['votes'] if consensus else 0,
-        }
-    except HTTPException:
-        raise  # 400 ya formateado arriba
-    except Exception as e:
-        logger.error(f"[Community] Error saving track type override: {e}")
-        raise HTTPException(500, f"Error: {str(e)}")
+    """Legacy Fase 2: voto de track_type. Delega al endpoint generico."""
+    proxy = CommunityOverrideRequest(
+        fingerprint=request.fingerprint,
+        device_id=request.device_id,
+        field='track_type',
+        value=request.track_type,
+    )
+    result = await submit_community_override(proxy)
+    # Shape Fase 2: 'consensus' string (no objeto con field).
+    return {
+        "status": result.get("status", "ok"),
+        "votes": result.get("votes", {}),
+        "consensus": result.get("consensus"),
+        "consensus_votes": result.get("consensus_votes", 0),
+    }
 
 @app.get("/community/track-type/{fingerprint}")
 async def get_community_track_type(fingerprint: str):
-    """Devuelve el consensus comunitario + distribucion de votos.
-
-    Esta es la ruta que consume el motor local cuando corre /analyze: si hay
-    consensus, lo aplica overriding el algoritmico.
-    """
-    try:
-        consensus = db.get_track_type_consensus(fingerprint)
-        votes = db.get_track_type_votes(fingerprint)
-        return {
-            "fingerprint": fingerprint,
-            "consensus": consensus['type'] if consensus else None,
-            "consensus_votes": consensus['votes'] if consensus else 0,
-            "votes": votes,
-            "total_voters": sum(votes.values()),
-        }
-    except Exception as e:
-        logger.error(f"[Community] Error fetching track type consensus: {e}")
-        return {
-            "fingerprint": fingerprint,
-            "consensus": None,
-            "consensus_votes": 0,
-            "votes": {},
-            "total_voters": 0,
-        }
+    """Legacy Fase 2: consensus de track_type."""
+    r = _community_override_response(fingerprint, 'track_type')
+    # Shape Fase 2.
+    return {
+        "fingerprint": fingerprint,
+        "consensus": r["consensus"],
+        "consensus_votes": r["consensus_votes"],
+        "votes": r["votes"],
+        "total_voters": r["total_voters"],
+    }
 
 
-def _fetch_community_track_type(fingerprint: str) -> Optional[Dict]:
-    """Si somos motor local, pregunta a Render por consensus comunitario.
+def _fetch_community_override(fingerprint: str, field: str) -> Optional[Dict]:
+    """Si somos motor local, pregunta a Render por consensus de (fp, field).
 
     Si no somos motor local (estamos en Render), devuelve None — el caller
-    consultara db.get_track_type_consensus directo. Si Render no responde,
-    skip (fail open: caemos al algoritmico).
+    consultara db.get_community_consensus directo. Si Render no responde,
+    fail-open (devuelve None).
     """
     if not IS_LOCAL_ENGINE or not fingerprint:
         return None
@@ -4271,16 +4431,27 @@ def _fetch_community_track_type(fingerprint: str) -> Optional[Dict]:
         return None
     try:
         r = requests.get(
-            f"{render_url}/community/track-type/{fingerprint}",
+            f"{render_url}/community/override/{field}/{fingerprint}",
             timeout=2.0,
         )
         if r.status_code == 200:
             data = r.json()
             if data.get('consensus'):
                 return {
-                    'type': data['consensus'],
+                    'value': data['consensus'],
                     'votes': data.get('consensus_votes', 0),
                 }
     except (requests.RequestException, ValueError):
         pass
     return None
+
+
+def _fetch_community_track_type(fingerprint: str) -> Optional[Dict]:
+    """Wrapper legacy: delega al generico con field='track_type'.
+
+    Shape Fase 2 ('type' en lugar de 'value') para no romper callers.
+    """
+    result = _fetch_community_override(fingerprint, 'track_type')
+    if not result:
+        return None
+    return {'type': result['value'], 'votes': result['votes']}

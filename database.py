@@ -141,6 +141,12 @@ class AnalysisDB:
         # Un device_id puede votar 1 vez por fingerprint. Si N>=3 votos y el
         # winner supera al 2do por >=2, ese tipo gana sobre el algoritmico.
         # Implementacion en `get_track_type_consensus`.
+        #
+        # DEPRECADO Fase 4: reemplazado por community_overrides (tabla
+        # generica con `field` column). Se mantiene viva temporalmente para
+        # migrar datos historicos y para que upgrades en caliente no pierdan
+        # votos. Helpers nuevos escriben SOLO a community_overrides; los
+        # legacy wrappers (submit_track_type_override, etc.) tambien.
         conn.execute('''
             CREATE TABLE IF NOT EXISTS community_track_type_overrides (
                 fingerprint TEXT NOT NULL,
@@ -151,6 +157,34 @@ class AnalysisDB:
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_cttov_fp ON community_track_type_overrides(fingerprint)')
+
+        # Community overrides genericos (Fase 4 v2).
+        # Sistema unificado de votos comunitarios para CUALQUIER campo
+        # categorico (track_type, key, camelot, genre, subgenre). Mismas
+        # reglas de consensus: >=3 votos al winner y supera al 2do por >=2.
+        # `field` y `value` siempre strings; el caller los normaliza/valida
+        # segun whitelist por campo (COMMUNITY_VALID_VALUES en main.py).
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_overrides (
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                field TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, device_id, field)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_co_fp_field ON community_overrides(fingerprint, field)')
+        # Migracion idempotente: si la tabla legacy tiene votos y la nueva
+        # esta vacia para ese fp, copiar como field='track_type'. Sin LOCK
+        # porque ON CONFLICT DO NOTHING garantiza idempotencia si se llama
+        # multiples veces (ej. reinicio de Render).
+        conn.execute('''
+            INSERT OR IGNORE INTO community_overrides
+                (fingerprint, device_id, field, value, created_at)
+            SELECT fingerprint, device_id, 'track_type', track_type, created_at
+            FROM community_track_type_overrides
+        ''')
 
         # Notas comunitarias (todos los DJs ven las notas de todos)
         conn.execute('''
@@ -857,56 +891,54 @@ class AnalysisDB:
             'validated': False,
         }
 
-    # ==================== COMMUNITY TRACK TYPE OVERRIDES (Fase 2) ====================
+    # ==================== COMMUNITY OVERRIDES GENERICOS (Fase 4) ====================
+    # Sistema unificado para CUALQUIER campo categorico: track_type, key,
+    # camelot, genre, subgenre. Mismas reglas de consensus (>=3 votos al
+    # winner, supera al 2do por >=2). Whitelist por campo en main.py.
 
-    def submit_track_type_override(self, fingerprint: str, device_id: str, track_type: str) -> None:
-        """Guarda/actualiza el voto de un DJ sobre el track_type de un fingerprint.
+    def submit_community_override(
+        self, fingerprint: str, device_id: str, field: str, value: str,
+    ) -> None:
+        """Voto/cambia voto de un device sobre un campo de un track.
 
-        Un device_id solo puede tener 1 voto activo por fingerprint (PK compuesta).
-        El segundo POST del mismo device sobreescribe el primero — el DJ puede
-        cambiar de opinion.
+        PK (fingerprint, device_id, field) -> un device puede votar 1 campo
+        1 vez por track; segundo POST sobreescribe (cambio de opinion).
         """
         from datetime import datetime
         now = datetime.utcnow().isoformat()
         conn = self._open_conn()
         try:
             conn.execute('''
-                INSERT INTO community_track_type_overrides
-                    (fingerprint, device_id, track_type, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(fingerprint, device_id) DO UPDATE SET
-                    track_type = excluded.track_type,
+                INSERT INTO community_overrides
+                    (fingerprint, device_id, field, value, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint, device_id, field) DO UPDATE SET
+                    value = excluded.value,
                     created_at = excluded.created_at
-            ''', (fingerprint, device_id, track_type, now))
+            ''', (fingerprint, device_id, field, value, now))
             conn.commit()
         finally:
             conn.close()
 
-    def get_track_type_consensus(self, fingerprint: str) -> Optional[Dict]:
-        """Devuelve el consensus comunitario si los votos son inequivocos.
+    def get_community_consensus(
+        self, fingerprint: str, field: str,
+    ) -> Optional[Dict]:
+        """Devuelve consensus si los votos son inequivocos para (fp, field).
 
-        Reglas:
+        Reglas (mismas que Fase 2):
           - >= 3 votos totales al winner.
-          - winner supera al 2do mas votado por >= 2 votos (evita empates).
-        Si no se cumplen ambas, devuelve None (no hay consensus, fallback al
-        algoritmico).
-
-        Devuelve dict con:
-          type: str — el winner.
-          votes: int — votos al winner.
-          total: int — total de votos sobre este fingerprint.
-          distribution: dict[str,int] — votos por tipo.
+          - winner supera al 2do por >= 2 votos.
         """
         conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute('''
-                SELECT track_type, COUNT(*) AS votes
-                FROM community_track_type_overrides
-                WHERE fingerprint = ?
-                GROUP BY track_type
+                SELECT value, COUNT(*) AS votes
+                FROM community_overrides
+                WHERE fingerprint = ? AND field = ?
+                GROUP BY value
                 ORDER BY votes DESC
-            ''', (fingerprint,))
+            ''', (fingerprint, field))
             rows = c.fetchall()
         finally:
             conn.close()
@@ -914,9 +946,9 @@ class AnalysisDB:
         if not rows:
             return None
 
-        distribution = {r['track_type']: r['votes'] for r in rows}
+        distribution = {r['value']: r['votes'] for r in rows}
         total = sum(distribution.values())
-        winner_type = rows[0]['track_type']
+        winner_value = rows[0]['value']
         winner_votes = rows[0]['votes']
         second_votes = rows[1]['votes'] if len(rows) > 1 else 0
 
@@ -926,33 +958,56 @@ class AnalysisDB:
             return None
 
         return {
-            'type': winner_type,
+            'value': winner_value,
             'votes': winner_votes,
             'total': total,
             'distribution': distribution,
         }
 
-    def get_track_type_votes(self, fingerprint: str) -> Dict:
-        """Devuelve distribucion bruta de votos para un fingerprint.
-
-        A diferencia de get_track_type_consensus, esta funcion siempre devuelve
-        algo (aunque sea {}). Usada por el endpoint GET para mostrar el
-        breakdown completo al cliente, no solo el winner.
-        """
+    def get_community_votes(self, fingerprint: str, field: str) -> Dict:
+        """Distribucion bruta de votos por (fp, field). Siempre devuelve dict."""
         conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute('''
-                SELECT track_type, COUNT(*) AS votes
-                FROM community_track_type_overrides
-                WHERE fingerprint = ?
-                GROUP BY track_type
+                SELECT value, COUNT(*) AS votes
+                FROM community_overrides
+                WHERE fingerprint = ? AND field = ?
+                GROUP BY value
                 ORDER BY votes DESC
-            ''', (fingerprint,))
+            ''', (fingerprint, field))
             rows = c.fetchall()
         finally:
             conn.close()
-        return {r['track_type']: r['votes'] for r in rows}
+        return {r['value']: r['votes'] for r in rows}
+
+    # ==================== TRACK TYPE WRAPPERS (Fase 2 backwards-compat) ====================
+    # Mantenidos como wrappers de los genéricos arriba. Asi el codigo legacy
+    # de main.py + clientes Flutter pre-Fase 4 siguen funcionando sin cambios.
+
+    def submit_track_type_override(self, fingerprint: str, device_id: str, track_type: str) -> None:
+        """Wrapper legacy: delega a submit_community_override(field='track_type')."""
+        self.submit_community_override(fingerprint, device_id, 'track_type', track_type)
+
+    def get_track_type_consensus(self, fingerprint: str) -> Optional[Dict]:
+        """Wrapper legacy: delega a get_community_consensus(field='track_type').
+
+        Reformatea la respuesta para mantener la shape historica de Fase 2
+        (key 'type' en lugar de 'value').
+        """
+        consensus = self.get_community_consensus(fingerprint, 'track_type')
+        if not consensus:
+            return None
+        return {
+            'type': consensus['value'],
+            'votes': consensus['votes'],
+            'total': consensus['total'],
+            'distribution': consensus['distribution'],
+        }
+
+    def get_track_type_votes(self, fingerprint: str) -> Dict:
+        """Wrapper legacy: delega a get_community_votes(field='track_type')."""
+        return self.get_community_votes(fingerprint, 'track_type')
 
     # ==================== AUDD AUTO-TRIGGER LOG ====================
 
