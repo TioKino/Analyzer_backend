@@ -1,6 +1,7 @@
 """
 BPM validation and correction utilities.
 """
+import math
 import numpy as np
 import librosa
 import logging
@@ -96,3 +97,42 @@ def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset
         logger.info(f"[BPM] Correccion double/half: {original_bpm:.1f} -> {best_bpm:.1f}")
 
     return best_bpm
+
+
+def normalize_bpm_to_canonical(bpm: float) -> float:
+    """
+    Normaliza BPM al rango canonico [60, 180] multiplicando o dividiendo por 2.
+
+    Util para consensus comunitario: distintos DJs pueden reportar el mismo
+    track como 64, 128 o 256 (halftime/doubletime). La normalizacion los
+    colapsa al mismo valor canonico para que la mediana funcione.
+
+    Ejemplos:
+    - 32   -> 64  (32 -> 64; 64 ya esta en [60, 180])
+    - 64   -> 64  (ya esta en rango)
+    - 128  -> 128 (no cambia)
+    - 180  -> 180 (limite superior incluido)
+    - 256  -> 128 (256 -> 128)
+    - 60   -> 60  (limite inferior incluido)
+    - 59   -> 118 (59 -> 118; sale del rango por el limite inferior)
+
+    Casos edge:
+    - bpm <= 0: raise ValueError
+    - bpm es NaN/Inf: raise ValueError
+    - Resultado redondeado a 1 decimal.
+    """
+    try:
+        value = float(bpm)
+    except (TypeError, ValueError):
+        raise ValueError(f"BPM debe ser numerico: {bpm!r}")
+    if math.isnan(value) or math.isinf(value):
+        raise ValueError(f"BPM no puede ser NaN/Inf: {bpm!r}")
+    if value <= 0:
+        raise ValueError(f"BPM debe ser positivo: {bpm}")
+
+    while value < 60:
+        value *= 2
+    while value > 180:
+        value /= 2
+
+    return round(value, 1)
