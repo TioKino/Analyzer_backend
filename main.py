@@ -4447,6 +4447,41 @@ async def get_community_override(field: str, fingerprint: str):
         }
 
 
+@app.delete("/community/override/{field}/{fingerprint}")
+async def delete_community_override(field: str, fingerprint: str, device_id: str):
+    """Retira el voto del device sobre (field, fingerprint). Fase 5.5.
+
+    Idempotente: si el voto no existia, devuelve 200 con deleted=False. Asi
+    el cliente puede llamar "retirar voto" sin chequear previamente.
+
+    Args:
+        field: campo del cual retirar el voto. Whitelisted contra
+            COMMUNITY_VALID_FIELDS para evitar abuse.
+        fingerprint: hash del track.
+        device_id: identificador del device (query param: ?device_id=X).
+    """
+    if field not in COMMUNITY_VALID_FIELDS:
+        raise HTTPException(400, f"field no soportado: {field}")
+    if not device_id:
+        raise HTTPException(400, "device_id requerido")
+    try:
+        deleted = db.delete_community_override(fingerprint, device_id, field)
+        logger.info(
+            f"[Community] DELETE {field}: fp={fingerprint[:8]}... "
+            f"device={device_id[:8]}... deleted={deleted}"
+        )
+        return {
+            "status": "ok",
+            "deleted": deleted,
+            **_community_override_response(fingerprint, field),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Community] Error deleting {field} vote: {e}")
+        raise HTTPException(500, f"Error: {str(e)}")
+
+
 # ==================== COMMUNITY TRACK TYPE (Fase 2 backwards-compat) ====================
 # Mantenidos para no romper clientes Fase 2 que no se actualizaron al
 # endpoint generico. Internamente delegan al generico via DB.

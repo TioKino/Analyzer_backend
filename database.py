@@ -1069,6 +1069,31 @@ class AnalysisDB:
             conn.close()
         return {r['value']: r['votes'] for r in rows}
 
+    def delete_community_override(
+        self, fingerprint: str, device_id: str, field: str,
+    ) -> bool:
+        """Retira el voto de un device sobre (fingerprint, field).
+
+        Idempotente: si el voto no existia, devuelve False (no fue eliminado
+        pero no es un error). Asi el cliente puede llamar 'retirar voto' sin
+        chequear previamente si voto.
+
+        Returns:
+            True si se elimino un row, False si no habia voto previo.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                DELETE FROM community_overrides
+                WHERE fingerprint = ? AND device_id = ? AND field = ?
+            ''', (fingerprint, device_id, field))
+            deleted = c.rowcount > 0
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
+
     # ==================== TRACK TYPE WRAPPERS (Fase 2 backwards-compat) ====================
     # Mantenidos como wrappers de los genéricos arriba. Asi el codigo legacy
     # de main.py + clientes Flutter pre-Fase 4 siguen funcionando sin cambios.
