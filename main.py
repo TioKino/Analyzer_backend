@@ -826,6 +826,21 @@ def get_camelot(key: str) -> str:
     """Convierte key musical a notacion Camelot"""
     return KEY_TO_CAMELOT.get(key, '?')
 
+
+CAMELOT_TO_KEY = {v: k for k, v in KEY_TO_CAMELOT.items()}
+
+
+def camelot_to_key(camelot: str) -> str:
+    """Convierte notacion Camelot (1A-12B) a nota cruda (C, Cm, F#, etc.).
+
+    Raises ValueError si el input es invalido.
+    """
+    norm = camelot.strip().upper()
+    if norm not in CAMELOT_TO_KEY:
+        raise ValueError(f"Invalid Camelot notation: {camelot}")
+    return CAMELOT_TO_KEY[norm]
+
+
 # ==================== HELPERS ====================
 
 def calculate_fingerprint(file_path):
@@ -4305,6 +4320,37 @@ def _validate_community_field(field: str, value: str):
         normalized = ' '.join(w[0].upper() + w[1:].lower() if len(w) > 1 else w.upper()
                               for w in normalized.split())
         return normalized, None
+    if field == 'bpm':
+        try:
+            bpm_val = float(normalized)
+        except (TypeError, ValueError):
+            return None, "bpm debe ser numerico"
+        if bpm_val <= 0 or bpm_val > 999:
+            return None, "bpm fuera de rango (0.1-999)"
+        from bpm_utils import normalize_bpm_to_canonical
+        try:
+            canonical = normalize_bpm_to_canonical(bpm_val)
+        except ValueError as e:
+            return None, str(e)
+        return str(canonical), None
+    if field == 'energy':
+        try:
+            e_val = int(float(normalized))
+        except (TypeError, ValueError):
+            return None, "energy debe ser entero"
+        if e_val < 1 or e_val > 10:
+            return None, "energy debe estar entre 1 y 10"
+        return str(e_val), None
+    if field == 'year':
+        try:
+            y_val = int(normalized)
+        except (TypeError, ValueError):
+            return None, "year debe ser entero"
+        import datetime as _dt
+        current_year = _dt.datetime.now().year
+        if y_val < 1900 or y_val > current_year + 1:
+            return None, f"year fuera de rango (1900-{current_year + 1})"
+        return str(y_val), None
     return None, f"field no soportado: {field}"
 
 
@@ -4315,8 +4361,29 @@ class CommunityOverrideRequest(BaseModel):
     value: str
 
 
+COMMUNITY_NUMERIC_FIELDS = {'bpm', 'energy'}
+COMMUNITY_CATEGORICAL_FIELDS = {'track_type', 'key', 'camelot', 'genre', 'subgenre', 'year'}
+COMMUNITY_VALID_FIELDS = COMMUNITY_NUMERIC_FIELDS | COMMUNITY_CATEGORICAL_FIELDS
+
+
 def _community_override_response(fingerprint: str, field: str) -> dict:
-    """Helper compartido: distribucion + consensus de un (fp, field)."""
+    """Helper compartido: distribucion + consensus de un (fp, field).
+
+    Numericos (bpm, energy) usan mediana via get_community_consensus_numeric.
+    Categoricos (track_type/key/camelot/genre/subgenre/year) usan moda via
+    get_community_consensus. Shape de respuesta es identica para no romper
+    al frontend Fase 4.
+    """
+    if field in COMMUNITY_NUMERIC_FIELDS:
+        result = db.get_community_consensus_numeric(fingerprint, field)
+        return {
+            "fingerprint": fingerprint,
+            "field": field,
+            "consensus": result['consensus'],
+            "consensus_votes": result['consensus_votes'],
+            "votes": result['votes_distribution'],
+            "total_voters": result['total_voters'],
+        }
     consensus = db.get_community_consensus(fingerprint, field)
     votes = db.get_community_votes(fingerprint, field)
     return {
@@ -4365,8 +4432,12 @@ async def submit_community_override(request: CommunityOverrideRequest):
 @app.get("/community/override/{field}/{fingerprint}")
 async def get_community_override(field: str, fingerprint: str):
     """Devuelve consensus + distribucion de votos para (field, fingerprint)."""
+    if field not in COMMUNITY_VALID_FIELDS:
+        raise HTTPException(400, f"field no soportado: {field}")
     try:
         return _community_override_response(fingerprint, field)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[Community] Error fetching {field} consensus: {e}")
         return {
