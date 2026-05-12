@@ -3,6 +3,7 @@ import os
 import time
 from datetime import datetime, timezone
 import json
+import statistics
 from typing import List, Dict, Optional
 
 class AnalysisDB:
@@ -962,6 +963,93 @@ class AnalysisDB:
             'votes': winner_votes,
             'total': total,
             'distribution': distribution,
+        }
+
+    def get_community_consensus_numeric(
+        self, fingerprint: str, field: str, threshold: int = 3,
+    ) -> Dict:
+        """Calcula consensus numerico (Fase 5) usando MEDIANA.
+
+        A diferencia del consensus categorico (Fase 4) que usa MODA + tiebreak,
+        este metodo asume que los valores son numericos y calcula la mediana
+        sobre todos los votos del campo. La normalizacion previa la hace el
+        endpoint POST (ej. BPM colapsado al rango [60, 180] via bpm_utils).
+
+        Args:
+            fingerprint: hash del track
+            field: 'bpm' o 'energy'
+            threshold: minimo de votos para tener consensus (default 3)
+
+        Returns:
+            {
+                'consensus': float | int | None,  # mediana si N >= threshold
+                'consensus_votes': int,            # = total_voters si hay consensus
+                'votes_distribution': {value_str: count},
+                'total_voters': int
+            }
+
+        Notas:
+        - Para `bpm` redondeamos a 1 decimal (alineado con bpm_utils).
+        - Para `energy` redondeamos a entero (escala DJ 1-10).
+        - Si algun valor no parsea a float se ignora (defensivo, los votos
+          deberian estar normalizados por _validate_community_field).
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT value, COUNT(*) AS votes
+                FROM community_overrides
+                WHERE fingerprint = ? AND field = ?
+                GROUP BY value
+                ORDER BY votes DESC
+            ''', (fingerprint, field))
+            rows = c.fetchall()
+        finally:
+            conn.close()
+
+        distribution = {r['value']: r['votes'] for r in rows}
+        total_voters = sum(distribution.values())
+
+        if total_voters < threshold:
+            return {
+                'consensus': None,
+                'consensus_votes': 0,
+                'votes_distribution': distribution,
+                'total_voters': total_voters,
+            }
+
+        # Expandir a lista de floats respetando los conteos.
+        flat_values: List[float] = []
+        for value_str, count in distribution.items():
+            try:
+                parsed = float(value_str)
+            except (TypeError, ValueError):
+                # Voto malformado en BD: ignorar pero no romper.
+                continue
+            flat_values.extend([parsed] * int(count))
+
+        if not flat_values or len(flat_values) < threshold:
+            return {
+                'consensus': None,
+                'consensus_votes': 0,
+                'votes_distribution': distribution,
+                'total_voters': total_voters,
+            }
+
+        median_value = statistics.median(flat_values)
+        if field == 'bpm':
+            consensus_value: Any = round(float(median_value), 1)
+        elif field == 'energy':
+            consensus_value = int(round(median_value))
+        else:
+            consensus_value = round(float(median_value), 2)
+
+        return {
+            'consensus': consensus_value,
+            'consensus_votes': total_voters,
+            'votes_distribution': distribution,
+            'total_voters': total_voters,
         }
 
     def get_community_votes(self, fingerprint: str, field: str) -> Dict:
