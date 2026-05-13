@@ -1413,9 +1413,17 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
             except Exception as e:
                 logger.debug(f"  [Community] Key consensus fallo: {e}")
 
+    # Fix 2026-05-13: usar title_name/artist_name (enriquecidos por AudD
+    # auto-trigger si se disparo) en vez de id3_data.get(...) crudo. Antes
+    # AudD identificaba el track, actualizaba artist_name/title_name local,
+    # Discogs corria con ellos (genre correcto) pero la respuesta JSON
+    # devolvia los basura originales ("Unknown"/"Track 01") porque se leia
+    # de id3_data en este return. Verificado en test ficticio con Oxia -
+    # Domino renombrado a track01.mp3 (audd success=1 pero artist="Unknown"
+    # en la respuesta).
     return AnalysisResult(
-        title=id3_data.get('title'),
-        artist=id3_data.get('artist'),
+        title=title_name or id3_data.get('title'),
+        artist=artist_name or id3_data.get('artist'),
         album=id3_data.get('album'),
         label=label,
         year=year,
@@ -1706,9 +1714,11 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                 logger.debug(f"  [Community] Key consensus fallo: {e}")
 
     # ==================== RESULTADO ====================
+    # Fix 2026-05-13: mismo bug que en analyze_audio — usar title_name/
+    # artist_name (enriquecidos por AudD) en vez de id3_data crudo.
     return AnalysisResult(
-        title=id3_data.get('title'),
-        artist=id3_data.get('artist'),
+        title=title_name or id3_data.get('title'),
+        artist=artist_name or id3_data.get('artist'),
         album=id3_data.get('album'),
         label=label,
         year=year,

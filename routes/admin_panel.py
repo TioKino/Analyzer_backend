@@ -607,14 +607,20 @@ async def telemetry(request: Request):
             ).fetchone()
             if r:
                 audd_total, audd_success = int(r[0] or 0), int(r[1] or 0)
+            # called_at es REAL (UNIX timestamp) — comparamos con timestamps,
+            # no con datetime('now',...) que devuelve string. Verificado
+            # 2026-05-13: la query antigua daba siempre 0 porque comparaba
+            # numero vs string lexicograficamente.
+            import time as _time
+            now_ts = _time.time()
             r7 = adb.execute(
-                "SELECT COUNT(*) FROM audd_call_log "
-                "WHERE called_at >= datetime('now','-7 days')"
+                "SELECT COUNT(*) FROM audd_call_log WHERE called_at >= ?",
+                (now_ts - 7 * 86400,),
             ).fetchone()
             audd_last_7d = int(r7[0]) if r7 else 0
             r30 = adb.execute(
-                "SELECT COUNT(*) FROM audd_call_log "
-                "WHERE called_at >= datetime('now','-30 days')"
+                "SELECT COUNT(*) FROM audd_call_log WHERE called_at >= ?",
+                (now_ts - 30 * 86400,),
             ).fetchone()
             audd_last_30d = int(r30[0]) if r30 else 0
         except sqlite3.OperationalError:
