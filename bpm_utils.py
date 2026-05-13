@@ -1,5 +1,11 @@
 """
 BPM validation and correction utilities.
+
+Beatport helpers (validate_beatport_bpm, smart_bpm_correction) se eliminaron
+junto con el resto de la integracion Beatport en rama
+claude/kill-beatport-fix-audd-logging. Beatport era inalcanzable desde
+Render (Cloudflare WAF) y desde IPs residenciales sin browser real;
+0 de 84 tracks tenian bpm_source='beatport'.
 """
 import math
 import numpy as np
@@ -8,43 +14,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
-def validate_beatport_bpm(local_bpm: float, beatport_bpm: float, tolerance: float = 0.12) -> bool:
-    """Valida si el BPM de Beatport corresponde al track local."""
-    if local_bpm <= 0 or beatport_bpm <= 0:
-        return True
-    ratio = beatport_bpm / local_bpm
-    if abs(ratio - 1.0) <= tolerance:
-        return True
-    if abs(ratio - 2.0) <= tolerance and beatport_bpm >= 80:
-        return True
-    if abs(ratio - 0.5) <= tolerance and beatport_bpm >= 80:
-        return True
-    return False
-
-
-def smart_bpm_correction(local_bpm: float, beatport_bpm: float) -> float:
-    """
-    Correccion inteligente de BPM half/double tempo.
-
-    Si Beatport dice 140 y local dice 70 -> es double tempo -> corregir a 140.
-    Si Beatport dice 70 y local dice 140 -> es half tempo -> corregir a 70.
-    Si estan dentro del 12%, Beatport gana (datos del sello).
-    Si no hay match, devolver None (rechazar Beatport).
-    """
-    if local_bpm <= 0 or beatport_bpm <= 0:
-        return beatport_bpm or local_bpm
-
-    ratio = beatport_bpm / local_bpm
-
-    if abs(ratio - 1.0) <= 0.12:
-        return beatport_bpm
-    if abs(ratio - 2.0) <= 0.15:
-        return beatport_bpm
-    if abs(ratio - 0.5) <= 0.15:
-        return beatport_bpm
-
-    return None
 
 
 def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset_env=None) -> float:

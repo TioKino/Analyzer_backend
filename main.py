@@ -235,42 +235,6 @@ class SafeJSONResponse(JSONResponse):
             allow_nan=False,
         ).encode("utf-8")
 
-def validate_beatport_bpm(local_bpm: float, beatport_bpm: float, tolerance: float = 0.12) -> bool:
-    """Valida si el BPM de Beatport corresponde al track local."""
-    if local_bpm <= 0 or beatport_bpm <= 0:
-        return True
-    ratio = beatport_bpm / local_bpm
-    if abs(ratio - 1.0) <= tolerance:
-        return True
-    if abs(ratio - 2.0) <= tolerance and beatport_bpm >= 80:
-        return True
-    if abs(ratio - 0.5) <= tolerance and beatport_bpm >= 80:
-        return True
-    return False
-
-
-def smart_bpm_correction(local_bpm: float, beatport_bpm: float) -> float:
-    """
-    Correccion de BPM: Beatport SIEMPRE tiene prioridad.
-
-    Beatport obtiene el BPM directamente del sello discografico,
-    por lo que es mas fiable que librosa. Librosa puede detectar
-    half/double tempo o valores incorrectos en tracks complejos.
-
-    Returns: BPM de Beatport siempre (nunca None).
-    """
-    if beatport_bpm and beatport_bpm > 0:
-        if local_bpm > 0:
-            ratio = beatport_bpm / local_bpm
-            if abs(ratio - 1.0) <= 0.12:
-                logger.info(f"  [Beatport] BPM match directo: {beatport_bpm}")
-            elif abs(ratio - 2.0) <= 0.15 or abs(ratio - 0.5) <= 0.15:
-                logger.info(f"  [Beatport] BPM half/double corregido: local {local_bpm:.1f} -> Beatport {beatport_bpm}")
-            else:
-                logger.info(f"  [Beatport] BPM override: local {local_bpm:.1f} -> Beatport {beatport_bpm} (Beatport tiene prioridad)")
-        return beatport_bpm
-    return local_bpm
-
 
 def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset_env=None) -> float:
     """
@@ -447,290 +411,6 @@ def search_collective_db(artist: str, title: str) -> Optional[Dict]:
         logger.error(f" Error buscando en BD colectiva: {e}")
         return None
 
-
-# ==================== BEATPORT SEARCH ====================
-
-def search_beatport(artist: str, title: str) -> Optional[Dict]:
-    """
-    Busca BPM y Key de un track en Beatport via scraping HTML.
-    Beatport es Next.js y embebe datos en __NEXT_DATA__.
-    Campos: track_name, bpm, key_name, genre[].genre_name, artists[].artist_name, length (ms)
-    """
-    try:
-        import urllib.parse
-        
-        # Limpiar titulo
-        clean_title = re.sub(r'\s*\(?(Original Mix|Extended Mix|Radio Edit)\)?', '', title, flags=re.IGNORECASE).strip()
-        clean_title = re.sub(r'^[A-D]\d\s+', '', clean_title).strip()
-        
-        # Limpiar artista
-        clean_artist = artist.strip().rstrip('.')
-        
-        query = f"{clean_artist} {clean_title}"
-        encoded_query = urllib.parse.quote(query)
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-        }
-        
-        search_url = f"https://www.beatport.com/search?q={encoded_query}"
-        
-        response = requests.get(search_url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            logger.info(f"  [Beatport] HTTP {response.status_code}")
-            return None
-        
-        # Extraer __NEXT_DATA__
-        next_data_match = re.search(
-            r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
-            response.text, re.DOTALL
-        )
-        if not next_data_match:
-            logger.info(f"  [Beatport] No __NEXT_DATA__ encontrado")
-            return None
-        
-        data = json.loads(next_data_match.group(1))
-        
-        # Navegar a la ruta de tracks
-        # props.pageProps.dehydratedState.queries[0].state.data.tracks.data
-        try:
-            tracks = data["props"]["pageProps"]["dehydratedState"]["queries"][0]["state"]["data"]["tracks"]["data"]
-        except (KeyError, IndexError, TypeError):
-            logger.info(f"  [Beatport] Estructura JSON no esperada")
-            return None
-        
-        if not tracks:
-            return None
-        
-        # Buscar match
-        artist_lower = clean_artist.lower()
-        title_lower = clean_title.lower()
-        
-        for track in tracks:
-            if not isinstance(track, dict):
-                continue
-            
-            track_name = track.get('track_name', '').lower()
-            
-            # Match de titulo
-            title_match = (title_lower in track_name) or (track_name in title_lower)
-            if not title_match:
-                title_words = set(title_lower.split())
-                track_words = set(track_name.split())
-                if title_words and track_words:
-                    overlap = len(title_words & track_words) / max(len(title_words), 1)
-                    title_match = overlap >= 0.6
-            
-            if not title_match:
-                continue
-            
-            # Match de artista
-            track_artists = track.get('artists', [])
-            artist_match = False
-            for a in track_artists:
-                a_name = a.get('artist_name', '').lower() if isinstance(a, dict) else str(a).lower()
-                if artist_lower in a_name or a_name in artist_lower:
-                    artist_match = True
-                    break
-            
-            if not artist_match and track_artists:
-                continue
-            
-            # Extraer resultado
-            result = {}
-            
-            # BPM
-            if track.get('bpm'):
-                try:
-                    result['bpm'] = float(track['bpm'])
-                except (ValueError, TypeError):
-                    pass
-            
-            # Key - viene como key_name: "C Major", "D Minor", etc.
-            key_name = track.get('key_name', '')
-            if key_name:
-                result['key'] = convert_beatport_key(key_name)
-            
-            # Duration - viene en milisegundos en campo "length"
-            if track.get('length'):
-                try:
-                    result['duration'] = float(track['length']) / 1000.0
-                except (ValueError, TypeError):
-                    pass
-            
-            # Genre - viene como lista: [{"genre_id": 6, "genre_name": "Techno (Peak Time / Driving)"}]
-            genres = track.get('genre', [])
-            if genres and isinstance(genres, list):
-                genre_names = [g.get('genre_name', '') for g in genres if isinstance(g, dict)]
-                if genre_names:
-                    raw_genre = genre_names[0]
-                    cleaned = clean_beatport_genre(raw_genre)
-                    result['genre'] = cleaned['genre']
-                    result['genre_raw'] = raw_genre
-                    result['is_junk_genre'] = cleaned['is_junk']
-                    if cleaned['track_type_hint']:
-                        result['track_type_hint'] = cleaned['track_type_hint']
-            
-            if result.get('bpm') or result.get('key'):
-                return result
-        
-        return None
-        
-    except requests.exceptions.Timeout:
-        logger.info(f"  [Beatport] Timeout")
-        return None
-    except Exception as e:
-        logger.error(f"  [Beatport] Error: {e}")
-        return None
-
-
-def find_tracks_in_json(obj, results):
-    """Busca recursivamente tracks en estructura JSON"""
-    if isinstance(obj, dict):
-        # Si tiene bpm y name, probablemente es un track
-        if 'bpm' in obj and ('name' in obj or 'title' in obj or 'track_name' in obj):
-            results.append(obj)
-        # Buscar en valores
-        for v in obj.values():
-            find_tracks_in_json(v, results)
-    elif isinstance(obj, list):
-        for item in obj:
-            find_tracks_in_json(item, results)
-    return results
-
-
-# ==================== BEATPORT GENRE INTELLIGENCE ====================
-
-# Generos Beatport que NO son generos reales (son categorias comerciales)
-BEATPORT_JUNK_GENRES = {
-    'Mainstage', 'DJ Tools', 'Beats', 'Dance / Pop',
-}
-
-# Mapeo de calificadores Beatport entre parentesis -> track_type
-BEATPORT_QUALIFIER_TO_TYPE = {
-    # Peak / High energy
-    'Peak Time': 'peak_time',
-    'Driving': 'peak_time',
-    'Raw': 'peak_time',
-    'Hard': 'peak_time',
-    # Melodic / Builder
-    'Melodic': 'builder',
-    'Progressive': 'builder',
-    'Uplifting': 'builder',
-    # Deep / Opener
-    'Deep': 'opener',
-    'Hypnotic': 'opener',
-    'Minimal': 'opener',
-    'Deep Tech': 'opener',
-    # Chill / Warmup
-    'Downtempo': 'warmup',
-    'Ambient': 'warmup',
-    'Organic': 'warmup',
-    'Chill': 'warmup',
-    'Electronica': 'warmup',
-    # Anthem / Big room
-    'Big Room': 'anthem',
-    'Electro House': 'anthem',
-    'Future Rave': 'anthem',
-}
-
-def clean_beatport_genre(raw_genre: str) -> dict:
-    """
-    Procesa un genero de Beatport y extrae:
-    - genre: el genero limpio (sin calificadores entre parentesis)
-    - track_type_hint: sugerencia de track_type basada en calificadores
-    - is_junk: True si el genero es una categoria comercial sin valor
-    
-    Ejemplo:
-      "Techno (Peak Time / Driving)" -> {
-          'genre': 'Techno',
-          'track_type_hint': 'peak_time',
-          'is_junk': False
-      }
-      "Mainstage" -> {
-          'genre': 'Mainstage',
-          'track_type_hint': None,
-          'is_junk': True
-      }
-    """
-    if not raw_genre:
-        return {'genre': raw_genre, 'track_type_hint': None, 'is_junk': True}
-    
-    result = {
-        'genre': raw_genre,
-        'track_type_hint': None,
-        'is_junk': raw_genre in BEATPORT_JUNK_GENRES,
-    }
-    
-    # Extraer calificadores entre parentesis: "Techno (Peak Time / Driving)"
-    paren_match = re.match(r'^(.+?)\s*\((.+)\)$', raw_genre)
-    if paren_match:
-        base_genre = paren_match.group(1).strip()
-        qualifiers_str = paren_match.group(2).strip()
-        
-        # El genero limpio es la parte antes del parentesis
-        result['genre'] = base_genre
-        
-        # Buscar track_type en los calificadores
-        qualifiers = [q.strip() for q in qualifiers_str.replace('/', ',').split(',')]
-        for q in qualifiers:
-            q_clean = q.strip()
-            if q_clean in BEATPORT_QUALIFIER_TO_TYPE:
-                result['track_type_hint'] = BEATPORT_QUALIFIER_TO_TYPE[q_clean]
-                break
-    
-    # Generos compuestos con "/" pero sin parentesis: "Minimal / Deep Tech"
-    elif '/' in raw_genre and '(' not in raw_genre:
-        parts = [p.strip() for p in raw_genre.split('/')]
-        # Usar el primer componente como genero principal
-        result['genre'] = raw_genre  # mantener completo, es descriptivo
-        # Buscar hints en las partes
-        for p in parts:
-            if p in BEATPORT_QUALIFIER_TO_TYPE:
-                result['track_type_hint'] = BEATPORT_QUALIFIER_TO_TYPE[p]
-                break
-    
-    return result
-
-
-def convert_beatport_key(beatport_key: str) -> str:
-    """
-    Convierte key de formato Beatport a formato estandar.
-    Beatport: "D Minor", "G Major", "F# Minor", "G Flat Minor", "E Flat Major"
-    Estandar: "Dm", "G", "F#m", "F#m", "D#"
-    """
-    if not beatport_key:
-        return None
-    
-    key = beatport_key.strip()
-    
-    # Convertir "Flat" a "b" primero
-    key = key.replace(' Flat', 'b').replace(' flat', 'b')
-    # Convertir "Sharp" a "#"
-    key = key.replace(' Sharp', '#').replace(' sharp', '#')
-    
-    # Convertir "D Minor" -> "Dm", "G Major" -> "G"
-    key = key.replace(' Minor', 'm').replace(' minor', 'm')
-    key = key.replace(' Major', '').replace(' major', '')
-    key = key.replace(' min', 'm').replace(' maj', '')
-    
-    # Convertir bemoles a sostenidos (KEY_TO_CAMELOT solo tiene sostenidos)
-    # Enharmonicos: Cb=B, Db=C#, Eb=D#, Fb=E, Gb=F#, Ab=G#, Bb=A#
-    FLAT_TO_SHARP = {
-        'Cb': 'B',  'Db': 'C#', 'Eb': 'D#', 'Fb': 'E',
-        'Gb': 'F#', 'Ab': 'G#', 'Bb': 'A#',
-    }
-    
-    # Extraer la nota base y el sufijo (m o nada)
-    is_minor = key.endswith('m')
-    base = key[:-1] if is_minor else key
-    
-    if base in FLAT_TO_SHARP:
-        base = FLAT_TO_SHARP[base]
-    
-    return base + ('m' if is_minor else '')
 
 # ==================== MODELOS ====================
 
@@ -1517,16 +1197,18 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         genre = id3_genre
         genre_source = "id3"
         logger.info(f" ID3 (fallback): {genre}")
-    
-    # ==================== BEATPORT: FUENTE PRIMARIA BPM/KEY/GENRE ====================
-    # Beatport tiene datos 100% precisos del sello discografico
-    # Intentar SIEMPRE si tenemos artista y titulo
-    
+
+    # ==================== RESOLVER ARTIST / TITLE ====================
+    # Beatport solia ir aqui pero se elimino (WAF de Cloudflare bloquea el
+    # scraping desde datacenter e IP residencial sin browser real; los 84
+    # tracks de produccion tienen 0 con bpm_source='beatport'). El boton de
+    # Flutter "Buscar en Beatport" sigue funcionando porque solo abre URL.
+
     if not artist_name:
         artist_name = id3_data.get('artist')
     if not title_name:
         title_name = id3_data.get('title')
-    
+
     # Si no hay metadata ID3, intentar con filename parseado
     if not artist_name or not title_name:
         parsed = parse_filename(os.path.basename(file_path))
@@ -1537,9 +1219,9 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
 
     # ==================== AUDD AUTO-TRIGGER ====================
     # Si tras ID3 + filename seguimos sin artist/title utilizable, AudD como
-    # ultimo recurso (con presupuesto y cooldown). Toda la cascada externa
-    # (Beatport/Discogs/iTunes) requiere artist+title para arrancar, asi que
-    # recuperar la identidad aqui desbloquea el resto.
+    # ultimo recurso (con presupuesto y cooldown). Discogs/iTunes/MusicBrainz
+    # requieren artist+title para arrancar, asi que recuperar la identidad
+    # aqui desbloquea el resto.
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
             from audd_helper import enrich_with_audd_if_needed
@@ -1590,61 +1272,6 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                             logger.error(f"  [AudD-auto] re-run MusicBrainz error: {e}")
         except Exception as e:
             logger.error(f"  [AudD-auto] error: {e}")
-
-    if artist_name and title_name:
-        logger.info(f"  BEATPORT: Buscando {artist_name} - {title_name}")
-        try:
-            beatport_data = search_beatport(artist_name, title_name)
-            if beatport_data:
-                # ===== BPM: Beatport siempre tiene prioridad =====
-                bp_bpm = beatport_data.get('bpm')
-                if bp_bpm:
-                    corrected = smart_bpm_correction(bpm, bp_bpm)
-                    bpm = corrected
-                    bpm_source = 'beatport'
-                    bpm_confidence = 0.99
-
-                # Key
-                if beatport_data.get('key'):
-                    bp_key = beatport_data['key']
-                    bp_camelot = KEY_TO_CAMELOT.get(bp_key, None)
-                    if bp_camelot:
-                        key = bp_key
-                        camelot = bp_camelot
-                        key_source = 'beatport'
-                        key_confidence = 0.99
-                        logger.info(f"  [Beatport] Key: {key} ({camelot})")
-                    else:
-                        logger.info(f"  [Beatport] Key '{bp_key}' no mapeada a Camelot")
-
-                # Genero (proteger Discogs/MusicBrainz)
-                if beatport_data.get('genre'):
-                    bp_genre = beatport_data['genre']
-                    generic_genres = ['Electronic', 'Dance', 'Unknown', 'electronic', 'dance']
-                    if genre_source in ['discogs', 'musicbrainz']:
-                        logger.info(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-                    elif genre in generic_genres or genre_source in ['spectral_analysis', 'chunked_analysis', 'id3']:
-                        genre = bp_genre
-                        genre_source = 'beatport'
-                        logger.info(f"  [Beatport] Genre: {genre}")
-                    else:
-                        logger.info(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-
-                # Track type hint
-                if beatport_data.get('track_type_hint'):
-                    tt_hint = beatport_data['track_type_hint']
-                    old_type = track_type
-                    track_type = tt_hint
-                    track_type_source = 'beatport'
-                    track_type_confidence = 1.0
-                    track_type_alternatives = [{'type': tt_hint, 'score': 1.0}]
-                    logger.info(f"  [Beatport] Track type hint: {tt_hint}")
-                    if old_type != tt_hint:
-                        logger.info(f"  [Beatport] Track type override: {old_type} -> {tt_hint}")
-            else:
-                logger.info(f"  [Beatport] No encontrado")
-        except Exception as e:
-            logger.error(f"  [Beatport] Error: {e}")
 
     drop_time = find_drop_timestamp(y, sr, segments)
     
@@ -1705,8 +1332,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
             except Exception as e:
                 logger.error(f" Error buscando artwork online: {e}")
     
-    # ==================== TRACK TYPE: BEATPORT OVERRIDE ====================
-    # Si Beatport dio un track_type_hint, tiene prioridad sobre waveform
+    # ==================== TRACK TYPE: defaults + guards ====================
     track_type_source = 'waveform'
     # Guard: asegurar que track_type / confidence / alternatives existen
     # (por si classify_track_type fallo arriba).
@@ -1722,17 +1348,6 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         track_type_alternatives
     except NameError:
         track_type_alternatives = []
-    if artist_name and title_name:
-        try:
-            if beatport_data and beatport_data.get('track_type_hint'):
-                bp_type = beatport_data['track_type_hint']
-                logger.info(f"  [Beatport] Track type override: {track_type} -> {bp_type}")
-                track_type = bp_type
-                track_type_source = 'beatport'
-                track_type_confidence = 1.0
-                track_type_alternatives = [{'type': bp_type, 'score': 1.0}]
-        except NameError:
-            pass  # beatport_data no existe si no se ejecuto el bloque
 
     # ==================== TRACK TYPE: COMMUNITY CONSENSUS (Fase 2) ====================
     # Si NO hay Beatport hint, probar consensus comunitario. Si motor local,
@@ -1928,16 +1543,18 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
     if genre_source == "chunked_analysis" and id3_genre:
         genre = id3_genre
         genre_source = "id3"
-    
-    # ==================== BEATPORT: FUENTE PRIMARIA BPM/KEY/GENRE ====================
-    # Beatport tiene datos 100% precisos del sello discografico
-    # Intentar SIEMPRE si tenemos artista y titulo
-    
+
+    # ==================== RESOLVER ARTIST / TITLE ====================
+    # Beatport solia ir aqui pero se elimino (WAF de Cloudflare bloquea el
+    # scraping desde datacenter e IP residencial sin browser real; los 84
+    # tracks de produccion tienen 0 con bpm_source='beatport'). El boton de
+    # Flutter "Buscar en Beatport" sigue funcionando porque solo abre URL.
+
     if not artist_name:
         artist_name = id3_data.get('artist')
     if not title_name:
         title_name = id3_data.get('title')
-    
+
     # Si no hay metadata ID3, intentar con filename parseado
     if not artist_name or not title_name:
         parsed = parse_filename(os.path.basename(file_path))
@@ -1998,49 +1615,6 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
         except Exception as e:
             logger.error(f"  [AudD-auto] error: {e}")
 
-    if artist_name and title_name:
-        logger.info(f"  BEATPORT: Buscando {artist_name} - {title_name}")
-        try:
-            beatport_data = search_beatport(artist_name, title_name)
-            if beatport_data:
-                # ===== BPM: Beatport siempre tiene prioridad =====
-                bp_bpm = beatport_data.get('bpm')
-                if bp_bpm:
-                    corrected = smart_bpm_correction(bpm, bp_bpm)
-                    bpm = corrected
-                    bpm_source = 'beatport'
-                    bpm_confidence = 0.99
-
-                # Key
-                if beatport_data.get('key'):
-                    bp_key = beatport_data['key']
-                    bp_camelot = KEY_TO_CAMELOT.get(bp_key, None)
-                    if bp_camelot:
-                        key = bp_key
-                        camelot = bp_camelot
-                        key_source = 'beatport'
-                        key_confidence = 0.99
-                        logger.info(f"  [Beatport] Key: {key} ({camelot})")
-                    else:
-                        logger.info(f"  [Beatport] Key '{bp_key}' no mapeada a Camelot")
-
-                # Genero (proteger Discogs/MusicBrainz)
-                if beatport_data.get('genre'):
-                    bp_genre = beatport_data['genre']
-                    generic_genres = ['Electronic', 'Dance', 'Unknown', 'electronic', 'dance']
-                    if genre_source in ['discogs', 'musicbrainz']:
-                        logger.info(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-                    elif genre in generic_genres or genre_source in ['spectral_analysis', 'chunked_analysis', 'id3']:
-                        genre = bp_genre
-                        genre_source = 'beatport'
-                        logger.info(f"  [Beatport] Genre: {genre}")
-                    else:
-                        logger.info(f"  [Beatport] Genre '{bp_genre}' no sobreescribe '{genre}' ({genre_source})")
-            else:
-                logger.info(f"  [Beatport] No encontrado")
-        except Exception as e:
-            logger.error(f"  [Beatport] Error: {e}")
-
     # ==================== ARTWORK ====================
     artwork_embedded = False
     artwork_url = None
@@ -2067,24 +1641,13 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                 except Exception as e:
                     logger.error(f"   Error artwork online: {e}")
     
-    # ==================== TRACK TYPE: BEATPORT OVERRIDE ====================
+    # ==================== TRACK TYPE ====================
     track_type = result['track_type']
     track_type_source = 'waveform'
     # Chunked analyzer (chunked_analyzer.py) ya devuelve confidence + alternatives
     # con el mismo shape Fase 1; si por algún motivo no estan, default a neutro.
     track_type_confidence = result.get('track_type_confidence', 0.5)
     track_type_alternatives = result.get('track_type_alternatives', [])
-    if artist_name and title_name:
-        try:
-            if beatport_data and beatport_data.get('track_type_hint'):
-                bp_type = beatport_data['track_type_hint']
-                logger.info(f"  [Beatport] Track type override: {track_type} -> {bp_type}")
-                track_type = bp_type
-                track_type_source = 'beatport'
-                track_type_confidence = 1.0
-                track_type_alternatives = [{'type': bp_type, 'score': 1.0}]
-        except NameError:
-            pass
 
     # ==================== TRACK TYPE: COMMUNITY CONSENSUS (Fase 2) ====================
     # Ver flujo no-chunked para detalle. Mismo patron aqui.
@@ -2794,8 +2357,6 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         duration = 0.0
         bpm_source = 'pending'
         key_source = 'pending'
-        beatport_data = None
-        
         logger.info(f"Re-analizando audio...")
         try:
             # Local: sr=44100 para maxima precision. Render: sr=22050 para ahorrar RAM.
@@ -2883,44 +2444,7 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
                         duration = collective_data['duration']
                 else:
                     logger.info(f"No encontrado en BD colectiva")
-        
-        # BEATPORT: SIEMPRE intentar (fuera del except)
-        if artist and title:
-            logger.info(f"  BEATPORT: Buscando {artist} - {title}")
-            try:
-                beatport_data = search_beatport(artist, title)
-                if beatport_data:
-                    if beatport_data.get('bpm'):
-                        bpm = beatport_data['bpm']
-                        bpm_confidence = 0.99
-                        bpm_source = 'beatport'
-                        logger.info(f"  [Beatport] BPM: {bpm}")
-                    if beatport_data.get('key'):
-                        bp_key = beatport_data['key']
-                        bp_camelot = KEY_TO_CAMELOT.get(bp_key, None)
-                        if bp_camelot:
-                            key = bp_key
-                            camelot = bp_camelot
-                            key_source = 'beatport'
-                            logger.info(f"  [Beatport] Key: {key} ({camelot})")
-                    if beatport_data.get('genre') and genre_source != 'corrections':
-                        bp_genre = beatport_data['genre']
-                        is_junk = beatport_data.get('is_junk_genre', False)
-                        if not is_junk:
-                            genre = bp_genre
-                            genre_source = 'beatport'
-                            logger.info(f"  [Beatport] Genre: {genre}")
-                        else:
-                            logger.info(f"  [Beatport] Genre '{beatport_data.get('genre_raw', bp_genre)}' descartado (categoria comercial)")
-                    if beatport_data.get('track_type_hint'):
-                        logger.info(f"  [Beatport] Track type hint: {beatport_data['track_type_hint']}")
-                    if beatport_data.get('duration') and (not duration or duration == 0):
-                        duration = beatport_data['duration']
-                else:
-                    logger.info(f"  [Beatport] No encontrado")
-            except Exception as e:
-                logger.error(f"  [Beatport] Error: {e}")
-        
+
         # ==================== PASO 4: BUSCAR ARTWORK ====================
         artwork_url = None
         artwork_source = None
@@ -2965,8 +2489,8 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             'isrc': None,
             'artwork_url': artwork_url,
             'artwork_embedded': False,
-            'track_type': (beatport_data.get('track_type_hint') or 'peak_time') if beatport_data else 'peak_time',
-            'track_type_source': 'beatport' if (beatport_data and beatport_data.get('track_type_hint')) else 'waveform',
+            'track_type': 'peak_time',
+            'track_type_source': 'waveform',
             # Campos necesarios para que AnalysisResult funcione al recuperar
             'has_intro': False,
             'has_buildup': False,

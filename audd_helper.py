@@ -118,6 +118,13 @@ def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dic
     Devuelve track_data crudo o None si no se identifica.
     """
     if not api_token:
+        # Antes silencioso — el operador podia tener AUDD_AUTO_ENABLED=true
+        # y este module saltando sin que apareciera nada en logs. WARNING
+        # visible para diagnosticar configuracion incompleta en Render.
+        logger.warning(
+            "[AudD-auto] disabled — AUDD_API_TOKEN missing. "
+            "Configurar en env vars o desactivar AUDD_AUTO_ENABLED."
+        )
         return None
 
     fragment_path = None
