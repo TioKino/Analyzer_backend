@@ -811,9 +811,14 @@ class ChunkedAudioAnalyzer:
         else:
             mix_energy_start = mix_energy_end = 0.5
         
-        # Track type
-        track_type = self._classify_track_type(energy_dj / 10, structure, duration)
-        
+        # Track type — Fase 1 v2: el classifier devuelve dict con confidence
+        # + alternativas. Mantenemos compatibilidad: aún exportamos `track_type`
+        # como string (igual que antes) y añadimos los campos nuevos.
+        classification = self._classify_track_type(energy_dj / 10, structure, duration)
+        track_type = classification['type']
+        track_type_confidence = classification['confidence']
+        track_type_alternatives = classification['alternatives']
+
         logger.info(f"BPM: {bpm_final['bpm']} | Key: {key_final['key']}/{key_final['camelot']} | Energy: {energy_dj}/10")
         
         return {
@@ -840,6 +845,8 @@ class ChunkedAudioAnalyzer:
             'structure_sections': structure['sections'],
             'drop_timestamp': structure['drop_timestamp'],
             'track_type': track_type,
+            'track_type_confidence': track_type_confidence,
+            'track_type_alternatives': track_type_alternatives,
             'has_vocals': False,  # Desactivado (muchos falsos positivos)
             'has_heavy_bass': has_heavy_bass,
             'has_pads': has_pads,
@@ -861,15 +868,60 @@ class ChunkedAudioAnalyzer:
         energy_dj = int(round(1 + powered * 9))
         return max(1, min(10, energy_dj))
     
-    def _classify_track_type(self, energy_normalized: float, structure: Dict, duration: float) -> str:
-        """Clasifica el tipo de track para DJs."""
+    def _classify_track_type(self, energy_normalized: float, structure: Dict, duration: float) -> dict:
+        """Clasifica el tipo de track devolviendo dict con confidence + alternativas.
+
+        Mismo shape y semantica que `main.classify_track_type` (Fase 1 v2):
+        scoring acumulado -> margin top-1/top-2 -> confidence (0..1). Mantener
+        en sync con la version del flujo no-chunked si se modifica una.
+
+        Cambio cosmetico vs. la version anterior: usamos 'peak_time' en lugar
+        de 'peak' para alinearnos con el resto del backend (Beatport hints,
+        history_screen ya acepta ambos via fall-through).
+        """
+        scores = {'warmup': 0.0, 'peak_time': 0.0, 'closing': 0.0}
+
         if energy_normalized < 0.5 and structure['has_intro']:
-            return "warmup"
+            scores['warmup'] += 1.0
+        if energy_normalized < 0.4 and structure['has_intro']:
+            scores['warmup'] += 0.5
         if energy_normalized > 0.7 and structure['has_drop']:
-            return "peak"
+            scores['peak_time'] += 1.0
+        if energy_normalized > 0.8 and structure['has_drop']:
+            scores['peak_time'] += 0.5
         if structure['has_outro'] and duration > 300:
-            return "closing"
-        return "peak" if energy_normalized > 0.6 else "warmup"
+            scores['closing'] += 1.0
+        if structure['has_outro'] and duration > 420:
+            scores['closing'] += 0.3
+        if energy_normalized > 0.6:
+            scores['peak_time'] += 0.2
+        elif energy_normalized < 0.5:
+            scores['warmup'] += 0.2
+
+        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
+        winner_type, winner_score = sorted_scores[0]
+        second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+
+        if winner_score == 0.0:
+            winner_type = 'peak_time' if energy_normalized > 0.6 else 'warmup'
+            confidence = 0.0
+        else:
+            margin = winner_score - second_score
+            confidence = min(1.0, margin / max(winner_score, 0.5))
+
+        return {
+            'type': winner_type,
+            'confidence': round(confidence, 2),
+            'alternatives': [
+                {'type': t, 'score': round(s, 2)} for t, s in sorted_scores
+            ],
+            'reason': (
+                f"energy={energy_normalized:.2f} duration={duration:.0f} "
+                f"intro={structure['has_intro']} drop={structure['has_drop']} "
+                f"outro={structure['has_outro']}"
+            ),
+            'source': 'waveform',
+        }
 
 
 def get_chunked_analyzer(chunk_duration: int = 60) -> ChunkedAudioAnalyzer:

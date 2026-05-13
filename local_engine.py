@@ -36,8 +36,23 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     os.chdir(BASE_DIR)
 
+# DATA_DIR: directorio writable donde van log + DB + caches.
+# - macOS frozen: BASE_DIR vive dentro del .app, read-only en /Applications.
+#   Redirigimos a ~/Library/Application Support/DJ Analyzer/ (convencion
+#   Apple para datos persistentes de apps).
+# - Windows frozen: BASE_DIR es la carpeta de instalacion. Windows aplica
+#   VirtualStore redirect transparente a %LOCALAPPDATA%\VirtualStore\... si
+#   Program Files es read-only, asi que dejarlo en BASE_DIR sigue
+#   funcionando como hasta ahora.
+# - Dev (no frozen): BASE_DIR es Analyzer_backend/, writable, no tocamos.
+if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
+    DATA_DIR = os.path.expanduser('~/Library/Application Support/DJ Analyzer')
+    os.makedirs(DATA_DIR, exist_ok=True)
+else:
+    DATA_DIR = BASE_DIR
+
 # Configurar logging: archivo + consola (si hay)
-log_file = os.path.join(BASE_DIR, 'engine.log')
+log_file = os.path.join(DATA_DIR, 'engine.log')
 handlers = [logging.FileHandler(log_file, encoding='utf-8')]
 if not getattr(sys, 'frozen', False):
     handlers.append(logging.StreamHandler())
@@ -80,9 +95,9 @@ os.environ['PORT'] = '8000'
 os.environ['HOST'] = '0.0.0.0'
 os.environ['DEBUG'] = 'false'
 os.environ['LOCAL_ENGINE'] = 'true'  # Señal para main.py: modo local, CPU del usuario
-os.environ['DATABASE_PATH'] = os.path.join(BASE_DIR, 'local_analysis.db')
-os.environ['ARTWORK_CACHE_DIR'] = os.path.join(BASE_DIR, 'artwork_cache')
-os.environ['PREVIEWS_DIR'] = os.path.join(BASE_DIR, 'previews_cache')
+os.environ['DATABASE_PATH'] = os.path.join(DATA_DIR, 'local_analysis.db')
+os.environ['ARTWORK_CACHE_DIR'] = os.path.join(DATA_DIR, 'artwork_cache')
+os.environ['PREVIEWS_DIR'] = os.path.join(DATA_DIR, 'previews_cache')
 
 # RENDER_SYNC_URL: el motor local lo usa para hacer push de previews/artwork
 # al Render. Flutter (LocalEngineService) lo pasa cuando lanza el engine,
@@ -102,6 +117,7 @@ def main():
     logger.info("  DJ ANALYZER PRO - Motor Local")
     logger.info(f"  Puerto: {os.environ['PORT']}")
     logger.info(f"  Base: {BASE_DIR}")
+    logger.info(f"  Data: {DATA_DIR}")
     logger.info(f"  DB: {os.environ['DATABASE_PATH']}")
     logger.info("=" * 60)
 

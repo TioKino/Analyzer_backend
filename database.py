@@ -3,6 +3,7 @@ import os
 import time
 from datetime import datetime, timezone
 import json
+import statistics
 from typing import List, Dict, Optional
 
 class AnalysisDB:
@@ -135,6 +136,55 @@ class AnalysisDB:
                 updated_at TEXT,
                 UNIQUE(fingerprint, device_id)
             )
+        ''')
+
+        # Track type community overrides (Fase 2 v2).
+        # Un device_id puede votar 1 vez por fingerprint. Si N>=3 votos y el
+        # winner supera al 2do por >=2, ese tipo gana sobre el algoritmico.
+        # Implementacion en `get_track_type_consensus`.
+        #
+        # DEPRECADO Fase 4: reemplazado por community_overrides (tabla
+        # generica con `field` column). Se mantiene viva temporalmente para
+        # migrar datos historicos y para que upgrades en caliente no pierdan
+        # votos. Helpers nuevos escriben SOLO a community_overrides; los
+        # legacy wrappers (submit_track_type_override, etc.) tambien.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_track_type_overrides (
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                track_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, device_id)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_cttov_fp ON community_track_type_overrides(fingerprint)')
+
+        # Community overrides genericos (Fase 4 v2).
+        # Sistema unificado de votos comunitarios para CUALQUIER campo
+        # categorico (track_type, key, camelot, genre, subgenre). Mismas
+        # reglas de consensus: >=3 votos al winner y supera al 2do por >=2.
+        # `field` y `value` siempre strings; el caller los normaliza/valida
+        # segun whitelist por campo (COMMUNITY_VALID_VALUES en main.py).
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_overrides (
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                field TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, device_id, field)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_co_fp_field ON community_overrides(fingerprint, field)')
+        # Migracion idempotente: si la tabla legacy tiene votos y la nueva
+        # esta vacia para ese fp, copiar como field='track_type'. Sin LOCK
+        # porque ON CONFLICT DO NOTHING garantiza idempotencia si se llama
+        # multiples veces (ej. reinicio de Render).
+        conn.execute('''
+            INSERT OR IGNORE INTO community_overrides
+                (fingerprint, device_id, field, value, created_at)
+            SELECT fingerprint, device_id, 'track_type', track_type, created_at
+            FROM community_track_type_overrides
         ''')
 
         # Notas comunitarias (todos los DJs ven las notas de todos)
@@ -841,6 +891,236 @@ class AnalysisDB:
             'contributors': 0,
             'validated': False,
         }
+
+    # ==================== COMMUNITY OVERRIDES GENERICOS (Fase 4) ====================
+    # Sistema unificado para CUALQUIER campo categorico: track_type, key,
+    # camelot, genre, subgenre. Mismas reglas de consensus (>=3 votos al
+    # winner, supera al 2do por >=2). Whitelist por campo en main.py.
+
+    def submit_community_override(
+        self, fingerprint: str, device_id: str, field: str, value: str,
+    ) -> None:
+        """Voto/cambia voto de un device sobre un campo de un track.
+
+        PK (fingerprint, device_id, field) -> un device puede votar 1 campo
+        1 vez por track; segundo POST sobreescribe (cambio de opinion).
+        """
+        from datetime import datetime
+        now = datetime.utcnow().isoformat()
+        conn = self._open_conn()
+        try:
+            conn.execute('''
+                INSERT INTO community_overrides
+                    (fingerprint, device_id, field, value, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint, device_id, field) DO UPDATE SET
+                    value = excluded.value,
+                    created_at = excluded.created_at
+            ''', (fingerprint, device_id, field, value, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_community_consensus(
+        self, fingerprint: str, field: str,
+    ) -> Optional[Dict]:
+        """Devuelve consensus si los votos son inequivocos para (fp, field).
+
+        Reglas (mismas que Fase 2):
+          - >= 3 votos totales al winner.
+          - winner supera al 2do por >= 2 votos.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT value, COUNT(*) AS votes
+                FROM community_overrides
+                WHERE fingerprint = ? AND field = ?
+                GROUP BY value
+                ORDER BY votes DESC
+            ''', (fingerprint, field))
+            rows = c.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return None
+
+        distribution = {r['value']: r['votes'] for r in rows}
+        total = sum(distribution.values())
+        winner_value = rows[0]['value']
+        winner_votes = rows[0]['votes']
+        second_votes = rows[1]['votes'] if len(rows) > 1 else 0
+
+        if winner_votes < 3:
+            return None
+        if winner_votes - second_votes < 2:
+            return None
+
+        return {
+            'value': winner_value,
+            'votes': winner_votes,
+            'total': total,
+            'distribution': distribution,
+        }
+
+    def get_community_consensus_numeric(
+        self, fingerprint: str, field: str, threshold: int = 3,
+    ) -> Dict:
+        """Calcula consensus numerico (Fase 5) usando MEDIANA.
+
+        A diferencia del consensus categorico (Fase 4) que usa MODA + tiebreak,
+        este metodo asume que los valores son numericos y calcula la mediana
+        sobre todos los votos del campo. La normalizacion previa la hace el
+        endpoint POST (ej. BPM colapsado al rango [60, 180] via bpm_utils).
+
+        Args:
+            fingerprint: hash del track
+            field: 'bpm' o 'energy'
+            threshold: minimo de votos para tener consensus (default 3)
+
+        Returns:
+            {
+                'consensus': float | int | None,  # mediana si N >= threshold
+                'consensus_votes': int,            # = total_voters si hay consensus
+                'votes_distribution': {value_str: count},
+                'total_voters': int
+            }
+
+        Notas:
+        - Para `bpm` redondeamos a 1 decimal (alineado con bpm_utils).
+        - Para `energy` redondeamos a entero (escala DJ 1-10).
+        - Si algun valor no parsea a float se ignora (defensivo, los votos
+          deberian estar normalizados por _validate_community_field).
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT value, COUNT(*) AS votes
+                FROM community_overrides
+                WHERE fingerprint = ? AND field = ?
+                GROUP BY value
+                ORDER BY votes DESC
+            ''', (fingerprint, field))
+            rows = c.fetchall()
+        finally:
+            conn.close()
+
+        distribution = {r['value']: r['votes'] for r in rows}
+        total_voters = sum(distribution.values())
+
+        if total_voters < threshold:
+            return {
+                'consensus': None,
+                'consensus_votes': 0,
+                'votes_distribution': distribution,
+                'total_voters': total_voters,
+            }
+
+        # Expandir a lista de floats respetando los conteos.
+        flat_values: List[float] = []
+        for value_str, count in distribution.items():
+            try:
+                parsed = float(value_str)
+            except (TypeError, ValueError):
+                # Voto malformado en BD: ignorar pero no romper.
+                continue
+            flat_values.extend([parsed] * int(count))
+
+        if not flat_values or len(flat_values) < threshold:
+            return {
+                'consensus': None,
+                'consensus_votes': 0,
+                'votes_distribution': distribution,
+                'total_voters': total_voters,
+            }
+
+        median_value = statistics.median(flat_values)
+        if field == 'bpm':
+            consensus_value: Any = round(float(median_value), 1)
+        elif field == 'energy':
+            consensus_value = int(round(median_value))
+        else:
+            consensus_value = round(float(median_value), 2)
+
+        return {
+            'consensus': consensus_value,
+            'consensus_votes': total_voters,
+            'votes_distribution': distribution,
+            'total_voters': total_voters,
+        }
+
+    def get_community_votes(self, fingerprint: str, field: str) -> Dict:
+        """Distribucion bruta de votos por (fp, field). Siempre devuelve dict."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT value, COUNT(*) AS votes
+                FROM community_overrides
+                WHERE fingerprint = ? AND field = ?
+                GROUP BY value
+                ORDER BY votes DESC
+            ''', (fingerprint, field))
+            rows = c.fetchall()
+        finally:
+            conn.close()
+        return {r['value']: r['votes'] for r in rows}
+
+    def delete_community_override(
+        self, fingerprint: str, device_id: str, field: str,
+    ) -> bool:
+        """Retira el voto de un device sobre (fingerprint, field).
+
+        Idempotente: si el voto no existia, devuelve False (no fue eliminado
+        pero no es un error). Asi el cliente puede llamar 'retirar voto' sin
+        chequear previamente si voto.
+
+        Returns:
+            True si se elimino un row, False si no habia voto previo.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                DELETE FROM community_overrides
+                WHERE fingerprint = ? AND device_id = ? AND field = ?
+            ''', (fingerprint, device_id, field))
+            deleted = c.rowcount > 0
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
+
+    # ==================== TRACK TYPE WRAPPERS (Fase 2 backwards-compat) ====================
+    # Mantenidos como wrappers de los genéricos arriba. Asi el codigo legacy
+    # de main.py + clientes Flutter pre-Fase 4 siguen funcionando sin cambios.
+
+    def submit_track_type_override(self, fingerprint: str, device_id: str, track_type: str) -> None:
+        """Wrapper legacy: delega a submit_community_override(field='track_type')."""
+        self.submit_community_override(fingerprint, device_id, 'track_type', track_type)
+
+    def get_track_type_consensus(self, fingerprint: str) -> Optional[Dict]:
+        """Wrapper legacy: delega a get_community_consensus(field='track_type').
+
+        Reformatea la respuesta para mantener la shape historica de Fase 2
+        (key 'type' en lugar de 'value').
+        """
+        consensus = self.get_community_consensus(fingerprint, 'track_type')
+        if not consensus:
+            return None
+        return {
+            'type': consensus['value'],
+            'votes': consensus['votes'],
+            'total': consensus['total'],
+            'distribution': consensus['distribution'],
+        }
+
+    def get_track_type_votes(self, fingerprint: str) -> Dict:
+        """Wrapper legacy: delega a get_community_votes(field='track_type')."""
+        return self.get_community_votes(fingerprint, 'track_type')
 
     # ==================== AUDD AUTO-TRIGGER LOG ====================
 
