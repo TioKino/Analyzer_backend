@@ -668,8 +668,16 @@ async def telemetry(request: Request):
     engine_local = engine_counts.get('local_engine', 0)
     engine_total = engine_render + engine_local
 
+    # Flag visible: hay token configurado en este entorno? Permite al panel
+    # decir "AudD no configurado" en vez de un 0% misterioso si Render no
+    # tiene la env var.
+    audd_token_present = bool(os.environ.get("AUDD_API_TOKEN", "").strip())
+    audd_auto_enabled = (os.environ.get("AUDD_AUTO_ENABLED", "true").lower() == "true")
+
     return {
         "audd": {
+            "configured": audd_token_present,
+            "auto_enabled": audd_auto_enabled,
             "total_calls": audd_total,
             "success_calls": audd_success,
             "fail_calls": audd_total - audd_success,
