@@ -98,6 +98,13 @@ os.environ['LOCAL_ENGINE'] = 'true'  # Señal para main.py: modo local, CPU del 
 os.environ['DATABASE_PATH'] = os.path.join(DATA_DIR, 'local_analysis.db')
 os.environ['ARTWORK_CACHE_DIR'] = os.path.join(DATA_DIR, 'artwork_cache')
 os.environ['PREVIEWS_DIR'] = os.path.join(DATA_DIR, 'previews_cache')
+# SYNC_DB_PATH: routes/admin_panel.py por defecto apunta a /data/sync.db
+# (path de Render/Linux). En el motor local Mac/Windows ese path no existe
+# y los endpoints admin/* tiran 500 con `unable to open database file`.
+# Lo redirigimos a un archivo dentro del DATA_DIR del motor para que el
+# panel admin funcione contra el motor local. Si el archivo no existe
+# todavia se crea vacio en la primera conexion.
+os.environ['SYNC_DB_PATH'] = os.path.join(DATA_DIR, 'local_sync.db')
 
 # RENDER_SYNC_URL: el motor local lo usa para hacer push de previews/artwork
 # al Render. Flutter (LocalEngineService) lo pasa cuando lanza el engine,
@@ -125,6 +132,16 @@ def main():
 
     # Importar la app FastAPI desde main.py
     from main import app
+
+    # Pre-init sync.db (crea sync_items, users, etc) para que el panel
+    # admin pueda consultar incluso si no hay /sync/* requests previas
+    # — caso tipico del motor local en Mac/Windows fresh.
+    try:
+        from sync_endpoints import _get_conn as _init_sync_db
+        _init_sync_db()
+        logger.info("  Sync DB inicializada: %s", os.environ['SYNC_DB_PATH'])
+    except Exception as e:
+        logger.warning("Sync DB pre-init fallo (admin panel podria 500): %s", e)
 
     # Manejar Ctrl+C limpiamente
     def handle_exit(sig, frame):

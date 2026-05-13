@@ -242,6 +242,43 @@ class AnalysisDB:
         conn.execute('CREATE INDEX IF NOT EXISTS idx_audd_fp ON audd_call_log(fingerprint)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_audd_at ON audd_call_log(called_at)')
 
+        # Tabla de errores de analisis (privacy-first: filename hasheado).
+        # Captura fallos de /analyze y /identify para diagnostico operacional
+        # desde el panel admin. NO se guarda el filename real, solo su MD5;
+        # device_id sirve para drill-down por usuario sin exponer contenido.
+        # Schema 1.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS analysis_errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                device_id TEXT,
+                filename_hash TEXT,
+                fingerprint TEXT,
+                error_class TEXT NOT NULL,
+                error_msg TEXT,
+                traceback TEXT,
+                endpoint TEXT DEFAULT '/analyze',
+                resolved INTEGER NOT NULL DEFAULT 0,
+                resolved_at TEXT,
+                msg_short TEXT GENERATED ALWAYS AS (substr(COALESCE(error_msg,''),1,80)) VIRTUAL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_aerr_ts ON analysis_errors(timestamp)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_aerr_resolved ON analysis_errors(resolved)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_aerr_device ON analysis_errors(device_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_aerr_class ON analysis_errors(error_class)')
+
+        # Engine source: que motor analizo este track (render | local_engine).
+        # Permite calcular ratios desde el panel admin. ALTER TABLE idempotente
+        # para no romper BDs antiguas. Default NULL = origen desconocido
+        # (tracks pre-instrumentacion).
+        try:
+            conn.execute("ALTER TABLE tracks ADD COLUMN engine_source TEXT")
+        except sqlite3.OperationalError:
+            # Columna ya existe.
+            pass
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_tracks_engine ON tracks(engine_source)')
+
         conn.commit()
         conn.close()
 
@@ -314,8 +351,9 @@ class AnalysisDB:
         c.execute('''
             INSERT OR REPLACE INTO tracks
             (id, filename, artist, title, duration, bpm, key, camelot,
-             energy_dj, genre, track_type, analysis_json, analyzed_at, fingerprint)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             energy_dj, genre, track_type, analysis_json, analyzed_at,
+             fingerprint, engine_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             track_data['id'],
             track_data['filename'],
@@ -330,7 +368,8 @@ class AnalysisDB:
             track_data['track_type'],
             json.dumps(track_data),
             datetime.now().isoformat(),
-            track_data.get('fingerprint')
+            track_data.get('fingerprint'),
+            track_data.get('engine_source'),
         ))
 
         conn.commit()
@@ -1171,5 +1210,180 @@ class AnalysisDB:
             )
             row = c.fetchone()
             return row['n'] if row else 0
+        finally:
+            conn.close()
+
+    # ─────────────── analysis_errors helpers ───────────────
+
+    def log_analysis_error(
+        self,
+        *,
+        device_id: Optional[str],
+        filename: Optional[str],
+        fingerprint: Optional[str],
+        error_class: str,
+        error_msg: str,
+        traceback_str: Optional[str] = None,
+        endpoint: str = '/analyze',
+    ) -> int:
+        """Registra un error de analisis con filename HASHEADO (privacy).
+
+        device_id, fingerprint y traceback opcionales (algunos fallos
+        ocurren antes de tener el fp). error_msg se trunca a 1000 chars
+        para evitar payloads gigantes.
+        """
+        import hashlib
+        filename_hash = (
+            hashlib.md5(filename.encode('utf-8', errors='replace')).hexdigest()
+            if filename else None
+        )
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'INSERT INTO analysis_errors '
+                '(device_id, filename_hash, fingerprint, error_class, '
+                ' error_msg, traceback, endpoint) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (
+                    device_id,
+                    filename_hash,
+                    fingerprint,
+                    error_class[:120],
+                    (error_msg or '')[:1000],
+                    (traceback_str or '')[:4000] if traceback_str else None,
+                    endpoint,
+                ),
+            )
+            conn.commit()
+            return c.lastrowid or 0
+        except sqlite3.OperationalError:
+            # Tabla no creada todavia en BDs muy antiguas.
+            return 0
+        finally:
+            conn.close()
+
+    def get_analysis_errors(
+        self,
+        *,
+        device_id: Optional[str] = None,
+        resolved: Optional[bool] = None,
+        limit: int = 200,
+    ) -> List[Dict]:
+        """Devuelve errores con filename_hash (no filename real)."""
+        clauses = []
+        params: list = []
+        if device_id:
+            clauses.append('device_id = ?')
+            params.append(device_id)
+        if resolved is not None:
+            clauses.append('resolved = ?')
+            params.append(1 if resolved else 0)
+        where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        params.append(int(limit))
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT id, timestamp, device_id, filename_hash, fingerprint, '
+                '       error_class, error_msg, traceback, endpoint, '
+                '       resolved, resolved_at '
+                f'FROM analysis_errors{where} '
+                'ORDER BY id DESC LIMIT ?',
+                params,
+            )
+            return [dict(r) for r in c.fetchall()]
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+
+    def get_errors_grouped(self, resolved: Optional[bool] = None) -> List[Dict]:
+        """Agrupa por (error_class, msg_short) con count y devices_affected."""
+        clauses = []
+        params: list = []
+        if resolved is not None:
+            clauses.append('resolved = ?')
+            params.append(1 if resolved else 0)
+        where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT error_class, msg_short, COUNT(*) AS count, '
+                '       COUNT(DISTINCT device_id) AS devices_affected, '
+                '       MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen, '
+                '       MAX(id) AS latest_id, '
+                '       SUM(CASE WHEN resolved = 0 THEN 1 ELSE 0 END) AS unresolved_count, '
+                '       MAX(error_msg) AS sample_msg, '
+                '       MAX(traceback) AS sample_traceback, '
+                '       MAX(filename_hash) AS sample_filename '
+                f'FROM analysis_errors{where} '
+                'GROUP BY error_class, msg_short '
+                'ORDER BY count DESC',
+                params,
+            )
+            return [dict(r) for r in c.fetchall()]
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+
+    def toggle_error_resolved(self, error_id: int) -> bool:
+        """Toggle resolved flag. Devuelve el nuevo valor."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('SELECT resolved FROM analysis_errors WHERE id = ?', (error_id,))
+            row = c.fetchone()
+            if not row:
+                return False
+            new_val = 0 if row['resolved'] else 1
+            resolved_at = datetime.now(timezone.utc).isoformat() if new_val else None
+            c.execute(
+                'UPDATE analysis_errors SET resolved = ?, resolved_at = ? '
+                'WHERE id = ?',
+                (new_val, resolved_at, error_id),
+            )
+            conn.commit()
+            return bool(new_val)
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            conn.close()
+
+    def resolve_error_group(self, error_class: str, msg_short: str) -> int:
+        """Marca como resolved TODAS las occurrencias de un grupo.
+        Devuelve el numero de filas actualizadas."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            resolved_at = datetime.now(timezone.utc).isoformat()
+            c.execute(
+                'UPDATE analysis_errors SET resolved = 1, resolved_at = ? '
+                'WHERE error_class = ? AND msg_short = ? AND resolved = 0',
+                (resolved_at, error_class, msg_short),
+            )
+            conn.commit()
+            return c.rowcount
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def count_engine_sources(self) -> Dict[str, int]:
+        """Counts de tracks por engine_source. Solo tracks con valor
+        (NULL = pre-instrumentacion, se excluyen)."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT engine_source, COUNT(*) AS n FROM tracks '
+                'WHERE engine_source IS NOT NULL '
+                'GROUP BY engine_source'
+            )
+            return {r['engine_source']: r['n'] for r in c.fetchall()}
+        except sqlite3.OperationalError:
+            return {}
         finally:
             conn.close()

@@ -440,6 +440,272 @@ async def global_stats(request: Request):
             "total_sessions": total_sessions,
             "desktop_users": desktop_users,
             "mobile_users": mobile_users,
+            # Errores y resueltos: stubeados hasta que exista la tabla
+            # analysis_errors (sprint propio). El cliente Flutter espera
+            # estas claves; devolver 0 evita un crash de Pydantic.
+            "errors_unresolved": 0,
+            "errors_resolved": 0,
         }
     finally:
         conn.close()
+
+
+# ── GET /admin/users/{device_id}/summary ────────────────────
+# Counts agregados por usuario (privacy-first: solo numeros, sin
+# nombres de archivo, artistas ni titulos). Reemplaza el granular
+# /admin/users/{id}/{tracks,previews,sessions} que el cliente Flutter
+# privacy-first ya no consume.
+
+@admin_panel_router.get("/users/{device_id}/summary")
+async def user_summary(device_id: str, request: Request):
+    await _verify_admin_secret(request)
+    conn = _get_sync_conn()
+    try:
+        def _count_payload(data_type: str, key: str = "") -> int:
+            row = conn.execute(
+                "SELECT payload FROM sync_items WHERE data_type = ? AND last_device_id = ?",
+                (data_type, device_id),
+            ).fetchone()
+            if not row:
+                return 0
+            try:
+                data = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                return 0
+            if isinstance(data, dict):
+                if key:
+                    inner = data.get(key, data)
+                else:
+                    inner = data
+                if isinstance(inner, dict):
+                    return len(inner)
+                if isinstance(inner, list):
+                    return len(inner)
+            if isinstance(data, list):
+                return len(data)
+            return 0
+
+        tracks = _count_payload("analysis", "tracks")
+        sessions = _count_payload("session")
+        folders = _count_payload("folder")
+        collections = _count_payload("collection")
+        cues = _count_payload("cue")
+        favorites = _count_payload("favorite")
+        overrides = _count_payload("override")
+
+        # Previews: contar fingerprints del usuario que tienen .mp3 cacheado
+        previews = 0
+        arow = conn.execute(
+            "SELECT payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if arow:
+            tracks_map = _parse_analysis_payload(arow["payload"])
+            for t in tracks_map.values():
+                fp = t.get("fingerprint", "") if isinstance(t, dict) else ""
+                if _preview_exists(fp):
+                    previews += 1
+
+        return {
+            "device_id": device_id,
+            "counts": {
+                "tracks": tracks,
+                "previews": previews,
+                "sessions": sessions,
+                "folders": folders,
+                "collections": collections,
+                "cues": cues,
+                "favorites": favorites,
+                "overrides": overrides,
+                # Stub hasta tener analysis_errors table real.
+                "errors_unresolved": 0,
+            },
+        }
+    finally:
+        conn.close()
+
+
+# ── Errors endpoints ───────────────────────────────────────
+# Consultan la tabla analysis_errors via los helpers de AnalysisDB.
+# Lazy-import del modulo main para evitar circular imports a load time.
+
+def _get_db():
+    """Lazy import del singleton AnalysisDB definido en main.py."""
+    import main
+    return main.db
+
+
+@admin_panel_router.get("/users/{device_id}/errors")
+async def user_errors(device_id: str, request: Request, resolved: Optional[int] = None):
+    await _verify_admin_secret(request)
+    resolved_bool = None if resolved is None else bool(resolved)
+    errors = _get_db().get_analysis_errors(
+        device_id=device_id, resolved=resolved_bool, limit=200,
+    )
+    return {"device_id": device_id, "errors": errors, "total": len(errors)}
+
+
+@admin_panel_router.get("/errors")
+async def global_errors(request: Request, resolved: Optional[int] = None, limit: int = 200):
+    await _verify_admin_secret(request)
+    resolved_bool = None if resolved is None else bool(resolved)
+    errors = _get_db().get_analysis_errors(resolved=resolved_bool, limit=limit)
+    return {"errors": errors, "total": len(errors)}
+
+
+@admin_panel_router.get("/errors-grouped")
+async def errors_grouped(request: Request, resolved: Optional[int] = None):
+    await _verify_admin_secret(request)
+    resolved_bool = None if resolved is None else bool(resolved)
+    groups = _get_db().get_errors_grouped(resolved=resolved_bool)
+    return {"groups": groups, "total": len(groups)}
+
+
+@admin_panel_router.post("/errors/{error_id}/resolve")
+async def resolve_error(error_id: int, request: Request):
+    await _verify_admin_secret(request)
+    new_state = _get_db().toggle_error_resolved(error_id)
+    return {"id": error_id, "resolved": new_state}
+
+
+@admin_panel_router.post("/errors/group/resolve")
+async def resolve_error_group_endpoint(request: Request):
+    await _verify_admin_secret(request)
+    body = await request.json()
+    error_class = body.get("error_class", "")
+    msg_short = body.get("msg_short", "")
+    if not error_class or not msg_short:
+        raise HTTPException(400, "error_class y msg_short requeridos")
+    n = _get_db().resolve_error_group(error_class, msg_short)
+    return {"resolved": n}
+
+
+# ── GET /admin/telemetry ────────────────────────────────────
+# Snapshot agregado privacy-first para tu panel. Cuenta llamadas a
+# AudD (success/fail) desde audd_call_log y le suma cobertura de
+# previews y artwork sobre el total de tracks. NO devuelve filenames,
+# artistas ni titulos.
+
+@admin_panel_router.get("/telemetry")
+async def telemetry(request: Request):
+    await _verify_admin_secret(request)
+    # 1) AudD stats desde la BD de analisis. La tabla vive en analysis.db
+    # (no sync.db), por eso abrimos otra conexion.
+    analysis_db_path = os.environ.get(
+        "DATABASE_PATH",
+        os.environ.get("ANALYSIS_DB_PATH", "analysis.db"),
+    )
+    audd_total = 0
+    audd_success = 0
+    audd_last_7d = 0
+    audd_last_30d = 0
+    if os.path.exists(analysis_db_path):
+        adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        try:
+            r = adb.execute(
+                "SELECT COUNT(*), COALESCE(SUM(success),0) FROM audd_call_log"
+            ).fetchone()
+            if r:
+                audd_total, audd_success = int(r[0] or 0), int(r[1] or 0)
+            r7 = adb.execute(
+                "SELECT COUNT(*) FROM audd_call_log "
+                "WHERE called_at >= datetime('now','-7 days')"
+            ).fetchone()
+            audd_last_7d = int(r7[0]) if r7 else 0
+            r30 = adb.execute(
+                "SELECT COUNT(*) FROM audd_call_log "
+                "WHERE called_at >= datetime('now','-30 days')"
+            ).fetchone()
+            audd_last_30d = int(r30[0]) if r30 else 0
+        except sqlite3.OperationalError:
+            # Tabla no existe en BDs antiguas — skip silencioso.
+            pass
+        finally:
+            adb.close()
+    audd_success_rate = (audd_success / audd_total) if audd_total else 0.0
+
+    # 2) Cobertura preview + artwork sobre el total de tracks sync.
+    conn = _get_sync_conn()
+    try:
+        total_tracks = 0
+        with_preview = 0
+        with_artwork = 0
+        artwork_dir = os.environ.get("ARTWORK_CACHE_DIR", "artwork_cache")
+        arows = conn.execute(
+            "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
+        ).fetchall()
+        for arow in arows:
+            tracks_map = _parse_analysis_payload(arow["payload"])
+            for t in tracks_map.values():
+                if not isinstance(t, dict):
+                    continue
+                total_tracks += 1
+                fp = t.get("fingerprint", "")
+                if _preview_exists(fp):
+                    with_preview += 1
+                # Artwork file convencion: <fp>.jpg / <fp>.png
+                if fp and os.path.isdir(artwork_dir):
+                    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                        if os.path.exists(os.path.join(artwork_dir, f"{fp}{ext}")):
+                            with_artwork += 1
+                            break
+    finally:
+        conn.close()
+    preview_rate = (with_preview / total_tracks) if total_tracks else 0.0
+    artwork_rate = (with_artwork / total_tracks) if total_tracks else 0.0
+
+    # 3) Errores agregados de analysis_errors via AnalysisDB helpers.
+    db = _get_db()
+    unresolved_errs = db.get_analysis_errors(resolved=False, limit=999999)
+    resolved_errs = db.get_analysis_errors(resolved=True, limit=999999)
+    # Top-N grupos de errores no resueltos para que el panel los muestre
+    # sin tener que hacer otra request.
+    top_groups = db.get_errors_grouped(resolved=False)[:5]
+
+    # 4) Engine source breakdown.
+    engine_counts = db.count_engine_sources()
+    engine_render = engine_counts.get('render', 0)
+    engine_local = engine_counts.get('local_engine', 0)
+    engine_total = engine_render + engine_local
+
+    return {
+        "audd": {
+            "total_calls": audd_total,
+            "success_calls": audd_success,
+            "fail_calls": audd_total - audd_success,
+            "success_rate": round(audd_success_rate, 3),
+            "calls_last_7d": audd_last_7d,
+            "calls_last_30d": audd_last_30d,
+        },
+        "coverage": {
+            "total_tracks": total_tracks,
+            "with_preview": with_preview,
+            "with_artwork": with_artwork,
+            "preview_rate": round(preview_rate, 3),
+            "artwork_rate": round(artwork_rate, 3),
+        },
+        "errors": {
+            "unresolved": len(unresolved_errs),
+            "resolved": len(resolved_errs),
+            "top_groups": [
+                {
+                    "error_class": g["error_class"],
+                    "msg_short": g["msg_short"],
+                    "count": g["count"],
+                    "devices_affected": g["devices_affected"],
+                    "last_seen": g["last_seen"],
+                }
+                for g in top_groups
+            ],
+        },
+        "engine_source": {
+            "render": engine_render,
+            "local_engine": engine_local,
+            "render_pct": round(engine_render / engine_total, 3) if engine_total else None,
+            "tracked_total": engine_total,
+            "note": (
+                None if engine_total else
+                "Sin tracks con engine_source seteado (pre-instrumentacion)."
+            ),
+        },
+    }

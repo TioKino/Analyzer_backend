@@ -2477,11 +2477,16 @@ async def analyze_track(
             except (ValueError, TypeError):
                 pass
         
-        # Guardar en BD
+        # Guardar en BD. engine_source distingue render vs local_engine
+        # para que el panel admin pueda comparar latencias y cobertura por
+        # motor. Se marca aqui porque /analyze es la unica via de creacion
+        # de tracks "analizados" (vs los del fallback de mas abajo, que son
+        # tracks pendientes y no representan analisis reales).
         track_data = result.model_dump()
         track_data['id'] = fingerprint
         track_data['filename'] = file.filename
         track_data['fingerprint'] = fingerprint
+        track_data['engine_source'] = 'local_engine' if IS_LOCAL_ENGINE else 'render'
         db.save_track(track_data)
 
         # Incrementar contador de popularidad
@@ -2516,11 +2521,30 @@ async def analyze_track(
         import traceback
         error_detail = traceback.format_exc()
         logger.error(f"ERROR en anlisis de audio:\n{error_detail}")
-        
+
+        # Telemetria privacy-first: registra el error en analysis_errors
+        # para que el panel admin lo muestre. Filename se hashea dentro
+        # de log_analysis_error. device_id viene del header X-Device-Id
+        # cuando el cliente lo manda (cliente desktop lo hace en sync;
+        # /analyze raw no siempre lo incluye).
+        try:
+            db.log_analysis_error(
+                device_id=request.headers.get("X-Device-Id"),
+                filename=file.filename,
+                fingerprint=None,
+                error_class=type(e).__name__,
+                error_msg=str(e),
+                traceback_str=error_detail,
+                endpoint='/analyze',
+            )
+        except Exception:
+            # No bloquear el flow si la tabla aun no esta migrada.
+            pass
+
         # ==================== FALLBACK: Track corrupto ====================
         # Intentar crear resultado bsico con ID3 y/o filename
         logger.info(f" Intentando fallback para: {file.filename}")
-        
+
         try:
             # Intentar fingerprint del contenido primero
             try:

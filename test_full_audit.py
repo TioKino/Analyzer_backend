@@ -319,6 +319,50 @@ class TestA016_LargeFileUpload:
         assert r.status_code == 400
 
 
+class TestA017_AdminAuthTimingAttack:
+    """A-017: Auth admin debe usar comparacion constant-time (hmac.compare_digest)
+    para que un atacante no pueda inferir bytes del token via timing diferencial.
+    """
+
+    def test_uses_hmac_compare_digest(self):
+        # Inspeccion estatica del source: garantiza que el code path de auth usa
+        # compare_digest y no `==`. Un test de wall-clock seria flaky en CI.
+        import inspect
+        from main import _verify_admin_bearer
+        src = inspect.getsource(_verify_admin_bearer)
+        assert "hmac.compare_digest" in src, (
+            "_verify_admin_bearer debe usar hmac.compare_digest para evitar "
+            "timing attacks contra ADMIN_TOKEN"
+        )
+        assert " == ADMIN_TOKEN" not in src and "ADMIN_TOKEN ==" not in src, (
+            "Comparacion directa con == es vulnerable a timing attack"
+        )
+
+    def test_rejects_wrong_token_same_length(self, client, monkeypatch):
+        # Con un token correcto seteado, un token del mismo length pero
+        # contenido distinto debe rechazarse con 401.
+        monkeypatch.setattr("main.ADMIN_TOKEN", "correct-token-1234567890abcdef")
+        r = client.delete(
+            "/admin/reset-database?confirm=CONFIRMAR",
+            headers={"Authorization": "Bearer wrong-token-1234567890abcdef!"},
+        )
+        assert r.status_code == 401
+
+    def test_rejects_wrong_token_different_length(self, client, monkeypatch):
+        # Longitud distinta tambien rechazada (compare_digest devuelve False).
+        monkeypatch.setattr("main.ADMIN_TOKEN", "correct-token-1234567890abcdef")
+        r = client.delete(
+            "/admin/reset-database?confirm=CONFIRMAR",
+            headers={"Authorization": "Bearer short"},
+        )
+        assert r.status_code == 401
+
+    def test_rejects_missing_bearer(self, client, monkeypatch):
+        monkeypatch.setattr("main.ADMIN_TOKEN", "correct-token-1234567890abcdef")
+        r = client.delete("/admin/reset-database?confirm=CONFIRMAR")
+        assert r.status_code == 401
+
+
 # ============================================================================
 # SECTION R: REGRESSION TESTS
 # ============================================================================
