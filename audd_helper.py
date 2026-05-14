@@ -78,8 +78,14 @@ def should_trigger_audd(
     max_duration: float = 720.0,
     daily_cap: int = 50,
     cooldown_days: int = 7,
+    force: bool = False,
 ) -> Tuple[bool, str]:
     """Decide si AudD debe dispararse para este track.
+
+    Con force=True (usuario pidio explicitamente "limpiar con AudD" desde la
+    UI) se saltea el check de metadata-utilizable y el cooldown por
+    fingerprint. El daily cap y los limites de duracion SE RESPETAN para no
+    quemar cuota ni mandar fragmentos invalidos.
 
     Returns: (should_fire, reason)
     """
@@ -88,10 +94,10 @@ def should_trigger_audd(
     if duration and duration > max_duration:
         return False, f"duracion>{max_duration}s"
 
-    if not is_garbage_metadata(artist, title):
+    if not force and not is_garbage_metadata(artist, title):
         return False, "metadata utilizable"
 
-    if fingerprint and db is not None:
+    if not force and fingerprint and db is not None:
         try:
             last_call = db.get_last_audd_call(fingerprint)
             if last_call is not None:
@@ -109,7 +115,7 @@ def should_trigger_audd(
         except Exception as e:
             logger.warning(f"[AudD-auto] cap check fallo: {e}")
 
-    return True, "metadata insuficiente"
+    return True, "force manual" if force else "metadata insuficiente"
 
 
 def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dict]:
@@ -188,11 +194,17 @@ def enrich_with_audd_if_needed(
     max_duration: float = 720.0,
     daily_cap: int = 50,
     cooldown_days: int = 7,
+    force: bool = False,
 ) -> Optional[Dict]:
     """Si el trigger lo permite, llama a AudD y devuelve track_data crudo.
 
     Tambien registra cada intento (exito o fallo) en la BD para honrar el
     cooldown y el daily cap.
+
+    force=True salta el cooldown por fingerprint y el check de garbage
+    metadata. Lo usa el endpoint `/analyze?force_audd=true` cuando el usuario
+    pide "limpiar con AudD" desde la UI con un track ya analizado. El daily
+    cap y los limites de duracion siguen respetandose.
 
     Returns: track_data dict (con artist/title/label/release_date/...) o None.
     """
@@ -203,6 +215,7 @@ def enrich_with_audd_if_needed(
         artist, title, duration, fingerprint, db,
         min_duration=min_duration, max_duration=max_duration,
         daily_cap=daily_cap, cooldown_days=cooldown_days,
+        force=force,
     )
     if not should:
         logger.debug(f"[AudD-auto] skip: {reason}")

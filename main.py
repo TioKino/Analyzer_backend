@@ -934,17 +934,17 @@ def generate_preview_snippet(
 
 # ==================== ANALISIS PRINCIPAL ====================
 
-def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
+def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = False) -> AnalysisResult:
     import warnings
     warnings.filterwarnings('ignore')
-    
+
     #  Obtener duracin SIN cargar audio completo
     duration = librosa.get_duration(path=file_path)
-    
+
     #  Si el track es largo (>4 min), usar anlisis por chunks
     if CHUNKED_ANALYZER_ENABLED and duration > CHUNK_ANALYSIS_THRESHOLD:
         logger.info(f" Track largo ({duration/60:.1f} min) - Usando anlisis por chunks")
-        return analyze_audio_chunked(file_path, fingerprint, duration)
+        return analyze_audio_chunked(file_path, fingerprint, duration, force_audd=force_audd)
     
     # Track corto: anlisis tradicional (carga todo en RAM)
     logger.info(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
@@ -1237,6 +1237,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                 max_duration=AUDD_MAX_DURATION,
                 daily_cap=AUDD_DAILY_CAP,
                 cooldown_days=AUDD_COOLDOWN_DAYS,
+                force=force_audd,
             )
             if audd_track:
                 if audd_track.get('artist'):
@@ -1467,7 +1468,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         artwork_url=artwork_url,
     )
 
-def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> AnalysisResult:
+def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, force_audd: bool = False) -> AnalysisResult:
     """
     Analiza tracks largos por chunks para reducir uso de RAM.
     Usado automticamente para tracks > 4 minutos.
@@ -1589,6 +1590,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                 max_duration=AUDD_MAX_DURATION,
                 daily_cap=AUDD_DAILY_CAP,
                 cooldown_days=AUDD_COOLDOWN_DAYS,
+                force=force_audd,
             )
             if audd_track:
                 if audd_track.get('artist'):
@@ -1768,8 +1770,18 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
 async def analyze_track(
     request: Request,
     file: UploadFile = File(...),
-    force: bool = Query(False, description="Forzar reanalisis ignorando cache")
+    force: bool = Query(False, description="Forzar reanalisis ignorando cache"),
+    force_audd: bool = Query(
+        False,
+        description="Forzar AudD aunque metadata sea utilizable y saltar cooldown 7d. "
+                    "Implica force=true porque el cache existente ya tiene metadata "
+                    "que el usuario quiere reemplazar. Daily cap se respeta.",
+    ),
 ):
+    # force_audd implica force=true: el usuario pidio explicitamente AudD y el
+    # registro cacheado debe sobreescribirse con el resultado nuevo.
+    if force_audd:
+        force = True
     # Rate limiting — /analyze es CPU-bound (librosa) y acepta hasta 100MB,
     # por lo que es un vector de DoS trivial sin limite. Ver AUDIT 2026-04-20 B-H2.
     check_rate_limit(get_client_ip(request))
@@ -1965,7 +1977,7 @@ async def analyze_track(
         
         consensus = db.get_all_consensus(fingerprint)
 
-        result = analyze_audio(tmp_path, fingerprint)
+        result = analyze_audio(tmp_path, fingerprint, force_audd=force_audd)
 
         # Parsear nombre si falta metadata
         if not result.artist or not result.title:
