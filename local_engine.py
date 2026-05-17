@@ -18,6 +18,39 @@ import os
 import signal
 import shutil
 
+# Monkey-patch global de subprocess.Popen — Windows only.
+#
+# Motivo: librosa.load() usa audioread internamente, que para mp3/m4a
+# llama a `subprocess.Popen(['ffmpeg', ...])` SIN pasar creationflags.
+# En Windows eso hace que cada decode (uno por track durante /analyze)
+# abra una consola transitoria visible, produciendo un flash de
+# PowerShell que el usuario ve por cada track al analizar.
+#
+# El cliente Flutter ya invoca SUS subprocesses con CREATE_NO_WINDOW via
+# FFI Win32, pero no podemos controlar los subprocesses que el local
+# engine de Python lanza internamente (audioread/librosa son
+# dependencias). Parchear Popen al inicio del proceso garantiza que
+# CUALQUIER subprocess que se cree heredara el flag, da igual desde que
+# libreria salga.
+#
+# Tiene que ir ANTES del primer `import subprocess` real de cualquier
+# modulo, asi que esta justo aqui arriba — antes incluso de configurar
+# logging — para asegurar que se aplica a TODA la cadena de imports.
+if sys.platform == 'win32':
+    import subprocess as _sp
+    _CREATE_NO_WINDOW = 0x08000000
+    _orig_popen_init = _sp.Popen.__init__
+
+    def _patched_popen_init(self, *args, **kwargs):
+        # Combinamos en vez de sobreescribir por si el caller ya pasaba
+        # flags propios (DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP, etc).
+        kwargs['creationflags'] = (
+            kwargs.get('creationflags', 0) | _CREATE_NO_WINDOW
+        )
+        return _orig_popen_init(self, *args, **kwargs)
+
+    _sp.Popen.__init__ = _patched_popen_init
+
 # Determinar directorio base antes de configurar logging
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
