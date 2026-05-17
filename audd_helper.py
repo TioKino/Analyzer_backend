@@ -131,9 +131,38 @@ def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dic
     try:
         import librosa
         import soundfile as sf
+        try:
+            from audio_helpers import silence_native_stderr
+        except ImportError:
+            import contextlib
+            @contextlib.contextmanager
+            def silence_native_stderr():
+                yield
 
         # Fragmento de 20s desde 0:30 (mismo patron que /identify)
-        y, sr = librosa.load(file_path, sr=22050, mono=True, duration=20, offset=30)
+        with silence_native_stderr():
+            y, sr = librosa.load(file_path, sr=22050, mono=True, duration=20, offset=30)
+
+        # Validar que el fragmento sirve antes de gastar cuota de AudD.
+        # AudD devuelve "Recognition failed: there's been a problem with
+        # creating an audio fingerprint" cuando el audio es muy corto,
+        # silencioso o esta corrupto — facil de detectar localmente y
+        # ahorrarnos la llamada (era ~30% de las llamadas en una semana).
+        try:
+            import numpy as _np
+            duration_loaded = len(y) / sr if sr else 0
+            rms = float(_np.sqrt(_np.mean(_np.square(y)))) if len(y) else 0.0
+            if duration_loaded < 3.0:
+                logger.info(f"[AudD-auto] skip: fragmento muy corto ({duration_loaded:.1f}s)")
+                return None
+            if rms < 0.002:
+                logger.info(f"[AudD-auto] skip: fragmento silencioso (rms={rms:.4f})")
+                return None
+        except Exception:
+            # Si el check falla por algun motivo raro, seguimos a AudD
+            # — no queremos bloquear identificacion por un bug aqui.
+            pass
+
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
             fragment_path = tmp.name
         sf.write(fragment_path, y, sr)
@@ -153,10 +182,15 @@ def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dic
             logger.warning(f"[AudD-auto] HTTP {response.status_code}")
             return None
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.warning(f"[AudD-auto] respuesta no es JSON: {e}")
+            return None
         if data.get('status') != 'success':
             err = data.get('error', {}).get('error_message', 'unknown')
-            logger.info(f"[AudD-auto] API: {err}")
+            # Truncamos: AudD devuelve mensajes de ~500 chars con links.
+            logger.info(f"[AudD-auto] API rechazo: {(err or '').split('.')[0][:120]}")
             return None
 
         track = data.get('result')

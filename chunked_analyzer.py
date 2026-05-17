@@ -30,6 +30,16 @@ except ImportError:
     LIBROSA_AVAILABLE = False
     logger.warning("Librosa no disponible")
 
+try:
+    from audio_helpers import silence_native_stderr
+except ImportError:
+    # Fallback: no-op si por lo que sea audio_helpers no esta disponible
+    # (ej. cli scripts independientes).
+    import contextlib
+    @contextlib.contextmanager
+    def silence_native_stderr():
+        yield
+
 
 # ==================== CONFIGURACIÓN ====================
 
@@ -88,27 +98,29 @@ class ChunkedAudioAnalyzer:
     
     def get_audio_duration(self, file_path: str) -> float:
         """Obtiene la duración sin cargar el audio completo."""
-        return librosa.get_duration(path=file_path)
-    
+        with silence_native_stderr():
+            return librosa.get_duration(path=file_path)
+
     def load_chunk(self, file_path: str, start_time: float, duration: float) -> Tuple[np.ndarray, int]:
         """
         Carga solo un segmento del audio.
-        
+
         Args:
             file_path: Ruta al archivo
             start_time: Tiempo de inicio en segundos
             duration: Duración del chunk en segundos
-            
+
         Returns:
             Tuple de (audio_array, sample_rate)
         """
-        y, sr = librosa.load(
-            file_path, 
-            sr=self.sr, 
-            mono=True,
-            offset=start_time,
-            duration=duration
-        )
+        with silence_native_stderr():
+            y, sr = librosa.load(
+                file_path,
+                sr=self.sr,
+                mono=True,
+                offset=start_time,
+                duration=duration
+            )
         return y, sr
     
     def analyze_chunk_bpm(self, y: np.ndarray, sr: int) -> Dict:

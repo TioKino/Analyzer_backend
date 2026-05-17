@@ -41,6 +41,7 @@ import logging
 logger = logging.getLogger('dj_analyzer')
 logger.setLevel(logging.INFO)
 from pydantic import BaseModel
+from audio_helpers import silence_native_stderr
 from spectral_genre_classifier import classify_genre_advanced
 from config import (
     AUDD_API_TOKEN,
@@ -937,18 +938,29 @@ def generate_preview_snippet(
 def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
     import warnings
     warnings.filterwarnings('ignore')
-    
+
+    # Defensa basica contra cleanup race (ver bug del 14/05 con
+    # /tmp/tmpyvolczw6.mp3 desaparecido al llegar a librosa.load).
+    # Mejor mensaje + falla rapido sin pasear por audioread/soundfile.
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(
+            f"Archivo a analizar no existe en disco: {file_path}. "
+            "Posible cleanup race del tmp_path."
+        )
+
     #  Obtener duracin SIN cargar audio completo
-    duration = librosa.get_duration(path=file_path)
-    
+    with silence_native_stderr():
+        duration = librosa.get_duration(path=file_path)
+
     #  Si el track es largo (>4 min), usar anlisis por chunks
     if CHUNKED_ANALYZER_ENABLED and duration > CHUNK_ANALYSIS_THRESHOLD:
         logger.info(f" Track largo ({duration/60:.1f} min) - Usando anlisis por chunks")
         return analyze_audio_chunked(file_path, fingerprint, duration)
-    
+
     # Track corto: anlisis tradicional (carga todo en RAM)
     logger.info(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
-    y, sr = librosa.load(file_path, sr=44100, mono=True)
+    with silence_native_stderr():
+        y, sr = librosa.load(file_path, sr=44100, mono=True)
 
     
     # ==================== ID3 METADATA ====================
@@ -1965,6 +1977,13 @@ async def analyze_track(
         
         consensus = db.get_all_consensus(fingerprint)
 
+        # Defensa contra "tmp_path desaparecio entre creacion y analisis".
+        # Falla rapido y con mensaje claro si pasa, en vez de irse al
+        # exception handler de abajo con un LibsndfileError opaco.
+        if not os.path.exists(tmp_path):
+            logger.error(f"tmp_path {tmp_path} desaparecio antes de analyze_audio")
+            raise HTTPException(500, "Archivo temporal desaparecio antes del analisis")
+
         result = analyze_audio(tmp_path, fingerprint)
 
         # Parsear nombre si falta metadata
@@ -2285,7 +2304,8 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         audio_to_send = tmp_path
         
         try:
-            y, sr = librosa.load(tmp_path, sr=22050, mono=True, duration=20, offset=30)
+            with silence_native_stderr():
+                y, sr = librosa.load(tmp_path, sr=22050, mono=True, duration=20, offset=30)
             import soundfile as sf
             fragment_path = tmp_path + "_fragment.wav"
             sf.write(fragment_path, y, sr)
@@ -2371,7 +2391,8 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         try:
             # Local: sr=44100 para maxima precision. Render: sr=22050 para ahorrar RAM.
             analysis_sr = 44100 if IS_LOCAL_ENGINE else 22050
-            y_full, sr_full = librosa.load(tmp_path, sr=analysis_sr, mono=True)
+            with silence_native_stderr():
+                y_full, sr_full = librosa.load(tmp_path, sr=analysis_sr, mono=True)
             duration = librosa.get_duration(y=y_full, sr=sr_full)
             
             # BPM
@@ -2613,7 +2634,14 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
 
         if result.returncode != 0:
             stderr = result.stderr.decode('utf-8', errors='replace')
-            logger.error(f"  [Recognize] ffmpeg {strategy} error: {stderr[:200]}")
+            # stderr[:200] solo recoge el banner de version de ffmpeg. Nos
+            # quedamos con las lineas que parecen errores reales o el tail.
+            err_lines = [ln for ln in stderr.splitlines() if ln and (
+                ln.lower().startswith('error') or 'invalid' in ln.lower()
+                or 'no such file' in ln.lower() or 'failed' in ln.lower()
+            )]
+            real_err = ' | '.join(err_lines[-3:])[:400] if err_lines else stderr[-400:].strip()
+            logger.error(f"  [Recognize] ffmpeg {strategy} exit {result.returncode}: {real_err or 'unknown'}")
             return False
 
         # Verificar que el archivo resultante tiene contenido útil
@@ -2654,7 +2682,12 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optiona
 
     if result.get('status') != 'success':
         error_msg = result.get('error', {}).get('error_message', 'Unknown error')
-        logger.error(f"  [AudD] API error: {error_msg}")
+        # AudD devuelve mensajes largos (~500 chars con links y FAQ).
+        # Truncamos para no inundar logs. Bajamos a warning porque el
+        # caso comun es "audio invalido / silencioso / muy corto" que no
+        # es un bug nuestro y tenemos fallback con preprocesamiento.
+        short_msg = error_msg.split('.')[0][:140] if error_msg else 'unknown'
+        logger.warning(f"  [AudD] API rechazo audio: {short_msg}")
         return None
 
     track_data = result.get('result')

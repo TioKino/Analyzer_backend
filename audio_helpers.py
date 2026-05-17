@@ -1,17 +1,80 @@
 """
 Audio analysis helper functions: fingerprint, filename parsing, structure detection, vocals.
 """
+import contextlib
 import math
 import json
 import hashlib
+import os
 import re
 import logging
+import sys
 import numpy as np
 import librosa
 
 from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def silence_native_stderr():
+    """Silencia el FD 2 (stderr) durante la operacion envuelta.
+
+    libmpg123 / libsndfile / libavcodec escriben sus warnings de MP3
+    corruptos directamente al descriptor de stderr (no via logging de
+    Python), inundando los logs de Render con lineas tipo
+    "[src/libmpg123/parse.c:skip_junk():1276] error: Giving up...".
+    Nuestro codigo Python ya maneja los fallos via try/except, asi que
+    esos mensajes son ruido. Aqui redirigimos FD 2 a /dev/null solo
+    durante la llamada (deberia durar ~1-2s para una carga de audio).
+
+    Si por lo que sea no podemos redirigir, dejamos pasar la operacion
+    sin silenciar — perderemos limpieza de logs pero no funcionalidad.
+    """
+    if os.name == 'nt' or not hasattr(os, 'dup2'):
+        yield
+        return
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    devnull_fd = None
+    saved_fd = None
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_fd = os.dup(2)
+        os.dup2(devnull_fd, 2)
+    except OSError:
+        if saved_fd is not None:
+            try:
+                os.close(saved_fd)
+            except OSError:
+                pass
+            saved_fd = None
+        if devnull_fd is not None:
+            try:
+                os.close(devnull_fd)
+            except OSError:
+                pass
+            devnull_fd = None
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            os.dup2(saved_fd, 2)
+        except OSError:
+            pass
+        try:
+            os.close(saved_fd)
+        except OSError:
+            pass
+        try:
+            os.close(devnull_fd)
+        except OSError:
+            pass
 
 
 # ==================== FLOAT SANITIZER ====================

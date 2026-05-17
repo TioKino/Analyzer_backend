@@ -21,6 +21,14 @@ except ImportError:
     LIBROSA_AVAILABLE = False
     logger.warning("Librosa no disponible")
 
+try:
+    from audio_helpers import silence_native_stderr
+except ImportError:
+    import contextlib
+    @contextlib.contextmanager
+    def silence_native_stderr():
+        yield
+
 # Essentia no disponible en este sistema
 ESSENTIA_AVAILABLE = False
 
@@ -64,7 +72,8 @@ class ImprovedLibrosaAnalyzer:
         logger.info(f"ImprovedLibrosaAnalyzer inicializado (EDMA: {use_edma_profiles})")
     
     def load_audio(self, file_path: str, sample_rate: int = 44100) -> Tuple[np.ndarray, int]:
-        y, sr = librosa.load(file_path, sr=sample_rate, mono=True)
+        with silence_native_stderr():
+            y, sr = librosa.load(file_path, sr=sample_rate, mono=True)
         return y, sr
     
     def analyze_bpm_improved(self, y: np.ndarray, sr: int = 44100) -> Dict:
