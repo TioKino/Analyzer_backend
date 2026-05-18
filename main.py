@@ -160,6 +160,50 @@ def _upload_to_render_cache(track_data: dict):
     threading.Thread(target=_do_upload, daemon=True).start()
 
 
+def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
+    """
+    Consulta Render para el análisis cacheado de un fingerprint. Solo se
+    usa cuando el motor local NO tiene el track en su BD local, como
+    fallback antes de invocar librosa.
+
+    El endpoint `/analysis/by-fingerprint/{fp}` en Render solo hace SELECT
+    en la BD y devuelve JSON: cero CPU/memoria de análisis, es una lectura
+    barata. Acelera escenarios como Mac nuevo / reanalisis post-wipe del
+    HDD donde Render ya tiene los análisis del PC.
+
+    Devuelve el dict del análisis si Render lo tiene y es válido
+    (bpm > 0, key no vacío, no marcado como `analysis_status='failed'`).
+    None si Render no lo tiene, está dormido (timeout), o devuelve datos
+    basura que no merecen reusarse.
+    """
+    if not fingerprint or len(fingerprint) < 16:
+        return None
+    try:
+        resp = requests.get(
+            f"{RENDER_BACKEND_URL}/analysis/by-fingerprint/{fingerprint}",
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except (requests.Timeout, requests.RequestException, ValueError):
+        return None
+
+    # Validar que NO es un fallback "failed" (bpm=0, key=null,
+    # analysis_status='failed'). Si lo es, mejor analizar local
+    # de cero — el motor local ya tiene librosa OK aquí.
+    try:
+        bpm_val = float(data.get('bpm') or 0)
+    except (TypeError, ValueError):
+        bpm_val = 0
+    key_val = (data.get('key') or '').strip() if data.get('key') else ''
+    if bpm_val <= 0 or not key_val:
+        return None
+    if data.get('analysis_status') == 'failed':
+        return None
+    return data
+
+
 # ==================== IMPORTS LOCALES ====================
 from database import AnalysisDB
 
@@ -1974,7 +2018,46 @@ async def analyze_track(
                 except Exception as e:
                     logger.error(f"[Cache] Error construyendo resultado desde cache: {e}")
                     # Continuar con analisis normal si falla
-        
+            elif IS_LOCAL_ENGINE:
+                # Fallback Render: el motor local NO tiene el fingerprint
+                # en su BD local. Antes de meter librosa a trabajar (segundos
+                # de CPU por track), preguntamos a Render si ya existe. El
+                # endpoint /analysis/by-fingerprint solo hace SELECT en BD,
+                # cero CPU. Acelera reanalisis post-wipe / Mac nuevo / HDD
+                # nuevo donde Render ya tiene los analisis de otros equipos
+                # del mismo usuario.
+                render_cached = _fetch_render_cache(fingerprint)
+                if render_cached:
+                    logger.info(
+                        f"[Render fallback] Hit {fingerprint[:8]}... — "
+                        f"{render_cached.get('artist', '?')} - "
+                        f"{render_cached.get('title', '?')}"
+                    )
+                    # Guardar local con el filename actual (para futuras
+                    # busquedas por filename) y devolver sin invocar librosa.
+                    try:
+                        to_save = dict(render_cached)
+                        to_save['filename'] = file.filename
+                        to_save['fingerprint'] = fingerprint
+                        to_save['id'] = fingerprint
+                        if 'analysis_json' not in to_save:
+                            to_save['analysis_json'] = json.dumps(render_cached)
+                        db.save_track(to_save)
+                    except Exception as e:
+                        logger.warning(f"[Render fallback] save_track fallo: {e}")
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                    try:
+                        return AnalysisResult(**render_cached)
+                    except Exception as e:
+                        logger.warning(
+                            f"[Render fallback] No se pudo construir "
+                            f"AnalysisResult, cayendo a librosa: {e}"
+                        )
+
         consensus = db.get_all_consensus(fingerprint)
 
         result = analyze_audio(tmp_path, fingerprint, force_audd=force_audd)
