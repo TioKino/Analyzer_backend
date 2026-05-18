@@ -296,13 +296,13 @@ class TestA015_RateLimiting:
     """A-015: Rate limiting funciona"""
 
     def test_rate_limiter_blocks_after_limit(self):
-        limiter = SimpleRateLimiter(requests_per_minute=5)
+        limiter = SimpleRateLimiter(max_requests=5)
         for _ in range(5):
             limiter.is_allowed("test-client-flood")
         assert limiter.is_allowed("test-client-flood") is False
 
     def test_different_clients_independent(self):
-        limiter = SimpleRateLimiter(requests_per_minute=3)
+        limiter = SimpleRateLimiter(max_requests=3)
         for _ in range(3):
             limiter.is_allowed("client-A")
         assert limiter.is_allowed("client-A") is False
