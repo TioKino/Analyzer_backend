@@ -381,7 +381,10 @@ def extract_id3_metadata(file_path: str) -> Dict:
                     metadata['isrc'] = str(tags['TSRC'])
                     
             except (FileNotFoundError, IOError, OSError, ValueError, KeyError) as e:
-                logger.error(f"Error leyendo ID3: {e}")
+                # Warning, no error: muchos MP3s validos no tienen tag ID3
+                # (ej. exportados sin metadata). El flujo principal cae a
+                # parse_filename y sigue analizando sin problema.
+                logger.warning(f"Sin ID3 valido: {e}")
         
         elif file_path.lower().endswith('.flac'):
             try:

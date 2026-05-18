@@ -23,8 +23,16 @@ logger = logging.getLogger(__name__)
 try:
     import discogs_client
     DISCOGS_AVAILABLE = True
+    # Excepciones del SDK de Discogs, para capturarlas explicitamente en
+    # get_discogs_genre y separarlas de errores genericos de red.
+    try:
+        from discogs_client.exceptions import DiscogsAPIError, HTTPError as DiscogsHTTPError
+        _DISCOGS_EXCS = (DiscogsAPIError, DiscogsHTTPError)
+    except ImportError:
+        _DISCOGS_EXCS = ()
 except ImportError:
     DISCOGS_AVAILABLE = False
+    _DISCOGS_EXCS = ()
     logger.warning("discogs_client no instalado. pip install discogs_client")
 
 
@@ -125,58 +133,78 @@ class GenreDetector:
             
             return None
             
-        except (requests.RequestException, AttributeError, IndexError, KeyError) as e:
-            logger.error(f"Error Discogs: {e}")
+        except (requests.RequestException, AttributeError, IndexError, KeyError, ValueError) + _DISCOGS_EXCS as e:
+            # ValueError cubre json.JSONDecodeError de discogs_client cuando
+            # la API devuelve cuerpo vacio (rate limit / 5xx transitorios).
+            # _DISCOGS_EXCS cubre HTTPError/DiscogsAPIError del SDK.
+            # Antes era logger.error: hacia ruido en alertas para algo que
+            # no es bug nuestro y para el que ya tenemos fallback a MB.
+            logger.warning(f"Discogs no disponible para '{artist} - {title}': {type(e).__name__}: {e}")
             return None
 
     def get_musicbrainz_info(self, artist: str, title: str) -> Optional[dict]:
-        """Obtener info de MusicBrainz"""
+        """Obtener info de MusicBrainz con timeout y retry."""
         if not artist or not title:
             return None
-        
-        try:
-            # Buscar en MusicBrainz
-            search_url = "https://musicbrainz.org/ws/2/recording/"
-            params = {
-                'query': f'artist:"{artist}" AND recording:"{title}"',
-                'fmt': 'json',
-                'limit': 1
-            }
-            
-            headers = {'User-Agent': 'DJAnalyzerPro/2.3 (contact@djanalyzer.pro)'}
-            response = requests.get(search_url, params=params, headers=headers, timeout=10)
-            
-            if response.status_code != 200:
+
+        # MB latency mediana ~2-5s pero p99 puede irse a 15-20s en horas pico.
+        # Timeout=10s producia muchos "Read timed out" en los logs. Subimos
+        # a 20s con 1 retry simple con backoff de 2s.
+        search_url = "https://musicbrainz.org/ws/2/recording/"
+        params = {
+            'query': f'artist:"{artist}" AND recording:"{title}"',
+            'fmt': 'json',
+            'limit': 1
+        }
+        headers = {'User-Agent': 'DJAnalyzerPro/2.3 (contact@djanalyzer.pro)'}
+
+        response = None
+        for attempt in range(2):
+            try:
+                response = requests.get(search_url, params=params, headers=headers, timeout=20)
+                break
+            except requests.Timeout:
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                logger.warning(
+                    f"MusicBrainz timeout tras 2 intentos para '{artist} - {title}'"
+                )
                 return None
-            
-            data = response.json()
-            recordings = data.get('recordings', [])
-            
-            if not recordings:
+            except requests.RequestException as e:
+                logger.warning(f"MusicBrainz request fallo: {type(e).__name__}: {e}")
                 return None
-            
-            recording = recordings[0]
-            
-            # Extraer tags como género
-            tags = recording.get('tags', [])
-            genre = None
-            if tags:
-                # Ordenar por count y tomar el primero
-                sorted_tags = sorted(tags, key=lambda x: x.get('count', 0), reverse=True)
-                genre = self._normalize_genre(sorted_tags[0].get('name', ''))
-            
-            # Rate limit para MusicBrainz (1 req/sec)
-            time.sleep(1)
-            
-            return {
-                'genre': genre,
-                'mbid': recording.get('id'),
-                'source': 'musicbrainz'
-            }
-            
-        except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
-            logger.error(f"Error MusicBrainz: {e}")
+
+        if response is None or response.status_code != 200:
             return None
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.warning(f"MusicBrainz JSON invalido: {e}")
+            return None
+
+        recordings = data.get('recordings', [])
+        if not recordings:
+            return None
+
+        recording = recordings[0]
+
+        # Extraer tags como género
+        tags = recording.get('tags', [])
+        genre = None
+        if tags:
+            sorted_tags = sorted(tags, key=lambda x: x.get('count', 0), reverse=True)
+            genre = self._normalize_genre(sorted_tags[0].get('name', ''))
+
+        # Rate limit para MusicBrainz (1 req/sec)
+        time.sleep(1)
+
+        return {
+            'genre': genre,
+            'mbid': recording.get('id'),
+            'source': 'musicbrainz'
+        }
 
     def _normalize_genre(self, genre: str) -> str:
         """Normalizar géneros a categorías consistentes usando el mapeo universal.

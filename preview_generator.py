@@ -106,8 +106,27 @@ def generate_preview_snippet(
             os.unlink(output_path)
         return None
     except subprocess.CalledProcessError as e:
-        stderr_msg = e.stderr.decode('utf-8', errors='replace')[:200] if e.stderr else 'unknown'
-        logger.error(f"[Preview] ffmpeg error: {stderr_msg}")
+        # ffmpeg vuelca su banner de version y headers de input al stderr
+        # antes del mensaje real de error. Antes haciamos stderr[:200],
+        # lo que solo recogia el banner ("ffmpeg version 5.1.8...") y
+        # disparaba alertas falsas. Filtramos por lineas que parecen
+        # mensajes de error reales y caemos al tail si no hay match.
+        stderr_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
+        error_lines = [
+            ln for ln in stderr_msg.splitlines()
+            if ln and (
+                ln.lower().startswith('error')
+                or 'invalid' in ln.lower()
+                or 'no such file' in ln.lower()
+                or 'permission denied' in ln.lower()
+                or 'failed' in ln.lower()
+            )
+        ]
+        if error_lines:
+            real_err = ' | '.join(error_lines[-3:])[:400]
+        else:
+            real_err = stderr_msg[-400:].strip() or 'unknown'
+        logger.error(f"[Preview] ffmpeg exit {e.returncode}: {real_err}")
         if os.path.exists(output_path):
             os.unlink(output_path)
         return None
