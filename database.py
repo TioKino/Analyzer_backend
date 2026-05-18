@@ -1448,6 +1448,47 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def count_analysis_sources(self) -> Dict[str, Dict[str, int]]:
+        """Breakdown agregado de `*_source` (bpm, key, genre, track_type)
+        a partir de los analisis guardados en `tracks.analysis_json`.
+
+        Las columnas fisicas no existen — los sources viven dentro del
+        JSON. Usamos `json_extract` (SQLite json1, presente en builds
+        modernas). Si el motor no tiene json1, devuelve dict vacio.
+
+        Returns:
+            {
+              'bpm': {'rekordbox': 12, 'local_engine': 80, ...},
+              'key': {...},
+              'genre': {...},
+              'track_type': {...},
+            }
+        """
+        fields = ('bpm_source', 'key_source', 'genre_source', 'track_type_source')
+        out: Dict[str, Dict[str, int]] = {f.replace('_source', ''): {} for f in fields}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            for field in fields:
+                short = field.replace('_source', '')
+                try:
+                    rows = c.execute(
+                        f"SELECT COALESCE(json_extract(analysis_json, '$.{field}'), 'unknown') AS src, "
+                        '       COUNT(*) AS n '
+                        '  FROM tracks '
+                        ' WHERE analysis_json IS NOT NULL '
+                        ' GROUP BY src'
+                    ).fetchall()
+                    for r in rows:
+                        src = r['src'] or 'unknown'
+                        out[short][str(src)] = int(r['n'])
+                except sqlite3.OperationalError:
+                    # json1 no disponible en este SQLite — saltar el campo.
+                    continue
+            return out
+        finally:
+            conn.close()
+
     def count_client_errors_by_context(self, since_hours: int = 24) -> Dict[str, int]:
         """Counts de errores cliente agrupados por context (sufijo despues
         de 'client:'). Util para el panel: ver de un vistazo si chromaprint

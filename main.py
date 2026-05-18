@@ -1502,7 +1502,22 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                     logger.info(f" No se encontr artwork online")
             except Exception as e:
                 logger.error(f" Error buscando artwork online: {e}")
-    
+                # Telemetria: cuando las 3 APIs externas (iTunes/Deezer/Last.fm)
+                # peten en cascada, queremos ver la tasa en el panel.
+                try:
+                    import traceback as _tb
+                    db.log_analysis_error(
+                        device_id=None,
+                        filename=None,
+                        fingerprint=fingerprint,
+                        error_class=type(e).__name__,
+                        error_msg=str(e),
+                        traceback_str=_tb.format_exc(),
+                        endpoint='artwork',
+                    )
+                except Exception:
+                    pass
+
     # ==================== TRACK TYPE: defaults + guards ====================
     track_type_source = 'waveform'
     # Guard: asegurar que track_type / confidence / alternatives existen
@@ -2305,7 +2320,9 @@ async def analyze_track(
         except Exception:
             pass
 
-        # Generar preview snippet (no bloquea si falla)
+        # Generar preview snippet (no bloquea si falla).
+        # Logueamos fallos en analysis_errors con endpoint='preview' para
+        # que el panel admin pueda contar la tasa de fallo del generador.
         try:
             preview_path = generate_preview_snippet(
                 file_path=tmp_path,
@@ -2320,6 +2337,19 @@ async def analyze_track(
                 _push_preview_async(fingerprint, preview_path)
         except Exception as preview_err:
             logger.error(f"  [Preview] Error (no crítico): {preview_err}")
+            try:
+                import traceback as _tb
+                db.log_analysis_error(
+                    device_id=None,
+                    filename=file.filename,
+                    fingerprint=fingerprint,
+                    error_class=type(preview_err).__name__,
+                    error_msg=str(preview_err),
+                    traceback_str=_tb.format_exc(),
+                    endpoint='preview',
+                )
+            except Exception:
+                pass
 
         # Auto-upload a Render como cache comunitario (solo en modo local)
         if IS_LOCAL_ENGINE:

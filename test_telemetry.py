@@ -140,3 +140,72 @@ class TestClientErrorsByContext:
             endpoint='/analyze',
         )
         assert db.count_client_errors_by_context(since_hours=24) == {}
+
+
+def _insert_track_with_analysis(db: AnalysisDB, *, track_id: str, sources):
+    """Inserta un track con analysis_json conteniendo los sources dados.
+    sources es dict {bpm_source, key_source, genre_source, track_type_source}.
+    """
+    import json as _json
+    payload = _json.dumps(sources)
+    conn = db._open_conn()
+    try:
+        conn.execute(
+            'INSERT INTO tracks (id, filename, analysis_json) VALUES (?, ?, ?)',
+            (track_id, f'{track_id}.mp3', payload),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestAnalysisSourcesBreakdown:
+    """count_analysis_sources: parsea bpm/key/genre/track_type sources
+    desde analysis_json y los cuenta por valor. Se basa en json_extract
+    (SQLite json1), que SQLite3 estandar trae desde hace anios."""
+
+    def test_empty_db_returns_empty_buckets(self, db):
+        out = db.count_analysis_sources()
+        # Debe devolver los 4 buckets siempre (aunque vacios)
+        assert set(out.keys()) == {'bpm', 'key', 'genre', 'track_type'}
+        for bucket in out.values():
+            assert bucket == {}
+
+    def test_counts_bpm_sources(self, db):
+        _insert_track_with_analysis(db, track_id='a',
+            sources={'bpm_source': 'rekordbox'})
+        _insert_track_with_analysis(db, track_id='b',
+            sources={'bpm_source': 'rekordbox'})
+        _insert_track_with_analysis(db, track_id='c',
+            sources={'bpm_source': 'local_engine'})
+        out = db.count_analysis_sources()
+        assert out['bpm'].get('rekordbox') == 2
+        assert out['bpm'].get('local_engine') == 1
+
+    def test_missing_source_field_uses_unknown(self, db):
+        _insert_track_with_analysis(db, track_id='a',
+            sources={'bpm_source': 'rekordbox'})  # falta key/genre/track_type
+        out = db.count_analysis_sources()
+        assert out['key'].get('unknown') == 1
+        assert out['genre'].get('unknown') == 1
+        assert out['track_type'].get('unknown') == 1
+
+    def test_counts_all_four_buckets_independently(self, db):
+        _insert_track_with_analysis(db, track_id='a', sources={
+            'bpm_source': 'rekordbox',
+            'key_source': 'rekordbox',
+            'genre_source': 'discogs',
+            'track_type_source': 'waveform',
+        })
+        out = db.count_analysis_sources()
+        assert out['bpm'].get('rekordbox') == 1
+        assert out['key'].get('rekordbox') == 1
+        assert out['genre'].get('discogs') == 1
+        assert out['track_type'].get('waveform') == 1
+
+    def test_tracks_sin_analysis_json_son_ignorados(self, db):
+        # Track sin analysis_json (caso fallback pending). NO debe contar.
+        _insert_track(db, track_id='legacy', fingerprint='abc')
+        out = db.count_analysis_sources()
+        for bucket in out.values():
+            assert bucket == {}
