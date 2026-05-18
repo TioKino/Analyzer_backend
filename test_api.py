@@ -94,44 +94,48 @@ class TestKeyToCamelot:
 
 
 class TestClassifyTrackType:
-    """Tests para clasificación de tipo de track"""
-    
+    """Tests para clasificación de tipo de track.
+
+    Track Type v2 (fase 1): la función devuelve dict con `type`, `confidence`,
+    `alternatives`, `reason`, `source`. Los tipos canónicos son `warmup`,
+    `peak_time`, `closing` (antes de v2 se usaba `peak` corto).
+    """
+
     def test_peak_high_energy_with_drop(self):
         """Track peak con alta energía y drop"""
-        # Usar segments completo como lo usa la función real
         segments = {
-            'has_drop': True, 
+            'has_drop': True,
             'has_buildup': True,
             'has_intro': True,
             'has_outro': True,
             'has_breakdown': False
         }
         result = classify_track_type(0.85, segments, 360.0)
-        assert result == 'peak'
-    
+        assert result['type'] == 'peak_time'
+
     def test_warmup_low_energy_with_intro(self):
         """Track warmup con energía baja e intro"""
         segments = {
-            'has_drop': False, 
+            'has_drop': False,
             'has_buildup': False,
             'has_intro': True,
             'has_outro': False,
             'has_breakdown': False
         }
         result = classify_track_type(0.3, segments, 360.0)
-        assert result == 'warmup'
-    
+        assert result['type'] == 'warmup'
+
     def test_closing_with_outro(self):
         """Track closing con outro largo"""
         segments = {
-            'has_drop': False, 
+            'has_drop': False,
             'has_buildup': False,
             'has_intro': False,
             'has_outro': True,
             'has_breakdown': False
         }
         result = classify_track_type(0.5, segments, 400.0)
-        assert result == 'closing'
+        assert result['type'] == 'closing'
 
 
 # ============================================================================

@@ -557,8 +557,10 @@ CAMELOT_TO_KEY = {v: k for k, v in KEY_TO_CAMELOT.items()}
 def camelot_to_key(camelot: str) -> str:
     """Convierte notacion Camelot (1A-12B) a nota cruda (C, Cm, F#, etc.).
 
-    Raises ValueError si el input es invalido.
+    Raises ValueError si el input es invalido (incluye None / no-str).
     """
+    if not isinstance(camelot, str):
+        raise ValueError(f"Invalid Camelot notation: {camelot!r}")
     norm = camelot.strip().upper()
     if norm not in CAMELOT_TO_KEY:
         raise ValueError(f"Invalid Camelot notation: {camelot}")
