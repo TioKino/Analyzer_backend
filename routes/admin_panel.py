@@ -674,6 +674,12 @@ async def telemetry(request: Request):
     engine_local = engine_counts.get('local_engine', 0)
     engine_total = engine_render + engine_local
 
+    # 5) Fingerprint stats: cobertura y colisiones (informa decision Hamming).
+    fp_stats = db.get_fingerprint_stats()
+
+    # 6) Errores del cliente / no manejados en las ultimas 24h.
+    client_errors_24h = db.count_client_errors_by_context(since_hours=24)
+
     # Flag visible: hay token configurado en este entorno? Permite al panel
     # decir "AudD no configurado" en vez de un 0% misterioso si Render no
     # tiene la env var.
@@ -722,4 +728,24 @@ async def telemetry(request: Request):
                 "Sin tracks con engine_source seteado (pre-instrumentacion)."
             ),
         },
+        # "fingerprints" informa la decision de invertir en Hamming distance
+        # (item 9 PENDING). collision_extra_rows > 0 significa que el dedup
+        # actual exact-match esta dejando entrar tracks duplicados — si
+        # esa cifra crece, vale la pena el threshold de Hamming.
+        "fingerprints": {
+            "total_tracks": fp_stats.get('total_tracks', 0),
+            "with_fingerprint": fp_stats.get('with_fingerprint', 0),
+            "without_fingerprint": fp_stats.get('without_fingerprint', 0),
+            "unique_fingerprints": fp_stats.get('unique_fingerprints', 0),
+            "collision_groups": fp_stats.get('collision_groups', 0),
+            "collision_extra_rows": fp_stats.get('collision_extra_rows', 0),
+            "coverage_pct": (
+                round(fp_stats.get('with_fingerprint', 0) / fp_stats.get('total_tracks', 1), 3)
+                if fp_stats.get('total_tracks', 0) > 0 else None
+            ),
+        },
+        # "client_errors_24h": contadores por context para que el panel pinte
+        # un health-check rapido. _unhandled = errores no manejados (middleware
+        # global). El resto son contexts que reporto Flutter via /client-error.
+        "client_errors_24h": client_errors_24h,
     }

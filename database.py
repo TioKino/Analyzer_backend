@@ -1387,3 +1387,95 @@ class AnalysisDB:
             return {}
         finally:
             conn.close()
+
+    def get_fingerprint_stats(self) -> Dict[str, int]:
+        """Stats agregadas para el panel admin: cuantos tracks tienen
+        fingerprint, cuantos no, y cuantas colisiones hay (mismo fp,
+        distinto id). Las colisiones son la senal mas clara de que el
+        dedup actual exact-match esta dejando pasar duplicados — si la
+        cifra crece con el tiempo, justifica invertir en Hamming distance
+        (item 9 del backlog).
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            stats = {
+                'total_tracks': 0,
+                'with_fingerprint': 0,
+                'without_fingerprint': 0,
+                'unique_fingerprints': 0,
+                'collision_groups': 0,
+                'collision_extra_rows': 0,
+            }
+            r = c.execute('SELECT COUNT(*) AS n FROM tracks').fetchone()
+            stats['total_tracks'] = int(r['n']) if r else 0
+
+            r = c.execute(
+                'SELECT COUNT(*) AS n FROM tracks '
+                "WHERE fingerprint IS NOT NULL AND fingerprint != ''"
+            ).fetchone()
+            stats['with_fingerprint'] = int(r['n']) if r else 0
+            stats['without_fingerprint'] = stats['total_tracks'] - stats['with_fingerprint']
+
+            r = c.execute(
+                'SELECT COUNT(DISTINCT fingerprint) AS n FROM tracks '
+                "WHERE fingerprint IS NOT NULL AND fingerprint != ''"
+            ).fetchone()
+            stats['unique_fingerprints'] = int(r['n']) if r else 0
+
+            # Colisiones: grupos con >=2 tracks distintos compartiendo fp.
+            # "collision_extra_rows" = filas que sobran (cada grupo de N
+            # aporta N-1). Si suma 0, el dedup actual cubre todo.
+            r = c.execute(
+                'SELECT COUNT(*) AS groups, COALESCE(SUM(n - 1), 0) AS extras '
+                'FROM (SELECT fingerprint, COUNT(*) AS n FROM tracks '
+                "      WHERE fingerprint IS NOT NULL AND fingerprint != '' "
+                '      GROUP BY fingerprint HAVING n > 1)'
+            ).fetchone()
+            if r:
+                stats['collision_groups'] = int(r['groups'])
+                stats['collision_extra_rows'] = int(r['extras'])
+            return stats
+        except sqlite3.OperationalError:
+            return {
+                'total_tracks': 0,
+                'with_fingerprint': 0,
+                'without_fingerprint': 0,
+                'unique_fingerprints': 0,
+                'collision_groups': 0,
+                'collision_extra_rows': 0,
+            }
+        finally:
+            conn.close()
+
+    def count_client_errors_by_context(self, since_hours: int = 24) -> Dict[str, int]:
+        """Counts de errores cliente agrupados por context (sufijo despues
+        de 'client:'). Util para el panel: ver de un vistazo si chromaprint
+        / sync / analysis_api estan petando mas de lo normal en las ultimas
+        24h. Tambien cuenta los 'unhandled:*' (middleware global) bajo la
+        clave especial '_unhandled'.
+        """
+        from datetime import datetime, timedelta, timezone
+        since_iso = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).strftime('%Y-%m-%d %H:%M:%S')
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            rows = c.execute(
+                'SELECT endpoint, COUNT(*) AS n FROM analysis_errors '
+                'WHERE timestamp >= ? '
+                "  AND (endpoint LIKE 'client:%' OR endpoint LIKE 'unhandled:%') "
+                'GROUP BY endpoint',
+                (since_iso,),
+            ).fetchall()
+            out: Dict[str, int] = {}
+            for r in rows:
+                ep = r['endpoint'] or ''
+                if ep.startswith('client:'):
+                    out[ep[len('client:'):]] = int(r['n'])
+                elif ep.startswith('unhandled:'):
+                    out['_unhandled'] = out.get('_unhandled', 0) + int(r['n'])
+            return out
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()

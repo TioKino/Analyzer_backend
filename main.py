@@ -387,6 +387,108 @@ async def validation_error_handler(request: Request, exc: ValidationError):
         }
     )
 
+
+# ==================== TELEMETRIA: ERRORES NO MANEJADOS ====================
+#
+# Antes solo /analyze y /identify capturaban errores en analysis_errors
+# (try/except manual). Cualquier endpoint que peteara sin try/except se
+# perdia silenciosamente en logs. Este middleware global registra TODO
+# 500 no manejado en la misma tabla, marcado con endpoint=request.url.path
+# para que el panel admin pueda filtrar por ruta y diagnosticar puntos
+# calientes. Las HTTPException intencionales (4xx) NO se loguean — solo
+# fallos genuinos. Privacy-first: no se guarda body ni query params.
+@app.middleware("http")
+async def telemetry_unhandled_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except HTTPException:
+        # 4xx intencionales: dejar pasar sin logear como error
+        raise
+    except Exception as exc:
+        try:
+            import traceback as _tb
+            db.log_analysis_error(
+                device_id=request.headers.get('X-Device-Id'),
+                filename=None,
+                fingerprint=None,
+                error_class=type(exc).__name__,
+                error_msg=str(exc),
+                traceback_str=_tb.format_exc(),
+                endpoint=f"unhandled:{request.url.path}",
+            )
+        except Exception as log_err:
+            logger.error(f"[Telemetry] No se pudo loguear error no manejado: {log_err}")
+        # Re-elevar para que FastAPI devuelva 500 al cliente
+        raise
+
+
+# ==================== TELEMETRIA: ERRORES DEL CLIENTE ====================
+#
+# Endpoint para que Flutter reporte sus propios errores (network, parsing,
+# Chromaprint, sync). Hasta hoy todo se quedaba en debugPrint local: si en
+# produccion peta el sync o falla fpcalc, no nos enteramos. Privacy-first:
+# nada de filename real (se hashea), nada de paths sin sanitizar (el cliente
+# debe truncar/sanear antes de mandar).
+class ClientErrorPayload(BaseModel):
+    error_class: str
+    error_msg: Optional[str] = None
+    stack: Optional[str] = None
+    context: str  # "chromaprint", "sync", "analysis_api", "uncaught", ...
+    platform: Optional[str] = None  # "windows" | "macos" | "android" | "ios" | "linux"
+    app_version: Optional[str] = None
+    fingerprint: Optional[str] = None
+    filename: Optional[str] = None  # se hashea server-side, NUNCA se persiste literal
+
+
+@app.post("/client-error")
+async def report_client_error(payload: ClientErrorPayload, request: Request):
+    """Recibe un error del cliente y lo persiste en analysis_errors.
+
+    El cliente envia error_class + msg + stack truncados y un context que
+    identifica el modulo (ej: "chromaprint", "sync"). El endpoint en BD se
+    formatea como "client:{context}" para que el panel pueda filtrar.
+
+    Fire-and-forget desde el cliente: la respuesta es siempre 202 si la
+    forma es valida, aun si el INSERT falla (no queremos que un fallo de
+    telemetria desencadene otro error en el cliente).
+    """
+    error_class = (payload.error_class or 'Unknown')[:120]
+    # Tamanos por encima del limite del schema: el cliente deberia truncar,
+    # pero por defensa server-side reaplicamos.
+    error_msg = (payload.error_msg or '')[:500]
+    stack = (payload.stack or '')[:2000] if payload.stack else None
+    context = (payload.context or 'unknown')[:60]
+    platform = (payload.platform or '')[:20] or None
+    app_version = (payload.app_version or '')[:20] or None
+
+    # Tag platform+version dentro de error_msg para que el panel pueda
+    # segmentar sin necesidad de columnas nuevas en el schema. Formato
+    # estable, parseable: "[ios 2.8.0] <msg original>".
+    tag_parts = []
+    if platform:
+        tag_parts.append(platform)
+    if app_version:
+        tag_parts.append(app_version)
+    tagged_msg = f"[{' '.join(tag_parts)}] {error_msg}" if tag_parts else error_msg
+
+    try:
+        db.log_analysis_error(
+            device_id=request.headers.get('X-Device-Id'),
+            filename=payload.filename,
+            fingerprint=payload.fingerprint,
+            error_class=error_class,
+            error_msg=tagged_msg,
+            traceback_str=stack,
+            endpoint=f"client:{context}",
+        )
+    except Exception as e:
+        logger.warning(f"[ClientError] log fallo: {e}")
+        # No reelevamos: el cliente no debe sufrir por nuestra telemetria
+        return JSONResponse(status_code=202, content={"ok": False, "logged": False})
+
+    return JSONResponse(status_code=202, content={"ok": True, "logged": True})
+
+
 # Inicializar BD con path de config (no hardcoded)
 db = AnalysisDB(db_path=DATABASE_PATH)
 
