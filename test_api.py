@@ -13,10 +13,12 @@ import tempfile
 import os
 
 # Importar la app
+# NOTE: convert_beatport_key fue eliminado 2026-05-13 junto con todo el
+# scraping de Beatport (Cloudflare WAF lo bloqueaba). Si vuelve por API
+# oficial, su test class vivira aqui de nuevo.
 from main import (
-    app, 
-    parse_filename, 
-    convert_beatport_key,
+    app,
+    parse_filename,
     KEY_TO_CAMELOT,
     classify_track_type,
 )
@@ -72,34 +74,6 @@ class TestParseFilename:
             result = parse_filename(f"Artist - Track{ext}")
             assert result['artist'] == "Artist"
             assert result['title'] == "Track"
-
-
-class TestConvertBeatportKey:
-    """Tests para conversión de tonalidades Beatport"""
-    
-    def test_major_key(self):
-        assert convert_beatport_key("G Major") == "G"
-        assert convert_beatport_key("C Major") == "C"
-    
-    def test_minor_key(self):
-        assert convert_beatport_key("A Minor") == "Am"
-        assert convert_beatport_key("D Minor") == "Dm"
-    
-    def test_flat_key_returns_something(self):
-        """Test que bemoles retornan algo (puede variar la implementación)"""
-        result = convert_beatport_key("B♭ Major")
-        assert result is not None
-        assert len(result) >= 1
-    
-    def test_sharp_keys_returns_something(self):
-        """Test que sostenidos retornan algo"""
-        result = convert_beatport_key("F♯ Minor")
-        assert result is not None
-        assert 'm' in result.lower() or 'M' in result  # Es menor
-    
-    def test_short_format_passthrough(self):
-        assert convert_beatport_key("Am") == "Am"
-        assert convert_beatport_key("G") == "G"
 
 
 class TestKeyToCamelot:
