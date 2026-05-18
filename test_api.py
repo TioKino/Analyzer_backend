@@ -13,10 +13,12 @@ import tempfile
 import os
 
 # Importar la app
+# NOTE: convert_beatport_key fue eliminado 2026-05-13 junto con todo el
+# scraping de Beatport (Cloudflare WAF lo bloqueaba). Si vuelve por API
+# oficial, su test class vivira aqui de nuevo.
 from main import (
-    app, 
-    parse_filename, 
-    convert_beatport_key,
+    app,
+    parse_filename,
     KEY_TO_CAMELOT,
     classify_track_type,
 )
@@ -74,34 +76,6 @@ class TestParseFilename:
             assert result['title'] == "Track"
 
 
-class TestConvertBeatportKey:
-    """Tests para conversión de tonalidades Beatport"""
-    
-    def test_major_key(self):
-        assert convert_beatport_key("G Major") == "G"
-        assert convert_beatport_key("C Major") == "C"
-    
-    def test_minor_key(self):
-        assert convert_beatport_key("A Minor") == "Am"
-        assert convert_beatport_key("D Minor") == "Dm"
-    
-    def test_flat_key_returns_something(self):
-        """Test que bemoles retornan algo (puede variar la implementación)"""
-        result = convert_beatport_key("B♭ Major")
-        assert result is not None
-        assert len(result) >= 1
-    
-    def test_sharp_keys_returns_something(self):
-        """Test que sostenidos retornan algo"""
-        result = convert_beatport_key("F♯ Minor")
-        assert result is not None
-        assert 'm' in result.lower() or 'M' in result  # Es menor
-    
-    def test_short_format_passthrough(self):
-        assert convert_beatport_key("Am") == "Am"
-        assert convert_beatport_key("G") == "G"
-
-
 class TestKeyToCamelot:
     """Tests para mapeo Key → Camelot"""
     
@@ -120,44 +94,48 @@ class TestKeyToCamelot:
 
 
 class TestClassifyTrackType:
-    """Tests para clasificación de tipo de track"""
-    
+    """Tests para clasificación de tipo de track.
+
+    Track Type v2 (fase 1): la función devuelve dict con `type`, `confidence`,
+    `alternatives`, `reason`, `source`. Los tipos canónicos son `warmup`,
+    `peak_time`, `closing` (antes de v2 se usaba `peak` corto).
+    """
+
     def test_peak_high_energy_with_drop(self):
         """Track peak con alta energía y drop"""
-        # Usar segments completo como lo usa la función real
         segments = {
-            'has_drop': True, 
+            'has_drop': True,
             'has_buildup': True,
             'has_intro': True,
             'has_outro': True,
             'has_breakdown': False
         }
         result = classify_track_type(0.85, segments, 360.0)
-        assert result == 'peak'
-    
+        assert result['type'] == 'peak_time'
+
     def test_warmup_low_energy_with_intro(self):
         """Track warmup con energía baja e intro"""
         segments = {
-            'has_drop': False, 
+            'has_drop': False,
             'has_buildup': False,
             'has_intro': True,
             'has_outro': False,
             'has_breakdown': False
         }
         result = classify_track_type(0.3, segments, 360.0)
-        assert result == 'warmup'
-    
+        assert result['type'] == 'warmup'
+
     def test_closing_with_outro(self):
         """Track closing con outro largo"""
         segments = {
-            'has_drop': False, 
+            'has_drop': False,
             'has_buildup': False,
             'has_intro': False,
             'has_outro': True,
             'has_breakdown': False
         }
         result = classify_track_type(0.5, segments, 400.0)
-        assert result == 'closing'
+        assert result['type'] == 'closing'
 
 
 # ============================================================================

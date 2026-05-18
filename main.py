@@ -160,6 +160,50 @@ def _upload_to_render_cache(track_data: dict):
     threading.Thread(target=_do_upload, daemon=True).start()
 
 
+def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
+    """
+    Consulta Render para el análisis cacheado de un fingerprint. Solo se
+    usa cuando el motor local NO tiene el track en su BD local, como
+    fallback antes de invocar librosa.
+
+    El endpoint `/analysis/by-fingerprint/{fp}` en Render solo hace SELECT
+    en la BD y devuelve JSON: cero CPU/memoria de análisis, es una lectura
+    barata. Acelera escenarios como Mac nuevo / reanalisis post-wipe del
+    HDD donde Render ya tiene los análisis del PC.
+
+    Devuelve el dict del análisis si Render lo tiene y es válido
+    (bpm > 0, key no vacío, no marcado como `analysis_status='failed'`).
+    None si Render no lo tiene, está dormido (timeout), o devuelve datos
+    basura que no merecen reusarse.
+    """
+    if not fingerprint or len(fingerprint) < 16:
+        return None
+    try:
+        resp = requests.get(
+            f"{RENDER_BACKEND_URL}/analysis/by-fingerprint/{fingerprint}",
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except (requests.Timeout, requests.RequestException, ValueError):
+        return None
+
+    # Validar que NO es un fallback "failed" (bpm=0, key=null,
+    # analysis_status='failed'). Si lo es, mejor analizar local
+    # de cero — el motor local ya tiene librosa OK aquí.
+    try:
+        bpm_val = float(data.get('bpm') or 0)
+    except (TypeError, ValueError):
+        bpm_val = 0
+    key_val = (data.get('key') or '').strip() if data.get('key') else ''
+    if bpm_val <= 0 or not key_val:
+        return None
+    if data.get('analysis_status') == 'failed':
+        return None
+    return data
+
+
 # ==================== IMPORTS LOCALES ====================
 from database import AnalysisDB
 
@@ -513,8 +557,10 @@ CAMELOT_TO_KEY = {v: k for k, v in KEY_TO_CAMELOT.items()}
 def camelot_to_key(camelot: str) -> str:
     """Convierte notacion Camelot (1A-12B) a nota cruda (C, Cm, F#, etc.).
 
-    Raises ValueError si el input es invalido.
+    Raises ValueError si el input es invalido (incluye None / no-str).
     """
+    if not isinstance(camelot, str):
+        raise ValueError(f"Invalid Camelot notation: {camelot!r}")
     norm = camelot.strip().upper()
     if norm not in CAMELOT_TO_KEY:
         raise ValueError(f"Invalid Camelot notation: {camelot}")
@@ -934,17 +980,17 @@ def generate_preview_snippet(
 
 # ==================== ANALISIS PRINCIPAL ====================
 
-def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
+def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = False) -> AnalysisResult:
     import warnings
     warnings.filterwarnings('ignore')
-    
+
     #  Obtener duracin SIN cargar audio completo
     duration = librosa.get_duration(path=file_path)
-    
+
     #  Si el track es largo (>4 min), usar anlisis por chunks
     if CHUNKED_ANALYZER_ENABLED and duration > CHUNK_ANALYSIS_THRESHOLD:
         logger.info(f" Track largo ({duration/60:.1f} min) - Usando anlisis por chunks")
-        return analyze_audio_chunked(file_path, fingerprint, duration)
+        return analyze_audio_chunked(file_path, fingerprint, duration, force_audd=force_audd)
     
     # Track corto: anlisis tradicional (carga todo en RAM)
     logger.info(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
@@ -1237,6 +1283,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
                 max_duration=AUDD_MAX_DURATION,
                 daily_cap=AUDD_DAILY_CAP,
                 cooldown_days=AUDD_COOLDOWN_DAYS,
+                force=force_audd,
             )
             if audd_track:
                 if audd_track.get('artist'):
@@ -1467,7 +1514,7 @@ def analyze_audio(file_path: str, fingerprint: str = None) -> AnalysisResult:
         artwork_url=artwork_url,
     )
 
-def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> AnalysisResult:
+def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, force_audd: bool = False) -> AnalysisResult:
     """
     Analiza tracks largos por chunks para reducir uso de RAM.
     Usado automticamente para tracks > 4 minutos.
@@ -1589,6 +1636,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
                 max_duration=AUDD_MAX_DURATION,
                 daily_cap=AUDD_DAILY_CAP,
                 cooldown_days=AUDD_COOLDOWN_DAYS,
+                force=force_audd,
             )
             if audd_track:
                 if audd_track.get('artist'):
@@ -1768,8 +1816,18 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float) -> 
 async def analyze_track(
     request: Request,
     file: UploadFile = File(...),
-    force: bool = Query(False, description="Forzar reanalisis ignorando cache")
+    force: bool = Query(False, description="Forzar reanalisis ignorando cache"),
+    force_audd: bool = Query(
+        False,
+        description="Forzar AudD aunque metadata sea utilizable y saltar cooldown 7d. "
+                    "Implica force=true porque el cache existente ya tiene metadata "
+                    "que el usuario quiere reemplazar. Daily cap se respeta.",
+    ),
 ):
+    # force_audd implica force=true: el usuario pidio explicitamente AudD y el
+    # registro cacheado debe sobreescribirse con el resultado nuevo.
+    if force_audd:
+        force = True
     # Rate limiting — /analyze es CPU-bound (librosa) y acepta hasta 100MB,
     # por lo que es un vector de DoS trivial sin limite. Ver AUDIT 2026-04-20 B-H2.
     check_rate_limit(get_client_ip(request))
@@ -1962,10 +2020,49 @@ async def analyze_track(
                 except Exception as e:
                     logger.error(f"[Cache] Error construyendo resultado desde cache: {e}")
                     # Continuar con analisis normal si falla
-        
+            elif IS_LOCAL_ENGINE:
+                # Fallback Render: el motor local NO tiene el fingerprint
+                # en su BD local. Antes de meter librosa a trabajar (segundos
+                # de CPU por track), preguntamos a Render si ya existe. El
+                # endpoint /analysis/by-fingerprint solo hace SELECT en BD,
+                # cero CPU. Acelera reanalisis post-wipe / Mac nuevo / HDD
+                # nuevo donde Render ya tiene los analisis de otros equipos
+                # del mismo usuario.
+                render_cached = _fetch_render_cache(fingerprint)
+                if render_cached:
+                    logger.info(
+                        f"[Render fallback] Hit {fingerprint[:8]}... — "
+                        f"{render_cached.get('artist', '?')} - "
+                        f"{render_cached.get('title', '?')}"
+                    )
+                    # Guardar local con el filename actual (para futuras
+                    # busquedas por filename) y devolver sin invocar librosa.
+                    try:
+                        to_save = dict(render_cached)
+                        to_save['filename'] = file.filename
+                        to_save['fingerprint'] = fingerprint
+                        to_save['id'] = fingerprint
+                        if 'analysis_json' not in to_save:
+                            to_save['analysis_json'] = json.dumps(render_cached)
+                        db.save_track(to_save)
+                    except Exception as e:
+                        logger.warning(f"[Render fallback] save_track fallo: {e}")
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                    try:
+                        return AnalysisResult(**render_cached)
+                    except Exception as e:
+                        logger.warning(
+                            f"[Render fallback] No se pudo construir "
+                            f"AnalysisResult, cayendo a librosa: {e}"
+                        )
+
         consensus = db.get_all_consensus(fingerprint)
 
-        result = analyze_audio(tmp_path, fingerprint)
+        result = analyze_audio(tmp_path, fingerprint, force_audd=force_audd)
 
         # Parsear nombre si falta metadata
         if not result.artist or not result.title:

@@ -299,25 +299,25 @@ class TestSimpleRateLimiter:
     
     def test_allows_first_request(self):
         """Test que permite primera solicitud"""
-        limiter = SimpleRateLimiter(requests_per_minute=10)
+        limiter = SimpleRateLimiter(max_requests=10)
         assert limiter.is_allowed("client1") is True
     
     def test_allows_multiple_within_limit(self):
         """Test que permite múltiples dentro del límite"""
-        limiter = SimpleRateLimiter(requests_per_minute=10)
+        limiter = SimpleRateLimiter(max_requests=10)
         for _ in range(5):
             assert limiter.is_allowed("client2") is True
     
     def test_blocks_when_exceeded(self):
         """Test que bloquea cuando se excede"""
-        limiter = SimpleRateLimiter(requests_per_minute=3)
+        limiter = SimpleRateLimiter(max_requests=3)
         for _ in range(3):
             limiter.is_allowed("client3")
         assert limiter.is_allowed("client3") is False
     
     def test_different_clients_independent(self):
         """Test que clientes diferentes son independientes"""
-        limiter = SimpleRateLimiter(requests_per_minute=2)
+        limiter = SimpleRateLimiter(max_requests=2)
         limiter.is_allowed("clientA")
         limiter.is_allowed("clientA")
         # clientA está al límite
@@ -327,7 +327,7 @@ class TestSimpleRateLimiter:
     
     def test_get_remaining(self):
         """Test obtener requests restantes"""
-        limiter = SimpleRateLimiter(requests_per_minute=10)
+        limiter = SimpleRateLimiter(max_requests=10)
         limiter.is_allowed("client4")
         limiter.is_allowed("client4")
         assert limiter.get_remaining("client4") == 8
