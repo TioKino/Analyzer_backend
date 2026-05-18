@@ -18,8 +18,16 @@ from fastapi import APIRouter, HTTPException, Request
 
 logger = logging.getLogger(__name__)
 
+# Importar paths desde config (unica fuente de verdad). Antes leiamos
+# ENV var con default relativo, lo que en Render hacia que buscaramos
+# en directorios que NO eran los persistentes (/data/...). Resultado:
+# total_previews=0 aunque /data/previews tuviera 800 mp3s.
+from config import (  # noqa: E402  (import dinamico tras logger)
+    PREVIEWS_DIR as _PREVIEWS_DIR,
+    ARTWORK_CACHE_DIR as _ARTWORK_CACHE_DIR,
+)
+
 _SYNC_DB_PATH = os.environ.get("SYNC_DB_PATH", "/data/sync.db")
-_PREVIEWS_DIR = os.environ.get("PREVIEWS_DIR", "previews_cache")
 
 
 # ── Auth dependency ─────────────────────────────────────────
@@ -731,7 +739,11 @@ async def telemetry(request: Request):
         total_tracks = 0
         with_preview = 0
         with_artwork = 0
-        artwork_dir = os.environ.get("ARTWORK_CACHE_DIR", "artwork_cache")
+        # _ARTWORK_CACHE_DIR viene de config (persistente /data/ en Render).
+        # Antes leiamos env var directa con default 'artwork_cache' relativo,
+        # asi que en Render contaba siempre 0 aunque hubiera artwork en disco.
+        artwork_dir = _ARTWORK_CACHE_DIR
+        artwork_dir_exists = os.path.isdir(artwork_dir)
         arows = conn.execute(
             "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
         ).fetchall()
@@ -745,7 +757,7 @@ async def telemetry(request: Request):
                 if _preview_exists(fp):
                     with_preview += 1
                 # Artwork file convencion: <fp>.jpg / <fp>.png
-                if fp and os.path.isdir(artwork_dir):
+                if fp and artwork_dir_exists:
                     for ext in (".jpg", ".jpeg", ".png", ".webp"):
                         if os.path.exists(os.path.join(artwork_dir, f"{fp}{ext}")):
                             with_artwork += 1
