@@ -117,6 +117,16 @@ CHUNK_ANALYSIS_THRESHOLD = 240  # 4 minutos
 
 RENDER_BACKEND_URL = os.environ.get('RENDER_BACKEND_URL', 'https://dj-analyzer-api.onrender.com')
 
+# ==================== RANKING DE FUENTES (item 8: "mejor gana") ====================
+# Logica de prioridad de bpm_source extraida a analysis_ranking.py para
+# que sea testeable sin importar la app entera (librosa pesado).
+from analysis_ranking import (
+    ANALYSIS_SOURCE_PRIORITY,
+    get_source_priority,
+    should_overwrite_analysis,
+)
+
+
 def _upload_to_render_cache(track_data: dict):
     """
     Sube resultado de análisis local a Render como cache comunitario.
@@ -376,6 +386,108 @@ async def validation_error_handler(request: Request, exc: ValidationError):
             "field": getattr(exc, 'field', None)
         }
     )
+
+
+# ==================== TELEMETRIA: ERRORES NO MANEJADOS ====================
+#
+# Antes solo /analyze y /identify capturaban errores en analysis_errors
+# (try/except manual). Cualquier endpoint que peteara sin try/except se
+# perdia silenciosamente en logs. Este middleware global registra TODO
+# 500 no manejado en la misma tabla, marcado con endpoint=request.url.path
+# para que el panel admin pueda filtrar por ruta y diagnosticar puntos
+# calientes. Las HTTPException intencionales (4xx) NO se loguean — solo
+# fallos genuinos. Privacy-first: no se guarda body ni query params.
+@app.middleware("http")
+async def telemetry_unhandled_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except HTTPException:
+        # 4xx intencionales: dejar pasar sin logear como error
+        raise
+    except Exception as exc:
+        try:
+            import traceback as _tb
+            db.log_analysis_error(
+                device_id=request.headers.get('X-Device-Id'),
+                filename=None,
+                fingerprint=None,
+                error_class=type(exc).__name__,
+                error_msg=str(exc),
+                traceback_str=_tb.format_exc(),
+                endpoint=f"unhandled:{request.url.path}",
+            )
+        except Exception as log_err:
+            logger.error(f"[Telemetry] No se pudo loguear error no manejado: {log_err}")
+        # Re-elevar para que FastAPI devuelva 500 al cliente
+        raise
+
+
+# ==================== TELEMETRIA: ERRORES DEL CLIENTE ====================
+#
+# Endpoint para que Flutter reporte sus propios errores (network, parsing,
+# Chromaprint, sync). Hasta hoy todo se quedaba en debugPrint local: si en
+# produccion peta el sync o falla fpcalc, no nos enteramos. Privacy-first:
+# nada de filename real (se hashea), nada de paths sin sanitizar (el cliente
+# debe truncar/sanear antes de mandar).
+class ClientErrorPayload(BaseModel):
+    error_class: str
+    error_msg: Optional[str] = None
+    stack: Optional[str] = None
+    context: str  # "chromaprint", "sync", "analysis_api", "uncaught", ...
+    platform: Optional[str] = None  # "windows" | "macos" | "android" | "ios" | "linux"
+    app_version: Optional[str] = None
+    fingerprint: Optional[str] = None
+    filename: Optional[str] = None  # se hashea server-side, NUNCA se persiste literal
+
+
+@app.post("/client-error")
+async def report_client_error(payload: ClientErrorPayload, request: Request):
+    """Recibe un error del cliente y lo persiste en analysis_errors.
+
+    El cliente envia error_class + msg + stack truncados y un context que
+    identifica el modulo (ej: "chromaprint", "sync"). El endpoint en BD se
+    formatea como "client:{context}" para que el panel pueda filtrar.
+
+    Fire-and-forget desde el cliente: la respuesta es siempre 202 si la
+    forma es valida, aun si el INSERT falla (no queremos que un fallo de
+    telemetria desencadene otro error en el cliente).
+    """
+    error_class = (payload.error_class or 'Unknown')[:120]
+    # Tamanos por encima del limite del schema: el cliente deberia truncar,
+    # pero por defensa server-side reaplicamos.
+    error_msg = (payload.error_msg or '')[:500]
+    stack = (payload.stack or '')[:2000] if payload.stack else None
+    context = (payload.context or 'unknown')[:60]
+    platform = (payload.platform or '')[:20] or None
+    app_version = (payload.app_version or '')[:20] or None
+
+    # Tag platform+version dentro de error_msg para que el panel pueda
+    # segmentar sin necesidad de columnas nuevas en el schema. Formato
+    # estable, parseable: "[ios 2.8.0] <msg original>".
+    tag_parts = []
+    if platform:
+        tag_parts.append(platform)
+    if app_version:
+        tag_parts.append(app_version)
+    tagged_msg = f"[{' '.join(tag_parts)}] {error_msg}" if tag_parts else error_msg
+
+    try:
+        db.log_analysis_error(
+            device_id=request.headers.get('X-Device-Id'),
+            filename=payload.filename,
+            fingerprint=payload.fingerprint,
+            error_class=error_class,
+            error_msg=tagged_msg,
+            traceback_str=stack,
+            endpoint=f"client:{context}",
+        )
+    except Exception as e:
+        logger.warning(f"[ClientError] log fallo: {e}")
+        # No reelevamos: el cliente no debe sufrir por nuestra telemetria
+        return JSONResponse(status_code=202, content={"ok": False, "logged": False})
+
+    return JSONResponse(status_code=202, content={"ok": True, "logged": True})
+
 
 # Inicializar BD con path de config (no hardcoded)
 db = AnalysisDB(db_path=DATABASE_PATH)
@@ -1390,7 +1502,22 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                     logger.info(f" No se encontr artwork online")
             except Exception as e:
                 logger.error(f" Error buscando artwork online: {e}")
-    
+                # Telemetria: cuando las 3 APIs externas (iTunes/Deezer/Last.fm)
+                # peten en cascada, queremos ver la tasa en el panel.
+                try:
+                    import traceback as _tb
+                    db.log_analysis_error(
+                        device_id=None,
+                        filename=None,
+                        fingerprint=fingerprint,
+                        error_class=type(e).__name__,
+                        error_msg=str(e),
+                        traceback_str=_tb.format_exc(),
+                        endpoint='artwork',
+                    )
+                except Exception:
+                    pass
+
     # ==================== TRACK TYPE: defaults + guards ====================
     track_type_source = 'waveform'
     # Guard: asegurar que track_type / confidence / alternatives existen
@@ -2045,18 +2172,27 @@ async def analyze_track(
                     logger.info(
                         f"[Render fallback] Hit {fingerprint[:8]}... — "
                         f"{render_cached.get('artist', '?')} - "
-                        f"{render_cached.get('title', '?')}"
+                        f"{render_cached.get('title', '?')} "
+                        f"(source={render_cached.get('bpm_source', '?')})"
                     )
                     # Guardar local con el filename actual (para futuras
                     # busquedas por filename) y devolver sin invocar librosa.
+                    # No sobreescribir un analisis local si el de Render es
+                    # de fuente peor (ranking "mejor gana", item 8).
                     try:
-                        to_save = dict(render_cached)
-                        to_save['filename'] = file.filename
-                        to_save['fingerprint'] = fingerprint
-                        to_save['id'] = fingerprint
-                        if 'analysis_json' not in to_save:
-                            to_save['analysis_json'] = json.dumps(render_cached)
-                        db.save_track(to_save)
+                        if not should_overwrite_analysis(existing_by_fp, render_cached):
+                            logger.info(
+                                f"[Render fallback] local existente es mejor, "
+                                f"no se machaca con Render"
+                            )
+                        else:
+                            to_save = dict(render_cached)
+                            to_save['filename'] = file.filename
+                            to_save['fingerprint'] = fingerprint
+                            to_save['id'] = fingerprint
+                            if 'analysis_json' not in to_save:
+                                to_save['analysis_json'] = json.dumps(render_cached)
+                            db.save_track(to_save)
                     except Exception as e:
                         logger.warning(f"[Render fallback] save_track fallo: {e}")
                     if os.path.exists(tmp_path):
@@ -2184,7 +2320,9 @@ async def analyze_track(
         except Exception:
             pass
 
-        # Generar preview snippet (no bloquea si falla)
+        # Generar preview snippet (no bloquea si falla).
+        # Logueamos fallos en analysis_errors con endpoint='preview' para
+        # que el panel admin pueda contar la tasa de fallo del generador.
         try:
             preview_path = generate_preview_snippet(
                 file_path=tmp_path,
@@ -2199,6 +2337,19 @@ async def analyze_track(
                 _push_preview_async(fingerprint, preview_path)
         except Exception as preview_err:
             logger.error(f"  [Preview] Error (no crítico): {preview_err}")
+            try:
+                import traceback as _tb
+                db.log_analysis_error(
+                    device_id=None,
+                    filename=file.filename,
+                    fingerprint=fingerprint,
+                    error_class=type(preview_err).__name__,
+                    error_msg=str(preview_err),
+                    traceback_str=_tb.format_exc(),
+                    endpoint='preview',
+                )
+            except Exception:
+                pass
 
         # Auto-upload a Render como cache comunitario (solo en modo local)
         if IS_LOCAL_ENGINE:
@@ -2985,22 +3136,26 @@ async def cache_analysis(request: Request):
     if not fingerprint:
         raise HTTPException(400, "fingerprint requerido")
 
-    # No sobreescribir si ya existe con análisis completo. El método
-    # correcto es `get_track_by_fingerprint` — `db.get_track` nunca
-    # existió y rompía el endpoint con 500 cuando el motor local
-    # intentaba subir el resultado a Render.
+    # Ranking "mejor gana": comparamos bpm_source nuevo vs existente y
+    # solo sobreescribimos si la nueva fuente tiene mayor prioridad (o
+    # empate con existente vacio). Ver ANALYSIS_SOURCE_PRIORITY arriba.
     existing = db.get_track_by_fingerprint(fingerprint)
-    if existing:
-        existing_json = existing.get('analysis_json')
-        if existing_json:
-            try:
-                ej = json.loads(existing_json) if isinstance(existing_json, str) else existing_json
-                # Si el existente tiene BPM real (no 0, no pending), no sobreescribir
-                if ej.get('bpm', 0) > 0 and ej.get('bpm_source') != 'pending':
-                    logger.info(f"[Cache] {fingerprint[:12]} ya existe con análisis completo, skip")
-                    return {"status": "exists", "fingerprint": fingerprint}
-            except (json.JSONDecodeError, TypeError):
-                pass
+    if existing and not should_overwrite_analysis(existing, data):
+        existing_source = '?'
+        try:
+            ej_raw = existing.get('analysis_json')
+            if ej_raw:
+                ej = json.loads(ej_raw) if isinstance(ej_raw, str) else ej_raw
+                existing_source = ej.get('bpm_source', '?')
+        except (json.JSONDecodeError, TypeError):
+            pass
+        logger.info(
+            f"[Cache] {fingerprint[:12]} skip (existente={existing_source} "
+            f"prio={get_source_priority(existing_source)} "
+            f">= nuevo={data.get('bpm_source', '?')} "
+            f"prio={get_source_priority(data.get('bpm_source'))})"
+        )
+        return {"status": "exists", "fingerprint": fingerprint}
 
     # Construir datos para guardar
     track_data = {
@@ -3112,7 +3267,9 @@ async def get_analysis_by_fingerprint(fingerprint: str):
             return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             pass
-    # Fallback: construir desde columnas
+    # Fallback: construir desde columnas. Incluir *_source para que el
+    # cliente sepa si vale la pena sobreescribir su analisis local (ranking
+    # "mejor gana" en sync comunitario, item 8).
     return {
         "id": existing.get('id'),
         "filename": existing.get('filename'),
@@ -3126,6 +3283,10 @@ async def get_analysis_by_fingerprint(fingerprint: str):
         "genre": existing.get('genre'),
         "track_type": existing.get('track_type'),
         "fingerprint": existing.get('fingerprint'),
+        "bpm_source": existing.get('bpm_source'),
+        "key_source": existing.get('key_source'),
+        "genre_source": existing.get('genre_source'),
+        "engine_source": existing.get('engine_source'),
     }
 
 

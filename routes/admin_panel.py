@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import sqlite3
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -674,6 +674,48 @@ async def telemetry(request: Request):
     engine_local = engine_counts.get('local_engine', 0)
     engine_total = engine_render + engine_local
 
+    # 5) Fingerprint stats: cobertura y colisiones (informa decision Hamming).
+    fp_stats = db.get_fingerprint_stats()
+
+    # 6) Errores del cliente / no manejados en las ultimas 24h.
+    client_errors_24h = db.count_client_errors_by_context(since_hours=24)
+
+    # 7) Breakdown de sources del analisis (bpm / key / genre / track_type).
+    # Permite ver de un vistazo que % de la BD viene de Rekordbox/Traktor,
+    # consensus comunitario, motor local, ID3 o analisis espectral. Es la
+    # senal mas honesta de "calidad" de la cache colectiva.
+    sources_breakdown = db.count_analysis_sources()
+
+    # 8) Usuarios + dispositivos por plataforma. user_devices.device_type
+    # ya guarda windows/macos/ios/android/linux desde el cliente. Aqui
+    # solo agregamos. Si un device no esta vinculado a un usuario aun
+    # (caso raro, registro previo a vinculacion), aparece en counts pero
+    # no en total_users.
+    total_users = 0
+    total_devices = 0
+    platforms: Dict[str, int] = {}
+    try:
+        sconn = _get_sync_conn()
+        try:
+            r = sconn.execute(
+                "SELECT COUNT(DISTINCT user_id) AS n FROM user_devices "
+                "WHERE user_id IS NOT NULL"
+            ).fetchone()
+            total_users = int(r["n"]) if r else 0
+            r = sconn.execute("SELECT COUNT(*) AS n FROM user_devices").fetchone()
+            total_devices = int(r["n"]) if r else 0
+            rows = sconn.execute(
+                "SELECT COALESCE(device_type, 'unknown') AS dt, COUNT(*) AS n "
+                "FROM user_devices GROUP BY dt"
+            ).fetchall()
+            for row in rows:
+                platforms[str(row["dt"])] = int(row["n"])
+        finally:
+            sconn.close()
+    except sqlite3.OperationalError:
+        # Tabla user_devices no existe (BD muy temprana). Skip silencioso.
+        pass
+
     # Flag visible: hay token configurado en este entorno? Permite al panel
     # decir "AudD no configurado" en vez de un 0% misterioso si Render no
     # tiene la env var.
@@ -721,5 +763,35 @@ async def telemetry(request: Request):
                 None if engine_total else
                 "Sin tracks con engine_source seteado (pre-instrumentacion)."
             ),
+        },
+        # "fingerprints" informa la decision de invertir en Hamming distance
+        # (item 9 PENDING). collision_extra_rows > 0 significa que el dedup
+        # actual exact-match esta dejando entrar tracks duplicados — si
+        # esa cifra crece, vale la pena el threshold de Hamming.
+        "fingerprints": {
+            "total_tracks": fp_stats.get('total_tracks', 0),
+            "with_fingerprint": fp_stats.get('with_fingerprint', 0),
+            "without_fingerprint": fp_stats.get('without_fingerprint', 0),
+            "unique_fingerprints": fp_stats.get('unique_fingerprints', 0),
+            "collision_groups": fp_stats.get('collision_groups', 0),
+            "collision_extra_rows": fp_stats.get('collision_extra_rows', 0),
+            "coverage_pct": (
+                round(fp_stats.get('with_fingerprint', 0) / fp_stats.get('total_tracks', 1), 3)
+                if fp_stats.get('total_tracks', 0) > 0 else None
+            ),
+        },
+        # "client_errors_24h": contadores por context para que el panel pinte
+        # un health-check rapido. _unhandled = errores no manejados (middleware
+        # global). El resto son contexts que reporto Flutter via /client-error.
+        "client_errors_24h": client_errors_24h,
+        # "sources": breakdown de bpm/key/genre/track_type sources en la BD.
+        # Permite calcular % "fiable" en el cliente sin enviar datos pesados.
+        "sources": sources_breakdown,
+        # "users": numero total + dispositivos por plataforma. Privacidad:
+        # solo conteos agregados, jamas device_ids.
+        "users": {
+            "total_users": total_users,
+            "total_devices": total_devices,
+            "platforms": platforms,
         },
     }
