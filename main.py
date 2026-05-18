@@ -3872,7 +3872,7 @@ async def upload_preview(track_id: str, file: UploadFile = File(...)):
 async def root():
     return {
         "name": "DJ Analyzer Pro API",
-        "version": "2.3.0",
+        "version": "2.9.0",
         "status": "running",
         "modules": {
             "artwork": ARTWORK_ENABLED,
