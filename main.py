@@ -117,6 +117,16 @@ CHUNK_ANALYSIS_THRESHOLD = 240  # 4 minutos
 
 RENDER_BACKEND_URL = os.environ.get('RENDER_BACKEND_URL', 'https://dj-analyzer-api.onrender.com')
 
+# ==================== RANKING DE FUENTES (item 8: "mejor gana") ====================
+# Logica de prioridad de bpm_source extraida a analysis_ranking.py para
+# que sea testeable sin importar la app entera (librosa pesado).
+from analysis_ranking import (
+    ANALYSIS_SOURCE_PRIORITY,
+    get_source_priority,
+    should_overwrite_analysis,
+)
+
+
 def _upload_to_render_cache(track_data: dict):
     """
     Sube resultado de análisis local a Render como cache comunitario.
@@ -2045,18 +2055,27 @@ async def analyze_track(
                     logger.info(
                         f"[Render fallback] Hit {fingerprint[:8]}... — "
                         f"{render_cached.get('artist', '?')} - "
-                        f"{render_cached.get('title', '?')}"
+                        f"{render_cached.get('title', '?')} "
+                        f"(source={render_cached.get('bpm_source', '?')})"
                     )
                     # Guardar local con el filename actual (para futuras
                     # busquedas por filename) y devolver sin invocar librosa.
+                    # No sobreescribir un analisis local si el de Render es
+                    # de fuente peor (ranking "mejor gana", item 8).
                     try:
-                        to_save = dict(render_cached)
-                        to_save['filename'] = file.filename
-                        to_save['fingerprint'] = fingerprint
-                        to_save['id'] = fingerprint
-                        if 'analysis_json' not in to_save:
-                            to_save['analysis_json'] = json.dumps(render_cached)
-                        db.save_track(to_save)
+                        if not should_overwrite_analysis(existing_by_fp, render_cached):
+                            logger.info(
+                                f"[Render fallback] local existente es mejor, "
+                                f"no se machaca con Render"
+                            )
+                        else:
+                            to_save = dict(render_cached)
+                            to_save['filename'] = file.filename
+                            to_save['fingerprint'] = fingerprint
+                            to_save['id'] = fingerprint
+                            if 'analysis_json' not in to_save:
+                                to_save['analysis_json'] = json.dumps(render_cached)
+                            db.save_track(to_save)
                     except Exception as e:
                         logger.warning(f"[Render fallback] save_track fallo: {e}")
                     if os.path.exists(tmp_path):
@@ -2985,22 +3004,26 @@ async def cache_analysis(request: Request):
     if not fingerprint:
         raise HTTPException(400, "fingerprint requerido")
 
-    # No sobreescribir si ya existe con análisis completo. El método
-    # correcto es `get_track_by_fingerprint` — `db.get_track` nunca
-    # existió y rompía el endpoint con 500 cuando el motor local
-    # intentaba subir el resultado a Render.
+    # Ranking "mejor gana": comparamos bpm_source nuevo vs existente y
+    # solo sobreescribimos si la nueva fuente tiene mayor prioridad (o
+    # empate con existente vacio). Ver ANALYSIS_SOURCE_PRIORITY arriba.
     existing = db.get_track_by_fingerprint(fingerprint)
-    if existing:
-        existing_json = existing.get('analysis_json')
-        if existing_json:
-            try:
-                ej = json.loads(existing_json) if isinstance(existing_json, str) else existing_json
-                # Si el existente tiene BPM real (no 0, no pending), no sobreescribir
-                if ej.get('bpm', 0) > 0 and ej.get('bpm_source') != 'pending':
-                    logger.info(f"[Cache] {fingerprint[:12]} ya existe con análisis completo, skip")
-                    return {"status": "exists", "fingerprint": fingerprint}
-            except (json.JSONDecodeError, TypeError):
-                pass
+    if existing and not should_overwrite_analysis(existing, data):
+        existing_source = '?'
+        try:
+            ej_raw = existing.get('analysis_json')
+            if ej_raw:
+                ej = json.loads(ej_raw) if isinstance(ej_raw, str) else ej_raw
+                existing_source = ej.get('bpm_source', '?')
+        except (json.JSONDecodeError, TypeError):
+            pass
+        logger.info(
+            f"[Cache] {fingerprint[:12]} skip (existente={existing_source} "
+            f"prio={get_source_priority(existing_source)} "
+            f">= nuevo={data.get('bpm_source', '?')} "
+            f"prio={get_source_priority(data.get('bpm_source'))})"
+        )
+        return {"status": "exists", "fingerprint": fingerprint}
 
     # Construir datos para guardar
     track_data = {
@@ -3112,7 +3135,9 @@ async def get_analysis_by_fingerprint(fingerprint: str):
             return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             pass
-    # Fallback: construir desde columnas
+    # Fallback: construir desde columnas. Incluir *_source para que el
+    # cliente sepa si vale la pena sobreescribir su analisis local (ranking
+    # "mejor gana" en sync comunitario, item 8).
     return {
         "id": existing.get('id'),
         "filename": existing.get('filename'),
@@ -3126,6 +3151,10 @@ async def get_analysis_by_fingerprint(fingerprint: str):
         "genre": existing.get('genre'),
         "track_type": existing.get('track_type'),
         "fingerprint": existing.get('fingerprint'),
+        "bpm_source": existing.get('bpm_source'),
+        "key_source": existing.get('key_source'),
+        "genre_source": existing.get('genre_source'),
+        "engine_source": existing.get('engine_source'),
     }
 
 

@@ -444,6 +444,27 @@ class TestCheckAnalyzedByFingerprintEndpoint:
 
 
 # ============================================================================
+# RANKING DE FUENTES — endpoint test (logica pura en test_ranking.py)
+# ============================================================================
+
+class TestCacheAnalysisRanking:
+    """Endpoint POST /cache-analysis aplica el ranking. Tests minimos para
+    verificar que la guard previa devuelve 400 si falta fingerprint."""
+
+    def test_missing_fingerprint_returns_400(self, client):
+        response = client.post("/cache-analysis", json={"bpm": 128})
+        assert response.status_code == 400
+
+    def test_invalid_json_returns_400(self, client):
+        response = client.post(
+            "/cache-analysis",
+            data="not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 400
+
+
+# ============================================================================
 # RUN
 # ============================================================================
 
