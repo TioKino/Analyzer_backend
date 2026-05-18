@@ -7,7 +7,10 @@ pytest-asyncio>=0.21.0
 pytest-cov>=4.0.0
 
 # HTTP client para tests
-httpx>=0.24.0
+# Cap superior obligatorio: httpx 0.28+ elimino el kwarg `app=` de
+# Client.__init__, lo que rompe Starlette TestClient en las versiones
+# que vienen con FastAPI 0.109 (requirements-minimal.txt).
+httpx>=0.24.0,<0.28
 
 # Mocking
 pytest-mock>=3.10.0
