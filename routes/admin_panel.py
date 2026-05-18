@@ -75,6 +75,101 @@ def _parse_analysis_payload(payload_str: str) -> dict:
     return {}
 
 
+def _compute_telemetry_from_sync(conn) -> dict:
+    """Itera sync_items WHERE data_type='analysis' UNA sola vez y devuelve
+    fingerprint_stats + sources_breakdown + total_users + platforms.
+
+    Justificacion: los tracks "reales" de los usuarios viven en sync.db
+    (payload de sync_items), NO en analysis.db. La BD de analysis solo
+    se llena cuando un cliente analiza directamente contra /analyze de
+    Render — pero la mayoria usa motor local y solo sincroniza. Por eso
+    las metricas tienen que mirar aqui para reflejar la realidad.
+
+    Tolerante a payloads camelCase (cliente Flutter via cloud_sync) y
+    snake_case (re-uploads desde local_engine).
+    """
+    fp_total = 0
+    fp_with = 0
+    fp_seen: dict[str, int] = {}  # fingerprint -> count para detectar colisiones
+    sources = {
+        'bpm': {},
+        'key': {},
+        'genre': {},
+        'track_type': {},
+    }
+
+    def _get(track: dict, *keys: str):
+        """Devuelve el primer valor truthy entre las keys dadas."""
+        for k in keys:
+            v = track.get(k)
+            if v not in (None, '', 0):
+                return v
+        return None
+
+    def _bump(bucket: dict, key, value):
+        if value is None or value == '':
+            value = 'unknown'
+        bucket[str(value)] = bucket.get(str(value), 0) + 1
+
+    # Devices distintos vistos en sync_items + sus device_types.
+    distinct_devices: set[str] = set()
+    device_types: dict[str, str] = {}  # device_id -> device_type (ultimo visto)
+
+    rows = conn.execute(
+        "SELECT last_device_id, device_type, payload FROM sync_items "
+        "WHERE data_type = 'analysis'"
+    ).fetchall()
+    for row in rows:
+        did = row["last_device_id"]
+        if did:
+            distinct_devices.add(did)
+            dt = row["device_type"]
+            if dt:
+                device_types[did] = dt
+
+        tracks = _parse_analysis_payload(row["payload"])
+        for t in tracks.values():
+            if not isinstance(t, dict):
+                continue
+            fp_total += 1
+
+            fp = _get(t, 'fingerprint')
+            if fp:
+                fp_with += 1
+                fp_seen[str(fp)] = fp_seen.get(str(fp), 0) + 1
+
+            _bump(sources['bpm'], None, _get(t, 'bpm_source', 'bpmSource'))
+            _bump(sources['key'], None, _get(t, 'key_source', 'keySource'))
+            _bump(sources['genre'], None, _get(t, 'genre_source', 'genreSource'))
+            _bump(sources['track_type'], None,
+                  _get(t, 'track_type_source', 'trackTypeSource'))
+
+    # Colisiones: cuantos fingerprints aparecen >1 vez y cuantas filas extra
+    # aportan en total.
+    collision_groups = sum(1 for n in fp_seen.values() if n > 1)
+    collision_extras = sum((n - 1) for n in fp_seen.values() if n > 1)
+
+    # Platforms: contamos por device_type observado en sync_items.
+    platforms: dict[str, int] = {}
+    for dt in device_types.values():
+        key = (dt or 'unknown').lower()
+        platforms[key] = platforms.get(key, 0) + 1
+
+    return {
+        'fingerprints': {
+            'total_tracks': fp_total,
+            'with_fingerprint': fp_with,
+            'without_fingerprint': fp_total - fp_with,
+            'unique_fingerprints': len(fp_seen),
+            'collision_groups': collision_groups,
+            'collision_extra_rows': collision_extras,
+        },
+        'sources': sources,
+        'total_users': len(distinct_devices),
+        'platforms': platforms,
+    }
+
+
 def _parse_session_payload(payload_str: str) -> list:
     """Parse a session payload, returning the sessions list."""
     try:
@@ -674,47 +769,41 @@ async def telemetry(request: Request):
     engine_local = engine_counts.get('local_engine', 0)
     engine_total = engine_render + engine_local
 
-    # 5) Fingerprint stats: cobertura y colisiones (informa decision Hamming).
-    fp_stats = db.get_fingerprint_stats()
+    # 5/7/8) Fingerprints + sources + usuarios/plataformas: TODO sale de
+    # sync.db, no de analysis.db. La razon: los usuarios analizan en
+    # local_engine y suben el resultado via /sync; analysis.db solo se
+    # llena cuando alguien analiza directamente contra Render, que es
+    # un caso minoritario. _compute_telemetry_from_sync hace UNA pasada
+    # sobre sync_items y deriva todas las metricas a la vez.
+    sync_telemetry = {}
+    try:
+        sconn2 = _get_sync_conn()
+        try:
+            sync_telemetry = _compute_telemetry_from_sync(sconn2)
+        finally:
+            sconn2.close()
+    except sqlite3.OperationalError:
+        sync_telemetry = {
+            'fingerprints': {
+                'total_tracks': 0, 'with_fingerprint': 0,
+                'without_fingerprint': 0, 'unique_fingerprints': 0,
+                'collision_groups': 0, 'collision_extra_rows': 0,
+            },
+            'sources': {'bpm': {}, 'key': {}, 'genre': {}, 'track_type': {}},
+            'total_users': 0,
+            'platforms': {},
+        }
+    fp_stats = sync_telemetry['fingerprints']
+    sources_breakdown = sync_telemetry['sources']
+    total_users = sync_telemetry['total_users']
+    platforms = sync_telemetry['platforms']
+    # total_devices = usuarios distintos vistos en sync (mismo dato que
+    # total_users porque por ahora cada device es un user). En el futuro,
+    # cuando se introduzca user_id agrupando varios devices, separar.
+    total_devices = sum(platforms.values()) if platforms else total_users
 
     # 6) Errores del cliente / no manejados en las ultimas 24h.
     client_errors_24h = db.count_client_errors_by_context(since_hours=24)
-
-    # 7) Breakdown de sources del analisis (bpm / key / genre / track_type).
-    # Permite ver de un vistazo que % de la BD viene de Rekordbox/Traktor,
-    # consensus comunitario, motor local, ID3 o analisis espectral. Es la
-    # senal mas honesta de "calidad" de la cache colectiva.
-    sources_breakdown = db.count_analysis_sources()
-
-    # 8) Usuarios + dispositivos por plataforma. user_devices.device_type
-    # ya guarda windows/macos/ios/android/linux desde el cliente. Aqui
-    # solo agregamos. Si un device no esta vinculado a un usuario aun
-    # (caso raro, registro previo a vinculacion), aparece en counts pero
-    # no en total_users.
-    total_users = 0
-    total_devices = 0
-    platforms: Dict[str, int] = {}
-    try:
-        sconn = _get_sync_conn()
-        try:
-            r = sconn.execute(
-                "SELECT COUNT(DISTINCT user_id) AS n FROM user_devices "
-                "WHERE user_id IS NOT NULL"
-            ).fetchone()
-            total_users = int(r["n"]) if r else 0
-            r = sconn.execute("SELECT COUNT(*) AS n FROM user_devices").fetchone()
-            total_devices = int(r["n"]) if r else 0
-            rows = sconn.execute(
-                "SELECT COALESCE(device_type, 'unknown') AS dt, COUNT(*) AS n "
-                "FROM user_devices GROUP BY dt"
-            ).fetchall()
-            for row in rows:
-                platforms[str(row["dt"])] = int(row["n"])
-        finally:
-            sconn.close()
-    except sqlite3.OperationalError:
-        # Tabla user_devices no existe (BD muy temprana). Skip silencioso.
-        pass
 
     # Flag visible: hay token configurado en este entorno? Permite al panel
     # decir "AudD no configurado" en vez de un 0% misterioso si Render no
