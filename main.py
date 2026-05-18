@@ -1079,8 +1079,23 @@ def generate_preview_snippet(
             os.unlink(output_path)
         return None
     except subprocess.CalledProcessError as e:
-        stderr_msg = e.stderr.decode('utf-8', errors='replace')[:200] if e.stderr else 'unknown'
-        logger.error(f"  [Preview] ffmpeg error: {stderr_msg}")
+        # stderr[:200] solo recoge el banner "ffmpeg version 5.1.8..." y
+        # disparaba alertas falsas. Filtramos lineas que parecen error real
+        # o caemos al tail. Mismo patron que preview_generator.py y
+        # _preprocess_audio_for_recognition.
+        stderr_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
+        err_lines = [
+            ln for ln in stderr_msg.splitlines()
+            if ln and (
+                ln.lower().startswith('error')
+                or 'invalid' in ln.lower()
+                or 'no such file' in ln.lower()
+                or 'permission denied' in ln.lower()
+                or 'failed' in ln.lower()
+            )
+        ]
+        real_err = ' | '.join(err_lines[-3:])[:400] if err_lines else stderr_msg[-400:].strip() or 'unknown'
+        logger.error(f"  [Preview] ffmpeg exit {e.returncode}: {real_err}")
         if os.path.exists(output_path):
             os.unlink(output_path)
         return None
@@ -1349,8 +1364,11 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
             else:
                 logger.info(f" Discogs: No encontrado")
         except Exception as e:
-            logger.error(f" Error Discogs: {e}")
-        
+            # 404/JSON-empty/timeout son respuestas esperadas de un servicio
+            # externo, no bugs nuestros. Tenemos fallback a MusicBrainz/ID3.
+            # Warning evita disparar alertas de error en el panel admin.
+            logger.warning(f" Discogs no disponible ({type(e).__name__}): {e}")
+
         # 2. Si no hay Discogs, intentar MusicBrainz
         if genre_source not in ["discogs"]:
             try:
@@ -1360,7 +1378,7 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                     genre_source = "musicbrainz"
                     logger.info(f"   MusicBrainz: {genre}")
             except Exception as e:
-                logger.error(f" Error MusicBrainz: {e}")
+                logger.warning(f" MusicBrainz no disponible ({type(e).__name__}): {e}")
     
     # 3. Si no hay Discogs ni MusicBrainz, usar ID3 (gen(c)rico pero mejor que nada)
     if genre_source == "spectral_analysis" and id3_genre:
@@ -1432,7 +1450,9 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                             if not year and discogs_result.get('year'):
                                 year = str(discogs_result['year'])
                     except Exception as e:
-                        logger.error(f"  [AudD-auto] re-run Discogs error: {e}")
+                        # Mismo criterio que la cascada principal: fallo de
+                        # servicio externo es warning, no error.
+                        logger.warning(f"  [AudD-auto] re-run Discogs ({type(e).__name__}): {e}")
                     if genre_source in ('spectral_analysis', 'chunked_analysis'):
                         try:
                             mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
@@ -1440,9 +1460,9 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                                 genre = mb_result['genre']
                                 genre_source = 'musicbrainz'
                         except Exception as e:
-                            logger.error(f"  [AudD-auto] re-run MusicBrainz error: {e}")
+                            logger.warning(f"  [AudD-auto] re-run MusicBrainz ({type(e).__name__}): {e}")
         except Exception as e:
-            logger.error(f"  [AudD-auto] error: {e}")
+            logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
 
     drop_time = find_drop_timestamp(y, sr, segments)
     
@@ -1798,7 +1818,9 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
                             if not year and discogs_result.get('year'):
                                 year = str(discogs_result['year'])
                     except Exception as e:
-                        logger.error(f"  [AudD-auto] re-run Discogs error: {e}")
+                        # Mismo criterio que la cascada principal: fallo de
+                        # servicio externo es warning, no error.
+                        logger.warning(f"  [AudD-auto] re-run Discogs ({type(e).__name__}): {e}")
                     if genre_source in ('spectral_analysis', 'chunked_analysis'):
                         try:
                             mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
@@ -1806,9 +1828,9 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
                                 genre = mb_result['genre']
                                 genre_source = 'musicbrainz'
                         except Exception as e:
-                            logger.error(f"  [AudD-auto] re-run MusicBrainz error: {e}")
+                            logger.warning(f"  [AudD-auto] re-run MusicBrainz ({type(e).__name__}): {e}")
         except Exception as e:
-            logger.error(f"  [AudD-auto] error: {e}")
+            logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
 
     # ==================== ARTWORK ====================
     artwork_embedded = False
@@ -2360,7 +2382,15 @@ async def analyze_track(
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
-        logger.error(f"ERROR en anlisis de audio:\n{error_detail}")
+        # exc_info=True asegura que handlers que descartan \n en el message
+        # (uvicorn default formatter) sigan recibiendo el traceback via el
+        # campo exc_info del LogRecord. Sin esto, en Render solo veiamos
+        # "ERROR en anlisis de audio:" sin contexto. Ademas pasamos el
+        # tipo y mensaje en el header del log para verlo de un vistazo.
+        logger.error(
+            f"ERROR en anlisis de audio: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
 
         # Telemetria privacy-first: registra el error en analysis_errors
         # para que el panel admin lo muestre. Filename se hashea dentro

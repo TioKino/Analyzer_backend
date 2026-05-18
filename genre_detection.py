@@ -141,6 +141,15 @@ class GenreDetector:
             # no es bug nuestro y para el que ya tenemos fallback a MB.
             logger.warning(f"Discogs no disponible para '{artist} - {title}': {type(e).__name__}: {e}")
             return None
+        except Exception as e:
+            # Red de seguridad: cualquier excepcion no anticipada (cambios
+            # internos del SDK, TimeoutError nativo, etc) tambien debe
+            # caer aqui para que main.py:cascade_genres no la propague
+            # como ERROR. Verificado contra discogs_client 2.3.0 donde
+            # HTTPError esta en _DISCOGS_EXCS, pero la libreria podria
+            # introducir clases nuevas en versiones futuras.
+            logger.warning(f"Discogs error inesperado para '{artist} - {title}': {type(e).__name__}: {e}")
+            return None
 
     def get_musicbrainz_info(self, artist: str, title: str) -> Optional[dict]:
         """Obtener info de MusicBrainz con timeout y retry."""

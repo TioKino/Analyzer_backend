@@ -664,23 +664,37 @@ async def errors_grouped(request: Request, resolved: Optional[int] = None):
     return {"groups": groups, "total": len(groups)}
 
 
-@admin_panel_router.post("/errors/{error_id}/resolve")
-async def resolve_error(error_id: int, request: Request):
-    await _verify_admin_secret(request)
-    new_state = _get_db().toggle_error_resolved(error_id)
-    return {"id": error_id, "resolved": new_state}
-
-
+# Orden importante: /errors/group/resolve va ANTES que /errors/{error_id}/resolve.
+# FastAPI usa first-match routing, asi que con el orden inverso un POST a
+# /errors/group/resolve matcheaba la ruta {error_id} con error_id="group",
+# fallaba int_parsing y devolvia 422 sin nunca llegar a este handler.
+# Era el origen de los 422 que aparecen en el log del panel admin.
 @admin_panel_router.post("/errors/group/resolve")
 async def resolve_error_group_endpoint(request: Request):
     await _verify_admin_secret(request)
-    body = await request.json()
+    # await request.json() lanza JSONDecodeError -> FastAPI lo convierte a
+    # 422 sin contexto util. Cliente real envia application/json valido,
+    # pero el panel a veces hace POST vacio (botones doble click, sondas).
+    # Devolvemos 400 con mensaje explicito en lugar del 422 generico.
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(400, "Body debe ser JSON valido")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Body debe ser un objeto JSON")
     error_class = body.get("error_class", "")
     msg_short = body.get("msg_short", "")
     if not error_class or not msg_short:
         raise HTTPException(400, "error_class y msg_short requeridos")
     n = _get_db().resolve_error_group(error_class, msg_short)
     return {"resolved": n}
+
+
+@admin_panel_router.post("/errors/{error_id}/resolve")
+async def resolve_error(error_id: int, request: Request):
+    await _verify_admin_secret(request)
+    new_state = _get_db().toggle_error_resolved(error_id)
+    return {"id": error_id, "resolved": new_state}
 
 
 # ── GET /admin/telemetry ────────────────────────────────────

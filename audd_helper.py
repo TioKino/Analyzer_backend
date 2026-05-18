@@ -205,7 +205,10 @@ def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dic
         return track
 
     except (ImportError, OSError, requests.RequestException, ValueError) as e:
-        logger.error(f"[AudD-auto] error: {e}")
+        # Timeouts y errores de red contra api.audd.io son esperados (servicio
+        # externo, no bug nuestro). Mantenemos el log para diagnostico pero
+        # como warning para no disparar alertas en el panel admin.
+        logger.warning(f"[AudD-auto] {type(e).__name__}: {e}")
         return None
     finally:
         if fragment_path and os.path.exists(fragment_path):
