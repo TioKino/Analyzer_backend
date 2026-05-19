@@ -910,3 +910,139 @@ async def telemetry(request: Request):
             "platforms": platforms,
         },
     }
+
+
+# ── GET /admin/disk-usage ──────────────────────────────────
+# Breakdown del disco persistente /data/ en Render: tamano de cada BD,
+# count y tamano de previews/, count y tamano de artwork_cache/, total
+# usado vs libre. Util para diagnosticar uso de HDD persistente sin SSH.
+
+def _du_path(path: str) -> dict:
+    """Devuelve {'bytes': total_size, 'files': file_count} para un path
+    (archivo o directorio). Si no existe, ceros."""
+    if not os.path.exists(path):
+        return {'bytes': 0, 'files': 0, 'exists': False}
+    if os.path.isfile(path):
+        return {'bytes': os.path.getsize(path), 'files': 1, 'exists': True}
+    total_bytes = 0
+    total_files = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    total_bytes += os.path.getsize(fp)
+                    total_files += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return {'bytes': total_bytes, 'files': total_files, 'exists': True}
+
+
+def _fmt_mb(b: int) -> float:
+    return round(b / (1024 * 1024), 1)
+
+
+@admin_panel_router.get("/disk-usage")
+async def disk_usage(request: Request):
+    """Reporta uso del disco persistente /data/ con breakdown por
+    subdirectorio. Privacy-first: solo tamanos y conteos, jamas nombres
+    de archivos o contenido. Util para diagnosticar:
+    - Si artwork_cache esta vacio (problema de upload) o lleno.
+    - Si los previews crecen segun esperado.
+    - Cuanto pesan las dos SQLite (analysis.db, sync.db).
+    - Espacio libre restante del disco persistente.
+    """
+    await _verify_admin_secret(request)
+
+    # Paths principales. Usar los mismos que la app: importados de config.
+    analysis_db_path = os.environ.get(
+        'DATABASE_PATH',
+        os.environ.get('ANALYSIS_DB_PATH', '/data/analysis.db'),
+    )
+    sync_db_path = _SYNC_DB_PATH
+
+    breakdown = {
+        'analysis_db': _du_path(analysis_db_path),
+        'sync_db': _du_path(sync_db_path),
+        'previews': _du_path(_PREVIEWS_DIR),
+        'artwork_cache': _du_path(_ARTWORK_CACHE_DIR),
+    }
+
+    # Listar contenido top-level de /data/ para detectar archivos huerfanos
+    # (logs, .tmp, backups inesperados). Solo nombres y tamanos.
+    data_root_contents = []
+    data_root = '/data'
+    if os.path.isdir(data_root):
+        try:
+            for entry in sorted(os.listdir(data_root)):
+                full = os.path.join(data_root, entry)
+                if os.path.isdir(full):
+                    info = _du_path(full)
+                    data_root_contents.append({
+                        'name': entry + '/',
+                        'kind': 'dir',
+                        'mb': _fmt_mb(info['bytes']),
+                        'files': info['files'],
+                    })
+                else:
+                    try:
+                        sz = os.path.getsize(full)
+                    except OSError:
+                        sz = 0
+                    data_root_contents.append({
+                        'name': entry,
+                        'kind': 'file',
+                        'mb': _fmt_mb(sz),
+                        'files': 1,
+                    })
+        except OSError:
+            pass
+
+    # Disco completo del FS donde vive /data/
+    free_mb = 0
+    total_mb = 0
+    used_mb = 0
+    try:
+        import shutil as _sh
+        du = _sh.disk_usage('/data' if os.path.isdir('/data') else '/')
+        total_mb = _fmt_mb(du.total)
+        used_mb = _fmt_mb(du.used)
+        free_mb = _fmt_mb(du.free)
+    except OSError:
+        pass
+
+    return {
+        'totals': {
+            'disk_total_mb': total_mb,
+            'disk_used_mb': used_mb,
+            'disk_free_mb': free_mb,
+            'used_pct': round(used_mb / total_mb * 100, 1) if total_mb else None,
+        },
+        'breakdown': {
+            'analysis_db_mb': _fmt_mb(breakdown['analysis_db']['bytes']),
+            'sync_db_mb': _fmt_mb(breakdown['sync_db']['bytes']),
+            'previews': {
+                'mb': _fmt_mb(breakdown['previews']['bytes']),
+                'files': breakdown['previews']['files'],
+                'avg_kb': round(
+                    breakdown['previews']['bytes'] / breakdown['previews']['files'] / 1024, 1
+                ) if breakdown['previews']['files'] else None,
+                'path': _PREVIEWS_DIR,
+            },
+            'artwork_cache': {
+                'mb': _fmt_mb(breakdown['artwork_cache']['bytes']),
+                'files': breakdown['artwork_cache']['files'],
+                'avg_kb': round(
+                    breakdown['artwork_cache']['bytes'] / breakdown['artwork_cache']['files'] / 1024, 1
+                ) if breakdown['artwork_cache']['files'] else None,
+                'path': _ARTWORK_CACHE_DIR,
+            },
+        },
+        # data_root_contents: lista top-level de /data/ para detectar
+        # cualquier cosa fuera de los 4 esperados (analysis.db, sync.db,
+        # previews/, artwork_cache/). Si aparecen .log, .tmp, backups o
+        # algo raro -> alerta.
+        'data_root_contents': data_root_contents,
+    }
