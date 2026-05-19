@@ -1260,6 +1260,13 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         energy_dj = 1
     elif energy_raw >= 0.42:
         energy_dj = 10
+    elif not math.isfinite(energy_raw):
+        # NaN/Inf: el RMS puede salir NaN con audios muy cortos, silencio
+        # total o frames problematicos. Sin esta guard, int(NaN) explota
+        # con ValueError 'cannot convert float NaN to integer' (era el
+        # error #1 mas frecuente en el panel admin, 112 ocurrencias).
+        energy_dj = 5
+        logger.warning(f"   Energia: energy_raw={energy_raw} NaN/Inf, fallback a 5")
     else:
         normalized = (energy_raw - 0.02) / (0.42 - 0.02)
         powered = normalized ** 0.55  # expande rango bajo-medio
@@ -2725,6 +2732,11 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
                 energy_dj = 1
             elif avg_rms >= 0.42:
                 energy_dj = 10
+            elif not math.isfinite(avg_rms):
+                # Mismo guard NaN/Inf que en analyze_audio (linea 1266).
+                # Defensivo aqui aunque el except externo ya lo come — asi
+                # no perdemos el track al fallback de BD colectiva.
+                energy_dj = 5
             else:
                 normalized = (avg_rms - 0.02) / (0.42 - 0.02)
                 powered = normalized ** 0.55
