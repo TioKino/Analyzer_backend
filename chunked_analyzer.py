@@ -112,16 +112,46 @@ class ChunkedAudioAnalyzer:
             duration: Duración del chunk en segundos
 
         Returns:
-            Tuple de (audio_array, sample_rate)
+            Tuple de (audio_array, sample_rate). Devuelve array vacio +
+            self.sr si start_time supera el audio o duration<=0 — evita
+            que soundfile.read pida frames negativos y explote con
+            'negative dimensions are not allowed' (era el error #2 del
+            panel admin).
         """
-        with silence_native_stderr():
-            y, sr = librosa.load(
-                file_path,
-                sr=self.sr,
-                mono=True,
-                offset=start_time,
-                duration=duration
+        # Guard contra dimensiones negativas: si start_time o duration
+        # son raros (audio corrupto, chunking mal calculado, etc.) NO
+        # delegamos a librosa porque acaba en np.empty(shape_neg).
+        if duration is None or duration <= 0 or not math.isfinite(duration):
+            logger.warning(
+                f"[ChunkedAnalyzer] load_chunk skip — duration={duration} "
+                f"start_time={start_time} file={file_path}"
             )
+            return np.zeros(0, dtype=np.float32), self.sr
+        if start_time is None or start_time < 0 or not math.isfinite(start_time):
+            logger.warning(
+                f"[ChunkedAnalyzer] load_chunk skip — start_time={start_time} "
+                f"file={file_path}"
+            )
+            return np.zeros(0, dtype=np.float32), self.sr
+        try:
+            with silence_native_stderr():
+                y, sr = librosa.load(
+                    file_path,
+                    sr=self.sr,
+                    mono=True,
+                    offset=start_time,
+                    duration=duration
+                )
+        except ValueError as e:
+            # Captura defensiva: el guard de arriba cubre los casos comunes,
+            # pero soundfile puede aun lanzar 'negative dimensions' en
+            # archivos con headers raros. En lugar de tirar el analisis
+            # entero, devolvemos chunk vacio y el caller decide.
+            logger.warning(
+                f"[ChunkedAnalyzer] librosa.load fallo — {type(e).__name__}: {e} "
+                f"start={start_time} dur={duration} file={file_path}"
+            )
+            return np.zeros(0, dtype=np.float32), self.sr
         return y, sr
     
     def analyze_chunk_bpm(self, y: np.ndarray, sr: int) -> Dict:
@@ -769,7 +799,17 @@ class ChunkedAudioAnalyzer:
             
             # Cargar chunk
             y, sr = self.load_chunk(file_path, start_time, chunk_duration)
-            
+
+            # Si load_chunk devolvio array vacio (caso edge: start_time
+            # mas alla del audio, duration<=0, o soundfile fallo), saltar
+            # el chunk en lugar de pasarlo a los analyzers que petarian
+            # con array de longitud 0.
+            if y is None or len(y) == 0:
+                logger.warning(
+                    f"Chunk {i+1}/{num_chunks} vacio (start={start_time:.1f}s) — skip"
+                )
+                continue
+
             # Analizar chunk
             bpm_result = self.analyze_chunk_bpm(y, sr)
             key_result = self.analyze_chunk_key(y, sr)
