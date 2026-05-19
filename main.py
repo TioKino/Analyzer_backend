@@ -1488,62 +1488,87 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     artwork_embedded = False
     artwork_url = None
     artwork_source = None
-    
+
+    # ID3 grande (>=100KB) se acepta directo. Por debajo, comparamos con
+    # online y nos quedamos con el de mayor tamaño — mejor proxy de
+    # calidad sin parsear dimensiones de imagen. Esto cubre el caso real:
+    # ID3 default cutre (20-50KB, 300x300 borroso) cuando iTunes/Deezer
+    # tienen la version oficial 1200x1200 (>200KB).
+    ID3_TRUSTED_THRESHOLD = 100_000  # 100 KB
+
     if ARTWORK_ENABLED and fingerprint:
         artwork_info = extract_artwork_from_file(file_path)
-        
-        # Verificar que el artwork sea vlido (mnimo 10KB para evitar corruptos/placeholders)
-        if artwork_info and artwork_info.get('size', 0) > 10000:
-            artwork_embedded = True
-            artwork_source = "id3"
-            # Guardar en cach(c)
-            saved_filename = save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
-            artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-            # Si somos local engine, push a Render para que otros devices
-            # puedan ver la portada vía sync (sin esto, móvil veía 404).
-            _push_artwork_async(fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename))
-            logger.info(f"   Artwork ID3: {artwork_info.get('size', 0)} bytes")
-        else:
-            # Fallback: buscar online (iTunes/Deezer)
-            if artwork_info:
-                logger.info(f" Artwork ID3 muy peque+/-o ({artwork_info.get('size', 0)} bytes), buscando online...")
-            else:
-                logger.info(f" Sin artwork ID3, buscando online...")
-            
+        id3_size = artwork_info.get('size', 0) if artwork_info else 0
+
+        # Decidir si pedir online: solo si ID3 no es claramente bueno
+        online_artwork = None
+        online_size = 0
+        if id3_size < ID3_TRUSTED_THRESHOLD:
             artist_name = id3_data.get('artist')
             title_name = id3_data.get('title')
             album_name = id3_data.get('album')
-            
-            try:
-                from artwork_and_cuepoints import search_artwork_online
-                online_artwork = search_artwork_online(artist_name, title_name, album_name)
-                
-                if online_artwork and online_artwork.get('data'):
-                    artwork_embedded = False  # No est embebido, viene de online
-                    artwork_source = online_artwork.get('source', 'online')
-                    saved_filename = save_artwork_to_cache(fingerprint, online_artwork['data'], online_artwork['mime_type'])
-                    artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-                    _push_artwork_async(fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename))
-                    logger.info(f"   Artwork {artwork_source}: {online_artwork.get('size', 0)} bytes")
-                else:
-                    logger.info(f" No se encontr artwork online")
-            except Exception as e:
-                logger.error(f" Error buscando artwork online: {e}")
-                # Telemetria: cuando las 3 APIs externas (iTunes/Deezer/Last.fm)
-                # peten en cascada, queremos ver la tasa en el panel.
+            if artist_name and title_name:
                 try:
-                    import traceback as _tb
-                    db.log_analysis_error(
-                        device_id=None,
-                        filename=None,
-                        fingerprint=fingerprint,
-                        error_class=type(e).__name__,
-                        error_msg=str(e),
-                        traceback_str=_tb.format_exc(),
-                        endpoint='artwork',
+                    from artwork_and_cuepoints import search_artwork_online
+                    online_artwork = search_artwork_online(
+                        artist_name, title_name, album_name
                     )
-                except Exception:
-                    pass
+                    online_size = online_artwork.get('size', 0) if online_artwork else 0
+                except Exception as e:
+                    logger.warning(f"   Artwork online fallo: {e}")
+                    try:
+                        import traceback as _tb
+                        db.log_analysis_error(
+                            device_id=None, filename=None, fingerprint=fingerprint,
+                            error_class=type(e).__name__, error_msg=str(e),
+                            traceback_str=_tb.format_exc(), endpoint='artwork',
+                        )
+                    except Exception:
+                        pass
+
+        # Elegir: ID3 si es grande (>=100KB) o si supera al online en tamaño.
+        # Online si es valido (>=10KB) y mayor que ID3. Sino, nada.
+        use_id3 = id3_size >= ID3_TRUSTED_THRESHOLD or (
+            id3_size > 10000 and id3_size >= online_size
+        )
+        use_online = (
+            online_artwork is not None
+            and online_size >= 10000
+            and online_size > id3_size
+        )
+
+        if use_id3 and artwork_info:
+            artwork_embedded = True
+            artwork_source = "id3"
+            saved_filename = save_artwork_to_cache(
+                fingerprint, artwork_info['data'], artwork_info['mime_type']
+            )
+            artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
+            _push_artwork_async(
+                fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename)
+            )
+            logger.info(
+                f"   Artwork ID3: {id3_size} bytes "
+                f"(online disponible: {online_size} bytes)"
+            )
+        elif use_online and online_artwork:
+            artwork_embedded = False
+            artwork_source = online_artwork.get('source', 'online')
+            saved_filename = save_artwork_to_cache(
+                fingerprint, online_artwork['data'], online_artwork['mime_type']
+            )
+            artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
+            _push_artwork_async(
+                fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename)
+            )
+            logger.info(
+                f"   Artwork {artwork_source}: {online_size} bytes "
+                f"(ID3 era: {id3_size} bytes)"
+            )
+        else:
+            logger.info(
+                f"   Sin artwork: ID3={id3_size}b, online={online_size}b"
+            )
 
     # ==================== TRACK TYPE: defaults + guards ====================
     track_type_source = 'waveform'
@@ -1840,30 +1865,60 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
             logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
 
     # ==================== ARTWORK ====================
+    # Misma logica que en el flow no-chunked (linea ~1487): ID3 grande
+    # (>=100KB) se acepta directo; por debajo, comparamos con online y
+    # nos quedamos con el de mayor tamaño.
     artwork_embedded = False
     artwork_url = None
-    
+    ID3_TRUSTED_THRESHOLD = 100_000
+
     if ARTWORK_ENABLED and fingerprint:
         artwork_info = extract_artwork_from_file(file_path)
-        
-        if artwork_info and artwork_info.get('size', 0) > 10000:
+        id3_size = artwork_info.get('size', 0) if artwork_info else 0
+
+        online_artwork = None
+        online_size = 0
+        if id3_size < ID3_TRUSTED_THRESHOLD and artist_name and title_name:
+            try:
+                online_artwork = search_artwork_online(
+                    artist_name, title_name, id3_data.get('album')
+                )
+                online_size = online_artwork.get('size', 0) if online_artwork else 0
+            except Exception as e:
+                logger.warning(f"   Artwork online fallo: {e}")
+
+        use_id3 = id3_size >= ID3_TRUSTED_THRESHOLD or (
+            id3_size > 10000 and id3_size >= online_size
+        )
+        use_online = (
+            online_artwork is not None
+            and online_size >= 10000
+            and online_size > id3_size
+        )
+
+        if use_id3 and artwork_info:
             artwork_embedded = True
-            saved_filename = save_artwork_to_cache(fingerprint, artwork_info['data'], artwork_info['mime_type'])
+            saved_filename = save_artwork_to_cache(
+                fingerprint, artwork_info['data'], artwork_info['mime_type']
+            )
             artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-            # Si somos local engine, push a Render para que otros devices
-            # puedan ver la portada vía sync (sin esto, móvil veía 404).
-            _push_artwork_async(fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename))
-            logger.info(f"   Artwork ID3: {artwork_info.get('size', 0)} bytes")
-        else:
-            if artist_name and title_name:
-                try:
-                    online_artwork = search_artwork_online(artist_name, title_name, id3_data.get('album'))
-                    if online_artwork and online_artwork.get('data'):
-                        save_artwork_to_cache(fingerprint, online_artwork['data'], online_artwork['mime_type'])
-                        artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-                        logger.info(f"   Artwork online: {online_artwork.get('size', 0)} bytes")
-                except Exception as e:
-                    logger.error(f"   Error artwork online: {e}")
+            _push_artwork_async(
+                fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename)
+            )
+            logger.info(
+                f"   Artwork ID3: {id3_size}b (online: {online_size}b)"
+            )
+        elif use_online and online_artwork:
+            saved_filename = save_artwork_to_cache(
+                fingerprint, online_artwork['data'], online_artwork['mime_type']
+            )
+            artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
+            _push_artwork_async(
+                fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename)
+            )
+            logger.info(
+                f"   Artwork online: {online_size}b (ID3: {id3_size}b)"
+            )
     
     # ==================== TRACK TYPE ====================
     track_type = result['track_type']
