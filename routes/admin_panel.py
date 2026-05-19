@@ -105,6 +105,15 @@ def _compute_telemetry_from_sync(conn) -> dict:
         'genre': {},
         'track_type': {},
     }
+    # Artwork breakdown: cuantos tracks tienen artwork conseguido via el
+    # flow de analisis (ID3 embedded, iTunes, Deezer, LastFM, Discogs).
+    # NO mide el cache server-side de /data/artwork_cache (eso es otra
+    # cosa). Esta metrica refleja la realidad del USUARIO: cuantos de sus
+    # tracks lograron artwork con cualquier fuente.
+    artwork_total = 0
+    artwork_embedded_count = 0
+    artwork_url_only_count = 0  # tiene URL pero no embedded (online)
+    artwork_sources: dict[str, int] = {}
 
     def _get(track: dict, *keys: str):
         """Devuelve el primer valor truthy entre las keys dadas."""
@@ -152,6 +161,24 @@ def _compute_telemetry_from_sync(conn) -> dict:
             _bump(sources['track_type'], None,
                   _get(t, 'track_type_source', 'trackTypeSource'))
 
+            # Artwork: cuenta tracks con cualquier fuente de artwork.
+            # Tolerante a shapes camelCase (cliente) y snake_case (backend).
+            art_url = _get(t, 'artwork_url', 'artworkUrl')
+            art_embed = bool(
+                t.get('artwork_embedded') or t.get('hasArtworkEmbedded')
+            )
+            art_source = _get(t, 'artwork_source', 'artworkSource')
+            if art_url or art_embed:
+                artwork_total += 1
+                if art_embed:
+                    artwork_embedded_count += 1
+                elif art_url:
+                    artwork_url_only_count += 1
+                # Determinar fuente: si declara art_source la usamos, sino
+                # inferimos 'id3' para embedded y 'unknown' para URL suelta.
+                src = art_source or ('id3' if art_embed else 'unknown')
+                artwork_sources[str(src)] = artwork_sources.get(str(src), 0) + 1
+
     # Colisiones: cuantos fingerprints aparecen >1 vez y cuantas filas extra
     # aportan en total.
     collision_groups = sum(1 for n in fp_seen.values() if n > 1)
@@ -175,6 +202,14 @@ def _compute_telemetry_from_sync(conn) -> dict:
         'sources': sources,
         'total_users': len(distinct_devices),
         'platforms': platforms,
+        'artwork_coverage': {
+            'total_tracks': fp_total,
+            'with_artwork': artwork_total,
+            'with_artwork_embedded': artwork_embedded_count,
+            'with_artwork_url_only': artwork_url_only_count,
+            'rate': round(artwork_total / fp_total, 3) if fp_total else 0.0,
+            'sources': artwork_sources,
+        },
     }
 
 
@@ -823,6 +858,7 @@ async def telemetry(request: Request):
     sources_breakdown = sync_telemetry['sources']
     total_users = sync_telemetry['total_users']
     platforms = sync_telemetry['platforms']
+    artwork_coverage_real = sync_telemetry['artwork_coverage']
     # total_devices = usuarios distintos vistos en sync (mismo dato que
     # total_users porque por ahora cada device es un user). En el futuro,
     # cuando se introduzca user_id agrupando varios devices, separar.
@@ -909,6 +945,14 @@ async def telemetry(request: Request):
             "total_devices": total_devices,
             "platforms": platforms,
         },
+        # "artwork_real": cobertura de artwork conseguido por el flow de
+        # analisis (ID3 embedded + iTunes/Deezer/LastFM/Discogs en /analyze)
+        # leyendo los payloads de sync. NO es el cache server-side del HDD
+        # persistente (eso esta en coverage.with_artwork y siempre sera
+        # bajo porque solo se sube cuando el motor local lo decide). Esta
+        # metrica refleja "del total de tracks de los usuarios, cuantos
+        # tienen ALGUNA fuente de artwork".
+        "artwork_real": artwork_coverage_real,
     }
 
 
