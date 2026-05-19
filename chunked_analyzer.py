@@ -16,6 +16,7 @@ v1.0.0 - Implementación inicial
 """
 
 import logging
+import math
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 import warnings
@@ -870,7 +871,16 @@ class ChunkedAudioAnalyzer:
         }
     
     def _calculate_energy_dj(self, energy_raw: float) -> int:
-        """Convierte energia raw a escala DJ 1-10 con curva power 0.55."""
+        """Convierte energia raw a escala DJ 1-10 con curva power 0.55.
+
+        Guard NaN/Inf: si el RMS del chunked analyzer sale NaN (audio muy
+        corto, silencio total o frames problematicos), las comparaciones
+        <=0.02 y >=0.42 devuelven False y el `int(NaN)` explota con
+        ValueError. Era el error #1 del panel admin (112 ocurrencias)
+        antes del fix paralelo en main.py:1266.
+        """
+        if not math.isfinite(energy_raw):
+            return 5
         if energy_raw <= 0.02:
             return 1
         if energy_raw >= 0.42:
