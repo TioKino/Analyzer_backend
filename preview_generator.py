@@ -68,8 +68,16 @@ def generate_preview_snippet(
         ffmpeg_bin = os.environ.get('FFMPEG_BIN', 'ffmpeg')
         cmd = [
             ffmpeg_bin, '-y',
+            '-loglevel', 'error',
             '-ss', str(round(start, 2)),
             '-i', file_path,
+            # Descartar streams no-audio: artwork embebido (APIC corrupto en
+            # MP3s ripeados de fuentes raras), data streams, subtitulos. Sin
+            # esto ffmpeg intenta decodificar el artwork y aborta toda la
+            # conversion con "Error while decoding stream #0:1: Invalid data
+            # found... | Conversion failed!". Visto repetidamente en logs
+            # Render: el preview NUNCA se generaba para esos tracks.
+            '-vn', '-sn', '-dn',
             '-t', '6',
             '-ac', '1',
             '-ab', '64k',
