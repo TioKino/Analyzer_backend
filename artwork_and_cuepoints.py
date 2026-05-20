@@ -70,6 +70,8 @@ def search_artwork_online(artist: str, title: str, album: str = None) -> Optiona
 
 def _search_itunes(query: str) -> Optional[Dict]:
     """Buscar artwork en iTunes API"""
+    if not query:
+        return None
     try:
         from urllib.parse import quote
         url = f"https://itunes.apple.com/search?term={quote(query)}&media=music&limit=5"
@@ -101,6 +103,11 @@ def _search_itunes(query: str) -> Optional[Dict]:
 
 def _search_deezer(artist: str, title: str) -> Optional[Dict]:
     """Buscar artwork en Deezer API"""
+    # Defensive: el caller search_artwork_online() ya filtra None, pero
+    # estos helpers son publicos a nivel modulo y un crash aqui aborta
+    # todo el /analyze (TypeError "NoneType + str" visto en panel admin).
+    if not artist or not title:
+        return None
     try:
         from urllib.parse import quote
         # Intentar busqueda exacta primero
@@ -127,7 +134,7 @@ def _search_deezer(artist: str, title: str) -> Optional[Dict]:
                             }
         
         # Si no encuentra con busqueda exacta, intentar busqueda general
-        url = f"https://api.deezer.com/search?q={quote(artist + ' ' + title)}&limit=5"
+        url = f"https://api.deezer.com/search?q={quote(f'{artist} {title}')}&limit=5"
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             data = response.json()
@@ -158,6 +165,8 @@ def _search_spotify(artist: str, title: str) -> Optional[Dict]:
 
 def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
     """Buscar artwork en Last.fm"""
+    if not artist or not title:
+        return None
     try:
         from urllib.parse import quote
         
