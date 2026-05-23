@@ -2033,6 +2033,28 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         artwork_url=artwork_url,
     )    
 
+def _is_cached_analysis_valid(analysis_json: dict) -> bool:
+    """
+    Sanity check del payload `analysis_json` recuperado de la BD antes
+    de devolverlo como `AnalysisResult` desde el cache-hit.
+
+    Visto en produccion 2026-05-20: tracks con `analysis_json='{}'` o
+    con un payload anidado raro (`{"id": "...", "analysis_json": "{}"}`)
+    devolvian un dict sin los campos requeridos y `AnalysisResult(**d)`
+    petaba con `ValidationError` de 19 campos missing → 500 al user.
+
+    Validamos que estan los campos centrales del analisis. Si faltan,
+    el caller debe ignorar el cache-hit y caer al flujo de re-analisis
+    normal. Lista derivada de campos siempre presentes en un analisis
+    exitoso (bpm, key, duration son las metricas core; bpm_confidence
+    y key_confidence salieron en el ValidationError reportado).
+    """
+    if not isinstance(analysis_json, dict) or not analysis_json:
+        return False
+    required = ('bpm', 'key', 'duration', 'bpm_confidence', 'key_confidence')
+    return all(k in analysis_json for k in required)
+
+
 # ==================== ENDPOINTS PRINCIPALES ====================
 
 @app.post("/analyze", response_model=AnalysisResult)
@@ -2121,38 +2143,52 @@ async def analyze_track(
         if existing:
             analysis_json = json.loads(existing[11]) if len(existing) > 11 and existing[11] else {}
 
-            # Si no tiene preview, intentar generarlo ahora
-            fp = analysis_json.get('fingerprint') or (existing[13] if len(existing) > 13 else None)
-            if fp:
-                preview_file = os.path.join(PREVIEWS_DIR, f"{fp}.mp3")
-                if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
-                    logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
-                    try:
-                        regen_path = generate_preview_snippet(
-                            file_path=original_path,
-                            fingerprint=fp,
-                            drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
-                            duration=analysis_json.get('duration', 180.0),
-                        )
-                        if regen_path:
-                            _push_preview_async(fp, regen_path)
-                    except (FileNotFoundError, IOError, OSError) as e:
-                        logger.error(f"[Preview] Error generando desde cache: {e}")
+            # Defensa contra cache corrupto: si el row de BD tiene un
+            # analysis_json vacio o le faltan campos minimos
+            # (visto en produccion 2026-05-20: tracks con
+            # analysis_json='{"id": "...", "analysis_json": "{}"}' que al
+            # parsear daban un dict sin bpm/key/duration y AnalysisResult
+            # petaba con ValidationError de 19 campos missing). En este
+            # caso ignoramos el cache-hit y caemos al flujo de re-analisis
+            # normal — sin tirar 500 al user.
+            if not _is_cached_analysis_valid(analysis_json):
+                logger.warning(
+                    f"[Cache] Track '{file.filename}' tiene analysis_json corrupto "
+                    f"(keys={list(analysis_json.keys())[:5]}). Ignorando cache y re-analizando."
+                )
+            else:
+                # Si no tiene preview, intentar generarlo ahora
+                fp = analysis_json.get('fingerprint') or (existing[13] if len(existing) > 13 else None)
+                if fp:
+                    preview_file = os.path.join(PREVIEWS_DIR, f"{fp}.mp3")
+                    if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
+                        logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
+                        try:
+                            regen_path = generate_preview_snippet(
+                                file_path=original_path,
+                                fingerprint=fp,
+                                drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
+                                duration=analysis_json.get('duration', 180.0),
+                            )
+                            if regen_path:
+                                _push_preview_async(fp, regen_path)
+                        except (FileNotFoundError, IOError, OSError) as e:
+                            logger.error(f"[Preview] Error generando desde cache: {e}")
 
-                # Asegurar que el original_path se guarda para futuras peticiones
-                if original_path and not analysis_json.get('original_file_path'):
-                    analysis_json['original_file_path'] = original_path
-                    existing_dict = db._row_to_dict(existing) or {}
-                    existing_dict['analysis_json'] = json.dumps(analysis_json)
-                    # Re-save no es trivial, pero al menos guardamos el path
-            # Limpiar el tmp_path creado durante el upload streaming: este
-            # cache-hit no necesita el archivo subido. (No reventamos si ya
-            # no existe — race improbable con otro handler.)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            return AnalysisResult(**analysis_json)
+                    # Asegurar que el original_path se guarda para futuras peticiones
+                    if original_path and not analysis_json.get('original_file_path'):
+                        analysis_json['original_file_path'] = original_path
+                        existing_dict = db._row_to_dict(existing) or {}
+                        existing_dict['analysis_json'] = json.dumps(analysis_json)
+                        # Re-save no es trivial, pero al menos guardamos el path
+                # Limpiar el tmp_path creado durante el upload streaming: este
+                # cache-hit no necesita el archivo subido. (No reventamos si ya
+                # no existe — race improbable con otro handler.)
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return AnalysisResult(**analysis_json)
 
     # tmp_path ya fue creado arriba por el upload streaming. Seguimos.
     try:
