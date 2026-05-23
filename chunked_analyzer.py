@@ -346,26 +346,46 @@ class ChunkedAudioAnalyzer:
         total_weight = sum(energy_weights) + 1e-10
         weights = [w / total_weight for w in energy_weights]
         
-        # Contar votos ponderados por key
+        # Contar votos ponderados por key. Usar `r.get('key') or 'C'`
+        # en vez de `r.get('key', 'C')`: el segundo solo aplica default
+        # si la KEY no existe, NO si su valor es None — y en chunks
+        # degenerados algunos r tienen literal `'key': None`, lo que
+        # provocaba que best_key acabara siendo None y la linea
+        # `best_key.endswith('m')` petara con AttributeError
+        # (visto en panel admin 2026-05-20).
         key_votes = {}
         for r, w in zip(chunk_results, weights):
-            key = r.get('key', 'C')
+            key = r.get('key') or 'C'
             if key not in key_votes:
                 key_votes[key] = 0
-            key_votes[key] += w * r.get('confidence', 0.5)
-        
+            key_votes[key] += w * (r.get('confidence') or 0.5)
+
+        # Defensa contra el caso edge de 0 chunks (key_votes vacio
+        # rompe max() con ValueError).
+        if not key_votes:
+            return {
+                'key': 'C', 'camelot': '8B', 'scale': 'major',
+                'confidence': 0.0, 'source': 'chunked_analysis',
+            }
+
         # Key ganadora
         best_key = max(key_votes, key=key_votes.get)
         camelot = KEY_TO_CAMELOT.get(best_key, '8B')
-        
+
         # Confianza = voto ganador / total votos
         total_votes = sum(key_votes.values()) + 1e-10
         confidence = key_votes[best_key] / total_votes
-        
+
+        # Defensive: best_key garantizado string aqui (vino del dict de
+        # votos, que solo contiene strings tras el `or 'C'` de arriba),
+        # pero protegemos el endswith con cast por si llegan claves no
+        # string en el futuro.
+        scale = 'minor' if str(best_key).endswith('m') else 'major'
+
         return {
             'key': best_key,
             'camelot': camelot,
-            'scale': 'minor' if best_key.endswith('m') else 'major',
+            'scale': scale,
             'confidence': round(confidence, 3),
             'source': 'chunked_analysis'
         }

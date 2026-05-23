@@ -1085,6 +1085,42 @@ async def sync_pull_detected_tracks(
         return {"tracks": [], "total": 0, "error": str(e)}
 
 
+@sync_router.delete("/detected-tracks/{device_id}")
+async def sync_clear_detected_tracks(device_id: str):
+    """
+    Borra TODOS los detected tracks del usuario asociado a este device_id.
+    Multi-tenant: afecta a todos los devices vinculados al mismo user_id.
+
+    Lo invoca el cliente desde "BORRADO TOTAL" en Settings: sin esto, al
+    re-abrir el History tab el pullFromCloud() repuebla el historial desde
+    el backend porque los registros sobreviven al wipe local.
+
+    Devuelve cuántas filas se borraron para feedback del cliente.
+    """
+    conn = _get_conn()
+    user_id = _require_user_id(conn, device_id)
+
+    try:
+        cur = conn.execute(
+            "DELETE FROM detected_tracks_sync WHERE user_id = ?",
+            (user_id,),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        logger.info(
+            f"Cleared {deleted} detected tracks for user_id={user_id[:8]}..."
+        )
+        return {
+            "status": "ok",
+            "deleted": deleted,
+            "user_id": user_id,
+            "server_time": _now_iso(),
+        }
+    except sqlite3.Error as e:
+        logger.error(f"Clear detected tracks error: {e}")
+        return {"status": "error", "deleted": 0, "message": str(e)}
+
+
 # ════════════════════════════════════════════════════════════════
 # ADMIN ENDPOINTS — Vista de red para el administrador
 # ════════════════════════════════════════════════════════════════

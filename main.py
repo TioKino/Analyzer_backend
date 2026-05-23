@@ -422,6 +422,46 @@ async def telemetry_unhandled_errors(request: Request, call_next):
         raise
 
 
+# ==================== BLOQUEO DE IPs ABUSIVAS ====================
+#
+# Blacklist configurable via env var BLOCKED_IPS (lista separada por
+# comas, ej. "143.59.170.73,1.2.3.4"). Bots/scrapers de datacenter que
+# martillean la API acaparan logs, queman CPU de Render y cuota de AudD.
+# Bloquearlos aqui (antes de cualquier procesamiento) corta el gasto sin
+# necesidad de redeploy: basta editar la env var en el dashboard de
+# Render y reiniciar.
+#
+# La IP real del cliente viene en X-Forwarded-For (Render esta detras de
+# un proxy; request.client.host daria la IP interna del proxy, inutil
+# para filtrar). El primer valor del header es el cliente original:
+# "client, proxy1, proxy2".
+_BLOCKED_IPS = {
+    ip.strip()
+    for ip in os.environ.get('BLOCKED_IPS', '').split(',')
+    if ip.strip()
+}
+if _BLOCKED_IPS:
+    logger.info(f"[Security] {len(_BLOCKED_IPS)} IP(s) en blacklist")
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get('x-forwarded-for')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.client.host if request.client else ''
+
+
+@app.middleware("http")
+async def block_abusive_ips(request: Request, call_next):
+    if _BLOCKED_IPS:
+        ip = _client_ip(request)
+        if ip in _BLOCKED_IPS:
+            # 403 minimo, sin body util — no damos pistas al bot. No se
+            # loguea como error (es trafico esperado-rechazado, no un bug).
+            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+    return await call_next(request)
+
+
 # ==================== TELEMETRIA: ERRORES DEL CLIENTE ====================
 #
 # Endpoint para que Flutter reporte sus propios errores (network, parsing,
@@ -1208,6 +1248,20 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
             best_scale = 'minor'
     
     is_minor = best_scale == 'minor'
+    # Defensa contra audio degenerado: si todos los major_corr y minor_corr
+    # fueron NaN (chroma plano, silencio, archivo corrupto), best_key
+    # se queda en None. Antes la concatenacion `None + 'm'` petaba con
+    # TypeError NoneType+str (visto en panel admin 2026-05-20).
+    # Fallback: marcar como 'C' con confianza minima — el track aun se
+    # analiza, key_confidence=0 indica al cliente "no fiable".
+    if best_key is None:
+        logger.warning(
+            "[Key] best_key=None tras escaneo Krumhansl (audio plano / "
+            "todos NaN). Fallback a 'C' con confidence=0."
+        )
+        best_key = 'C'
+        is_minor = False
+        best_corr = 0.0
     key = best_key + ('m' if is_minor else '')
     key_source = "analysis"
     camelot = KEY_TO_CAMELOT.get(key, '?')
@@ -2033,6 +2087,28 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         artwork_url=artwork_url,
     )    
 
+def _is_cached_analysis_valid(analysis_json: dict) -> bool:
+    """
+    Sanity check del payload `analysis_json` recuperado de la BD antes
+    de devolverlo como `AnalysisResult` desde el cache-hit.
+
+    Visto en produccion 2026-05-20: tracks con `analysis_json='{}'` o
+    con un payload anidado raro (`{"id": "...", "analysis_json": "{}"}`)
+    devolvian un dict sin los campos requeridos y `AnalysisResult(**d)`
+    petaba con `ValidationError` de 19 campos missing → 500 al user.
+
+    Validamos que estan los campos centrales del analisis. Si faltan,
+    el caller debe ignorar el cache-hit y caer al flujo de re-analisis
+    normal. Lista derivada de campos siempre presentes en un analisis
+    exitoso (bpm, key, duration son las metricas core; bpm_confidence
+    y key_confidence salieron en el ValidationError reportado).
+    """
+    if not isinstance(analysis_json, dict) or not analysis_json:
+        return False
+    required = ('bpm', 'key', 'duration', 'bpm_confidence', 'key_confidence')
+    return all(k in analysis_json for k in required)
+
+
 # ==================== ENDPOINTS PRINCIPALES ====================
 
 @app.post("/analyze", response_model=AnalysisResult)
@@ -2121,38 +2197,52 @@ async def analyze_track(
         if existing:
             analysis_json = json.loads(existing[11]) if len(existing) > 11 and existing[11] else {}
 
-            # Si no tiene preview, intentar generarlo ahora
-            fp = analysis_json.get('fingerprint') or (existing[13] if len(existing) > 13 else None)
-            if fp:
-                preview_file = os.path.join(PREVIEWS_DIR, f"{fp}.mp3")
-                if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
-                    logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
-                    try:
-                        regen_path = generate_preview_snippet(
-                            file_path=original_path,
-                            fingerprint=fp,
-                            drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
-                            duration=analysis_json.get('duration', 180.0),
-                        )
-                        if regen_path:
-                            _push_preview_async(fp, regen_path)
-                    except (FileNotFoundError, IOError, OSError) as e:
-                        logger.error(f"[Preview] Error generando desde cache: {e}")
+            # Defensa contra cache corrupto: si el row de BD tiene un
+            # analysis_json vacio o le faltan campos minimos
+            # (visto en produccion 2026-05-20: tracks con
+            # analysis_json='{"id": "...", "analysis_json": "{}"}' que al
+            # parsear daban un dict sin bpm/key/duration y AnalysisResult
+            # petaba con ValidationError de 19 campos missing). En este
+            # caso ignoramos el cache-hit y caemos al flujo de re-analisis
+            # normal — sin tirar 500 al user.
+            if not _is_cached_analysis_valid(analysis_json):
+                logger.warning(
+                    f"[Cache] Track '{file.filename}' tiene analysis_json corrupto "
+                    f"(keys={list(analysis_json.keys())[:5]}). Ignorando cache y re-analizando."
+                )
+            else:
+                # Si no tiene preview, intentar generarlo ahora
+                fp = analysis_json.get('fingerprint') or (existing[13] if len(existing) > 13 else None)
+                if fp:
+                    preview_file = os.path.join(PREVIEWS_DIR, f"{fp}.mp3")
+                    if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
+                        logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
+                        try:
+                            regen_path = generate_preview_snippet(
+                                file_path=original_path,
+                                fingerprint=fp,
+                                drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
+                                duration=analysis_json.get('duration', 180.0),
+                            )
+                            if regen_path:
+                                _push_preview_async(fp, regen_path)
+                        except (FileNotFoundError, IOError, OSError) as e:
+                            logger.error(f"[Preview] Error generando desde cache: {e}")
 
-                # Asegurar que el original_path se guarda para futuras peticiones
-                if original_path and not analysis_json.get('original_file_path'):
-                    analysis_json['original_file_path'] = original_path
-                    existing_dict = db._row_to_dict(existing) or {}
-                    existing_dict['analysis_json'] = json.dumps(analysis_json)
-                    # Re-save no es trivial, pero al menos guardamos el path
-            # Limpiar el tmp_path creado durante el upload streaming: este
-            # cache-hit no necesita el archivo subido. (No reventamos si ya
-            # no existe — race improbable con otro handler.)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            return AnalysisResult(**analysis_json)
+                    # Asegurar que el original_path se guarda para futuras peticiones
+                    if original_path and not analysis_json.get('original_file_path'):
+                        analysis_json['original_file_path'] = original_path
+                        existing_dict = db._row_to_dict(existing) or {}
+                        existing_dict['analysis_json'] = json.dumps(analysis_json)
+                        # Re-save no es trivial, pero al menos guardamos el path
+                # Limpiar el tmp_path creado durante el upload streaming: este
+                # cache-hit no necesita el archivo subido. (No reventamos si ya
+                # no existe — race improbable con otro handler.)
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return AnalysisResult(**analysis_json)
 
     # tmp_path ya fue creado arriba por el upload streaming. Seguimos.
     try:
@@ -3992,6 +4082,41 @@ async def root():
             "Preview snippets (6s streaming)",
         ]
     }
+
+@app.get("/announcement")
+async def announcement():
+    """
+    Anuncio in-app para todos los clientes (canal de comunicacion del
+    owner). La app lo consulta al arrancar y muestra un banner dismissable
+    si hay uno nuevo (compara el `id` con el ultimo descartado en prefs).
+
+    Controlado por env vars en Render (sin tabla, sin redeploy de codigo):
+      ANNOUNCEMENT_MESSAGE  texto a mostrar (vacio/ausente = sin anuncio)
+      ANNOUNCEMENT_ID       id estable; cambialo para forzar re-mostrar a
+                            quien ya lo descarto. Si no se setea, usamos
+                            un hash del mensaje (cambiar el texto = nuevo
+                            id automatico).
+      ANNOUNCEMENT_URL      link opcional "saber mas"
+      ANNOUNCEMENT_LEVEL    "info" (default) | "warning"
+
+    Publico, sin auth: es un mensaje para todos. Privacy-first: no recibe
+    ni guarda nada del cliente.
+    """
+    msg = (os.environ.get('ANNOUNCEMENT_MESSAGE') or '').strip()
+    if not msg:
+        return {"active": False}
+    ann_id = (os.environ.get('ANNOUNCEMENT_ID') or '').strip()
+    if not ann_id:
+        import hashlib
+        ann_id = hashlib.md5(msg.encode('utf-8', errors='replace')).hexdigest()[:12]
+    return {
+        "active": True,
+        "id": ann_id,
+        "message": msg[:500],
+        "url": (os.environ.get('ANNOUNCEMENT_URL') or '').strip() or None,
+        "level": (os.environ.get('ANNOUNCEMENT_LEVEL') or 'info').strip(),
+    }
+
 
 @app.get("/health")
 async def health():
