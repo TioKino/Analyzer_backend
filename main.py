@@ -4083,6 +4083,41 @@ async def root():
         ]
     }
 
+@app.get("/announcement")
+async def announcement():
+    """
+    Anuncio in-app para todos los clientes (canal de comunicacion del
+    owner). La app lo consulta al arrancar y muestra un banner dismissable
+    si hay uno nuevo (compara el `id` con el ultimo descartado en prefs).
+
+    Controlado por env vars en Render (sin tabla, sin redeploy de codigo):
+      ANNOUNCEMENT_MESSAGE  texto a mostrar (vacio/ausente = sin anuncio)
+      ANNOUNCEMENT_ID       id estable; cambialo para forzar re-mostrar a
+                            quien ya lo descarto. Si no se setea, usamos
+                            un hash del mensaje (cambiar el texto = nuevo
+                            id automatico).
+      ANNOUNCEMENT_URL      link opcional "saber mas"
+      ANNOUNCEMENT_LEVEL    "info" (default) | "warning"
+
+    Publico, sin auth: es un mensaje para todos. Privacy-first: no recibe
+    ni guarda nada del cliente.
+    """
+    msg = (os.environ.get('ANNOUNCEMENT_MESSAGE') or '').strip()
+    if not msg:
+        return {"active": False}
+    ann_id = (os.environ.get('ANNOUNCEMENT_ID') or '').strip()
+    if not ann_id:
+        import hashlib
+        ann_id = hashlib.md5(msg.encode('utf-8', errors='replace')).hexdigest()[:12]
+    return {
+        "active": True,
+        "id": ann_id,
+        "message": msg[:500],
+        "url": (os.environ.get('ANNOUNCEMENT_URL') or '').strip() or None,
+        "level": (os.environ.get('ANNOUNCEMENT_LEVEL') or 'info').strip(),
+    }
+
+
 @app.get("/health")
 async def health():
     # Database check
