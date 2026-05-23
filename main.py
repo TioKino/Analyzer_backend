@@ -1208,6 +1208,20 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
             best_scale = 'minor'
     
     is_minor = best_scale == 'minor'
+    # Defensa contra audio degenerado: si todos los major_corr y minor_corr
+    # fueron NaN (chroma plano, silencio, archivo corrupto), best_key
+    # se queda en None. Antes la concatenacion `None + 'm'` petaba con
+    # TypeError NoneType+str (visto en panel admin 2026-05-20).
+    # Fallback: marcar como 'C' con confianza minima — el track aun se
+    # analiza, key_confidence=0 indica al cliente "no fiable".
+    if best_key is None:
+        logger.warning(
+            "[Key] best_key=None tras escaneo Krumhansl (audio plano / "
+            "todos NaN). Fallback a 'C' con confidence=0."
+        )
+        best_key = 'C'
+        is_minor = False
+        best_corr = 0.0
     key = best_key + ('m' if is_minor else '')
     key_source = "analysis"
     camelot = KEY_TO_CAMELOT.get(key, '?')
