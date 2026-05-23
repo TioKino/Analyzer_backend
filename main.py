@@ -422,6 +422,46 @@ async def telemetry_unhandled_errors(request: Request, call_next):
         raise
 
 
+# ==================== BLOQUEO DE IPs ABUSIVAS ====================
+#
+# Blacklist configurable via env var BLOCKED_IPS (lista separada por
+# comas, ej. "143.59.170.73,1.2.3.4"). Bots/scrapers de datacenter que
+# martillean la API acaparan logs, queman CPU de Render y cuota de AudD.
+# Bloquearlos aqui (antes de cualquier procesamiento) corta el gasto sin
+# necesidad de redeploy: basta editar la env var en el dashboard de
+# Render y reiniciar.
+#
+# La IP real del cliente viene en X-Forwarded-For (Render esta detras de
+# un proxy; request.client.host daria la IP interna del proxy, inutil
+# para filtrar). El primer valor del header es el cliente original:
+# "client, proxy1, proxy2".
+_BLOCKED_IPS = {
+    ip.strip()
+    for ip in os.environ.get('BLOCKED_IPS', '').split(',')
+    if ip.strip()
+}
+if _BLOCKED_IPS:
+    logger.info(f"[Security] {len(_BLOCKED_IPS)} IP(s) en blacklist")
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get('x-forwarded-for')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.client.host if request.client else ''
+
+
+@app.middleware("http")
+async def block_abusive_ips(request: Request, call_next):
+    if _BLOCKED_IPS:
+        ip = _client_ip(request)
+        if ip in _BLOCKED_IPS:
+            # 403 minimo, sin body util — no damos pistas al bot. No se
+            # loguea como error (es trafico esperado-rechazado, no un bug).
+            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+    return await call_next(request)
+
+
 # ==================== TELEMETRIA: ERRORES DEL CLIENTE ====================
 #
 # Endpoint para que Flutter reporte sus propios errores (network, parsing,
