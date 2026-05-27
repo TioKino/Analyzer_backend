@@ -3,8 +3,61 @@ import os
 import time
 from datetime import datetime, timezone
 import json
+import re
 import statistics
 from typing import List, Dict, Optional
+
+
+def derive_error_meta(error_class: str, error_msg: Optional[str],
+                      endpoint: Optional[str]) -> Dict[str, Optional[str]]:
+    """Deriva metadatos FIABLES de un error a partir de sus campos crudos.
+
+    El `endpoint` es el discriminador fiable cliente/servidor (lo setea el
+    backend al persistir): 'client:*' = error reportado por la app Flutter;
+    'unhandled:*' / '/analyze' / 'preview' / 'artwork' / '/identify' =
+    servidor. El TEXTO del mensaje NO se usa para decidir el origen — esa fue
+    justo la causa de los mal-etiquetados historicos (un FileSystemException de
+    iOS acababa rotulado como "disco en Render").
+
+    Devuelve origin, platform, app_version, context y clean_msg (el mensaje sin
+    el prefijo "[plataforma version]" que anade /client-error), mas un
+    human_message SIEMPRE atribuido al origen correcto.
+    """
+    endpoint = endpoint or ''
+    raw = error_msg or ''
+    origin = 'client' if endpoint.startswith('client:') else 'server'
+
+    # Errores de cliente vienen con prefijo "[plataforma version] msg".
+    platform: Optional[str] = None
+    app_version: Optional[str] = None
+    clean_msg = raw
+    m = re.match(r'^\[([^\]]*)\]\s*(.*)$', raw, re.DOTALL)
+    if m:
+        tag = m.group(1).split()
+        clean_msg = m.group(2)
+        if tag:
+            platform = tag[0]
+            if len(tag) > 1:
+                app_version = tag[1]
+
+    context = endpoint.split(':', 1)[1] if ':' in endpoint else endpoint
+
+    where = (
+        f"cliente {platform}" if origin == 'client' and platform
+        else 'cliente' if origin == 'client'
+        else 'servidor'
+    )
+    summary = (clean_msg or error_class).strip().splitlines()[0][:80]
+    human_message = f"[{where}] {summary}" if summary else f"[{where}] {error_class}"
+
+    return {
+        'origin': origin,
+        'platform': platform,
+        'app_version': app_version,
+        'context': context,
+        'clean_msg': clean_msg,
+        'human_message': human_message,
+    }
 
 class AnalysisDB:
     def __init__(self, db_path=None):
@@ -1298,13 +1351,31 @@ class AnalysisDB:
         finally:
             conn.close()
 
-    def get_errors_grouped(self, resolved: Optional[bool] = None) -> List[Dict]:
-        """Agrupa por (error_class, msg_short) con count y devices_affected."""
+    def get_errors_grouped(
+        self,
+        resolved: Optional[bool] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+    ) -> List[Dict]:
+        """Agrupa por (error_class, msg_short) con count y devices_affected.
+
+        `since`/`until` filtran por rango de fechas. DEBEN venir en el mismo
+        formato que la columna `timestamp` ('YYYY-MM-DD HH:MM:SS', UTC); si
+        llega solo una fecha 'YYYY-MM-DD' se compara igual lexicograficamente.
+        Cada grupo se enriquece con origin (cliente/servidor), platform,
+        app_version y clean_msg via derive_error_meta — derivados del
+        `endpoint`, que es la senal fiable, no del texto."""
         clauses = []
         params: list = []
         if resolved is not None:
             clauses.append('resolved = ?')
             params.append(1 if resolved else 0)
+        if since:
+            clauses.append('timestamp >= ?')
+            params.append(since)
+        if until:
+            clauses.append('timestamp <= ?')
+            params.append(until)
         where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
         conn = self._open_conn()
         try:
@@ -1317,15 +1388,76 @@ class AnalysisDB:
                 '       SUM(CASE WHEN resolved = 0 THEN 1 ELSE 0 END) AS unresolved_count, '
                 '       MAX(error_msg) AS sample_msg, '
                 '       MAX(traceback) AS sample_traceback, '
-                '       MAX(filename_hash) AS sample_filename '
+                '       MAX(filename_hash) AS sample_filename, '
+                '       MAX(endpoint) AS sample_endpoint '
                 f'FROM analysis_errors{where} '
                 'GROUP BY error_class, msg_short '
                 'ORDER BY count DESC',
                 params,
             )
-            return [dict(r) for r in c.fetchall()]
+            rows = [dict(r) for r in c.fetchall()]
         except sqlite3.OperationalError:
             return []
+        finally:
+            conn.close()
+
+        for row in rows:
+            meta = derive_error_meta(
+                row.get('error_class', ''),
+                row.get('sample_msg'),
+                row.get('sample_endpoint'),
+            )
+            row.update(meta)
+        return rows
+
+    def count_errors(
+        self,
+        resolved: Optional[bool] = None,
+        device_id: Optional[str] = None,
+    ) -> int:
+        """COUNT(*) de analysis_errors con filtros opcionales. Sustituye los
+        `0` hardcodeados que /admin/stats devolvia antes de existir la tabla."""
+        clauses = []
+        params: list = []
+        if resolved is not None:
+            clauses.append('resolved = ?')
+            params.append(1 if resolved else 0)
+        if device_id:
+            clauses.append('device_id = ?')
+            params.append(device_id)
+        where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            row = c.execute(
+                f'SELECT COUNT(*) AS n FROM analysis_errors{where}', params
+            ).fetchone()
+            return int(row['n']) if row else 0
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def prune_old_errors(self, days: int = 180, only_resolved: bool = True) -> int:
+        """Borra errores viejos para que la tabla no crezca sin limite.
+
+        Por defecto SOLO purga los ya resueltos (mas viejos que `days`),
+        preservando el historial accionable. Devuelve filas borradas. No se
+        ejecuta solo: se dispara desde el endpoint admin /errors/prune."""
+        from datetime import datetime, timedelta, timezone
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+        clause = 'timestamp < ?'
+        params: list = [cutoff]
+        if only_resolved:
+            clause += ' AND resolved = 1'
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(f'DELETE FROM analysis_errors WHERE {clause}', params)
+            conn.commit()
+            return c.rowcount
+        except sqlite3.OperationalError:
+            return 0
         finally:
             conn.close()
 
@@ -1372,15 +1504,19 @@ class AnalysisDB:
             conn.close()
 
     def count_engine_sources(self) -> Dict[str, int]:
-        """Counts de tracks por engine_source. Solo tracks con valor
-        (NULL = pre-instrumentacion, se excluyen)."""
+        """Counts de tracks por engine_source.
+
+        Los NULL (origen sin sellar) se reportan como 'unknown' EN VEZ de
+        excluirse: ocultarlos hacia que el panel mostrara "todo render" cuando
+        en realidad los analisis locales entran via /cache-analysis y se
+        guardaban sin engine_source. Mostrarlos como 'unknown' refleja la
+        realidad y deja ver como crece 'local_engine' segun se sellan."""
         conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute(
-                'SELECT engine_source, COUNT(*) AS n FROM tracks '
-                'WHERE engine_source IS NOT NULL '
-                'GROUP BY engine_source'
+                "SELECT COALESCE(engine_source, 'unknown') AS engine_source, "
+                'COUNT(*) AS n FROM tracks GROUP BY 1'
             )
             return {r['engine_source']: r['n'] for r in c.fetchall()}
         except sqlite3.OperationalError:
