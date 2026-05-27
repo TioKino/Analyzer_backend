@@ -152,6 +152,8 @@ def _upload_to_render_cache(track_data: dict):
                 'bpm_source': track_data.get('bpm_source', 'local_engine'),
                 'key_source': track_data.get('key_source', 'local_engine'),
                 'genre_source': track_data.get('genre_source', 'local_engine'),
+                # Propagar el origen real para que Render no lo marque NULL.
+                'engine_source': track_data.get('engine_source') or 'local_engine',
                 'analysis_json': track_data.get('analysis_json', {}),
             }
             resp = requests.post(
@@ -3006,7 +3008,24 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         
     except Exception as e:
         import traceback
-        logger.error(f"Error identificando: {traceback.format_exc()}")
+        tb = traceback.format_exc()
+        logger.error(f"Error identificando: {tb}")
+        # Persistir en analysis_errors: /identify relanza como HTTPException(500),
+        # que el middleware global ignora a proposito (solo loguea 500 NO
+        # manejados). Sin esto, un fallo real de /identify solo salia en los
+        # logs de Render y era invisible para el panel admin.
+        try:
+            db.log_analysis_error(
+                device_id=request.headers.get('X-Device-Id'),
+                filename=getattr(file, 'filename', None),
+                fingerprint=None,
+                error_class=type(e).__name__,
+                error_msg=str(e),
+                traceback_str=tb,
+                endpoint='/identify',
+            )
+        except Exception:
+            pass
         raise HTTPException(500, f"Error: {str(e)}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -3363,6 +3382,12 @@ async def cache_analysis(request: Request):
         'bpm_source': data.get('bpm_source', 'local_engine'),
         'key_source': data.get('key_source', 'local_engine'),
         'genre_source': data.get('genre_source', 'local_engine'),
+        # /cache-analysis es POR DEFINICION la via por la que un analisis hecho
+        # FUERA de Render (motor local) se cachea en el servidor. Sellamos el
+        # origen — antes quedaba NULL y el panel lo excluia, haciendo que el
+        # reparto engine pareciera "todo render". Respetamos un valor explicito
+        # si el cliente lo manda.
+        'engine_source': data.get('engine_source') or 'local_engine',
         'analysis_json': json.dumps(data.get('analysis_json', {})) if isinstance(data.get('analysis_json'), dict) else data.get('analysis_json', '{}'),
     }
 

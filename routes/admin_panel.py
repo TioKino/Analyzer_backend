@@ -7,7 +7,9 @@ users, tracks, previews, sessions, and global statistics.
 Auth: X-Admin-Secret header checked against ADMIN_SECRET env var.
 """
 
+import csv
 import hmac
+import io
 import json
 import logging
 import os
@@ -15,6 +17,7 @@ import sqlite3
 from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 
 logger = logging.getLogger(__name__)
 
@@ -578,11 +581,11 @@ async def global_stats(request: Request):
             "total_sessions": total_sessions,
             "desktop_users": desktop_users,
             "mobile_users": mobile_users,
-            # Errores y resueltos: stubeados hasta que exista la tabla
-            # analysis_errors (sprint propio). El cliente Flutter espera
-            # estas claves; devolver 0 evita un crash de Pydantic.
-            "errors_unresolved": 0,
-            "errors_resolved": 0,
+            # Conteos reales desde analysis_errors (analysis.db). Antes
+            # estaban hardcodeados a 0 (la tabla no existia); ya existe, asi
+            # que el panel mostraba siempre 0 errores aunque los hubiera.
+            "errors_unresolved": _get_db().count_errors(resolved=False),
+            "errors_resolved": _get_db().count_errors(resolved=True),
         }
     finally:
         conn.close()
@@ -655,8 +658,9 @@ async def user_summary(device_id: str, request: Request):
                 "cues": cues,
                 "favorites": favorites,
                 "overrides": overrides,
-                # Stub hasta tener analysis_errors table real.
-                "errors_unresolved": 0,
+                # Conteo real de errores sin resolver de este device.
+                "errors_unresolved": _get_db().count_errors(
+                    resolved=False, device_id=device_id),
             },
         }
     finally:
@@ -691,12 +695,78 @@ async def global_errors(request: Request, resolved: Optional[int] = None, limit:
     return {"errors": errors, "total": len(errors)}
 
 
+def _norm_since(s: Optional[str]) -> Optional[str]:
+    """Normaliza una fecha de query al formato de la columna `timestamp`
+    ('YYYY-MM-DD HH:MM:SS', UTC). Acepta 'YYYY-MM-DD' (compara igual)."""
+    return s.strip() if s else None
+
+
+def _norm_until(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    # Fecha sin hora: hacer el rango inclusivo hasta el final del dia.
+    return (s + ' 23:59:59') if len(s) == 10 else s
+
+
 @admin_panel_router.get("/errors-grouped")
-async def errors_grouped(request: Request, resolved: Optional[int] = None):
+async def errors_grouped(
+    request: Request,
+    resolved: Optional[int] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+):
     await _verify_admin_secret(request)
     resolved_bool = None if resolved is None else bool(resolved)
-    groups = _get_db().get_errors_grouped(resolved=resolved_bool)
-    return {"groups": groups, "total": len(groups)}
+    groups = _get_db().get_errors_grouped(
+        resolved=resolved_bool, since=_norm_since(since), until=_norm_until(until),
+    )
+    return {"groups": groups, "total": len(groups), "since": since, "until": until}
+
+
+@admin_panel_router.get("/errors-grouped.csv")
+async def errors_grouped_csv(
+    request: Request,
+    resolved: Optional[int] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+):
+    """Igual que /errors-grouped pero como CSV descargable, para bajar el
+    historial de un dia/rango y analizarlo offline. Ej:
+      curl -H "X-Admin-Secret: $ADMIN_TOKEN" \\
+        "https://<render>/admin/errors-grouped.csv?since=2026-05-26&until=2026-05-27" -o errores.csv
+    """
+    await _verify_admin_secret(request)
+    resolved_bool = None if resolved is None else bool(resolved)
+    groups = _get_db().get_errors_grouped(
+        resolved=resolved_bool, since=_norm_since(since), until=_norm_until(until),
+    )
+    cols = [
+        'error_class', 'origin', 'platform', 'app_version', 'human_message',
+        'count', 'devices_affected', 'unresolved_count', 'first_seen',
+        'last_seen', 'context', 'clean_msg', 'sample_filename',
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=cols, extrasaction='ignore')
+    writer.writeheader()
+    for g in groups:
+        writer.writerow({k: ('' if g.get(k) is None else g.get(k)) for k in cols})
+    fname = f"errores_{since or 'all'}_{until or 'now'}.csv".replace(' ', '_').replace(':', '')
+    return Response(
+        content=buf.getvalue(),
+        media_type='text/csv; charset=utf-8',
+        headers={'Content-Disposition': f'attachment; filename="{fname}"'},
+    )
+
+
+@admin_panel_router.post("/errors/prune")
+async def prune_errors(request: Request, days: int = 180, only_resolved: int = 1):
+    """Purga errores viejos (por defecto solo resueltos de mas de `days` dias)
+    para que la tabla no crezca sin limite. Manual a proposito: el backend NO
+    auto-borra telemetria por su cuenta."""
+    await _verify_admin_secret(request)
+    n = _get_db().prune_old_errors(days=days, only_resolved=bool(only_resolved))
+    return {"deleted": n, "days": days, "only_resolved": bool(only_resolved)}
 
 
 # Orden importante: /errors/group/resolve va ANTES que /errors/{error_id}/resolve.
@@ -824,11 +894,15 @@ async def telemetry(request: Request):
     # sin tener que hacer otra request.
     top_groups = db.get_errors_grouped(resolved=False)[:5]
 
-    # 4) Engine source breakdown.
+    # 4) Engine source breakdown. 'unknown' = tracks sin engine_source sellado
+    # (entraron via /cache-analysis antes del fix). Se exponen aparte en vez de
+    # ocultarse, que era lo que hacia parecer "todo render".
     engine_counts = db.count_engine_sources()
     engine_render = engine_counts.get('render', 0)
     engine_local = engine_counts.get('local_engine', 0)
-    engine_total = engine_render + engine_local
+    engine_unknown = engine_counts.get('unknown', 0)
+    engine_tagged = engine_render + engine_local
+    engine_total = engine_tagged + engine_unknown
 
     # 5/7/8) Fingerprints + sources + usuarios/plataformas: TODO sale de
     # sync.db, no de analysis.db. La razon: los usuarios analizan en
@@ -908,11 +982,15 @@ async def telemetry(request: Request):
         "engine_source": {
             "render": engine_render,
             "local_engine": engine_local,
-            "render_pct": round(engine_render / engine_total, 3) if engine_total else None,
-            "tracked_total": engine_total,
+            "unknown": engine_unknown,
+            "render_pct": round(engine_render / engine_tagged, 3) if engine_tagged else None,
+            "tagged_total": engine_tagged,
+            "total": engine_total,
             "note": (
-                None if engine_total else
-                "Sin tracks con engine_source seteado (pre-instrumentacion)."
+                "Los 'unknown' son tracks sin engine_source sellado (entraron "
+                "via /cache-analysis antes del fix). Los analisis nuevos ya se "
+                "reparten en render/local_engine."
+                if engine_unknown else None
             ),
         },
         # "fingerprints" informa la decision de invertir en Hamming distance
