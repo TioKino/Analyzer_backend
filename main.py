@@ -413,6 +413,12 @@ async def telemetry_unhandled_errors(request: Request, call_next):
         # ensuciaba el panel como un falso 500.
         raise
     except Exception as exc:
+        # "No response returned" lo lanza BaseHTTPMiddleware cuando el cliente
+        # se desconecta a mitad de la peticion (p.ej. cierra la app durante un
+        # /analyze largo). No es un fallo del servidor: lo dejamos pasar sin
+        # registrarlo (ensuciaba el panel como un falso 500).
+        if isinstance(exc, RuntimeError) and "No response returned" in str(exc):
+            raise
         try:
             import traceback as _tb
             db.log_analysis_error(

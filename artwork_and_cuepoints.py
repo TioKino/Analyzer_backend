@@ -255,7 +255,13 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
         from mutagen.flac import FLAC
         from mutagen.mp4 import MP4
         
-        audio = MutagenFile(file_path)
+        try:
+            audio = MutagenFile(file_path)
+        except Exception:
+            # Tags corruptos/truncados (p.ej. WAV con un ID3 roto) revientan
+            # mutagen (mutagen.wave.error / id3 IOError). Sin artwork NO
+            # abortamos el analisis del track: devolvemos None y seguimos.
+            return None
         
         if audio is None:
             return None
