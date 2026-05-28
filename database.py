@@ -1524,6 +1524,57 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def backfill_engine_source(self, value: str = 'local_engine',
+                               dry_run: bool = True) -> Dict:
+        """Sella engine_source en los tracks historicos sin etiquetar (NULL).
+
+        Esos NULL vienen casi todos de /cache-analysis (subidas del motor
+        local guardadas antes de instrumentar engine_source); los de Render ya
+        estan sellados 'render'. dry_run=True solo inspecciona (cuantos NULL y
+        su reparto por bpm_source, para verlo antes de tocar). dry_run=False
+        aplica UPDATE engine_source=value WHERE engine_source IS NULL."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            total = c.execute('SELECT COUNT(*) AS n FROM tracks').fetchone()['n']
+            null_before = c.execute(
+                'SELECT COUNT(*) AS n FROM tracks WHERE engine_source IS NULL'
+            ).fetchone()['n']
+            # Reparto por bpm_source de los NULL — best-effort (requiere json1).
+            # Util para ver cuantos son analisis reales ('local_engine') vs
+            # imports/reconocimiento ('id3', 'rekordbox', 'audd', ...).
+            bpm_breakdown: Dict[str, int] = {}
+            try:
+                rows = c.execute(
+                    "SELECT COALESCE(json_extract(analysis_json,'$.bpm_source'),"
+                    "'(sin bpm_source)') AS bs, COUNT(*) AS n "
+                    'FROM tracks WHERE engine_source IS NULL GROUP BY bs '
+                    'ORDER BY n DESC'
+                ).fetchall()
+                bpm_breakdown = {r['bs']: r['n'] for r in rows}
+            except sqlite3.OperationalError:
+                bpm_breakdown = {'(json_extract no disponible)': null_before}
+            updated = 0
+            if not dry_run and null_before:
+                c.execute(
+                    'UPDATE tracks SET engine_source = ? WHERE engine_source IS NULL',
+                    (value,),
+                )
+                conn.commit()
+                updated = c.rowcount
+            return {
+                'dry_run': dry_run,
+                'value': value,
+                'total_tracks': total,
+                'null_before': null_before,
+                'bpm_source_breakdown': bpm_breakdown,
+                'updated': updated,
+            }
+        except sqlite3.OperationalError:
+            return {'error': 'tabla tracks no disponible'}
+        finally:
+            conn.close()
+
     def get_fingerprint_stats(self) -> Dict[str, int]:
         """Stats agregadas para el panel admin: cuantos tracks tienen
         fingerprint, cuantos no, y cuantas colisiones hay (mismo fp,

@@ -19,6 +19,7 @@ from sync_endpoints import sync_router
 from routes.admin_panel import admin_panel_router
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, JSONResponse
+from starlette.requests import ClientDisconnect
 import librosa
 import numpy as np
 import sys
@@ -405,6 +406,11 @@ async def telemetry_unhandled_errors(request: Request, call_next):
         return await call_next(request)
     except HTTPException:
         # 4xx intencionales: dejar pasar sin logear como error
+        raise
+    except ClientDisconnect:
+        # El cliente corto la conexion a mitad de peticion (p.ej. cerro la app
+        # durante /sync). No es un fallo del servidor: no lo registramos, que
+        # ensuciaba el panel como un falso 500.
         raise
     except Exception as exc:
         try:

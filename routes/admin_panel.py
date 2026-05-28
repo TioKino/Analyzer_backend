@@ -131,22 +131,26 @@ def _compute_telemetry_from_sync(conn) -> dict:
             value = 'unknown'
         bucket[str(value)] = bucket.get(str(value), 0) + 1
 
-    # Devices distintos vistos en sync_items + sus device_types.
+    # Devices: contar sobre TODOS los data_types (consistente con /admin/stats),
+    # no solo 'analysis' — un device puede sincronizar sesiones/favoritos sin
+    # haber analizado nada. Antes contaba solo 'analysis', que daba 44 frente a
+    # los 50 de /admin/stats.
     distinct_devices: set[str] = set()
-    device_types: dict[str, str] = {}  # device_id -> device_type (ultimo visto)
+    device_types: dict[str, str] = {}  # device_id -> device_type
+    for drow in conn.execute(
+        "SELECT last_device_id, device_type FROM sync_items GROUP BY last_device_id"
+    ).fetchall():
+        ddid = drow["last_device_id"]
+        if ddid:
+            distinct_devices.add(ddid)
+            if drow["device_type"]:
+                device_types[ddid] = drow["device_type"]
 
+    # Metricas de tracks/sources/fingerprints/artwork: solo de payloads 'analysis'.
     rows = conn.execute(
-        "SELECT last_device_id, device_type, payload FROM sync_items "
-        "WHERE data_type = 'analysis'"
+        "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
     ).fetchall()
     for row in rows:
-        did = row["last_device_id"]
-        if did:
-            distinct_devices.add(did)
-            dt = row["device_type"]
-            if dt:
-                device_types[did] = dt
-
         tracks = _parse_analysis_payload(row["payload"])
         for t in tracks.values():
             if not isinstance(t, dict):
@@ -187,10 +191,11 @@ def _compute_telemetry_from_sync(conn) -> dict:
     collision_groups = sum(1 for n in fp_seen.values() if n > 1)
     collision_extras = sum((n - 1) for n in fp_seen.values() if n > 1)
 
-    # Platforms: contamos por device_type observado en sync_items.
+    # Platforms sobre TODOS los devices distintos (incluye los que no declaran
+    # device_type, como 'unknown') -> la suma cuadra con total_users.
     platforms: dict[str, int] = {}
-    for dt in device_types.values():
-        key = (dt or 'unknown').lower()
+    for did in distinct_devices:
+        key = (device_types.get(did) or 'unknown').lower()
         platforms[key] = platforms.get(key, 0) + 1
 
     return {
@@ -767,6 +772,23 @@ async def prune_errors(request: Request, days: int = 180, only_resolved: int = 1
     await _verify_admin_secret(request)
     n = _get_db().prune_old_errors(days=days, only_resolved=bool(only_resolved))
     return {"deleted": n, "days": days, "only_resolved": bool(only_resolved)}
+
+
+@admin_panel_router.post("/engine-source/backfill")
+async def backfill_engine_source(
+    request: Request, dry_run: int = 1, value: str = "local_engine"
+):
+    """Sella engine_source de los tracks historicos sin etiquetar (NULL ->
+    'local_engine', que es de donde vienen casi todos via /cache-analysis).
+    `dry_run=1` (default) SOLO inspecciona: devuelve cuantos NULL hay y su
+    reparto por bpm_source. `dry_run=0` aplica el UPDATE. Ej:
+      curl -H "X-Admin-Secret: $ADMIN_TOKEN" -X POST \\
+        ".../admin/engine-source/backfill?dry_run=1"   # ver antes
+      curl -H "X-Admin-Secret: $ADMIN_TOKEN" -X POST \\
+        ".../admin/engine-source/backfill?dry_run=0"   # aplicar
+    """
+    await _verify_admin_secret(request)
+    return _get_db().backfill_engine_source(value=value, dry_run=bool(dry_run))
 
 
 # Orden importante: /errors/group/resolve va ANTES que /errors/{error_id}/resolve.
