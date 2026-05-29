@@ -61,13 +61,20 @@ async def _verify_sync_auth(request: Request):
     if not signature:
         raise HTTPException(status_code=401, detail="Missing X-Signature header")
 
-    expected = _hmac.new(
-        SYNC_AUTH_SECRET.encode(),
-        body,
-        hashlib.sha256
-    ).hexdigest()
+    # SYNC_AUTH_SECRET admite una LISTA separada por comas para ROTAR el secret
+    # SIN downtime: durante la transicion se pone "nuevo,viejo" y aceptamos la
+    # firma si coincide con CUALQUIERA. Asi los clientes viejos (firman con el
+    # viejo) siguen sincronizando hasta que actualizan; luego quitas el viejo de
+    # la env var. Un solo valor (sin coma) se comporta igual que antes.
+    secrets = [s.strip() for s in SYNC_AUTH_SECRET.split(',') if s.strip()]
+    valid = False
+    for secret in secrets:
+        expected = _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if _hmac.compare_digest(signature, expected):
+            valid = True
+            break
 
-    if not _hmac.compare_digest(signature, expected):
+    if not valid:
         raise HTTPException(status_code=401, detail="Invalid signature")
 
 
