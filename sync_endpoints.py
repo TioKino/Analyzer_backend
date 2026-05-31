@@ -23,6 +23,7 @@ import random
 import string
 
 from fastapi import APIRouter, Request, HTTPException, Depends
+from starlette.requests import ClientDisconnect
 from pydantic import BaseModel
 from typing import Any, Optional
 from datetime import datetime, timezone, timedelta
@@ -55,7 +56,10 @@ async def _verify_sync_auth(request: Request):
             raise HTTPException(status_code=500, detail="SYNC_AUTH_SECRET required in production")
         return  # Dev mode local: sin auth
 
-    body = await request.body()
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        raise HTTPException(status_code=499, detail="Client disconnected")
     signature = request.headers.get("X-Signature", "")
 
     if not signature:
