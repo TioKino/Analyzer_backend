@@ -645,11 +645,18 @@ async def sync_push(req: PushRequest):
 async def sync_pull(
     device_id: str,
     since: Optional[str] = None,
+    full: bool = False,
 ):
     """Descarga items cuyo hash sea DIFERENTE al que este dispositivo conoce.
 
     Multi-tenant: solo devuelve items del MISMO usuario + colectivos.
     Filtra por user_id (no por device_id como antes).
+
+    full=true → IGNORA device_seen y reenvía TODO lo del usuario. Necesario
+    cuando un cliente se quedó a medias aplicando un pull anterior (p.ej. la
+    app se congeló/cerró tras recibir la respuesta pero antes de persistir):
+    el servidor ya había marcado esos items como "vistos", así que un pull
+    normal los saltaría para siempre. El cliente pide full=true para reparar.
     """
     conn = _get_conn()
     user_id = _require_user_id(conn, device_id)
@@ -670,13 +677,14 @@ async def sync_pull(
     for row in rows:
         key, data_type, item_key, payload_json, deleted, updated_at, device_type, item_hash = row
 
-        # Verificar si el dispositivo ya conoce este hash
-        seen = conn.execute(
-            "SELECT hash FROM device_seen WHERE device_id = ? AND item_key = ?",
-            (device_id, key),
-        ).fetchone()
-        if seen and seen[0] == item_hash:
-            continue
+        # Verificar si el dispositivo ya conoce este hash (salvo full=true)
+        if not full:
+            seen = conn.execute(
+                "SELECT hash FROM device_seen WHERE device_id = ? AND item_key = ?",
+                (device_id, key),
+            ).fetchone()
+            if seen and seen[0] == item_hash:
+                continue
 
         changes.append({
             "data_type":   data_type,
