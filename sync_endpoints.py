@@ -647,6 +647,8 @@ async def sync_pull(
     since: Optional[str] = None,
     full: bool = False,
     types: Optional[str] = None,
+    limit: int = 0,   # 0 = sin paginación (compat con clientes viejos)
+    offset: int = 0,  # solo se usa cuando limit > 0
 ):
     """Descarga items cuyo hash sea DIFERENTE al que este dispositivo conoce.
 
@@ -663,6 +665,11 @@ async def sync_pull(
     móvil lo usa con full=true para reparar SOLO la estructura (carpetas/
     colecciones), sin re-bajar los miles de items per-track de análisis que ya
     tiene en caché (re-bajarlos sería un OOM inútil en móvil).
+
+    limit/offset → paginación para installs frescos con bibliotecas grandes.
+    El cliente móvil descarga 200 items a la vez y aplica cada página antes
+    de pedir la siguiente. Así el pico de RAM es ~200 items en vez de ~5000.
+    has_more=true en la respuesta indica que quedan páginas por descargar.
     """
     conn = _get_conn()
     user_id = _require_user_id(conn, device_id)
@@ -671,7 +678,8 @@ async def sync_pull(
         [t.strip() for t in types.split(",") if t.strip()] if types else None
     )
 
-    # Items del mismo usuario + colectivos, que NO subió este device
+    # Orden por rowid garantiza paginación estable (rowid no cambia para
+    # rows existentes en SQLite; nuevas inserciones van al final).
     sql = (
         "SELECT si.key, si.data_type, si.item_key, si.payload, si.deleted, "
         "       si.updated_at, si.device_type, si.hash "
@@ -684,10 +692,11 @@ async def sync_pull(
         placeholders = ",".join("?" for _ in type_list)
         sql += f" AND si.data_type IN ({placeholders})"
         params.extend(type_list)
+    sql += " ORDER BY si.rowid"
     rows = conn.execute(sql, params).fetchall()
 
-    changes = []
-    update_seen = []
+    # Construir lista completa de cambios (con o sin filtro device_seen)
+    all_items: list = []  # list of (change_dict, (dev_id, key, hash))
 
     for row in rows:
         key, data_type, item_key, payload_json, deleted, updated_at, device_type, item_hash = row
@@ -701,15 +710,26 @@ async def sync_pull(
             if seen and seen[0] == item_hash:
                 continue
 
-        changes.append({
-            "data_type":   data_type,
-            "item_key":    item_key,
-            "payload":     json.loads(payload_json),
-            "deleted":     bool(deleted),
-            "updated_at":  updated_at,
-            "device_type": device_type,
-        })
-        update_seen.append((device_id, key, item_hash))
+        all_items.append((
+            {
+                "data_type":   data_type,
+                "item_key":    item_key,
+                "payload":     json.loads(payload_json),
+                "deleted":     bool(deleted),
+                "updated_at":  updated_at,
+                "device_type": device_type,
+            },
+            (device_id, key, item_hash),
+        ))
+
+    # Paginación: si limit>0, recortar al rango [offset, offset+limit)
+    has_more = False
+    if limit > 0 and limit < len(all_items):
+        has_more = len(all_items) > offset + limit
+        all_items = all_items[offset:offset + limit]
+
+    changes = [item[0] for item in all_items]
+    update_seen = [item[1] for item in all_items]
 
     # Marcar como vistos con payload
     for dev_id, key, h in update_seen:
@@ -726,6 +746,7 @@ async def sync_pull(
     return {
         "changes":   changes,
         "total":     len(changes),
+        "has_more":  has_more,
         "alerts":    [],
         "timestamp": _now_iso(),
         "user_id":   user_id,
