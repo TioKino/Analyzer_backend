@@ -473,7 +473,14 @@ async def block_abusive_ips(request: Request, call_next):
             # 403 minimo, sin body util — no damos pistas al bot. No se
             # loguea como error (es trafico esperado-rechazado, no un bug).
             return JSONResponse(status_code=403, content={"detail": "Forbidden"})
-    return await call_next(request)
+    try:
+        return await call_next(request)
+    except ClientDisconnect:
+        return Response(status_code=499)
+    except RuntimeError as exc:
+        if "No response returned" in str(exc):
+            return Response(status_code=499)
+        raise
 
 
 # ==================== TELEMETRIA: ERRORES DEL CLIENTE ====================
