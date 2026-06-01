@@ -646,6 +646,7 @@ async def sync_pull(
     device_id: str,
     since: Optional[str] = None,
     full: bool = False,
+    types: Optional[str] = None,
 ):
     """Descarga items cuyo hash sea DIFERENTE al que este dispositivo conoce.
 
@@ -657,19 +658,33 @@ async def sync_pull(
     app se congeló/cerró tras recibir la respuesta pero antes de persistir):
     el servidor ya había marcado esos items como "vistos", así que un pull
     normal los saltaría para siempre. El cliente pide full=true para reparar.
+
+    types=folder,collection,... → limita el pull a esos data_types. El cliente
+    móvil lo usa con full=true para reparar SOLO la estructura (carpetas/
+    colecciones), sin re-bajar los miles de items per-track de análisis que ya
+    tiene en caché (re-bajarlos sería un OOM inútil en móvil).
     """
     conn = _get_conn()
     user_id = _require_user_id(conn, device_id)
 
+    type_list = (
+        [t.strip() for t in types.split(",") if t.strip()] if types else None
+    )
+
     # Items del mismo usuario + colectivos, que NO subió este device
-    rows = conn.execute(
-        """SELECT si.key, si.data_type, si.item_key, si.payload, si.deleted,
-                  si.updated_at, si.device_type, si.hash
-           FROM sync_items si
-           WHERE si.last_device_id != ?
-             AND (si.user_id = ? OR si.user_id = '__collective__')""",
-        (device_id, user_id),
-    ).fetchall()
+    sql = (
+        "SELECT si.key, si.data_type, si.item_key, si.payload, si.deleted, "
+        "       si.updated_at, si.device_type, si.hash "
+        "FROM sync_items si "
+        "WHERE si.last_device_id != ? "
+        "  AND (si.user_id = ? OR si.user_id = '__collective__')"
+    )
+    params: list = [device_id, user_id]
+    if type_list:
+        placeholders = ",".join("?" for _ in type_list)
+        sql += f" AND si.data_type IN ({placeholders})"
+        params.extend(type_list)
+    rows = conn.execute(sql, params).fetchall()
 
     changes = []
     update_seen = []
@@ -821,6 +836,13 @@ def _compute_detail(
 
     # ── Diff real por tipo ──
     if data_type == "analysis":
+        # Items per-track (2.9.3): el payload es UN análisis (clave 'track'),
+        # no el blob {tracks:{...}}. Contar como una unidad modificada. Sin
+        # esto, la lógica de blob de abajo daría 0 y el contador mentiría.
+        if "tracks" not in remote_payload:
+            if _payload_hash(local_payload) != _payload_hash(remote_payload):
+                result["analysis_modified"] = 1
+            return result
         local_keys = set((local_payload.get("tracks") or {}).keys())
         remote_keys = set((remote_payload.get("tracks") or {}).keys())
         added = len(remote_keys - local_keys)
