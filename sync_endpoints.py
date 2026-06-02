@@ -695,20 +695,25 @@ async def sync_pull(
     sql += " ORDER BY si.rowid"
     rows = conn.execute(sql, params).fetchall()
 
+    # Pre-cargar lo que este dispositivo ya conoce en UNA query (en vez de un
+    # SELECT por item dentro del loop). Lookup O(1) en memoria.
+    seen_map: dict = {}
+    if not full:
+        for ik, h in conn.execute(
+            "SELECT item_key, hash FROM device_seen WHERE device_id = ?",
+            (device_id,),
+        ):
+            seen_map[ik] = h
+
     # Construir lista completa de cambios (con o sin filtro device_seen)
-    all_items: list = []  # list of (change_dict, (dev_id, key, hash))
+    all_items: list = []  # list of (change_dict, (key, hash, payload_json))
 
     for row in rows:
         key, data_type, item_key, payload_json, deleted, updated_at, device_type, item_hash = row
 
         # Verificar si el dispositivo ya conoce este hash (salvo full=true)
-        if not full:
-            seen = conn.execute(
-                "SELECT hash FROM device_seen WHERE device_id = ? AND item_key = ?",
-                (device_id, key),
-            ).fetchone()
-            if seen and seen[0] == item_hash:
-                continue
+        if not full and seen_map.get(key) == item_hash:
+            continue
 
         all_items.append((
             {
@@ -719,7 +724,7 @@ async def sync_pull(
                 "updated_at":  updated_at,
                 "device_type": device_type,
             },
-            (device_id, key, item_hash),
+            (key, item_hash, payload_json),
         ))
 
     # Paginación: si limit>0, recortar al rango [offset, offset+limit)
@@ -731,15 +736,14 @@ async def sync_pull(
     changes = [item[0] for item in all_items]
     update_seen = [item[1] for item in all_items]
 
-    # Marcar como vistos con payload
-    for dev_id, key, h in update_seen:
-        row = conn.execute("SELECT payload FROM sync_items WHERE key = ?", (key,)).fetchone()
-        payload_to_save = row[0] if row else None
+    # Marcar como vistos reutilizando el payload ya leído arriba (antes se
+    # re-consultaba sync_items una vez por item).
+    for key, h, payload_to_save in update_seen:
         conn.execute(
             """INSERT INTO device_seen (device_id, item_key, hash, payload)
                VALUES (?, ?, ?, ?)
                ON CONFLICT(device_id, item_key) DO UPDATE SET hash = ?, payload = ?""",
-            (dev_id, key, h, payload_to_save, h, payload_to_save),
+            (device_id, key, h, payload_to_save, h, payload_to_save),
         )
     conn.commit()
 
@@ -773,17 +777,23 @@ async def sync_pending(device_id: str, since: Optional[str] = None):
         (device_id, user_id),
     ).fetchall()
 
+    # Pre-cargar device_seen de este dispositivo en UNA query (en vez de un
+    # SELECT por item dentro del loop). Lookup O(1) en memoria.
+    seen_map: dict = {}
+    for ik, h, p in conn.execute(
+        "SELECT item_key, hash, payload FROM device_seen WHERE device_id = ?",
+        (device_id,),
+    ):
+        seen_map[ik] = (h, p)
+
     detail: dict[str, int] = {}
     total = 0
 
     for row in remote_rows:
         key, data_type, item_key, payload_json, item_hash = row
 
-        # Buscar qué versión conoce este dispositivo (de device_seen)
-        seen = conn.execute(
-            "SELECT hash, payload FROM device_seen WHERE device_id = ? AND item_key = ?",
-            (device_id, key),
-        ).fetchone()
+        # Qué versión conoce este dispositivo (de device_seen)
+        seen = seen_map.get(key)
 
         # Si ya conoce este hash exacto → no hay cambio
         if seen and seen[0] == item_hash:
