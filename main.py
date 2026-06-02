@@ -354,7 +354,7 @@ def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset
 
 # ==================== APP ====================
 
-app = FastAPI(title="DJ Analyzer Pro API", version="2.9.2", default_response_class=SafeJSONResponse)
+app = FastAPI(title="DJ Analyzer Pro API", version="2.9.3", default_response_class=SafeJSONResponse)
 _startup_time = time.time()
 app.include_router(sync_router)
 app.include_router(admin_panel_router)
