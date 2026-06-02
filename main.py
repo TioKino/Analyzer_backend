@@ -4061,6 +4061,37 @@ async def check_previews(request: PreviewCheckRequest):
     }
 
 
+@app.post("/artworks/check")
+async def check_artworks(request: PreviewCheckRequest):
+    """
+    Devuelve qué track_ids ya tienen artwork cacheado en Render.
+
+    Espejo de /previews/check para que el cliente desktop compruebe en UNA
+    petición batch (en lugar de un HEAD por archivo) cuáles portadas faltan
+    por subir. Máximo 500 IDs por petición.
+    """
+    track_ids = request.track_ids
+
+    if len(track_ids) > 500:
+        raise HTTPException(400, "Máximo 500 track_ids por petición")
+
+    available = []
+    for tid in track_ids:
+        safe_id = re.sub(r'[^a-fA-F0-9]', '', tid)
+        if not safe_id:
+            continue
+        for ext in ('jpg', 'png', 'jpeg'):
+            if os.path.exists(os.path.join(ARTWORK_CACHE_DIR, f"{safe_id}.{ext}")):
+                available.append(tid)
+                break
+
+    return {
+        "available": available,
+        "total_checked": len(track_ids),
+        "total_available": len(available),
+    }
+
+
 @app.post("/preview/upload/{track_id}")
 async def upload_preview(track_id: str, file: UploadFile = File(...)):
     """
