@@ -553,6 +553,13 @@ async def report_client_error(payload: ClientErrorPayload, request: Request):
 # Inicializar BD con path de config (no hardcoded)
 db = AnalysisDB(db_path=DATABASE_PATH)
 
+# Registrar endpoints de community cues (/community-cues, /user-cues).
+# El modulo community_cues_endpoint.py expone register_community_endpoints
+# pero NUNCA se cableaba aqui -> el cliente recibia 404 al subir/leer cues
+# de comunidad. La tabla `community_cues` ya se crea en database.py:init_db().
+from community_cues_endpoint import register_community_endpoints
+register_community_endpoints(app, db)
+
 # Crear directorio de cach(c) para artwork
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
 
@@ -641,24 +648,31 @@ class AnalysisResult(BaseModel):
     isrc: Optional[str] = None
     duration: float
     bpm: float
-    bpm_confidence: float
+    # Los 18 campos extendidos abajo llevan default. Motivo: tracks viejos
+    # cuyo analysis_json en BD se guardo ANTES de que existieran estos campos
+    # reventaban en AnalysisResult(**analysis_data) (cache-hit por fingerprint,
+    # main.py:~2302) -> spam "[Cache] Error parseando analysis_json: 18
+    # validation errors". El analisis real siempre los setea explicito, asi que
+    # el default solo aplica al parsear JSON legacy. Defaults alineados con el
+    # fallback de reconstruccion desde columnas.
+    bpm_confidence: float = 0.0
     bpm_source: str = "analysis"
     key: Optional[str] = None
     camelot: Optional[str] = None
-    key_confidence: float
+    key_confidence: float = 0.0
     key_source: str = "analysis"
-    energy_raw: float
-    energy_normalized: float
-    energy_dj: int
-    groove_score: float
-    swing_factor: float
-    has_intro: bool
-    has_buildup: bool
-    has_drop: bool
-    has_breakdown: bool
-    has_outro: bool
-    structure_sections: List[Dict]
-    track_type: str
+    energy_raw: float = 0.0
+    energy_normalized: float = 0.0
+    energy_dj: int = 5
+    groove_score: float = 0.0
+    swing_factor: float = 0.0
+    has_intro: bool = False
+    has_buildup: bool = False
+    has_drop: bool = False
+    has_breakdown: bool = False
+    has_outro: bool = False
+    structure_sections: List[Dict] = []
+    track_type: str = "peak"
     track_type_source: str = "waveform"
     # Fase 1 Track Type v2: confianza algoritmica (0..1) + top-3 alternativas.
     # Permite a la UI mostrar honestidad sobre tracks ambiguos. Cuando
@@ -670,13 +684,13 @@ class AnalysisResult(BaseModel):
     genre: str = "unknown"
     subgenre: Optional[str] = None
     genre_source: str = "spectral_analysis"
-    has_vocals: bool
-    has_heavy_bass: bool
-    has_pads: bool
-    percussion_density: float
-    mix_energy_start: float
-    mix_energy_end: float
-    drop_timestamp: float
+    has_vocals: bool = False
+    has_heavy_bass: bool = False
+    has_pads: bool = False
+    percussion_density: float = 0.0
+    mix_energy_start: float = 0.0
+    mix_energy_end: float = 0.0
+    drop_timestamp: float = 0.0
     #  Cue Points
     cue_points: List[Dict] = []
     #  Beat Grid
