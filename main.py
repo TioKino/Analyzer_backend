@@ -1183,6 +1183,43 @@ def generate_preview_snippet(
 
 # ==================== ANALISIS PRINCIPAL ====================
 
+def robust_audio_load(file_path: str, sr: int = 44100, mono: bool = True):
+    """Carga audio resiliente. En Render el libsndfile no decodifica algunos
+    mp3 y audioread no encuentra backend (-> NoBackendError / LibsndfileError
+    'File does not exist or is not a regular file'). ffmpeg SI esta disponible
+    (health lo confirma), asi que si librosa.load falla transcodificamos a WAV
+    con ffmpeg y lo leemos con soundfile. Si ffmpeg tampoco puede, el archivo
+    es de verdad ilegible y propagamos la excepcion (el middleware la registra
+    una vez, no en bucle, porque el track ya no se reintenta sin cambios).
+    """
+    try:
+        with silence_native_stderr():
+            return librosa.load(file_path, sr=sr, mono=mono)
+    except Exception as e:
+        logger.warning(
+            f"[decode] librosa.load fallo ({type(e).__name__}: {e}); "
+            f"reintentando via ffmpeg->wav"
+        )
+        import soundfile as sf
+        wav_path = file_path + '.dec.wav'
+        try:
+            subprocess.run(
+                ['ffmpeg', '-v', 'error', '-y', '-i', file_path,
+                 '-ac', '1' if mono else '2', '-ar', str(sr), wav_path],
+                capture_output=True, timeout=180, check=True,
+            )
+            y, file_sr = sf.read(wav_path, dtype='float32')
+            if mono and getattr(y, 'ndim', 1) > 1:
+                y = y.mean(axis=1)
+            return y, file_sr
+        finally:
+            if os.path.exists(wav_path):
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+
+
 def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = False) -> AnalysisResult:
     import warnings
     warnings.filterwarnings('ignore')
@@ -1219,8 +1256,7 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
 
     # Track corto: anlisis tradicional (carga todo en RAM)
     logger.info(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
-    with silence_native_stderr():
-        y, sr = librosa.load(file_path, sr=44100, mono=True)
+    y, sr = robust_audio_load(file_path, sr=44100, mono=True)
 
     
     # ==================== ID3 METADATA ====================

@@ -17,6 +17,8 @@ v1.0.0 - Implementación inicial
 
 import logging
 import math
+import os
+import subprocess
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 import warnings
@@ -142,17 +144,42 @@ class ChunkedAudioAnalyzer:
                     offset=start_time,
                     duration=duration
                 )
-        except ValueError as e:
-            # Captura defensiva: el guard de arriba cubre los casos comunes,
-            # pero soundfile puede aun lanzar 'negative dimensions' en
-            # archivos con headers raros. En lugar de tirar el analisis
-            # entero, devolvemos chunk vacio y el caller decide.
+            return y, sr
+        except Exception as e:
+            # librosa.load puede fallar por (a) 'negative dimensions' en headers
+            # raros o (b) en Render, libsndfile sin mp3 + audioread sin backend
+            # (LibsndfileError/NoBackendError). Intentamos un fallback via ffmpeg
+            # extrayendo SOLO la ventana [start_time, start_time+duration]; si
+            # tambien falla, devolvemos chunk vacio y el caller decide.
             logger.warning(
                 f"[ChunkedAnalyzer] librosa.load fallo — {type(e).__name__}: {e} "
-                f"start={start_time} dur={duration} file={file_path}"
+                f"start={start_time} dur={duration} file={file_path}; probando ffmpeg"
             )
-            return np.zeros(0, dtype=np.float32), self.sr
-        return y, sr
+            wav_path = f"{file_path}.chunk{int(start_time)}.wav"
+            try:
+                import soundfile as sf
+                subprocess.run(
+                    ['ffmpeg', '-v', 'error', '-y',
+                     '-ss', str(start_time), '-t', str(duration),
+                     '-i', file_path, '-ac', '1', '-ar', str(self.sr), wav_path],
+                    capture_output=True, timeout=120, check=True,
+                )
+                y, sr = sf.read(wav_path, dtype='float32')
+                if getattr(y, 'ndim', 1) > 1:
+                    y = y.mean(axis=1)
+                return y, sr
+            except Exception as e2:
+                logger.warning(
+                    f"[ChunkedAnalyzer] ffmpeg fallback tambien fallo — "
+                    f"{type(e2).__name__}: {e2} file={file_path}"
+                )
+                return np.zeros(0, dtype=np.float32), self.sr
+            finally:
+                if os.path.exists(wav_path):
+                    try:
+                        os.unlink(wav_path)
+                    except OSError:
+                        pass
     
     def analyze_chunk_bpm(self, y: np.ndarray, sr: int) -> Dict:
         """Analiza BPM de un chunk."""
