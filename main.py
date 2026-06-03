@@ -1197,8 +1197,20 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         )
 
     #  Obtener duracin SIN cargar audio completo
-    with silence_native_stderr():
-        duration = librosa.get_duration(path=file_path)
+    try:
+        with silence_native_stderr():
+            duration = librosa.get_duration(path=file_path)
+    except Exception:
+        # soundfile no soporta mp3 nativo en algunos entornos; ffprobe fallback
+        try:
+            proc = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'csv=p=0', file_path],
+                capture_output=True, text=True, timeout=30
+            )
+            duration = float(proc.stdout.strip() or '0')
+        except Exception:
+            duration = 0.0
 
     #  Si el track es largo (>4 min), usar anlisis por chunks
     if CHUNKED_ANALYZER_ENABLED and duration > CHUNK_ANALYSIS_THRESHOLD:
