@@ -881,9 +881,11 @@ async def resolve_error_group_endpoint(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(400, "Body debe ser un objeto JSON")
     error_class = body.get("error_class", "")
-    msg_short = body.get("msg_short", "")
-    if not error_class or not msg_short:
-        raise HTTPException(400, "error_class y msg_short requeridos")
+    msg_short = body.get("msg_short", "")  # puede ser '' para errores sin mensaje
+    if not error_class:
+        raise HTTPException(400, "error_class requerido")
+    # msg_short puede ser vacio (errores sin mensaje como ClientDisconnect).
+    # En ese caso resolve_error_group resuelve por error_class sin filtro de msg.
     n = _get_db().resolve_error_group(error_class, msg_short)
     return {"resolved": n}
 

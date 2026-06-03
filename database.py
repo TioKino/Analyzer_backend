@@ -1577,7 +1577,11 @@ class AnalysisDB:
         '[plataforma version]') que devuelve get_errors_grouped. Resolvemos
         cualquier fila del mismo error_class cuyo mensaje normalice a esa clave,
         no importa la version -> los gemelos de '[ios 2.9.0]' y '[ios 2.9.2]'
-        caen todos. Devuelve el numero de filas actualizadas."""
+        caen todos. Devuelve el numero de filas actualizadas.
+
+        Si msg_short es '' (errores sin mensaje, p.ej. ClientDisconnect) se
+        resuelven TODOS los errores sin resolver de ese error_class sin filtrar
+        por mensaje — son todos del mismo bug logico."""
         conn = self._open_conn()
         try:
             c = conn.cursor()
@@ -1586,10 +1590,13 @@ class AnalysisDB:
                 'WHERE error_class = ? AND resolved = 0',
                 (error_class,),
             )
-            ids = [
-                r['id'] for r in c.fetchall()
-                if normalize_error_key(r['error_msg']) == msg_short
-            ]
+            rows = c.fetchall()
+            if msg_short:
+                ids = [r['id'] for r in rows if normalize_error_key(r['error_msg']) == msg_short]
+            else:
+                # msg_short vacio: resolver todos los de este error_class cuyo
+                # mensaje normalizado tambien sea vacio (mismo grupo sin mensaje).
+                ids = [r['id'] for r in rows if not normalize_error_key(r['error_msg'])]
             if not ids:
                 return 0
             resolved_at = datetime.now(timezone.utc).isoformat()
