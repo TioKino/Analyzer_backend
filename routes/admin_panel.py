@@ -242,6 +242,76 @@ def _preview_exists(fingerprint: str) -> bool:
     return os.path.isfile(path)
 
 
+def _count_unique_tracks(analysis_rows, check_previews: bool = True):
+    """Cuenta tracks UNICOS a partir de filas sync_items (data_type='analysis').
+
+    Maneja los DOS formatos que coexisten en produccion:
+
+      1. Incremental (v2.9.3+): cada fila es UN track, item_key=<trackId>,
+         payload = el track suelto (un dict de campos: id, bpm, key, ...).
+         NO viene envuelto en {"tracks": {...}}. La identidad del track es
+         directamente el item_key. OJO: pasar este payload por
+         _parse_analysis_payload + .items() iteraria los CAMPOS del track
+         como si cada uno fuera un track => inflaba el contador a cientos de
+         miles. Por eso se trata por separado mirando el item_key.
+
+      2. Blob legacy (clientes < v2.9.3): item_key='all_analysis',
+         payload = {"tracks": {trackId: {...}}}. Aqui si se itera el dict.
+
+    Identidad canonica = track.id (chromaprint MD5, idempotente al
+    filename/tags/re-codec e identico cross-device para el mismo archivo),
+    con fallback a fingerprint y al item_key / key del dict. Esto deduplica
+    el mismo track sincronizado desde varios devices (PC+Mac+movil) y entre
+    el blob legacy y las filas incrementales.
+
+    Devuelve (seen_ids:set, preview_fps:set, no_id_tracks:int).
+    """
+    seen_ids: set = set()
+    preview_fps: set = set()
+    no_id_tracks = 0
+
+    def _maybe_preview(fp):
+        if check_previews and fp and fp not in preview_fps and _preview_exists(fp):
+            preview_fps.add(fp)
+
+    for arow in analysis_rows:
+        try:
+            ikey = arow["item_key"] or ""
+        except (KeyError, IndexError, TypeError):
+            ikey = ""
+        raw = arow["payload"]
+
+        if ikey and ikey != "all_analysis":
+            # Incremental: una fila = un track. item_key ES el trackId.
+            fp = None
+            try:
+                pl = json.loads(raw)
+                if isinstance(pl, dict):
+                    fp = pl.get("fingerprint") or pl.get("id")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            seen_ids.add(str(fp or ikey))
+            _maybe_preview(fp)
+            continue
+
+        # Blob legacy all_analysis: iterar el dict de tracks.
+        tracks = _parse_analysis_payload(raw)
+        for tkey, t in tracks.items():
+            ident = None
+            fp = None
+            if isinstance(t, dict):
+                ident = t.get("id") or t.get("fingerprint")
+                fp = t.get("fingerprint", "")
+            ident = ident or tkey
+            if ident:
+                seen_ids.add(str(ident))
+            else:
+                no_id_tracks += 1
+            _maybe_preview(fp)
+
+    return seen_ids, preview_fps, no_id_tracks
+
+
 # ── GET /admin/users ────────────────────────────────────────
 
 @admin_panel_router.get("/users")
@@ -262,20 +332,19 @@ async def list_users(request: Request):
         for row in rows:
             device_id = row["last_device_id"]
 
-            # Count tracks from analysis payloads
-            analysis_row = conn.execute(
-                "SELECT payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
+            # Count tracks from analysis payloads. Usa fetchall() + helper:
+            # con sync incremental v2.9.3 un device tiene MUCHAS filas analysis
+            # (una por track, item_key=<trackId>), no una sola. El antiguo
+            # fetchone()+len(tracks) devolvia basura para esos usuarios (contaba
+            # los CAMPOS de un unico track). _count_unique_tracks dedup-ea por id
+            # y maneja blob legacy + incremental por igual.
+            analysis_rows = conn.execute(
+                "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
                 (device_id,),
-            ).fetchone()
-            track_count = 0
-            preview_count = 0
-            if analysis_row:
-                tracks = _parse_analysis_payload(analysis_row["payload"])
-                track_count = len(tracks)
-                for t in tracks.values():
-                    fp = t.get("fingerprint", "") if isinstance(t, dict) else ""
-                    if _preview_exists(fp):
-                        preview_count += 1
+            ).fetchall()
+            u_ids, u_prev, u_noid = _count_unique_tracks(analysis_rows)
+            track_count = len(u_ids) + u_noid
+            preview_count = len(u_prev)
 
             # Count sessions
             session_row = conn.execute(
@@ -556,30 +625,20 @@ async def global_stats(request: Request):
         desktop_users = sum(1 for r in device_rows if (r["device_type"] or "").lower() in ("desktop", "macos", "windows", "linux"))
         mobile_users = sum(1 for r in device_rows if (r["device_type"] or "").lower() in ("mobile", "ios", "android"))
 
-        # Count tracks and previews across all devices, DEDUPLICADO por
-        # fingerprint. Antes se hacia total_tracks += len(tracks) por cada fila
-        # de sync_items, lo que contaba la MISMA cancion una vez por cada device
-        # que la sincroniza (PC + Mac + movil = x3) ademas del blob legacy
-        # 'all_analysis' coexistiendo con las filas incrementales -> el contador
-        # se disparaba a cientos de miles. Ahora refleja tracks unicos reales.
-        seen_fps: set = set()
-        no_fp_tracks = 0
-        preview_fps: set = set()
+        # Count tracks and previews across all devices, DEDUPLICADO por track.id.
+        # Antes se hacia total_tracks += len(tracks) por cada fila de sync_items,
+        # lo que contaba la MISMA cancion una vez por cada device que la sincroniza
+        # (PC + Mac + movil = x3). Peor aun: con la sync incremental v2.9.3 cada
+        # fila es UN track suelto (item_key=<trackId>, payload sin wrapper
+        # "tracks"), y al pasarla por _parse_analysis_payload().items() se
+        # iteraban sus CAMPOS como si fueran tracks => el contador se disparaba a
+        # cientos de miles. _count_unique_tracks maneja ambos formatos y dedup-ea
+        # por track.id (chromaprint MD5, identico cross-device). Ver su docstring.
         analysis_rows = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
+            "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
         ).fetchall()
-        for arow in analysis_rows:
-            tracks = _parse_analysis_payload(arow["payload"])
-            for t in tracks.values():
-                fp = t.get("fingerprint", "") if isinstance(t, dict) else ""
-                if fp:
-                    seen_fps.add(fp)
-                    if fp not in preview_fps and _preview_exists(fp):
-                        preview_fps.add(fp)
-                else:
-                    # Sin fingerprint no se puede deduplicar; cuenta individual.
-                    no_fp_tracks += 1
-        total_tracks = len(seen_fps) + no_fp_tracks
+        seen_ids, preview_fps, no_id_tracks = _count_unique_tracks(analysis_rows)
+        total_tracks = len(seen_ids) + no_id_tracks
         total_previews = len(preview_fps)
 
         # Count sessions
