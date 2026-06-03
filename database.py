@@ -8,15 +8,51 @@ import statistics
 from typing import List, Dict, Optional
 
 
+def _scrub_volatile_tokens(text: str) -> str:
+    """Sustituye tokens VARIABLES de un mensaje de error por placeholders
+    estables, para que dos errores del MISMO bug logico que solo difieren en
+    el path/hash/numero concreto produzcan la misma clave de agrupacion.
+
+    Sin esto, errores de servidor como
+      "NoBackendError: ... for /tmp/u0.mp3"
+      "NoBackendError: ... for /tmp/u1.mp3"
+    generaban un grupo distinto por cada archivo -> decenas de singletons que
+    en la UI se ven identicos (la UI muestra un human_message truncado) y que
+    al resolver uno dejaban vivos a los gemelos => "no desaparece".
+
+    Orden importa: paths antes que numeros (un path puede contener digitos).
+    """
+    # Rutas Windows (C:\foo\bar) y POSIX (/tmp/foo/bar.mp3). Captura tambien
+    # la extension. Se hace ANTES de scrubbear numeros/hex.
+    text = re.sub(r'[A-Za-z]:\\[^\s\'"]+', '<path>', text)
+    text = re.sub(r'(?:/[\w.\-]+){2,}', '<path>', text)
+    # Direcciones de memoria y hex largos (md5/sha/fingerprints).
+    text = re.sub(r'0x[0-9a-fA-F]+', '<addr>', text)
+    text = re.sub(r'\b[0-9a-fA-F]{8,}\b', '<hex>', text)
+    # UUIDs.
+    text = re.sub(
+        r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+        r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b', '<uuid>', text)
+    # Numeros de 2+ digitos (line numbers, tamanos, puertos, timestamps).
+    # 2+ para no tocar cosas como "0-dimensional" (un solo digito).
+    text = re.sub(r'\b\d{2,}\b', '<n>', text)
+    return text
+
+
 def normalize_error_key(error_msg: Optional[str]) -> str:
     """Clave de agrupacion estable de un error: el mensaje SIN el prefijo
-    '[plataforma version]' que anade /client-error, primera linea, 80 chars.
+    '[plataforma version]' que anade /client-error, primera linea, tokens
+    volatiles scrubbeados (ver _scrub_volatile_tokens), 80 chars.
 
     Critico para que "[ios 2.9.0] X" y "[ios 2.9.2] X" caigan en el MISMO
     grupo. Antes se agrupaba por substr(error_msg,1,80) crudo, que metia la
     version en la clave -> el mismo bug logico aparecia como N grupos (uno
     por version) que en la UI se veian identicos (la UI muestra clean_msg).
     Resolver uno dejaba los gemelos de otras versiones -> "no desaparece".
+
+    Ademas scrubbea paths/hash/numeros: errores de servidor que solo difieren
+    en el archivo concreto (/tmp/aX.mp3) colapsan en un unico grupo en vez de
+    generar decenas de singletons identicos a la vista.
     """
     raw = error_msg or ''
     m = re.match(r'^\[([^\]]*)\]\s*(.*)$', raw, re.DOTALL)
@@ -24,7 +60,8 @@ def normalize_error_key(error_msg: Optional[str]) -> str:
     clean = clean.strip()
     if not clean:
         return ''
-    return clean.splitlines()[0][:80]
+    first_line = clean.splitlines()[0]
+    return _scrub_volatile_tokens(first_line)[:80]
 
 
 def derive_error_meta(error_class: str, error_msg: Optional[str],
