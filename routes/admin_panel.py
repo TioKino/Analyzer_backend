@@ -556,19 +556,31 @@ async def global_stats(request: Request):
         desktop_users = sum(1 for r in device_rows if (r["device_type"] or "").lower() in ("desktop", "macos", "windows", "linux"))
         mobile_users = sum(1 for r in device_rows if (r["device_type"] or "").lower() in ("mobile", "ios", "android"))
 
-        # Count tracks and previews across all devices
-        total_tracks = 0
-        total_previews = 0
+        # Count tracks and previews across all devices, DEDUPLICADO por
+        # fingerprint. Antes se hacia total_tracks += len(tracks) por cada fila
+        # de sync_items, lo que contaba la MISMA cancion una vez por cada device
+        # que la sincroniza (PC + Mac + movil = x3) ademas del blob legacy
+        # 'all_analysis' coexistiendo con las filas incrementales -> el contador
+        # se disparaba a cientos de miles. Ahora refleja tracks unicos reales.
+        seen_fps: set = set()
+        no_fp_tracks = 0
+        preview_fps: set = set()
         analysis_rows = conn.execute(
             "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
         ).fetchall()
         for arow in analysis_rows:
             tracks = _parse_analysis_payload(arow["payload"])
-            total_tracks += len(tracks)
             for t in tracks.values():
                 fp = t.get("fingerprint", "") if isinstance(t, dict) else ""
-                if _preview_exists(fp):
-                    total_previews += 1
+                if fp:
+                    seen_fps.add(fp)
+                    if fp not in preview_fps and _preview_exists(fp):
+                        preview_fps.add(fp)
+                else:
+                    # Sin fingerprint no se puede deduplicar; cuenta individual.
+                    no_fp_tracks += 1
+        total_tracks = len(seen_fps) + no_fp_tracks
+        total_previews = len(preview_fps)
 
         # Count sessions
         total_sessions = 0

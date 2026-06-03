@@ -8,6 +8,25 @@ import statistics
 from typing import List, Dict, Optional
 
 
+def normalize_error_key(error_msg: Optional[str]) -> str:
+    """Clave de agrupacion estable de un error: el mensaje SIN el prefijo
+    '[plataforma version]' que anade /client-error, primera linea, 80 chars.
+
+    Critico para que "[ios 2.9.0] X" y "[ios 2.9.2] X" caigan en el MISMO
+    grupo. Antes se agrupaba por substr(error_msg,1,80) crudo, que metia la
+    version en la clave -> el mismo bug logico aparecia como N grupos (uno
+    por version) que en la UI se veian identicos (la UI muestra clean_msg).
+    Resolver uno dejaba los gemelos de otras versiones -> "no desaparece".
+    """
+    raw = error_msg or ''
+    m = re.match(r'^\[([^\]]*)\]\s*(.*)$', raw, re.DOTALL)
+    clean = m.group(2) if m else raw
+    clean = clean.strip()
+    if not clean:
+        return ''
+    return clean.splitlines()[0][:80]
+
+
 def derive_error_meta(error_class: str, error_msg: Optional[str],
                       endpoint: Optional[str]) -> Dict[str, Optional[str]]:
     """Deriva metadatos FIABLES de un error a partir de sus campos crudos.
@@ -1381,33 +1400,64 @@ class AnalysisDB:
         try:
             c = conn.cursor()
             c.execute(
-                'SELECT error_class, msg_short, COUNT(*) AS count, '
-                '       COUNT(DISTINCT device_id) AS devices_affected, '
-                '       MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen, '
-                '       MAX(id) AS latest_id, '
-                '       SUM(CASE WHEN resolved = 0 THEN 1 ELSE 0 END) AS unresolved_count, '
-                '       MAX(error_msg) AS sample_msg, '
-                '       MAX(traceback) AS sample_traceback, '
-                '       MAX(filename_hash) AS sample_filename, '
-                '       MAX(endpoint) AS sample_endpoint '
+                'SELECT error_class, error_msg, device_id, timestamp, id, '
+                '       resolved, traceback, filename_hash, endpoint '
                 f'FROM analysis_errors{where} '
-                'GROUP BY error_class, msg_short '
-                'ORDER BY count DESC',
+                'ORDER BY id DESC',
                 params,
             )
-            rows = [dict(r) for r in c.fetchall()]
+            raw_rows = [dict(r) for r in c.fetchall()]
         except sqlite3.OperationalError:
             return []
         finally:
             conn.close()
 
-        for row in rows:
+        # Agrupacion en Python por (error_class, msg_normalizado). El normalizado
+        # quita el prefijo '[plataforma version]' para fusionar el mismo bug a
+        # traves de versiones (ver normalize_error_key). msg_short del grupo = la
+        # clave normalizada, que es lo que el cliente devuelve para resolver.
+        groups: Dict[tuple, dict] = {}
+        for r in raw_rows:
+            key = (r.get('error_class', ''), normalize_error_key(r.get('error_msg')))
+            g = groups.get(key)
+            ts = r.get('timestamp')
+            if g is None:
+                groups[key] = {
+                    'error_class': key[0],
+                    'msg_short': key[1],
+                    'count': 1,
+                    '_devices': {r.get('device_id')},
+                    'first_seen': ts,
+                    'last_seen': ts,
+                    'latest_id': r.get('id'),
+                    'unresolved_count': 1 if not r.get('resolved') else 0,
+                    'sample_msg': r.get('error_msg'),
+                    'sample_traceback': r.get('traceback'),
+                    'sample_filename': r.get('filename_hash'),
+                    'sample_endpoint': r.get('endpoint'),
+                }
+            else:
+                g['count'] += 1
+                g['_devices'].add(r.get('device_id'))
+                if not r.get('resolved'):
+                    g['unresolved_count'] += 1
+                if ts and (g['first_seen'] is None or ts < g['first_seen']):
+                    g['first_seen'] = ts
+                if ts and (g['last_seen'] is None or ts > g['last_seen']):
+                    g['last_seen'] = ts
+
+        rows = []
+        for g in groups.values():
+            g['devices_affected'] = len(g.pop('_devices'))
             meta = derive_error_meta(
-                row.get('error_class', ''),
-                row.get('sample_msg'),
-                row.get('sample_endpoint'),
+                g.get('error_class', ''),
+                g.get('sample_msg'),
+                g.get('sample_endpoint'),
             )
-            row.update(meta)
+            g.update(meta)
+            rows.append(g)
+
+        rows.sort(key=lambda x: x['count'], reverse=True)
         return rows
 
     def count_errors(
@@ -1485,19 +1535,34 @@ class AnalysisDB:
             conn.close()
 
     def resolve_error_group(self, error_class: str, msg_short: str) -> int:
-        """Marca como resolved TODAS las occurrencias de un grupo.
-        Devuelve el numero de filas actualizadas."""
+        """Marca como resolved TODAS las occurrencias de un grupo, fusionando
+        a traves de versiones. `msg_short` es la clave NORMALIZADA (sin prefijo
+        '[plataforma version]') que devuelve get_errors_grouped. Resolvemos
+        cualquier fila del mismo error_class cuyo mensaje normalice a esa clave,
+        no importa la version -> los gemelos de '[ios 2.9.0]' y '[ios 2.9.2]'
+        caen todos. Devuelve el numero de filas actualizadas."""
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            resolved_at = datetime.now(timezone.utc).isoformat()
             c.execute(
+                'SELECT id, error_msg FROM analysis_errors '
+                'WHERE error_class = ? AND resolved = 0',
+                (error_class,),
+            )
+            ids = [
+                r['id'] for r in c.fetchall()
+                if normalize_error_key(r['error_msg']) == msg_short
+            ]
+            if not ids:
+                return 0
+            resolved_at = datetime.now(timezone.utc).isoformat()
+            c.executemany(
                 'UPDATE analysis_errors SET resolved = 1, resolved_at = ? '
-                'WHERE error_class = ? AND msg_short = ? AND resolved = 0',
-                (resolved_at, error_class, msg_short),
+                'WHERE id = ?',
+                [(resolved_at, _id) for _id in ids],
             )
             conn.commit()
-            return c.rowcount
+            return len(ids)
         except sqlite3.OperationalError:
             return 0
         finally:
