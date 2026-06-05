@@ -3632,18 +3632,28 @@ async def head_artwork(track_id: str):
     (search_artwork_online tiene side effects: red + escritura a cache).
     Devuelve 200 con Content-Type/Content-Length, o 404 sin body.
     """
-    for ext in ('jpg', 'png', 'jpeg'):
+    for ext in ('jpg', 'png', 'jpeg', 'webp', 'gif'):
         cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
         if os.path.exists(cache_path):
-            media_type = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
             return Response(
                 status_code=200,
                 headers={
-                    "Content-Type": media_type,
+                    "Content-Type": _artwork_media_type(ext),
                     "Content-Length": str(os.path.getsize(cache_path)),
                 },
             )
     raise HTTPException(404, "Artwork no encontrado")
+
+
+def _artwork_media_type(ext: str) -> str:
+    """Mimetype para servir un artwork cacheado según su extensión."""
+    return {
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'webp': 'image/webp',
+        'gif': 'image/gif',
+    }.get(ext, 'image/jpeg')
 
 
 @app.get("/artwork/{track_id}")
@@ -3658,11 +3668,10 @@ async def get_artwork(track_id: str):
          artist+title de la BD y lo cacheamos para futuras peticiones.
       3. 404 si nada de lo anterior funciona.
     """
-    for ext in ['jpg', 'png', 'jpeg']:
+    for ext in ['jpg', 'png', 'jpeg', 'webp', 'gif']:
         cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
         if os.path.exists(cache_path):
-            media_type = "image/jpeg" if ext in ['jpg', 'jpeg'] else "image/png"
-            return FileResponse(cache_path, media_type=media_type)
+            return FileResponse(cache_path, media_type=_artwork_media_type(ext))
 
     # Fallback: buscar online por artist+title si tenemos el track en BD.
     try:
@@ -3706,17 +3715,24 @@ async def upload_artwork(fingerprint: str, file: UploadFile = File(...)):
         raise HTTPException(400, "artwork demasiado grande (max 5MB)")
 
     # Detectar tipo por bytes mágicos. Defaults a jpg si no clarifica.
+    # WEBP/GIF se aceptan porque algunas carátulas embebidas vienen en esos
+    # formatos; el motor local las escribe como `.jpg` aunque el contenido
+    # sea webp/gif, así que sin esto el upload daba 400 en bucle.
     if content[:3] == b'\xff\xd8\xff':
         ext = 'jpg'
     elif content[:8] == b'\x89PNG\r\n\x1a\n':
         ext = 'png'
+    elif content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+        ext = 'webp'
+    elif content[:6] in (b'GIF87a', b'GIF89a'):
+        ext = 'gif'
     else:
         # No reconocido — rechazar para no llenar el disco con basura.
-        raise HTTPException(400, "formato no soportado (sólo JPEG/PNG)")
+        raise HTTPException(400, "formato no soportado (sólo JPEG/PNG/WEBP/GIF)")
 
     # Eliminar versiones previas con otra extensión para evitar dos
     # archivos del mismo fingerprint en el cache.
-    for prev_ext in ('jpg', 'jpeg', 'png'):
+    for prev_ext in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
         prev = os.path.join(ARTWORK_CACHE_DIR, f"{safe_fp}.{prev_ext}")
         if os.path.exists(prev):
             try:
@@ -4142,7 +4158,7 @@ async def check_artworks(request: PreviewCheckRequest):
         safe_id = re.sub(r'[^a-fA-F0-9]', '', tid)
         if not safe_id:
             continue
-        for ext in ('jpg', 'png', 'jpeg'):
+        for ext in ('jpg', 'png', 'jpeg', 'webp', 'gif'):
             if os.path.exists(os.path.join(ARTWORK_CACHE_DIR, f"{safe_id}.{ext}")):
                 available.append(tid)
                 break
