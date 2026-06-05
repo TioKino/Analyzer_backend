@@ -1640,28 +1640,28 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         # Decidir si pedir online: solo si ID3 no es claramente bueno
         online_artwork = None
         online_size = 0
-        if id3_size < ID3_TRUSTED_THRESHOLD:
-            artist_name = id3_data.get('artist')
-            title_name = id3_data.get('title')
+        # Bug fix 2026-06-05: no sobreescribir artist_name/title_name con id3_data
+        # crudo aqui — ya estan enriquecidos por AudD (linea ~1553). Usar directo.
+        # El path chunked (analyze_audio_chunked) ya lo hacia bien desde siempre.
+        if id3_size < ID3_TRUSTED_THRESHOLD and artist_name and title_name:
             album_name = id3_data.get('album')
-            if artist_name and title_name:
+            try:
+                from artwork_and_cuepoints import search_artwork_online
+                online_artwork = search_artwork_online(
+                    artist_name, title_name, album_name
+                )
+                online_size = online_artwork.get('size', 0) if online_artwork else 0
+            except Exception as e:
+                logger.warning(f"   Artwork online fallo: {e}")
                 try:
-                    from artwork_and_cuepoints import search_artwork_online
-                    online_artwork = search_artwork_online(
-                        artist_name, title_name, album_name
+                    import traceback as _tb
+                    db.log_analysis_error(
+                        device_id=None, filename=None, fingerprint=fingerprint,
+                        error_class=type(e).__name__, error_msg=str(e),
+                        traceback_str=_tb.format_exc(), endpoint='artwork',
                     )
-                    online_size = online_artwork.get('size', 0) if online_artwork else 0
-                except Exception as e:
-                    logger.warning(f"   Artwork online fallo: {e}")
-                    try:
-                        import traceback as _tb
-                        db.log_analysis_error(
-                            device_id=None, filename=None, fingerprint=fingerprint,
-                            error_class=type(e).__name__, error_msg=str(e),
-                            traceback_str=_tb.format_exc(), endpoint='artwork',
-                        )
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
         # Elegir: ID3 si es grande (>=100KB) o si supera al online en tamaño.
         # Online si es valido (>=10KB) y mayor que ID3. Sino, nada.
