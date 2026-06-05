@@ -135,7 +135,14 @@ class AnalysisDB:
         Las funciones existentes que usan row[N] siguen funcionando
         sin cambios porque sqlite3.Row soporta ambas formas de acceso.
         """
-        conn = sqlite3.connect(self.db_path)
+        # timeout=30 + busy_timeout: si otra conexion tiene la BD bloqueada,
+        # esperamos hasta 30s en vez de fallar al instante con "database is
+        # locked". WAL permite lectores concurrentes con un escritor; el
+        # busy_timeout cubre la contienda entre escritores (save_track,
+        # delete_track_by_filename, corrections) bajo carga concurrente.
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -143,8 +150,9 @@ class AnalysisDB:
     def conn(self):
         """Conexion persistente con WAL + row_factory (lazy)."""
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.row_factory = sqlite3.Row
         return self._conn
 
@@ -246,6 +254,16 @@ class AnalysisDB:
                 UNIQUE(fingerprint, device_id)
             )
         ''')
+
+        # Migracion: BDs creadas antes de v2.9.3 tienen beat_grid_corrections
+        # SIN created_at/updated_at (el CREATE IF NOT EXISTS no altera tablas
+        # ya existentes). El INSERT de save_beat_grid_correction referencia
+        # ambas columnas -> 500 "no column named created_at". ALTER idempotente.
+        for _bg_col in ('created_at', 'updated_at'):
+            try:
+                conn.execute(f'ALTER TABLE beat_grid_corrections ADD COLUMN {_bg_col} TEXT')
+            except sqlite3.OperationalError:
+                pass  # Ya existe
 
         # Track type community overrides (Fase 2 v2).
         # Un device_id puede votar 1 vez por fingerprint. Si N>=3 votos y el
