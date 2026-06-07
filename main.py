@@ -97,6 +97,17 @@ except ImportError as e:
 # y usar análisis más intensivos.
 IS_LOCAL_ENGINE = os.environ.get('LOCAL_ENGINE', 'false').lower() == 'true'
 
+# Versión del motor de análisis. Incrementar cuando se mejore el algoritmo
+# (BPM, key, energy, etc.) para invalidar la cache y forzar re-análisis.
+# Convención: NULL en BD == "1" (registros pre-versionado no se reanalizan).
+ANALYSIS_VERSION = "1"
+
+
+def _is_analysis_current(track: dict) -> bool:
+    """True si el análisis guardado coincide con ANALYSIS_VERSION actual."""
+    return (track.get('analysis_version') or '1') == ANALYSIS_VERSION
+
+
 if IS_LOCAL_ENGINE:
     CHUNKED_ANALYZER_ENABLED = False  # No necesario: RAM del usuario suficiente
     logger.info("=" * 50)
@@ -214,6 +225,14 @@ def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
     if bpm_val <= 0 or not key_val:
         return None
     if data.get('analysis_status') == 'failed':
+        return None
+    # Si Render tiene una versión antigua del análisis, mejor re-analizar local
+    if (data.get('analysis_version') or '1') != ANALYSIS_VERSION:
+        logger.info(
+            f"[Render fallback] version obsoleta "
+            f"({data.get('analysis_version') or 'NULL'} != {ANALYSIS_VERSION}), "
+            f"re-analizando local"
+        )
         return None
     return data
 
@@ -2339,7 +2358,7 @@ async def analyze_track(
         # Esto recupera datos de AudD guardados previamente
         if not force:
             existing_by_fp = db.get_track_by_fingerprint(fingerprint)
-            if existing_by_fp:
+            if existing_by_fp and _is_analysis_current(existing_by_fp):
                 # Log dedup multi-dispositivo: si un track sube desde móvil
                 # con nombre distinto al que tenía en PC, este log permite
                 # verificar que NO se reanaliza.
@@ -2569,6 +2588,7 @@ async def analyze_track(
         track_data['filename'] = file.filename
         track_data['fingerprint'] = fingerprint
         track_data['engine_source'] = 'local_engine' if IS_LOCAL_ENGINE else 'render'
+        track_data['analysis_version'] = ANALYSIS_VERSION
         db.save_track(track_data)
 
         # Incrementar contador de popularidad
@@ -3527,7 +3547,7 @@ async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintReque
         # `get_track_by_fingerprint` ya cubre el caso `id == fingerprint`
         # para registros antiguos donde el id legacy es el propio MD5.
         existing = db.get_track_by_fingerprint(fp)
-        if existing:
+        if existing and _is_analysis_current(existing):
             analyzed.append(fp)
         else:
             not_analyzed.append(fp)
@@ -3580,6 +3600,7 @@ async def get_analysis_by_fingerprint(fingerprint: str):
         "key_source": existing.get('key_source'),
         "genre_source": existing.get('genre_source'),
         "engine_source": existing.get('engine_source'),
+        "analysis_version": existing.get('analysis_version') or '1',
     }
 
 
