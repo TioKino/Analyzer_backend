@@ -50,7 +50,13 @@ MUSICBRAINZ_USER_AGENT: str = os.getenv(
 # Ver audd_helper.py para la logica de decision.
 
 AUDD_AUTO_ENABLED: bool = os.getenv('AUDD_AUTO_ENABLED', 'true').lower() in ('true', '1', 'yes')
-AUDD_DAILY_CAP: int = int(os.getenv('AUDD_DAILY_CAP', '50'))
+# Cap diario del auto-trigger. Subido 50->100 (2026-06-09): absorbe dias con
+# import grande sin throttlear. El cooldown de 7d por fingerprint evita
+# re-cobrar el mismo track, asi que el gasto mensual real queda cerca del nº de
+# tracks unicos nuevos con metadata basura, no de 100*30. Override por env si el
+# plan AudD lo requiere. (Backfill de portadas tiene su propio presupuesto
+# cliente: ver ArtworkBackfillNotifier._dailyAuddBudget.)
+AUDD_DAILY_CAP: int = int(os.getenv('AUDD_DAILY_CAP', '100'))
 AUDD_COOLDOWN_DAYS: int = int(os.getenv('AUDD_COOLDOWN_DAYS', '7'))
 AUDD_MIN_DURATION: float = float(os.getenv('AUDD_MIN_DURATION', '30'))
 AUDD_MAX_DURATION: float = float(os.getenv('AUDD_MAX_DURATION', '720'))
