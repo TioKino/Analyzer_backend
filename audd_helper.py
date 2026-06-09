@@ -279,3 +279,87 @@ def enrich_with_audd_if_needed(
 
     logger.info(f"[AudD-auto] identificado: {track_data['artist']} - {track_data['title']}")
     return track_data
+
+
+def _extract_artwork_url_from_audd(track_data: Dict) -> Optional[Tuple[str, str]]:
+    """Extrae la URL de portada del payload AudD (apple_music/deezer/spotify).
+
+    AudD ya identifico el track EXACTO, asi que esta portada es la oficial del
+    release — mas fiable que volver a buscar por texto en iTunes/Deezer. No
+    cuesta cuota extra: la respuesta ya venia con `return=apple_music,deezer,...`.
+
+    Prioridad por resolucion: Apple Music (template hasta 1000x1000) > Deezer
+    cover_xl (1000x1000) > Spotify (640x640).
+
+    Returns: (url, source) o None.
+    """
+    if not track_data:
+        return None
+
+    # 1. Apple Music — la URL es un template con {w}x{h}; pedimos 1000x1000.
+    apple = track_data.get('apple_music') or {}
+    artwork = apple.get('artwork') or {}
+    apple_url = artwork.get('url')
+    if apple_url and '{w}' in apple_url and '{h}' in apple_url:
+        return apple_url.replace('{w}', '1000').replace('{h}', '1000'), 'apple_music'
+    if apple_url:
+        return apple_url, 'apple_music'
+
+    # 2. Deezer — cover_xl es 1000x1000.
+    deezer = track_data.get('deezer') or {}
+    deezer_album = deezer.get('album') or {}
+    deezer_url = deezer_album.get('cover_xl') or deezer_album.get('cover_big')
+    if deezer_url:
+        return deezer_url, 'deezer'
+
+    # 3. Spotify — la primera imagen es la mas grande (640x640).
+    spotify = track_data.get('spotify') or {}
+    spotify_album = spotify.get('album') or {}
+    images = spotify_album.get('images') or []
+    if images and isinstance(images, list):
+        img_url = images[0].get('url') if isinstance(images[0], dict) else None
+        if img_url:
+            return img_url, 'spotify'
+
+    return None
+
+
+def download_artwork_from_audd(track_data: Dict, timeout: int = 8) -> Optional[Dict]:
+    """Descarga la portada exacta que AudD devolvio para el track identificado.
+
+    Devuelve el mismo formato que `search_artwork_online`:
+        {'url', 'data' (bytes), 'mime_type', 'size', 'source'} o None.
+
+    El `source` lleva sufijo `_audd` (ej. 'apple_music_audd') para distinguir
+    en logs/panel admin que vino del match exacto de AudD, no de una busqueda
+    por texto.
+    """
+    extracted = _extract_artwork_url_from_audd(track_data)
+    if not extracted:
+        return None
+    url, source = extracted
+
+    try:
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code == 200 and len(resp.content) > 10000:
+            mime = resp.headers.get('Content-Type', 'image/jpeg').split(';')[0].strip()
+            if not mime.startswith('image/'):
+                mime = 'image/jpeg'
+            logger.info(
+                f"[AudD-auto] artwork {source}: {len(resp.content)} bytes (match exacto)"
+            )
+            return {
+                'url': url,
+                'data': resp.content,
+                'mime_type': mime,
+                'size': len(resp.content),
+                'source': f'{source}_audd',
+            }
+        logger.debug(
+            f"[AudD-auto] artwork {source} descarga insuficiente "
+            f"(HTTP {resp.status_code}, {len(resp.content)}b)"
+        )
+    except requests.RequestException as e:
+        logger.warning(f"[AudD-auto] artwork download {type(e).__name__}: {e}")
+
+    return None

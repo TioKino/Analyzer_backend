@@ -1573,9 +1573,10 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # ultimo recurso (con presupuesto y cooldown). Discogs/iTunes/MusicBrainz
     # requieren artist+title para arrancar, asi que recuperar la identidad
     # aqui desbloquea el resto.
+    audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
-            from audd_helper import enrich_with_audd_if_needed
+            from audd_helper import enrich_with_audd_if_needed, download_artwork_from_audd
             audd_track = enrich_with_audd_if_needed(
                 file_path=file_path,
                 fingerprint=fingerprint,
@@ -1599,6 +1600,12 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                     label = audd_track['label']
                 if not year and audd_track.get('release_date'):
                     year = audd_track['release_date'][:4]
+                # Portada exacta del match AudD (Apple Music/Deezer/Spotify):
+                # AudD ya identifico el track preciso, asi que su caratula es la
+                # oficial del release — mejor que re-buscar por texto. Gratis
+                # (la respuesta ya venia con esos campos). Se usa como candidata
+                # preferente en el bloque de ARTWORK de abajo.
+                audd_artwork = download_artwork_from_audd(audd_track)
                 # Re-correr Discogs/MusicBrainz si la cascada anterior no aporto
                 # genero (sigue siendo el default analitico).
                 if (genre_source in ('spectral_analysis', 'chunked_analysis')
@@ -1659,10 +1666,16 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         # Decidir si pedir online: solo si ID3 no es claramente bueno
         online_artwork = None
         online_size = 0
+        # Candidata preferente: la portada exacta que AudD ya nos dio (match
+        # exacto del track). Evita la busqueda por texto (menos fiable, mas
+        # latencia) cuando AudD identifico el track.
+        if audd_artwork:
+            online_artwork = audd_artwork
+            online_size = audd_artwork.get('size', 0)
         # Bug fix 2026-06-05: no sobreescribir artist_name/title_name con id3_data
         # crudo aqui — ya estan enriquecidos por AudD (linea ~1553). Usar directo.
         # El path chunked (analyze_audio_chunked) ya lo hacia bien desde siempre.
-        if id3_size < ID3_TRUSTED_THRESHOLD and artist_name and title_name:
+        elif id3_size < ID3_TRUSTED_THRESHOLD and artist_name and title_name:
             album_name = id3_data.get('album')
             try:
                 from artwork_and_cuepoints import search_artwork_online
@@ -1968,9 +1981,10 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
     # ==================== AUDD AUTO-TRIGGER ====================
     # Mismo trigger que en analyze_audio: si tras ID3+filename seguimos sin
     # artist/title utilizable, AudD como ultimo recurso.
+    audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
-            from audd_helper import enrich_with_audd_if_needed
+            from audd_helper import enrich_with_audd_if_needed, download_artwork_from_audd
             audd_track = enrich_with_audd_if_needed(
                 file_path=file_path,
                 fingerprint=fingerprint,
@@ -1994,6 +2008,8 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
                     label = audd_track['label']
                 if not year and audd_track.get('release_date'):
                     year = audd_track['release_date'][:4]
+                # Portada exacta del match AudD (ver path no-chunked arriba).
+                audd_artwork = download_artwork_from_audd(audd_track)
                 if (genre_source in ('spectral_analysis', 'chunked_analysis')
                         and GENRE_DETECTOR_ENABLED and genre_detector):
                     try:
@@ -2034,7 +2050,12 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
 
         online_artwork = None
         online_size = 0
-        if id3_size < ID3_TRUSTED_THRESHOLD and artist_name and title_name:
+        # Candidata preferente: portada exacta del match AudD (ver path
+        # no-chunked). Solo si no la hay caemos a la busqueda por texto.
+        if audd_artwork:
+            online_artwork = audd_artwork
+            online_size = audd_artwork.get('size', 0)
+        elif id3_size < ID3_TRUSTED_THRESHOLD and artist_name and title_name:
             try:
                 online_artwork = search_artwork_online(
                     artist_name, title_name, id3_data.get('album')
