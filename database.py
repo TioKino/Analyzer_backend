@@ -179,7 +179,8 @@ class AnalysisDB:
                 analysis_json TEXT,
                 analyzed_at TEXT,
                 fingerprint TEXT,
-                chromaprint TEXT
+                chromaprint TEXT,
+                analysis_version TEXT
             )
         ''')
 
@@ -406,6 +407,14 @@ class AnalysisDB:
             pass
         conn.execute('CREATE INDEX IF NOT EXISTS idx_tracks_engine ON tracks(engine_source)')
 
+        # Versión del motor de análisis. NULL = "1" (tracks pre-versionado).
+        # Incrementar ANALYSIS_VERSION en main.py invalida la cache y fuerza
+        # re-análisis automático en la próxima subida/consulta.
+        try:
+            conn.execute("ALTER TABLE tracks ADD COLUMN analysis_version TEXT")
+        except sqlite3.OperationalError:
+            pass
+
         conn.commit()
         conn.close()
 
@@ -479,8 +488,8 @@ class AnalysisDB:
             INSERT OR REPLACE INTO tracks
             (id, filename, artist, title, duration, bpm, key, camelot,
              energy_dj, genre, track_type, analysis_json, analyzed_at,
-             fingerprint, engine_source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             fingerprint, engine_source, analysis_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             track_data['id'],
             track_data['filename'],
@@ -497,6 +506,7 @@ class AnalysisDB:
             datetime.now().isoformat(),
             track_data.get('fingerprint'),
             track_data.get('engine_source'),
+            track_data.get('analysis_version'),
         ))
 
         conn.commit()
