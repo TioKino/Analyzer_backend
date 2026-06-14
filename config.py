@@ -116,7 +116,10 @@ RATE_LIMIT_WINDOW: int = int(os.getenv('RATE_LIMIT_WINDOW', '60'))  # segundos
 
 MAX_FILE_SIZE_MB: int = int(os.getenv('MAX_FILE_SIZE_MB', '100'))
 ANALYSIS_TIMEOUT_SECONDS: int = int(os.getenv('ANALYSIS_TIMEOUT_SECONDS', '180'))
-SUPPORTED_FORMATS: tuple = ('.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma')
+SUPPORTED_FORMATS: tuple = (
+    '.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg',
+    '.aiff', '.aif', '.opus', '.wma',
+)
 
 
 # ==================== SEGURIDAD ====================

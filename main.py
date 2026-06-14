@@ -2275,8 +2275,19 @@ async def analyze_track(
     if not file.filename:
         raise HTTPException(400, "No se proporcion archivo")
     
-    if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg')):
-        raise HTTPException(400, "Formato no soportado. Permitidos: mp3, wav, flac, m4a, aac, ogg")
+    # AIFF (.aiff/.aif) es estandar en el mundo DJ Mac (Serato/Rekordbox lo
+    # exportan a saco) y libsndfile lo decodifica nativo; opus/wma los abre
+    # ffmpeg (fallback de robust_audio_load). Su ausencia causaba 400s en
+    # reales (ej. device con biblioteca AIFF rechazada track a track).
+    if not file.filename.lower().endswith(
+        ('.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg',
+         '.aiff', '.aif', '.opus', '.wma')
+    ):
+        raise HTTPException(
+            400,
+            "Formato no soportado. Permitidos: mp3, wav, flac, m4a, aac, "
+            "ogg, aiff, aif, opus, wma",
+        )
 
     # Upload streaming a disco en bloques de 1 MB. ANTES hacíamos
     # `content = await file.read()` que chupaba hasta 100 MB en RAM de golpe
