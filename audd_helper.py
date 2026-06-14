@@ -145,9 +145,27 @@ def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dic
             def silence_native_stderr():
                 yield
 
-        # Fragmento de 20s desde 0:30 (mismo patron que /identify)
+        # Fragmento de 20s desde 0:30 (mismo patron que /identify).
+        # Offset adaptativo: en tracks cortos (<33s) un offset=30 hace que
+        # librosa intente leer un rango que empieza pasado el EOF y revienta
+        # con "ValueError: negative dimensions are not allowed". Calculamos la
+        # duracion primero (barato, lee metadata) y caemos a offset=0 cuando el
+        # track no llega — asi los tracks cortos tambien se identifican via AudD
+        # en vez de saltarse silenciosamente.
+        offset = 30.0
+        try:
+            total_dur = librosa.get_duration(path=file_path)
+        except Exception:
+            total_dur = 0.0
+        # Necesitamos al menos 3s tras el offset (mismo umbral que el check de
+        # abajo). Si no llega, empezamos desde el principio.
+        if total_dur and total_dur < offset + 3.0:
+            offset = 0.0
+
         with silence_native_stderr():
-            y, sr = librosa.load(file_path, sr=22050, mono=True, duration=20, offset=30)
+            y, sr = librosa.load(
+                file_path, sr=22050, mono=True, duration=20, offset=offset
+            )
 
         # Validar que el fragmento sirve antes de gastar cuota de AudD.
         # AudD devuelve "Recognition failed: there's been a problem with
