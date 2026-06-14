@@ -2658,34 +2658,54 @@ async def analyze_track(
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
-        # exc_info=True asegura que handlers que descartan \n en el message
-        # (uvicorn default formatter) sigan recibiendo el traceback via el
-        # campo exc_info del LogRecord. Sin esto, en Render solo veiamos
-        # "ERROR en anlisis de audio:" sin contexto. Ademas pasamos el
-        # tipo y mensaje en el header del log para verlo de un vistazo.
-        logger.error(
-            f"ERROR en anlisis de audio: {type(e).__name__}: {e}",
-            exc_info=True,
-        )
 
-        # Telemetria privacy-first: registra el error en analysis_errors
-        # para que el panel admin lo muestre. Filename se hashea dentro
-        # de log_analysis_error. device_id viene del header X-Device-Id
-        # cuando el cliente lo manda (cliente desktop lo hace en sync;
-        # /analyze raw no siempre lo incluye).
-        try:
-            db.log_analysis_error(
-                device_id=request.headers.get("X-Device-Id"),
-                filename=file.filename,
-                fingerprint=None,
-                error_class=type(e).__name__,
-                error_msg=str(e),
-                traceback_str=error_detail,
-                endpoint='/analyze',
+        # Distinguir "audio genuinamente ilegible" (problema de DATOS del
+        # cliente, no bug del backend) de un error real accionable. Cuando
+        # librosa Y el fallback ffmpeg fallan, robust_audio_load propaga el
+        # CalledProcessError de ffmpeg: el fichero subido esta corrupto/vacio
+        # o con un codec que ffmpeg no abre. No hay nada que arreglar en el
+        # servidor — antes esto ensuciaba el panel admin (ej. 18x desde 1
+        # device con ficheros rotos), tratandolo como un fallo del backend.
+        # Mismo criterio que los timeouts de AudD: WARNING y NO se registra en
+        # la telemetria de errores. El fallback de abajo igualmente devuelve un
+        # resultado degradado (pending) + 200, asi que el track aparece con la
+        # metadata del filename.
+        is_corrupt_audio = isinstance(e, subprocess.CalledProcessError)
+
+        if is_corrupt_audio:
+            logger.warning(
+                f"[decode] audio ilegible — cliente subio fichero corrupto: "
+                f"{file.filename} ({type(e).__name__})"
             )
-        except Exception:
-            # No bloquear el flow si la tabla aun no esta migrada.
-            pass
+        else:
+            # exc_info=True asegura que handlers que descartan \n en el message
+            # (uvicorn default formatter) sigan recibiendo el traceback via el
+            # campo exc_info del LogRecord. Sin esto, en Render solo veiamos
+            # "ERROR en anlisis de audio:" sin contexto. Ademas pasamos el
+            # tipo y mensaje en el header del log para verlo de un vistazo.
+            logger.error(
+                f"ERROR en anlisis de audio: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+
+            # Telemetria privacy-first: registra el error en analysis_errors
+            # para que el panel admin lo muestre. Filename se hashea dentro
+            # de log_analysis_error. device_id viene del header X-Device-Id
+            # cuando el cliente lo manda (cliente desktop lo hace en sync;
+            # /analyze raw no siempre lo incluye).
+            try:
+                db.log_analysis_error(
+                    device_id=request.headers.get("X-Device-Id"),
+                    filename=file.filename,
+                    fingerprint=None,
+                    error_class=type(e).__name__,
+                    error_msg=str(e),
+                    traceback_str=error_detail,
+                    endpoint='/analyze',
+                )
+            except Exception:
+                # No bloquear el flow si la tabla aun no esta migrada.
+                pass
 
         # ==================== FALLBACK: Track corrupto ====================
         # Intentar crear resultado bsico con ID3 y/o filename
