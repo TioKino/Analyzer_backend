@@ -25,11 +25,16 @@ import os
 # Límites de archivo
 MAX_FILE_SIZE_MB = 100  # 100 MB máximo
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-ALLOWED_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg'}
+ALLOWED_EXTENSIONS = {
+    '.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg',
+    '.aiff', '.aif', '.opus', '.wma',
+}
 ALLOWED_MIME_TYPES = {
     'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-wav',
     'audio/flac', 'audio/x-flac', 'audio/mp4', 'audio/m4a',
-    'audio/aac', 'audio/ogg', 'application/octet-stream'
+    'audio/aac', 'audio/ogg',
+    'audio/aiff', 'audio/x-aiff', 'audio/opus', 'audio/x-ms-wma',
+    'application/octet-stream'
 }
 
 # Límites de BPM
