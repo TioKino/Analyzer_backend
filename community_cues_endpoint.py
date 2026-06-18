@@ -168,6 +168,7 @@ def register_community_endpoints(app, db):
     """Registra los endpoints de community cues en la app FastAPI"""
 
     @app.post("/community-cues", response_model=dict)
+    @app.post("/community/cues", response_model=dict)  # alias: el cliente llama con barra
     async def upload_community_cues(upload: CueUpload):
         """
         Un DJ sube sus cues para un track (por fingerprint).
@@ -235,6 +236,7 @@ def register_community_endpoints(app, db):
             return {"status": "error", "message": str(e)}
 
     @app.get("/community-cues/{fingerprint}", response_model=CommunityResponse)
+    @app.get("/community/cues/{fingerprint}", response_model=CommunityResponse)  # alias barra
     async def get_community_cues(fingerprint: str):
         """
         Obtiene las zonas comunitarias agregadas para un track.

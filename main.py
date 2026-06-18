@@ -4820,6 +4820,94 @@ async def get_community_track_type(fingerprint: str):
     }
 
 
+# ==================== COMMUNITY NOTES / RATINGS / POPULARITY ====================
+# Portados inline desde routes/community.py: ese community_router NUNCA se monta
+# en main.py (solo sync_router + admin_panel_router via include_router), asi que
+# /community/notes, /community/rate y /community/popularity devolvian 404 (ruta
+# inexistente). Beat-grid y override ya estaban inline mas arriba; estos faltaban.
+
+class CommunityNoteRequest(BaseModel):
+    fingerprint: str
+    device_id: str
+    note_text: str
+    display_name: str = "DJ"
+    note_type: str = "general"  # general, technique, mixing, warning
+
+
+class TrackRatingRequest(BaseModel):
+    fingerprint: str
+    device_id: str
+    rating: int  # 1-5
+
+
+@app.post("/community/notes")
+async def post_community_note(req: CommunityNoteRequest):
+    """Un DJ deja una nota publica en un track (visible para todos)."""
+    if not req.note_text.strip():
+        raise HTTPException(400, "note_text vacio")
+    if len(req.note_text) > 500:
+        raise HTTPException(400, "Nota demasiado larga (max 500 chars)")
+    try:
+        note_id = db.save_community_note(
+            fingerprint=req.fingerprint,
+            device_id=req.device_id,
+            note_text=req.note_text.strip(),
+            display_name=req.display_name.strip()[:30] or "DJ",
+            note_type=req.note_type,
+        )
+        logger.info(f"[Community] Nota guardada: fp={req.fingerprint[:8]}... by {req.display_name}")
+        return {"status": "ok", "note_id": note_id}
+    except Exception as e:
+        logger.error(f"[Community] Error guardando nota: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/community/notes/{fingerprint}")
+async def get_community_notes(fingerprint: str):
+    """Devuelve todas las notas de la comunidad para un track."""
+    try:
+        notes = db.get_community_notes(fingerprint)
+        return {"fingerprint": fingerprint, "notes": notes, "total": len(notes)}
+    except Exception as e:
+        logger.error(f"[Community] Error leyendo notas: {e}")
+        return {"fingerprint": fingerprint, "notes": [], "total": 0}
+
+
+@app.post("/community/notes/{note_id}/upvote")
+async def upvote_note(note_id: int):
+    """Sube un voto a una nota comunitaria."""
+    try:
+        db.upvote_community_note(note_id)
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/community/rate")
+async def rate_track_endpoint(req: TrackRatingRequest):
+    """Un DJ puntua un track (1-5 estrellas). Una valoracion por DJ por track."""
+    if req.rating < 1 or req.rating > 5:
+        raise HTTPException(400, "Rating debe ser 1-5")
+    try:
+        result = db.rate_track(req.fingerprint, req.device_id, req.rating)
+        logger.info(f"[Community] Rating: fp={req.fingerprint[:8]}... = {req.rating} (avg {result.get('avg_rating')})")
+        return {"status": "ok", **result}
+    except Exception as e:
+        logger.error(f"[Community] Error rating: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/community/popularity/{fingerprint}")
+async def get_popularity(fingerprint: str, device_id: str = ""):
+    """Devuelve popularidad + rating medio + tu rating para un track."""
+    try:
+        pop = db.get_track_popularity(fingerprint)
+        my_rating = db.get_my_rating(fingerprint, device_id) if device_id else 0
+        return {**pop, "my_rating": my_rating}
+    except Exception:
+        return {"analysis_count": 0, "dj_count": 0, "avg_rating": 0, "total_ratings": 0, "my_rating": 0}
+
+
 def _fetch_community_override(fingerprint: str, field: str) -> Optional[Dict]:
     """Si somos motor local, pregunta a Render por consensus de (fp, field).
 
