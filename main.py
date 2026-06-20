@@ -1246,7 +1246,8 @@ def robust_audio_load(file_path: str, sr: int = 44100, mono: bool = True):
                     pass
 
 
-def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = False) -> AnalysisResult:
+def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = False,
+                  original_filename: Optional[str] = None) -> AnalysisResult:
     import warnings
     warnings.filterwarnings('ignore')
 
@@ -1278,7 +1279,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     #  Si el track es largo (>4 min), usar anlisis por chunks
     if CHUNKED_ANALYZER_ENABLED and duration > CHUNK_ANALYSIS_THRESHOLD:
         logger.info(f" Track largo ({duration/60:.1f} min) - Usando anlisis por chunks")
-        return analyze_audio_chunked(file_path, fingerprint, duration, force_audd=force_audd)
+        return analyze_audio_chunked(file_path, fingerprint, duration, force_audd=force_audd,
+                                     original_filename=original_filename)
 
     # Track corto: anlisis tradicional (carga todo en RAM)
     logger.info(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
@@ -1567,9 +1569,14 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     if not title_name:
         title_name = id3_data.get('title')
 
-    # Si no hay metadata ID3, intentar con filename parseado
+    # Si no hay metadata ID3, intentar con filename parseado.
+    # IMPORTANTE: usar el filename REAL (original_filename) y NO el basename
+    # del file_path, que en /analyze es el tmp_path (/tmp/tmpXXXXXX.mp3). Si
+    # parseabamos el basename del temp, el "title" salia "tmpXXXXXX" (basura)
+    # y como no quedaba vacio, el fallback del endpoint con file.filename
+    # nunca disparaba -> la limpieza proponia nombres tmpXXXX. Bug 2026-06.
     if not artist_name or not title_name:
-        parsed = parse_filename(os.path.basename(file_path))
+        parsed = parse_filename(original_filename or os.path.basename(file_path))
         if not artist_name:
             artist_name = parsed.get('artist')
         if not title_name:
@@ -1881,7 +1888,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         artwork_url=artwork_url,
     )
 
-def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, force_audd: bool = False) -> AnalysisResult:
+def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, force_audd: bool = False,
+                          original_filename: Optional[str] = None) -> AnalysisResult:
     """
     Analiza tracks largos por chunks para reducir uso de RAM.
     Usado automticamente para tracks > 4 minutos.
@@ -1977,9 +1985,14 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
     if not title_name:
         title_name = id3_data.get('title')
 
-    # Si no hay metadata ID3, intentar con filename parseado
+    # Si no hay metadata ID3, intentar con filename parseado.
+    # IMPORTANTE: usar el filename REAL (original_filename) y NO el basename
+    # del file_path, que en /analyze es el tmp_path (/tmp/tmpXXXXXX.mp3). Si
+    # parseabamos el basename del temp, el "title" salia "tmpXXXXXX" (basura)
+    # y como no quedaba vacio, el fallback del endpoint con file.filename
+    # nunca disparaba -> la limpieza proponia nombres tmpXXXX. Bug 2026-06.
     if not artist_name or not title_name:
-        parsed = parse_filename(os.path.basename(file_path))
+        parsed = parse_filename(original_filename or os.path.basename(file_path))
         if not artist_name:
             artist_name = parsed.get('artist')
         if not title_name:
@@ -2532,7 +2545,8 @@ async def analyze_track(
             logger.error(f"tmp_path {tmp_path} desaparecio antes de analyze_audio")
             raise HTTPException(500, "Archivo temporal desaparecio antes del analisis")
 
-        result = analyze_audio(tmp_path, fingerprint, force_audd=force_audd)
+        result = analyze_audio(tmp_path, fingerprint, force_audd=force_audd,
+                               original_filename=file.filename)
 
         # Señal honesta de cap para la UI de "Limpiar con AudD" (force_audd):
         # si tras forzar AudD el track SIGUE sin metadata utilizable Y el cap
