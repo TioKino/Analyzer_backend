@@ -722,6 +722,13 @@ class AnalysisResult(BaseModel):
     preview_url: Optional[str] = None
     # Fingerprint del archivo
     fingerprint: Optional[str] = None
+    # Señal honesta para la UI (solo en /analyze?force_audd=true, p.ej.
+    # "Limpiar con AudD"): True cuando el usuario forzó AudD pero el cap diario
+    # GLOBAL ya estaba agotado, así que AudD NO corrió para este track. La UI
+    # muestra "límite diario alcanzado, inténtalo mañana" en vez de un genérico
+    # "no identificado". Default False => parsear analysis_json legacy sin el
+    # campo no rompe (mismo criterio que los 18 campos extendidos de arriba).
+    audd_daily_cap_reached: bool = False
 
 class CorrectionRequest(BaseModel):
     track_id: str
@@ -2526,6 +2533,29 @@ async def analyze_track(
             raise HTTPException(500, "Archivo temporal desaparecio antes del analisis")
 
         result = analyze_audio(tmp_path, fingerprint, force_audd=force_audd)
+
+        # Señal honesta de cap para la UI de "Limpiar con AudD" (force_audd):
+        # si tras forzar AudD el track SIGUE sin metadata utilizable Y el cap
+        # diario GLOBAL ya está agotado, AudD no se ejecutó por presupuesto
+        # (force ya salta cooldown y garbage-check, así que el cap es lo único
+        # que pudo bloquearlo). La UI lo usa para un mensaje honesto ("límite
+        # diario alcanzado, inténtalo mañana") en lugar de "no identificado".
+        #
+        # MONETIZACIÓN (paywall futuro): este auto-trigger de AudD durante
+        # /analyze pasará a ser Pro-only. La feature Escuchar (/identify, tipo
+        # Shazam) seguirá siendo GRATIS para todos. Para "AudD ilimitado en
+        # Pro" hay que mover el cap de GLOBAL a per-device_id (hoy
+        # count_audd_calls_today() es global y lo comparten todos). Ver
+        # should_trigger_audd() en audd_helper.py y CLAUDE.md > "AudD: tiers".
+        if force_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+            try:
+                from audd_helper import is_garbage_metadata
+                if (is_garbage_metadata(result.artist, result.title)
+                        and db is not None
+                        and db.count_audd_calls_today() >= AUDD_DAILY_CAP):
+                    result.audd_daily_cap_reached = True
+            except Exception:
+                pass
 
         # Parsear nombre si falta metadata
         if not result.artist or not result.title:
