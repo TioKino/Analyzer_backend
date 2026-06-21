@@ -1046,6 +1046,27 @@ class AnalysisDB:
         conn.close()
         return row['rating'] if row else 0
 
+    def get_my_ratings_batch(self, fingerprints: List[str], device_id: str) -> Dict[str, int]:
+        """Rating PROPIO (de este device_id) de varios tracks en UNA query.
+        Lo usa la columna de rating personal de la librería desktop. Devuelve
+        {fingerprint: rating}. Los tracks sin valorar por este device NO
+        aparecen (el cliente asume 0). Acota a 500 por seguridad."""
+        fps = [f for f in (fingerprints or []) if f][:500]
+        if not fps or not device_id:
+            return {}
+        placeholders = ','.join('?' * len(fps))
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT fingerprint, rating FROM track_ratings '
+                f'WHERE device_id = ? AND fingerprint IN ({placeholders})',
+                [device_id] + fps,
+            )
+            return {row['fingerprint']: row['rating'] for row in c.fetchall()}
+        finally:
+            conn.close()
+
     # ==================== COMMUNITY BEAT GRID ====================
 
     def submit_beat_grid_correction(self, fingerprint: str, device_id: str,

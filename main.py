@@ -4969,6 +4969,23 @@ async def get_popularity_batch(req: PopularityBatchRequest):
         return {}
 
 
+class MyRatingsBatchRequest(BaseModel):
+    fingerprints: List[str]
+    device_id: str
+
+
+@app.post("/community/my-ratings/batch")
+async def get_my_ratings_batch(req: MyRatingsBatchRequest):
+    """Rating PROPIO (de este device_id) de varios tracks en UNA llamada. Lo usa
+    la columna de rating personal de la libreria desktop. Devuelve {fingerprint:
+    rating}; los no valorados por este device no aparecen (cliente asume 0)."""
+    try:
+        return db.get_my_ratings_batch(req.fingerprints, req.device_id)
+    except Exception as e:
+        logger.error(f"[Community] Error my-ratings batch: {e}")
+        return {}
+
+
 def _fetch_community_override(fingerprint: str, field: str) -> Optional[Dict]:
     """Si somos motor local, pregunta a Render por consensus de (fp, field).
 
