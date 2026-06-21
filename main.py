@@ -4952,6 +4952,23 @@ async def get_popularity(fingerprint: str, device_id: str = ""):
         return {"analysis_count": 0, "dj_count": 0, "avg_rating": 0, "total_ratings": 0, "my_rating": 0}
 
 
+class PopularityBatchRequest(BaseModel):
+    fingerprints: List[str]
+
+
+@app.post("/community/popularity/batch")
+async def get_popularity_batch(req: PopularityBatchRequest):
+    """Popularidad de varios tracks en UNA llamada. Lo usa la columna de
+    popularidad de la libreria desktop (evita N peticiones por-track).
+    Devuelve {fingerprint: {analysis_count, dj_count, avg_rating, total_ratings}}.
+    Los fingerprints sin datos no aparecen (el cliente asume 0)."""
+    try:
+        return db.get_track_popularity_batch(req.fingerprints)
+    except Exception as e:
+        logger.error(f"[Community] Error popularity batch: {e}")
+        return {}
+
+
 def _fetch_community_override(fingerprint: str, field: str) -> Optional[Dict]:
     """Si somos motor local, pregunta a Render por consensus de (fp, field).
 

@@ -1007,6 +1007,36 @@ class AnalysisDB:
             }
         return {'analysis_count': 0, 'dj_count': 0, 'avg_rating': 0, 'total_ratings': 0}
 
+    def get_track_popularity_batch(self, fingerprints: List[str]) -> Dict[str, Dict]:
+        """Popularidad de varios fingerprints en UNA query (columna de libreria
+        del cliente desktop). Devuelve {fingerprint: {analysis_count, dj_count,
+        avg_rating, total_ratings}}. Los que no esten en la tabla NO aparecen
+        (el cliente asume 0). Acota a 500 por si el cliente no trocea."""
+        fps = [f for f in (fingerprints or []) if f][:500]
+        if not fps:
+            return {}
+        placeholders = ','.join('?' * len(fps))
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT fingerprint, analysis_count, dj_count, avg_rating, '
+                'total_ratings FROM track_popularity '
+                f'WHERE fingerprint IN ({placeholders})',
+                fps,
+            )
+            out: Dict[str, Dict] = {}
+            for row in c.fetchall():
+                out[row['fingerprint']] = {
+                    'analysis_count': row['analysis_count'] or 0,
+                    'dj_count': row['dj_count'] or 0,
+                    'avg_rating': round(row['avg_rating'] or 0, 1),
+                    'total_ratings': row['total_ratings'] or 0,
+                }
+            return out
+        finally:
+            conn.close()
+
     def get_my_rating(self, fingerprint: str, device_id: str) -> int:
         conn = self._open_conn()
         c = conn.cursor()
