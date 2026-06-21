@@ -971,13 +971,18 @@ class AnalysisDB:
         from datetime import datetime
         conn = self._open_conn()
         c = conn.cursor()
-        c.execute('''
-            INSERT INTO track_ratings (fingerprint, device_id, rating, rated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(fingerprint, device_id) DO UPDATE SET rating = ?, rated_at = ?
-        ''', (fingerprint, device_id, rating, datetime.utcnow().isoformat(),
-              rating, datetime.utcnow().isoformat()))
-        # Recalcular media
+        if rating <= 0:
+            # rating 0 = el DJ QUITA su valoracion (toggle off en la UI).
+            c.execute('DELETE FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
+                      (fingerprint, device_id))
+        else:
+            c.execute('''
+                INSERT INTO track_ratings (fingerprint, device_id, rating, rated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(fingerprint, device_id) DO UPDATE SET rating = ?, rated_at = ?
+            ''', (fingerprint, device_id, rating, datetime.utcnow().isoformat(),
+                  rating, datetime.utcnow().isoformat()))
+        # Recalcular media (con count=0 -> avg NULL -> 0)
         c.execute('SELECT AVG(rating) AS avg, COUNT(*) AS cnt FROM track_ratings WHERE fingerprint = ?', (fingerprint,))
         agg = c.fetchone()
         avg = agg['avg']

@@ -4929,9 +4929,10 @@ async def upvote_note(note_id: int):
 
 @app.post("/community/rate")
 async def rate_track_endpoint(req: TrackRatingRequest):
-    """Un DJ puntua un track (1-5 estrellas). Una valoracion por DJ por track."""
-    if req.rating < 1 or req.rating > 5:
-        raise HTTPException(400, "Rating debe ser 1-5")
+    """Un DJ puntua un track (1-5 estrellas). Una valoracion por DJ por track.
+    rating=0 QUITA la valoracion del DJ (toggle off desde la UI)."""
+    if req.rating < 0 or req.rating > 5:
+        raise HTTPException(400, "Rating debe ser 0-5 (0 = quitar)")
     try:
         result = db.rate_track(req.fingerprint, req.device_id, req.rating)
         logger.info(f"[Community] Rating: fp={req.fingerprint[:8]}... = {req.rating} (avg {result.get('avg_rating')})")
