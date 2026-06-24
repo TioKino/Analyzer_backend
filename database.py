@@ -406,6 +406,11 @@ class AnalysisDB:
             # Columna ya existe.
             pass
         conn.execute('CREATE INDEX IF NOT EXISTS idx_tracks_engine ON tracks(engine_source)')
+        # Index para el feed de actividad en vivo del panel admin
+        # (ORDER BY analyzed_at DESC LIMIT N + COUNT por ventana de tiempo).
+        # El endpoint /admin/activity es de auto-refresh, asi que la query es
+        # "caliente" y conviene tenerla indexada.
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_tracks_analyzed_at ON tracks(analyzed_at)')
 
         # Versión del motor de análisis. NULL = "1" (tracks pre-versionado).
         # Incrementar ANALYSIS_VERSION en main.py invalida la cache y fuerza

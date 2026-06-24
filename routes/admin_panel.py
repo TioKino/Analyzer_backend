@@ -1129,6 +1129,161 @@ async def telemetry(request: Request):
     }
 
 
+# ── GET /admin/activity ────────────────────────────────────
+# Feed cronologico de actividad reciente (analisis + AudD + errores) para ver
+# "que esta pasando ahora" desde el panel SIN abrir los logs de Render. Solo
+# LECTURA sobre tablas que ya existen (tracks.analyzed_at, audd_call_log,
+# analysis_errors) -> cero coste en el hot-path, sin tablas nuevas.
+#
+# Privacy: el owner es el unico con el ADMIN_TOKEN. A diferencia del resto del
+# panel (que oculta artist/title), este feed SI muestra artist/title del
+# analisis: es justo la info operativa que el owner ya ve en los logs de Render
+# y que este endpoint reemplaza. Los errores siguen anonimizados (el filename
+# va hasheado en analysis_errors y aqui ni se devuelve).
+
+@admin_panel_router.get("/activity")
+async def activity(request: Request):
+    await _verify_admin_secret(request)
+    import time as _time
+    from datetime import datetime
+
+    try:
+        limit = max(1, min(200, int(request.query_params.get("limit", "60"))))
+    except (TypeError, ValueError):
+        limit = 60
+
+    analysis_db_path = os.environ.get(
+        "DATABASE_PATH",
+        os.environ.get("ANALYSIS_DB_PATH", "analysis.db"),
+    )
+    now_ts = _time.time()
+    _EPOCH = datetime(1970, 1, 1)
+
+    def _iso_to_epoch(s):
+        """'YYYY-MM-DDTHH:MM:SS[.ffffff]' o 'YYYY-MM-DD HH:MM:SS' tratado como
+        UTC naive -> epoch float. None si no parsea. (Render corre en UTC, asi
+        que datetime.now() alli ya es UTC: el delta con now_ts es correcto.)"""
+        if not s:
+            return None
+        try:
+            txt = str(s).strip().replace("T", " ")[:19]
+            return (datetime.strptime(txt, "%Y-%m-%d %H:%M:%S") - _EPOCH).total_seconds()
+        except (ValueError, TypeError):
+            return None
+
+    events = []
+    pulse = {
+        "analyses_10m": 0, "analyses_1h": 0,
+        "audd_10m": 0, "audd_1h": 0,
+        "errors_10m": 0, "errors_1h": 0,
+        "last_analysis_epoch": None,
+    }
+
+    if os.path.exists(analysis_db_path):
+        adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        adb.row_factory = sqlite3.Row
+        try:
+            cut10_iso = datetime.utcfromtimestamp(now_ts - 600).isoformat()
+            cut60_iso = datetime.utcfromtimestamp(now_ts - 3600).isoformat()
+            cut10_sql = datetime.utcfromtimestamp(now_ts - 600).strftime("%Y-%m-%d %H:%M:%S")
+            cut60_sql = datetime.utcfromtimestamp(now_ts - 3600).strftime("%Y-%m-%d %H:%M:%S")
+
+            # --- Analisis recientes (tracks.analyzed_at, ISO TEXT) ---
+            try:
+                for r in adb.execute(
+                    "SELECT analyzed_at, artist, title, bpm, genre, engine_source "
+                    "FROM tracks WHERE analyzed_at IS NOT NULL "
+                    "ORDER BY analyzed_at DESC LIMIT ?", (limit,)
+                ).fetchall():
+                    ep = _iso_to_epoch(r["analyzed_at"])
+                    if ep is None:
+                        continue
+                    bpm = float(r["bpm"]) if r["bpm"] is not None else 0.0
+                    events.append({
+                        "kind": "analysis",
+                        "ts_epoch": ep,
+                        "ok": bpm > 0,  # bpm=0 = fallback "pendiente/fallido"
+                        "title": (r["title"] or r["artist"] or "—"),
+                        "artist": r["artist"] or "",
+                        "bpm": round(bpm, 1) if bpm > 0 else None,
+                        "genre": r["genre"] or "",
+                        "engine": r["engine_source"] or "",
+                    })
+                pulse["analyses_10m"] = adb.execute(
+                    "SELECT COUNT(*) FROM tracks WHERE analyzed_at >= ?", (cut10_iso,)
+                ).fetchone()[0]
+                pulse["analyses_1h"] = adb.execute(
+                    "SELECT COUNT(*) FROM tracks WHERE analyzed_at >= ?", (cut60_iso,)
+                ).fetchone()[0]
+                pulse["last_analysis_epoch"] = _iso_to_epoch(
+                    adb.execute("SELECT MAX(analyzed_at) FROM tracks").fetchone()[0]
+                )
+            except sqlite3.OperationalError:
+                pass
+
+            # --- AudD recientes (audd_call_log.called_at, epoch REAL) ---
+            try:
+                for r in adb.execute(
+                    "SELECT called_at, artist, title, success FROM audd_call_log "
+                    "ORDER BY called_at DESC LIMIT ?", (limit,)
+                ).fetchall():
+                    if r["called_at"] is None:
+                        continue
+                    events.append({
+                        "kind": "audd",
+                        "ts_epoch": float(r["called_at"]),
+                        "ok": bool(r["success"]),
+                        "title": (r["title"] or r["artist"] or "?"),
+                        "artist": r["artist"] or "",
+                    })
+                pulse["audd_10m"] = adb.execute(
+                    "SELECT COUNT(*) FROM audd_call_log WHERE called_at >= ?", (now_ts - 600,)
+                ).fetchone()[0]
+                pulse["audd_1h"] = adb.execute(
+                    "SELECT COUNT(*) FROM audd_call_log WHERE called_at >= ?", (now_ts - 3600,)
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                pass
+
+            # --- Errores recientes (analysis_errors.timestamp 'YYYY-MM-DD HH:MM:SS') ---
+            try:
+                for r in adb.execute(
+                    "SELECT timestamp, error_class, msg_short, endpoint "
+                    "FROM analysis_errors ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall():
+                    ep = _iso_to_epoch(r["timestamp"])
+                    if ep is None:
+                        continue
+                    events.append({
+                        "kind": "error",
+                        "ts_epoch": ep,
+                        "ok": False,
+                        "title": r["error_class"] or "Error",
+                        "msg": r["msg_short"] or "",
+                        "endpoint": r["endpoint"] or "",
+                    })
+                pulse["errors_10m"] = adb.execute(
+                    "SELECT COUNT(*) FROM analysis_errors WHERE timestamp >= ?", (cut10_sql,)
+                ).fetchone()[0]
+                pulse["errors_1h"] = adb.execute(
+                    "SELECT COUNT(*) FROM analysis_errors WHERE timestamp >= ?", (cut60_sql,)
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                pass
+        finally:
+            adb.close()
+
+    # Merge + orden cronologico descendente, recorte al limite global.
+    events.sort(key=lambda e: e["ts_epoch"], reverse=True)
+    events = events[:limit]
+
+    return {
+        "server_now_epoch": now_ts,
+        "pulse": pulse,
+        "events": events,
+    }
+
+
 # ── GET /admin/disk-usage ──────────────────────────────────
 # Breakdown del disco persistente /data/ en Render: tamano de cada BD,
 # count y tamano de previews/, count y tamano de artwork_cache/, total
