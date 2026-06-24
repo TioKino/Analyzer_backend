@@ -166,7 +166,17 @@ def _upload_to_render_cache(track_data: dict):
                 'genre_source': track_data.get('genre_source', 'local_engine'),
                 # Propagar el origen real para que Render no lo marque NULL.
                 'engine_source': track_data.get('engine_source') or 'local_engine',
-                'analysis_json': track_data.get('analysis_json', {}),
+                # Sellar la version: sin esto Render guardaba analysis_version
+                # NULL -> _is_analysis_current trataba la fila como stale -> el
+                # fallback por fingerprint re-analizaba aunque el dato fuera bueno.
+                'analysis_version': track_data.get('analysis_version'),
+                # Detalle COMPLETO del analisis. Antes mandabamos
+                # track_data.get('analysis_json', {}) que era SIEMPRE {} porque
+                # AnalysisResult no tiene campo 'analysis_json' -> se perdian
+                # bpm_confidence/key_confidence/structure_sections/cue_points/
+                # beat-grid/has_*, y la fila en Render quedaba "fina" (disparando
+                # "[Cache] corrupto" + re-analisis al re-subir el track por filename).
+                'analysis_json': {k: v for k, v in track_data.items() if k != 'analysis_json'},
             }
             resp = requests.post(
                 f"{RENDER_BACKEND_URL}/cache-analysis",
@@ -2240,16 +2250,20 @@ def _is_cached_analysis_valid(analysis_json: dict) -> bool:
     devolvian un dict sin los campos requeridos y `AnalysisResult(**d)`
     petaba con `ValidationError` de 19 campos missing → 500 al user.
 
-    Validamos que estan los campos centrales del analisis. Si faltan,
-    el caller debe ignorar el cache-hit y caer al flujo de re-analisis
-    normal. Lista derivada de campos siempre presentes en un analisis
-    exitoso (bpm, key, duration son las metricas core; bpm_confidence
-    y key_confidence salieron en el ValidationError reportado).
+    Solo exigimos los campos OBLIGATORIOS (sin default) del AnalysisResult de
+    este modulo: `bpm` y `duration`. El resto (bpm_confidence, key_confidence,
+    estructura, cues...) llevan default, asi que AnalysisResult(**analysis_json)
+    reconstruye sin petar aunque falten. Exigir los *_confidence aqui (como
+    hacia la version previa) rechazaba de mas las filas legitimas que llegaron
+    via /cache-analysis del motor local — traen bpm/key/duration pero
+    historicamente no aplanaban los confidence — disparando "[Cache] corrupto"
+    + un re-analisis inutil en Render. Se valida no-None (no solo presencia)
+    para cubrir el caso de un bpm/duration explicito a None.
     """
     if not isinstance(analysis_json, dict) or not analysis_json:
         return False
-    required = ('bpm', 'key', 'duration', 'bpm_confidence', 'key_confidence')
-    return all(k in analysis_json for k in required)
+    required = ('bpm', 'duration')
+    return all(analysis_json.get(k) is not None for k in required)
 
 
 # ==================== ENDPOINTS PRINCIPALES ====================
@@ -3560,8 +3574,30 @@ async def cache_analysis(request: Request):
         )
         return {"status": "exists", "fingerprint": fingerprint}
 
-    # Construir datos para guardar
+    # Detalle completo que el motor local manda anidado en `analysis_json`.
+    # Lo aplanamos al top-level para que la fila guardada sea tan RICA como una
+    # de /analyze directo. Antes se guardaba el nested como string (en la
+    # practica "{}" por el bug del productor) y la columna quedaba "fina" — sin
+    # bpm_confidence/key_confidence/structure_sections/cue_points/beat-grid — lo
+    # que disparaba "[Cache] corrupto" + re-analisis cuando el track se re-subia
+    # por filename desde otro dispositivo.
+    nested = data.get('analysis_json')
+    if isinstance(nested, str):
+        try:
+            nested = json.loads(nested)
+        except (json.JSONDecodeError, TypeError):
+            nested = {}
+    if not isinstance(nested, dict):
+        nested = {}
+
+    # Construir datos para guardar: base = detalle completo anidado; encima los
+    # campos resumen explicitos del payload (autoritativos: pueden venir ya
+    # limpiados por AudD / corregidos por la comunidad). save_track serializa el
+    # track_data ENTERO como la columna analysis_json, asi que NO re-anidamos un
+    # 'analysis_json' string -> la columna queda flat, completa y parseable por
+    # AnalysisResult(**analysis_json) con todo el detalle.
     track_data = {
+        **{k: v for k, v in nested.items() if k != 'analysis_json'},
         'id': fingerprint,
         'fingerprint': fingerprint,
         'filename': data.get('filename', ''),
@@ -3585,7 +3621,9 @@ async def cache_analysis(request: Request):
         # reparto engine pareciera "todo render". Respetamos un valor explicito
         # si el cliente lo manda.
         'engine_source': data.get('engine_source') or 'local_engine',
-        'analysis_json': json.dumps(data.get('analysis_json', {})) if isinstance(data.get('analysis_json'), dict) else data.get('analysis_json', '{}'),
+        # Sellar la version (explicita del payload o la del detalle anidado).
+        # Sin esto quedaba NULL -> _is_analysis_current la trataba como stale.
+        'analysis_version': data.get('analysis_version') or nested.get('analysis_version'),
     }
 
     db.save_track(track_data)
