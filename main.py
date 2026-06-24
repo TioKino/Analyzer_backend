@@ -19,6 +19,7 @@ from sync_endpoints import sync_router
 from routes.admin_panel import admin_panel_router
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 import librosa
 import numpy as np
@@ -33,6 +34,7 @@ import requests
 import shutil
 import sqlite3
 import time
+import asyncio
 from typing import Any, Dict, List, Optional
 
 # Logger global del modulo, definido temprano para que las llamadas
@@ -137,6 +139,35 @@ from analysis_ranking import (
     get_source_priority,
     should_overwrite_analysis,
 )
+
+
+# ==================== CONCURRENCIA DE ANALISIS ====================
+# /analyze corre en UN worker uvicorn (ver Procfile) y analyze_audio (librosa)
+# es CPU-bound y SINCRONO. Llamarlo directo en el event loop lo BLOQUEA durante
+# segundos -> cualquier peticion ligera concurrente (/admin/stats, /sync/*,
+# /artwork) se queda en cola y da timeout en el cliente cuando hay usuarios
+# analizando. Solucion: ejecutar el analisis en un threadpool
+# (run_in_threadpool) para liberar el event loop, ACOTADO por un semaforo para
+# no reventar la RAM de Render con varios arrays de audio a la vez.
+#
+# =1 mantiene el MISMO perfil CPU/RAM que el modelo bloqueante actual (un solo
+# analisis a la vez) pero deja de bloquear el loop. Subir SOLO si hay RAM de
+# sobra (cada analisis carga el track entero en memoria a sr=44100).
+_ANALYSIS_CONCURRENCY = max(1, int(os.environ.get('ANALYSIS_CONCURRENCY', '1')))
+_analysis_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_analysis_semaphore() -> asyncio.Semaphore:
+    """Crea el semaforo de forma perezosa DENTRO del event loop en marcha.
+
+    Crearlo a nivel de modulo (import time) lo bindea a un loop que en Python
+    3.9 puede no ser el de uvicorn (DeprecationWarning / cross-loop). Crearlo
+    en la primera llamada a /analyze garantiza el loop correcto en 3.9 y 3.10+.
+    """
+    global _analysis_semaphore
+    if _analysis_semaphore is None:
+        _analysis_semaphore = asyncio.Semaphore(_ANALYSIS_CONCURRENCY)
+    return _analysis_semaphore
 
 
 def _upload_to_render_cache(track_data: dict):
@@ -2559,8 +2590,18 @@ async def analyze_track(
             logger.error(f"tmp_path {tmp_path} desaparecio antes de analyze_audio")
             raise HTTPException(500, "Archivo temporal desaparecio antes del analisis")
 
-        result = analyze_audio(tmp_path, fingerprint, force_audd=force_audd,
-                               original_filename=file.filename)
+        # Offload del analisis CPU-bound a un threadpool para NO bloquear el
+        # event loop del unico worker (acotado por _analysis_semaphore para no
+        # disparar la RAM). Asi /admin/stats y demas peticiones ligeras siguen
+        # respondiendo mientras se analiza. Ver "CONCURRENCIA DE ANALISIS".
+        async with _get_analysis_semaphore():
+            result = await run_in_threadpool(
+                analyze_audio,
+                tmp_path,
+                fingerprint,
+                force_audd=force_audd,
+                original_filename=file.filename,
+            )
 
         # Señal honesta de cap para la UI de "Limpiar con AudD" (force_audd):
         # si tras forzar AudD el track SIGUE sin metadata utilizable Y el cap
