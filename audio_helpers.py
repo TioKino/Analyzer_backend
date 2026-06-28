@@ -233,14 +233,10 @@ def find_drop_timestamp(y, sr, segments: dict) -> float:
     return duration / 3
 
 
-def classify_track_type(energy: float, segments: dict, duration: float) -> str:
-    if energy < 0.5 and segments['has_intro']:
-        return "warmup"
-    if energy > 0.7 and segments['has_drop']:
-        return "peak"
-    if segments['has_outro'] and duration > 300:
-        return "closing"
-    return "peak" if energy > 0.6 else "warmup"
+# NOTA: `classify_track_type` (version string vieja) se borro aqui — estaba
+# muerta (no la importaba nadie). La version viva es `main.classify_track_type`
+# (Fase 1 v2: devuelve dict con confidence + alternativas), espejada en
+# `ChunkedAudioAnalyzer._classify_track_type`. No la recrees en audio_helpers.
 
 
 def detect_vocals_improved(y, sr, spectral_centroid):
