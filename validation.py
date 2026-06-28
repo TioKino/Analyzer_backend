@@ -546,9 +546,44 @@ def validate_audio_upload(max_size_mb: int = MAX_FILE_SIZE_MB):
 # FUNCIONES DE UTILIDAD
 # ============================================================================
 
+# Numero de proxies DE CONFIANZA delante de la app. En Render (un unico load
+# balancer) es 1. Si pones algo mas delante (p.ej. Cloudflare -> Render), serian
+# 2. Configurable por env para no hardcodear la topologia.
+TRUSTED_PROXY_HOPS = max(1, int(os.getenv('TRUSTED_PROXY_HOPS', '1')))
+
+
+def _pick_client_ip(xff: Optional[str], client_host: Optional[str],
+                    trusted_hops: int = 1) -> str:
+    """Extrae la IP real del cliente de la cadena X-Forwarded-For.
+
+    SEGURIDAD: X-Forwarded-For es "ip_cliente, proxy1, proxy2, ...". Cada proxy
+    de confianza ANEXA por la derecha la IP que vio. La parte IZQUIERDA la pone
+    el cliente y es FALSEABLE: si mandas `X-Forwarded-For: 9.9.9.9`, Render lo
+    convierte en `9.9.9.9, <tu_ip_real>`. Tomar la primera entrada (lo que hacia
+    antes) dejaba que cualquiera se inventara su IP -> un bucket de rate-limit
+    nuevo por request -> rate-limit saltado con una cabecera.
+
+    La entrada FIABLE es la que añadio nuestro proxy mas cercano: la
+    `trusted_hops`-esima desde la DERECHA. Con trusted_hops=1 (Render estandar)
+    es la ultima, que es la IP real del cliente vista por el LB y NO falseable.
+    """
+    if xff:
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            idx = len(parts) - trusted_hops
+            if idx < 0:
+                # Llegaron menos hops de los configurados (cadena mas corta de lo
+                # esperado): caemos a la entrada mas a la izquierda disponible.
+                idx = 0
+            return parts[idx]
+    return client_host or "unknown"
+
+
 def get_client_ip(request: Request) -> str:
-    """Obtiene IP del cliente (considerando proxies)"""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Obtiene la IP real del cliente resistiendo el spoof de X-Forwarded-For."""
+    client_host = request.client.host if request.client else None
+    return _pick_client_ip(
+        request.headers.get("X-Forwarded-For"),
+        client_host,
+        TRUSTED_PROXY_HOPS,
+    )
