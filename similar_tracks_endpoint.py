@@ -192,7 +192,14 @@ def calculate_compatibility_score(
         if track_genre == target_genre_lower:
             score += 15
             genre_match = True
-        elif target_genre_lower in track_genre or track_genre in target_genre_lower:
+        elif track_genre and (
+            target_genre_lower in track_genre or track_genre in target_genre_lower
+        ):
+            # OJO: el guard `track_genre and ...` es necesario. Sin el, un track
+            # SIN genero (track_genre == '') matchea SIEMPRE porque
+            # `'' in cualquier_string` es True en Python -> +10 y genre_match
+            # falso, colando tracks con metadata incompleta por delante de
+            # tracks de genero real distinto en "tracks similares".
             score += 10
             genre_match = True
         # Géneros relacionados

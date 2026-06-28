@@ -90,6 +90,27 @@ def should_overwrite_analysis(existing: Optional[dict], new_data: dict) -> bool:
         except (json.JSONDecodeError, TypeError):
             pass
 
+    # Salvaguarda anti-pérdida: NUNCA reemplazar un análisis existente con BPM
+    # válido por uno nuevo SIN BPM (bpm<=0 = análisis fallido), aunque el nuevo
+    # tenga mayor prioridad de fuente. Caso real: import Rekordbox/Traktor
+    # (prioridad 110/105) de un track sin BPM en el XML (bpm=0) machacaría un
+    # análisis local válido. La prioridad solo manda cuando hay BPM que escribir.
+    # OJO: el criterio es SOLO bpm>0, NO key — un análisis válido puede no tener
+    # tonalidad fiable (key vacía es normal), y no debe contar como "vacío".
+    def _has_bpm(bpm_val) -> bool:
+        try:
+            return float(bpm_val or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    new_has_bpm = _has_bpm(new_data.get('bpm'))
+    existing_has_bpm = _has_bpm(
+        existing_analysis.get('bpm')
+        or (existing.get('bpm') if isinstance(existing, dict) else 0)
+    )
+    if existing_has_bpm and not new_has_bpm:
+        return False
+
     existing_source = (
         existing_analysis.get('bpm_source')
         or (existing.get('bpm_source') if isinstance(existing, dict) else None)

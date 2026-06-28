@@ -98,3 +98,17 @@ class TestShouldOverwriteAnalysis:
         existing = {'bpm': 128, 'key': 'Am', 'bpm_source': 'local_engine'}
         new = {'bpm_source': 'rekordbox', 'bpm': 128.0}
         assert should_overwrite_analysis(existing, new) is True
+
+    def test_high_priority_empty_does_not_overwrite_valid(self):
+        # Salvaguarda anti-pérdida: un import de alta prioridad SIN bpm (track
+        # sin BPM en el XML de Rekordbox) NO debe machacar un análisis válido.
+        existing = {'analysis_json': '{"bpm": 128, "key": "Am", "bpm_source": "local_engine"}'}
+        new = {'bpm_source': 'rekordbox', 'bpm': 0}
+        assert should_overwrite_analysis(existing, new) is False
+
+    def test_high_priority_without_key_still_overwrites(self):
+        # Un análisis válido (bpm>0) pero SIN key NO es "vacío" — la key vacía
+        # es normal (baja confianza) y no debe bloquear el overwrite por prioridad.
+        existing = {'analysis_json': '{"bpm": 128, "key": "Am", "bpm_source": "local_engine"}'}
+        new = {'bpm_source': 'rekordbox', 'bpm': 124.0}
+        assert should_overwrite_analysis(existing, new) is True
