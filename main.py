@@ -1404,15 +1404,12 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # fueron NaN (chroma plano, silencio, archivo corrupto), best_key
     # se queda en None. Antes la concatenacion `None + 'm'` petaba con
     # TypeError NoneType+str (visto en panel admin 2026-05-20).
-    # Fallback: marcar como 'C' con confianza CERO — el track aun se analiza,
-    # pero key_confidence=0.0 le dice al cliente "no fiable" para que el badge
-    # Camelot degrade a '--' en vez de pintar un 8B fabricado con apariencia
-    # de certeza (ver KeyAnalysis.reliableConfidenceFloor en el cliente).
-    key_failed = best_key is None
-    if key_failed:
+    # Fallback: marcar como 'C' con confianza minima — el track aun se
+    # analiza, key_confidence=0 indica al cliente "no fiable".
+    if best_key is None:
         logger.warning(
             "[Key] best_key=None tras escaneo Krumhansl (audio plano / "
-            "todos NaN). Fallback a 'C' con confidence=0.0."
+            "todos NaN). Fallback a 'C' con confidence=0."
         )
         best_key = 'C'
         is_minor = False
@@ -1420,9 +1417,7 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     key = best_key + ('m' if is_minor else '')
     key_source = "analysis"
     camelot = KEY_TO_CAMELOT.get(key, '?')
-    # OJO: el fallback (best_corr==0) tiene que reportar 0.0, NO 0.5. Antes el
-    # `else 0.5` disfrazaba una deteccion fallida como medio-fiable.
-    key_confidence = float(best_corr) if best_corr > 0 else 0.0
+    key_confidence = float(best_corr) if best_corr > 0 else 0.5
     
     # Confianza major/minor: si la diferencia es minima, marcar como baja
     # para que Beatport/ID3 tengan prioridad

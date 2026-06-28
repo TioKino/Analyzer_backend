@@ -82,20 +82,6 @@ def _normalize_bpm_octave(bpm) -> Optional[float]:
     return round(value, 1)
 
 
-def _unknown_key_result() -> Dict:
-    """Resultado de tonalidad para una deteccion fallida.
-
-    key/camelot/scale None (en vez de 'C'/'8B'/'major' fabricados) + confidence
-    0.0, para que el cliente muestre '--' en lugar de un Camelot autoritario
-    falso. AnalysisResult.key/camelot son Optional[str], asi que None propaga
-    limpio; ademas el ID3 del track aun puede rellenar la key aguas abajo.
-    """
-    return {
-        'key': None, 'camelot': None, 'scale': None,
-        'confidence': 0.0, 'source': 'chunked_analysis',
-    }
-
-
 # ==================== CONFIGURACIÓN ====================
 
 # Tamaño de chunk en segundos (60s = ~50MB RAM a 44100Hz)
@@ -424,10 +410,8 @@ class ChunkedAudioAnalyzer:
         Fusiona resultados de key de múltiples chunks.
         Pondera más los chunks con mayor energía (suelen tener key más clara).
         """
-        # Deteccion fallida (0 chunks): key/camelot None, NO 'C'/'8B' fabricado.
-        # El cliente lo muestra como '--' (KeyAnalysis.reliableConfidenceFloor).
         if not chunk_results:
-            return _unknown_key_result()
+            return {'key': 'C', 'camelot': '8B', 'confidence': 0.0}
 
         # Si no hay pesos de energía, usar confianza
         if energy_weights is None:
@@ -437,24 +421,27 @@ class ChunkedAudioAnalyzer:
         total_weight = sum(energy_weights) + 1e-10
         weights = [w / total_weight for w in energy_weights]
 
-        # Solo votan los chunks con deteccion REAL. Un chunk fallido llega con
-        # key None/'' o confidence ~0 (`analyze_chunk_key` devuelve confidence
-        # 0.0 en su rama de error). ANTES esos chunks votaban 'C' con peso 0.5
-        # (`r.get('key') or 'C'` + `r.get('confidence') or 0.5`), de modo que un
-        # track cuyos chunks fallaron TODOS salia como 'C'/'8B' con confianza
-        # ALTA (voto unanime de basura): un Camelot falso con apariencia de
-        # certeza. Ahora los chunks sin senal se excluyen del voto.
+        # Contar votos ponderados por key. Usar `r.get('key') or 'C'`
+        # en vez de `r.get('key', 'C')`: el segundo solo aplica default
+        # si la KEY no existe, NO si su valor es None — y en chunks
+        # degenerados algunos r tienen literal `'key': None`, lo que
+        # provocaba que best_key acabara siendo None y la linea
+        # `best_key.endswith('m')` petara con AttributeError
+        # (visto en panel admin 2026-05-20).
         key_votes = {}
         for r, w in zip(chunk_results, weights):
-            key = r.get('key')
-            conf = r.get('confidence') or 0.0
-            if not key or conf <= 0.0:
-                continue  # chunk sin senal: no vota
-            key_votes[key] = key_votes.get(key, 0.0) + w * conf
+            key = r.get('key') or 'C'
+            if key not in key_votes:
+                key_votes[key] = 0
+            key_votes[key] += w * (r.get('confidence') or 0.5)
 
-        # Ningun voto fiable: deteccion fallida -> key/camelot None.
+        # Defensa contra el caso edge de 0 chunks (key_votes vacio
+        # rompe max() con ValueError).
         if not key_votes:
-            return _unknown_key_result()
+            return {
+                'key': 'C', 'camelot': '8B', 'scale': 'major',
+                'confidence': 0.0, 'source': 'chunked_analysis',
+            }
 
         # Key ganadora
         best_key = max(key_votes, key=key_votes.get)
