@@ -42,6 +42,13 @@ def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset
     best_bpm = original_bpm
     best_score = -1
 
+    # La autocorrelacion del onset_env NO depende de `bpm` (es loop-invariante):
+    # antes se recalculaba dentro del bucle hasta 3 veces. np.correlate(a, a,
+    # 'full') es O(n^2) sobre miles de frames, asi que computarla una sola vez
+    # ahorra 2/3 del coste en el path de correccion (tracks de baja confianza).
+    autocorr = np.correlate(onset_env, onset_env, mode='full')
+    center = len(autocorr) // 2
+
     for bpm in candidates:
         try:
             beat_interval = 60.0 / bpm
@@ -49,9 +56,6 @@ def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset
 
             if beat_frames <= 0 or beat_frames >= len(onset_env):
                 continue
-
-            autocorr = np.correlate(onset_env, onset_env, mode='full')
-            center = len(autocorr) // 2
 
             idx = center + beat_frames
             if idx < len(autocorr):
