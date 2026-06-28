@@ -132,7 +132,14 @@ def calculate_fingerprint(file_path):
 
 
 def parse_filename(filename: str) -> dict:
-    name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
+    # Quitar la extension. Antes solo cubria mp3|wav|flac|m4a -> para los otros
+    # formatos soportados (aac, ogg, aiff/aif, opus, wma) la extension quedaba
+    # pegada al titulo ("Domino.aiff"), ensuciando lo que se muestra y empeorando
+    # el match en AudD/Discogs. Lista alineada con config.SUPPORTED_FORMATS.
+    name = re.sub(
+        r'\.(mp3|wav|flac|m4a|aac|ogg|aiff|aif|opus|wma)$',
+        '', filename, flags=re.IGNORECASE,
+    )
     name = re.sub(r'^\d+[\s\-_.]+', '', name)
     name = re.sub(r'[\[\(][A-Z0-9]+[\]\)]', '', name)
     name = re.sub(r'(?i)\(original mix\)|\[original mix\]', '', name)
