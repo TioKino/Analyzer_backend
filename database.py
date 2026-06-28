@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import threading
 import time
 from datetime import datetime, timezone
 import json
@@ -120,7 +121,8 @@ class AnalysisDB:
         if db_path is None:
             db_path = os.getenv("DATABASE_PATH", "/data/analysis.db")
         self.db_path = db_path
-        self._conn = None  # Conexion persistente
+        # Conexion persistente POR HILO. Ver la property `conn`.
+        self._local = threading.local()
         self.init_db()
 
     def _open_conn(self):
@@ -148,13 +150,33 @@ class AnalysisDB:
 
     @property
     def conn(self):
-        """Conexion persistente con WAL + row_factory (lazy)."""
-        if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA busy_timeout=30000")
-            self._conn.row_factory = sqlite3.Row
-        return self._conn
+        """Conexion persistente POR HILO con WAL + row_factory (lazy).
+
+        ANTES era UNA conexion compartida (`self._conn`) con
+        check_same_thread=False. Funcionaba solo porque todos sus usuarios
+        (community cues, search, search_collective_db) viven en el event loop
+        async, que los serializa. Pero el flag silencia el guard de sqlite3:
+        el dia que alguien moviera un endpoint que usa `db.conn` a un
+        threadpool (como ya hace /analyze con `analyze_audio`), o llamara a
+        `db.conn` desde el hilo worker, el MISMO objeto Connection se usaria
+        desde dos hilos -> corrupcion/errores silenciosos ("recursive use of
+        cursors", transacciones entrelazadas).
+
+        Thread-local da a cada hilo su propia conexion al mismo fichero WAL
+        (el patron concurrente recomendado por SQLite: N conexiones + WAL +
+        busy_timeout). Asi `db.conn` es seguro venga del hilo que venga, sin
+        cambiar el comportamiento actual (el event loop sigue reutilizando una
+        unica conexion de larga vida). El numero de hilos del threadpool es
+        acotado, asi que las conexiones no crecen sin limite.
+        """
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return conn
 
     def init_db(self):
         # En init_db no consultamos columnas, solo creamos tablas/indices,

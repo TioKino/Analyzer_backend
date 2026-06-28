@@ -34,6 +34,16 @@ except ImportError:
     logger.warning("Librosa no disponible")
 
 try:
+    # Normalizador de octava canonico compartido ([60,180], colapsa
+    # halftime/doubletime). Mismo helper que usa el consenso comunitario
+    # (main.py), para que el BPM del analisis y el del consenso usen UNA
+    # sola politica de octava. Guardado por si bpm_utils arrastra librosa
+    # en un entorno sin libreria (degradacion, no crash de import).
+    from bpm_utils import normalize_bpm_to_canonical
+except Exception:  # pragma: no cover - solo si falta librosa
+    normalize_bpm_to_canonical = None
+
+try:
     from audio_helpers import silence_native_stderr
 except ImportError:
     # Fallback: no-op si por lo que sea audio_helpers no esta disponible
@@ -42,6 +52,34 @@ except ImportError:
     @contextlib.contextmanager
     def silence_native_stderr():
         yield
+
+
+def _normalize_bpm_octave(bpm) -> Optional[float]:
+    """Colapsa un BPM al rango canonico [60, 180] (octava).
+
+    Delega en `bpm_utils.normalize_bpm_to_canonical` cuando esta disponible
+    (fuente unica de verdad, compartida con el consenso comunitario). Si el
+    helper no se pudo importar, replica su semantica con un fallback puro.
+    Devuelve None para valores no normalizables (<= 0, NaN, Inf), para que el
+    chunk no contamine la votacion ponderada.
+    """
+    if normalize_bpm_to_canonical is not None:
+        try:
+            return normalize_bpm_to_canonical(bpm)
+        except (ValueError, TypeError):
+            return None
+    # Fallback puro (mismo rango [60,180] que bpm_utils).
+    try:
+        value = float(bpm)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(value) or math.isinf(value) or value <= 0:
+        return None
+    while value < 60:
+        value *= 2
+    while value > 180:
+        value /= 2
+    return round(value, 1)
 
 
 # ==================== CONFIGURACIÓN ====================
@@ -331,16 +369,26 @@ class ChunkedAudioAnalyzer:
         if not valid_results:
             valid_results = chunk_results
         
-        # Normalizar armónicos (doblar BPMs muy bajos, dividir muy altos)
+        # Normalizar armonicos al rango canonico [60, 180] colapsando
+        # octavas (halftime/doubletime) ANTES de promediar, para que
+        # chunks que leyeron el mismo track a distinta octava voten juntos.
+        #
+        # ANTES habia un umbral inline `bpm > 170: bpm /= 2` que partia el
+        # Drum & Bass: 174 BPM -> 87 BPM. Ademas divergia del normalizador
+        # del consenso comunitario (que ya usa [60,180]). Ahora ambos caminos
+        # comparten `normalize_bpm_to_canonical`, que preserva DnB (170-180).
         normalized = []
         for r in valid_results:
-            bpm = r['bpm']
-            if bpm < 70:
-                bpm *= 2
-            elif bpm > 170:
-                bpm /= 2
+            raw = r['bpm']
+            bpm = _normalize_bpm_octave(raw)
+            if bpm is None:
+                # bpm <= 0 / NaN / Inf en este chunk: no vota.
+                continue
             normalized.append({'bpm': bpm, 'confidence': r['confidence']})
-        
+
+        if not normalized:
+            return {'bpm': 120.0, 'confidence': 0.0, 'source': 'chunked_analysis'}
+
         # Votación ponderada por confianza
         total_weight = sum(r['confidence'] for r in normalized)
         if total_weight > 0:
@@ -364,15 +412,15 @@ class ChunkedAudioAnalyzer:
         """
         if not chunk_results:
             return {'key': 'C', 'camelot': '8B', 'confidence': 0.0}
-        
+
         # Si no hay pesos de energía, usar confianza
         if energy_weights is None:
             energy_weights = [r.get('confidence', 0.5) for r in chunk_results]
-        
+
         # Normalizar pesos
         total_weight = sum(energy_weights) + 1e-10
         weights = [w / total_weight for w in energy_weights]
-        
+
         # Contar votos ponderados por key. Usar `r.get('key') or 'C'`
         # en vez de `r.get('key', 'C')`: el segundo solo aplica default
         # si la KEY no existe, NO si su valor es None — y en chunks

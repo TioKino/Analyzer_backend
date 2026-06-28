@@ -105,7 +105,15 @@ def should_trigger_audd(
                 if elapsed_days < cooldown_days:
                     return False, f"cooldown ({elapsed_days:.1f}d/{cooldown_days}d)"
         except Exception as e:
-            logger.warning(f"[AudD-auto] cooldown check fallo: {e}")
+            # FAIL-CLOSED: ambos checks (cooldown y cap) son guards de GASTO —
+            # AudD cobra por llamada. Si no podemos VERIFICAR que estamos dentro
+            # de limites, NO disparamos. Antes el except solo logueaba y caia al
+            # `return True` final, de modo que un fallo transitorio de la BD (lock
+            # / timeout bajo carga) saltaba el control de coste y disparaba AudD
+            # sin tope. El path auto reintenta este track en el siguiente
+            # /analyze; force (peticion manual del usuario) ni pasa por aqui.
+            logger.warning(f"[AudD-auto] cooldown check fallo, fail-closed: {e}")
+            return False, "cooldown check error"
 
     if db is not None:
         try:
@@ -113,7 +121,11 @@ def should_trigger_audd(
             if today_count >= daily_cap:
                 return False, f"daily cap ({today_count}/{daily_cap})"
         except Exception as e:
-            logger.warning(f"[AudD-auto] cap check fallo: {e}")
+            # FAIL-CLOSED (ver nota arriba): un fallo al leer el contador NO debe
+            # conceder permiso para gastar. Skipear una identificacion es barato;
+            # reventar el presupuesto de AudD no.
+            logger.warning(f"[AudD-auto] cap check fallo, fail-closed: {e}")
+            return False, "cap check error"
 
     return True, "force manual" if force else "metadata insuficiente"
 
