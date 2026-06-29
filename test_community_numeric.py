@@ -130,64 +130,64 @@ class TestValidateCommunityField:
     nuevos campos numericos."""
 
     def test_bpm_accepts_and_normalizes(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         # 256 -> 128.0 canonico.
         normalized, err = _validate_community_field('bpm', '256')
         assert err is None
         assert normalized == '128.0'
 
     def test_bpm_keeps_in_range(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         normalized, err = _validate_community_field('bpm', '128.0')
         assert err is None
         assert normalized == '128.0'
 
     def test_bpm_rejects_negative(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         _, err = _validate_community_field('bpm', '-10')
         assert err is not None
 
     def test_bpm_rejects_non_numeric(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         _, err = _validate_community_field('bpm', 'abc')
         assert err is not None
 
     def test_bpm_rejects_too_large(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         _, err = _validate_community_field('bpm', '9999')
         assert err is not None  # >999
 
     def test_energy_accepts_int(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         normalized, err = _validate_community_field('energy', '7')
         assert err is None
         assert normalized == '7'
 
     def test_energy_rejects_out_of_range(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         _, err = _validate_community_field('energy', '0')
         assert err is not None
         _, err = _validate_community_field('energy', '11')
         assert err is not None
 
     def test_energy_rejects_non_numeric(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         _, err = _validate_community_field('energy', 'high')
         assert err is not None
 
     def test_year_accepts_valid(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         normalized, err = _validate_community_field('year', '1995')
         assert err is None
         assert normalized == '1995'
 
     def test_year_rejects_too_old(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         _, err = _validate_community_field('year', '1800')
         assert err is not None
 
     def test_year_rejects_far_future(self):
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         _, err = _validate_community_field('year', '3000')
         assert err is not None
 
@@ -219,7 +219,7 @@ class TestConsensusNumericMedian:
         # Simulamos lo que haria el endpoint: cada dev envia un valor crudo,
         # _validate_community_field lo normaliza a "128.0", y el consensus
         # los agrupa.
-        from main import _validate_community_field
+        from routes.community import _validate_community_field
         db = self._fresh_db()
         fp = 'test_fp_bpm_ht_' + os.urandom(4).hex()
         for dev, raw_value in [('d1', '64'), ('d2', '128'), ('d3', '256')]:
