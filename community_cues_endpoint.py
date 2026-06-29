@@ -55,6 +55,44 @@ class CommunityResponse(BaseModel):
     last_updated: Optional[str] = None
 
 
+# ==================== INPUT HARDENING ====================
+
+# Limites defensivos para el upload de cues (input NO confiable). Un track real
+# rara vez pasa de ~50 cues; 200 es holgado. Evita que un cliente con el secreto
+# meta miles de filas, posiciones negativas o notas gigantes en la tabla
+# comunitaria. La SQL ya es parametrizada (sin inyeccion); esto acota volumen.
+MAX_CUES_PER_UPLOAD = 200
+MAX_CUE_NOTE_LEN = 500
+
+
+def sanitize_cue_submissions(cues) -> list:
+    """Filtra/acota cues no confiables antes de insertarlos.
+
+    - Descarta cues con position_ms ausente o < 0 (no existe tiempo negativo).
+    - Anula end_position_ms si es < position_ms (region invalida -> cue puntual).
+    - Trunca la nota a MAX_CUE_NOTE_LEN.
+    - Corta la lista a MAX_CUES_PER_UPLOAD.
+
+    Devuelve lista de tuplas (type, position_ms, end_position_ms, note) lista
+    para el INSERT. Funcion pura (sin DB) para poder testearla aislada.
+    """
+    cleaned = []
+    for cue in cues:
+        pos = getattr(cue, 'position_ms', None)
+        if pos is None or pos < 0:
+            continue
+        end = getattr(cue, 'end_position_ms', None)
+        if end is not None and end < pos:
+            end = None
+        note = getattr(cue, 'note', None)
+        if isinstance(note, str) and len(note) > MAX_CUE_NOTE_LEN:
+            note = note[:MAX_CUE_NOTE_LEN]
+        cleaned.append((cue.type, pos, end, note))
+        if len(cleaned) >= MAX_CUES_PER_UPLOAD:
+            break
+    return cleaned
+
+
 # ==================== AGGREGATION LOGIC ====================
 
 # SELECT explicito que se reusa en endpoints. Fija el orden de columnas
@@ -190,9 +228,10 @@ def register_community_endpoints(app, db):
                 (upload.fingerprint, upload.device_id)
             )
 
-            # Insertar nuevos cues
+            # Insertar nuevos cues (acotados/saneados — input no confiable)
             now = datetime.now().isoformat()
-            for cue in upload.cues:
+            sanitized = sanitize_cue_submissions(upload.cues)
+            for cue_type, position_ms, end_position_ms, note in sanitized:
                 c.execute('''
                     INSERT INTO community_cues
                     (fingerprint, device_id, cue_type, position_ms, end_position_ms, note, created_at)
@@ -200,10 +239,10 @@ def register_community_endpoints(app, db):
                 ''', (
                     upload.fingerprint,
                     upload.device_id,
-                    cue.type,
-                    cue.position_ms,
-                    cue.end_position_ms,
-                    cue.note,
+                    cue_type,
+                    position_ms,
+                    end_position_ms,
+                    note,
                     now,
                 ))
 
@@ -226,7 +265,7 @@ def register_community_endpoints(app, db):
 
             return {
                 "status": "ok",
-                "cues_saved": len(upload.cues),
+                "cues_saved": len(sanitized),
                 "total_contributors": len(unique_devices),
                 "zones": zones,
             }

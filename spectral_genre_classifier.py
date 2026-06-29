@@ -162,43 +162,53 @@ def classify_genre_advanced(bpm: float, energy: float, has_bass: bool,
         
         return "Trance"
     
+    # === DRUM & BASS (160-180 BPM) ===
+    # REORDEN (review 2026-06-28): DnB va ANTES de Hard Dance. Antes, la banda
+    # Hard Dance (145-180) con su `return "Hardstyle"` incondicional tapaba TODO
+    # 160-180, dejando este bloque DnB como CODIGO MUERTO — un track de DnB a
+    # 174 BPM salia "Speedcore". Ahora DnB reclama 160-180 (su rango), y Hard
+    # Dance recoge ~150-160 (Hardstyle real). TRADEOFF documentado: Gabber/
+    # Speedcore (170+, nicho) ahora caen como DnB; para la inmensa mayoria de
+    # bibliotecas 160-180 es DnB, no gabber. VALIDAR con tracks reales antes de
+    # mergear; si hay coleccion gabber relevante, añadir discriminador.
+    if 160 <= bpm <= 180:
+        if brightness > 3000 and is_melodic:
+            return "Liquid Drum & Bass"
+
+        if is_dark and energy > 0.7:
+            return "Neurofunk"
+
+        if percussion_density > 0.8:
+            return "Jump Up"
+
+        if is_dark and energy < 0.5:
+            return "Atmospheric DnB"
+
+        return "Drum & Bass"
+
     # === HARD DANCE (145-180 BPM) ===
+    # Tras el reorden, 160-180 ya lo cogio DnB y 130-150 lo cogio Trance, asi
+    # que en la practica esta banda atiende ~150-160 (Hardstyle/Frenchcore).
     if 145 <= bpm <= 180:
         if bpm > 170:
             if energy > 0.8:
                 return "Gabber"
             return "Speedcore"
-        
+
         if bpm > 160:
             if is_melodic and brightness > 3000:
                 return "Happy Hardcore"
             return "Hardcore"
-        
+
         if energy > 0.8:
             if is_melodic:
                 return "Euphoric Hardstyle"
             return "Rawstyle"
-        
+
         if is_dark and has_bass:
             return "Frenchcore"
-        
+
         return "Hardstyle"
-    
-    # === DRUM & BASS (160-180 BPM) ===
-    if 160 <= bpm <= 180:
-        if brightness > 3000 and is_melodic:
-            return "Liquid Drum & Bass"
-        
-        if is_dark and energy > 0.7:
-            return "Neurofunk"
-        
-        if percussion_density > 0.8:
-            return "Jump Up"
-        
-        if is_dark and energy < 0.5:
-            return "Atmospheric DnB"
-        
-        return "Drum & Bass"
     
     # === JUNGLE (150-170 BPM con breakbeats) ===
     if 150 <= bpm <= 175:

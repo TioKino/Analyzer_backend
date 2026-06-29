@@ -238,8 +238,11 @@ class ChunkedAudioAnalyzer:
                 'confidence': confidence,
                 'beat_count': len(beats)
             }
-        except (ValueError, TypeError, RuntimeError) as e:
-            logger.warning(f"Error BPM chunk: {e}")
+        except Exception as e:
+            # Generico (como analyze_chunk_key): librosa levanta ParameterError,
+            # subclase de Exception pero NO de ValueError/TypeError/RuntimeError.
+            # Un chunk malo devuelve default, no tumba el analisis del track.
+            logger.warning(f"Error BPM chunk: {type(e).__name__}: {e}")
             return {'bpm': 120.0, 'confidence': 0.0, 'beat_count': 0}
     
     def analyze_chunk_key(self, y: np.ndarray, sr: int) -> Dict:
@@ -330,8 +333,8 @@ class ChunkedAudioAnalyzer:
                 'energy_std': float(np.std(rms)),
                 'energy_curve': energy_curve
             }
-        except (ValueError, TypeError, RuntimeError) as e:
-            logger.warning(f"Error Energy chunk: {e}")
+        except Exception as e:  # generico: ver analyze_chunk_key (ParameterError)
+            logger.warning(f"Error Energy chunk: {type(e).__name__}: {e}")
             return {'energy_mean': 0.1, 'energy_curve': []}
     
     def analyze_chunk_spectral(self, y: np.ndarray, sr: int) -> Dict:
@@ -352,8 +355,8 @@ class ChunkedAudioAnalyzer:
                 'has_heavy_bass': float(np.mean(centroid)) < 2500,
                 'has_pads': float(np.std(rolloff)) < 1500
             }
-        except (ValueError, TypeError, RuntimeError) as e:
-            logger.warning(f"Error Spectral chunk: {e}")
+        except Exception as e:  # generico: ver analyze_chunk_key (ParameterError)
+            logger.warning(f"Error Spectral chunk: {type(e).__name__}: {e}")
             return {'centroid_mean': 3000, 'has_heavy_bass': False, 'has_pads': False}
     
     def fuse_bpm_results(self, chunk_results: List[Dict]) -> Dict:
