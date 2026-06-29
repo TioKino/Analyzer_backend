@@ -17,6 +17,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, De
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sync_endpoints import sync_router
 from routes.admin_panel import admin_panel_router
+from routes.search import search_router, init as init_search
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.concurrency import run_in_threadpool
@@ -620,6 +621,14 @@ db = AnalysisDB(db_path=DATABASE_PATH)
 from community_cues_endpoint import register_community_endpoints
 register_community_endpoints(app, db)
 
+# Endpoints de busqueda/biblioteca/track (movidos de inline a routes/search.py,
+# paso 2 del troceo de main.py). init() inyecta la BD + el mapa Camelot ANTES
+# del include_router. CAMELOT_COMPATIBLE solo existe si similar_tracks cargo;
+# si no, inyectamos {} (los endpoints siguen vivos, solo /search/compatible
+# devuelve la propia key como unica compatible — mismo fallback que el .get()).
+init_search(db, CAMELOT_COMPATIBLE if SIMILAR_TRACKS_ENABLED else {})
+app.include_router(search_router)
+
 # Crear directorio de cach(c) para artwork
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
 
@@ -779,16 +788,7 @@ class CorrectionRequest(BaseModel):
     fingerprint: Optional[str] = None
     device_id: Optional[str] = None
 
-class SearchRequest(BaseModel):
-    artist: Optional[str] = None
-    genre: Optional[str] = None
-    min_bpm: Optional[float] = None
-    max_bpm: Optional[float] = None
-    min_energy: Optional[int] = None
-    max_energy: Optional[int] = None
-    key: Optional[str] = None
-    track_type: Optional[str] = None
-    limit: int = 100
+# SearchRequest se movio a routes/search.py (lo usa search_advanced, ya no inline).
 
 # ==================== MAPEOS ====================
 
@@ -3944,254 +3944,9 @@ async def upload_artwork(fingerprint: str, file: UploadFile = File(...)):
 
 # ==================== ENDPOINTS DE BUSQUEDA ====================
 
-@app.get("/search/artist/{artist}")
-async def search_by_artist(artist: str, limit: int = Query(50, ge=1, le=200)):
-    """Buscar tracks por artista"""
-    artist = sanitize_string(artist, max_length=200, allow_empty=False, field_name="artist")
-    limit = validate_limit(limit, max_limit=200)
-    results = db.search_by_artist(artist, limit)
-    return {"query": artist, "count": len(results), "tracks": results}
-
-@app.get("/search/genre/{genre}")
-async def search_by_genre(genre: str, limit: int = Query(100, ge=1, le=500)):
-    #  Sanitizar g(c)nero
-    genre = validate_genre(genre)
-    limit = validate_limit(limit, max_limit=500)
-    
-    return {"tracks": db.search_by_genre(genre, limit)}
-
-@app.get("/search/bpm")
-async def search_by_bpm(
-    request: Request,
-    min_bpm: Optional[float] = None,
-    max_bpm: Optional[float] = None,
-    limit: int = Query(100, ge=1, le=500)
-):
-    #  Validar rangos
-    min_bpm, max_bpm = validate_bpm_range(min_bpm, max_bpm)
-    limit = validate_limit(limit, max_limit=500)
-    
-    return {"tracks": db.search_by_bpm_range(min_bpm, max_bpm, limit)}
-
-@app.get("/search/energy")
-async def search_by_energy(
-    request: Request,
-    min_energy: Optional[int] = None,
-    max_energy: Optional[int] = None,
-    limit: int = Query(100, ge=1, le=500)
-):
-    #  Validar rangos
-    min_energy, max_energy = validate_energy_range(min_energy, max_energy)
-    limit = validate_limit(limit, max_limit=500)
-    
-    return {"tracks": db.search_by_energy(min_energy, max_energy, limit)}
-
-@app.get("/search/key/{key}")
-async def search_by_key(key: str, limit: int = Query(100, ge=1, le=500)):
-    #  Validar tonalidad
-    try:
-        key = validate_key(key)
-    except ValidationError:
-        # Si no es vlido como key, intentar como est
-        key = sanitize_string(key, max_length=10)
-    
-    limit = validate_limit(limit, max_limit=500)
-    
-    return {"tracks": db.search_by_key(key, limit)}
-
-@app.get("/search/compatible/{camelot}")
-async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=200)):
-    #  Validar Camelot
-    camelot = validate_camelot(camelot)
-    limit = validate_limit(limit, max_limit=200)
-    
-    # Obtener keys compatibles
-    compatible = CAMELOT_COMPATIBLE.get(camelot, [camelot])
-    
-    return {
-        "camelot": camelot,
-        "compatible_keys": compatible,
-        "tracks": db.search_compatible_keys(camelot, limit)
-    }
-@app.get("/search-analyzed")
-async def search_analyzed_track(
-    artist: str = Query(..., description="Nombre del artista"),
-    title: str = Query(..., description="Ttulo del track")
-):
-    """
-    Busca si un track ya fue analizado por algn usuario.
-    Devuelve TODA la informacin del anlisis si existe.
-    
-    Returns:
-        - found: bool - Si se encontr el track
-        - track: dict - Toda la informacin del anlisis (si existe)
-        - in_collective: bool - Si est en la memoria colectiva
-    """
-    import re
-    
-    # Validar y sanitizar entrada
-    artist_clean = sanitize_string(artist, max_length=200, allow_empty=False, field_name="artist")
-    title_clean = sanitize_string(title, max_length=200, allow_empty=False, field_name="title")
-    
-    # Normalizar para bsqueda
-    artist_normalized = artist_clean.lower().strip()
-    title_normalized = re.sub(
-        r'\s*\(?(Original Mix|Extended Mix|Radio Edit|Remix|Club Mix|Dub Mix)\)?', 
-        '', 
-        title_clean, 
-        flags=re.IGNORECASE
-    ).lower().strip()
-    
-    try:
-        conn = db.conn
-        cursor = conn.cursor()
-        
-        # Bsqueda exacta primero
-        cursor.execute("""
-            SELECT * FROM tracks 
-            WHERE LOWER(artist) = ? AND LOWER(title) LIKE ?
-            AND bpm IS NOT NULL AND bpm > 0
-            ORDER BY analyzed_at DESC
-            LIMIT 1
-        """, (artist_normalized, f"%{title_normalized}%"))
-        
-        row = cursor.fetchone()
-        
-        if not row:
-            # Bsqueda ms flexible
-            cursor.execute("""
-                SELECT * FROM tracks 
-                WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
-                AND bpm IS NOT NULL AND bpm > 0
-                ORDER BY analyzed_at DESC
-                LIMIT 1
-            """, (f"%{artist_normalized}%", f"%{title_normalized}%"))
-            row = cursor.fetchone()
-        
-        if row:
-            # Convertir a dict usando el m(c)todo existente
-            track_dict = db._row_to_dict(row)
-            
-            # Si hay analysis_json, parsear para obtener todos los campos
-            if track_dict and track_dict.get('analysis_json'):
-                try:
-                    full_analysis = json.loads(track_dict['analysis_json'])
-                    # Combinar con los campos bsicos
-                    track_dict.update(full_analysis)
-                except (json.JSONDecodeError, TypeError) as e:
-                    logger.warning("analysis_json corrupto en track %s: %s",
-                                   track_dict.get('id'), e)
-            
-            # Eliminar el JSON crudo del response
-            if track_dict and 'analysis_json' in track_dict:
-                del track_dict['analysis_json']
-            
-            return {
-                "found": True,
-                "in_collective": True,
-                "track": track_dict
-            }
-        
-        return {
-            "found": False,
-            "in_collective": False,
-            "track": None
-        }
-        
-    except Exception as e:
-        logger.error(f"Error en search-analyzed: {e}")
-        return {
-            "found": False,
-            "in_collective": False,
-            "track": None,
-            "error": str(e)
-        }
-
-@app.get("/search/track-type/{track_type}")
-async def search_by_track_type(track_type: str, limit: int = Query(100, ge=1, le=500)):
-    #  Validar tipo de track
-    track_type = validate_track_type(track_type)
-    limit = validate_limit(limit, max_limit=500)
-    
-    return {"tracks": db.search_by_track_type(track_type, limit)}
-
-@app.post("/search/advanced")
-async def search_advanced(search_request: SearchRequest):
-    #  Validar y sanitizar todos los campos
-    filters = {}
-    
-    if search_request.artist:
-        filters['artist'] = sanitize_string(search_request.artist, max_length=100)
-    
-    if search_request.genre:
-        filters['genre'] = validate_genre(search_request.genre)
-    
-    if search_request.min_bpm is not None or search_request.max_bpm is not None:
-        filters['min_bpm'], filters['max_bpm'] = validate_bpm_range(
-            search_request.min_bpm, 
-            search_request.max_bpm
-        )
-    
-    if search_request.min_energy is not None or search_request.max_energy is not None:
-        filters['min_energy'], filters['max_energy'] = validate_energy_range(
-            search_request.min_energy,
-            search_request.max_energy
-        )
-    
-    if search_request.key:
-        try:
-            filters['key'] = validate_key(search_request.key)
-        except ValidationError:
-            filters['key'] = sanitize_string(search_request.key, max_length=10)
-    
-    if search_request.track_type:
-        filters['track_type'] = validate_track_type(search_request.track_type)
-    
-    filters['limit'] = validate_limit(search_request.limit, max_limit=500)
-    
-    return {"tracks": db.search_advanced(**filters)}
-
-# ==================== ENDPOINTS DE BIBLIOTECA ====================
-
-@app.get("/library/all")
-async def get_all_tracks(limit: int = Query(1000, ge=1, le=5000)):
-    #  Validar lmite
-    limit = validate_limit(limit, max_limit=5000)
-    
-    return {"tracks": db.get_all_tracks(limit)}
-
-@app.get("/library/artists")
-async def get_unique_artists():
-    """Obtener lista de artistas nicos"""
-    artists = db.get_unique_artists()
-    return {"count": len(artists), "artists": artists}
-
-@app.get("/library/genres")
-async def get_unique_genres():
-    """Obtener lista de g(c)neros nicos"""
-    genres = db.get_unique_genres()
-    return {"count": len(genres), "genres": genres}
-
-@app.get("/library/stats")
-async def get_library_stats():
-    """Obtener estadsticas de la biblioteca"""
-    return db.get_stats()
-
-@app.get("/track/{track_id}")
-async def get_track(track_id: str):
-    """Obtener informacin de un track especfico"""
-    track = db.get_track_by_id(track_id)
-    if not track:
-        raise HTTPException(404, "Track no encontrado")
-    return track
-
-@app.delete("/track/{track_id}")
-async def delete_track(track_id: str):
-    """Eliminar un track de la base de datos"""
-    deleted = db.delete_track(track_id)
-    if not deleted:
-        raise HTTPException(404, "Track no encontrado")
-    return {"status": "ok", "message": "Track eliminado"}
+# ==================== ENDPOINTS DE BUSQUEDA / BIBLIOTECA / TRACK ====================
+# Movidos a routes/search.py (paso 2 del troceo de main.py). Se montan via
+# init_search(db, CAMELOT_COMPATIBLE) + app.include_router(search_router) arriba.
 
 # ==================== ENDPOINTS SIMILAR TRACKS ====================
 
