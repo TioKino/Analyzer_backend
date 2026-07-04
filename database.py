@@ -288,6 +288,33 @@ class AnalysisDB:
             except sqlite3.OperationalError:
                 pass  # Ya existe
 
+        # Migracion (2026-07-04): asegurar UNIQUE(fingerprint, device_id) via
+        # INDICE. Mismo patron que las columnas de arriba: las BDs creadas antes
+        # de que el CREATE llevara el `UNIQUE(fingerprint, device_id)` inline
+        # tienen la tabla SIN esa constraint (CREATE IF NOT EXISTS no altera
+        # tablas existentes). El INSERT ... ON CONFLICT(fingerprint, device_id)
+        # de submit_beat_grid_correction NO encuentra constraint que casar ->
+        # sqlite3.OperationalError -> 500 en CADA POST /community/beat-grid
+        # (visto en produccion 2026-07-04, mismo device reintentando). Un UNIQUE
+        # INDEX satisface el ON CONFLICT igual que la constraint inline y es
+        # idempotente (no-op si la tabla ya la tiene). Deduplicamos primero por
+        # si la tabla vieja, sin la constraint, acumulo (fingerprint, device_id)
+        # repetidos que harian fallar el CREATE UNIQUE INDEX.
+        try:
+            conn.execute('''
+                DELETE FROM beat_grid_corrections
+                WHERE id NOT IN (
+                    SELECT MAX(id) FROM beat_grid_corrections
+                    GROUP BY fingerprint, device_id
+                )
+            ''')
+            conn.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_beat_grid_fp_device
+                ON beat_grid_corrections(fingerprint, device_id)
+            ''')
+        except sqlite3.OperationalError:
+            pass
+
         # Track type community overrides (Fase 2 v2).
         # Un device_id puede votar 1 vez por fingerprint. Si N>=3 votos y el
         # winner supera al 2do por >=2, ese tipo gana sobre el algoritmico.
