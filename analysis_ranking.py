@@ -36,6 +36,7 @@ ANALYSIS_SOURCE_PRIORITY = {
     'beatport': 70,
     'local_engine': 50,
     'id3': 30,
+    'itunes': 30,  # BPM de iTunes = tag escrito a mano, mismo nivel que id3
     'suggestion_2': 25,
     'analysis': 15,
     'acousticbrainz': 14,
