@@ -618,6 +618,75 @@ class AnalysisDB:
             return row['acoustic_id']
         return fingerprint
 
+    def canonical_community_keys(self, fingerprints):
+        """Version batch de canonical_community_key: mapa {fingerprint ->
+        clave del cluster} para una lista, en UNA query. Los que no matchean un
+        track con acoustic_id se mapean a si mismos (fallback). Lo usan los
+        endpoints batch (columnas de popularidad/rating de la libreria desktop)
+        para no disparar N queries."""
+        fps = [f for f in (fingerprints or []) if f]
+        if not fps:
+            return {}
+        out = {f: f for f in fps}  # fallback: cada uno a si mismo
+        want = set(fps)
+        placeholders = ','.join('?' * len(fps))
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT fingerprint, id, acoustic_id FROM tracks '
+                'WHERE acoustic_id IS NOT NULL AND '
+                f'(fingerprint IN ({placeholders}) OR id IN ({placeholders}))',
+                fps + fps,
+            )
+            for row in c.fetchall():
+                aid = row['acoustic_id']
+                if row['fingerprint'] in want:
+                    out[row['fingerprint']] = aid
+                if row['id'] in want:
+                    out[row['id']] = aid
+        finally:
+            conn.close()
+        return out
+
+    def fingerprints_in_cluster(self, fingerprint):
+        """Todos los fingerprints (y track ids) del mismo cluster acustico que
+        `fingerprint`, incluido el propio. Sirve para AGREGAR la memoria
+        colectiva de TODAS las versiones del mismo audio en la LECTURA, sin
+        tocar la escritura (usado por los cues comunitarios, que comparten tabla
+        con el sync personal y por eso no se pueden re-key en escritura).
+
+        Si el track no tiene cluster todavia, devuelve solo el propio
+        fingerprint (comportamiento identico al de antes de la feature).
+        """
+        if not fingerprint:
+            return []
+        keys = {fingerprint}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            # Cluster del fingerprint pedido (por fingerprint o por id).
+            c.execute(
+                'SELECT acoustic_id FROM tracks WHERE fingerprint = ? OR id = ? '
+                'LIMIT 1',
+                (fingerprint, fingerprint),
+            )
+            row = c.fetchone()
+            aid = row['acoustic_id'] if row else None
+            if aid:
+                c.execute(
+                    'SELECT fingerprint, id FROM tracks WHERE acoustic_id = ?',
+                    (aid,),
+                )
+                for r in c.fetchall():
+                    if r['fingerprint']:
+                        keys.add(r['fingerprint'])
+                    if r['id']:
+                        keys.add(r['id'])
+        finally:
+            conn.close()
+        return list(keys)
+
     def save_track(self, track_data):
         conn = self._open_conn()
         c = conn.cursor()
@@ -661,6 +730,8 @@ class AnalysisDB:
         conn.close()
 
     def save_correction(self, track_id, field, old_value, new_value, fingerprint=None, device_id=None):
+        # Memoria colectiva por SONIDO: agrupar bajo el cluster acustico.
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         c = conn.cursor()
 
@@ -691,6 +762,7 @@ class AnalysisDB:
         """
         if not fingerprint:
             return None, 0
+        fingerprint = self.canonical_community_key(fingerprint)
 
         conn = self._open_conn()
         c = conn.cursor()
@@ -723,6 +795,7 @@ class AnalysisDB:
         """
         if not fingerprint:
             return {}
+        fingerprint = self.canonical_community_key(fingerprint)
 
         conn = self._open_conn()
         c = conn.cursor()
@@ -1057,6 +1130,7 @@ class AnalysisDB:
                             note_text: str, display_name: str = 'DJ',
                             note_type: str = 'general') -> int:
         from datetime import datetime
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
@@ -1071,6 +1145,7 @@ class AnalysisDB:
         return note_id
 
     def get_community_notes(self, fingerprint: str) -> List[Dict]:
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
@@ -1100,6 +1175,7 @@ class AnalysisDB:
 
     def increment_popularity(self, fingerprint: str, device_id: str = ''):
         from datetime import datetime
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT analysis_count FROM track_popularity WHERE fingerprint = ?', (fingerprint,))
@@ -1117,6 +1193,7 @@ class AnalysisDB:
 
     def rate_track(self, fingerprint: str, device_id: str, rating: int) -> Dict:
         from datetime import datetime
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         c = conn.cursor()
         if rating <= 0:
@@ -1145,6 +1222,7 @@ class AnalysisDB:
         return {'avg_rating': round(avg or 0, 1), 'total_ratings': count or 0}
 
     def get_track_popularity(self, fingerprint: str) -> Dict:
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT analysis_count, dj_count, avg_rating, total_ratings FROM track_popularity WHERE fingerprint = ?',
@@ -1168,7 +1246,11 @@ class AnalysisDB:
         fps = [f for f in (fingerprints or []) if f][:500]
         if not fps:
             return {}
-        placeholders = ','.join('?' * len(fps))
+        # Memoria colectiva por sonido: consultar por el cluster acustico, pero
+        # devolver keyed por el fingerprint ORIGINAL que mando el cliente.
+        canon = self.canonical_community_keys(fps)          # {orig -> cluster}
+        keys = list({canon[f] for f in fps})
+        placeholders = ','.join('?' * len(keys))
         conn = self._open_conn()
         try:
             c = conn.cursor()
@@ -1176,21 +1258,22 @@ class AnalysisDB:
                 'SELECT fingerprint, analysis_count, dj_count, avg_rating, '
                 'total_ratings FROM track_popularity '
                 f'WHERE fingerprint IN ({placeholders})',
-                fps,
+                keys,
             )
-            out: Dict[str, Dict] = {}
+            by_key: Dict[str, Dict] = {}
             for row in c.fetchall():
-                out[row['fingerprint']] = {
+                by_key[row['fingerprint']] = {
                     'analysis_count': row['analysis_count'] or 0,
                     'dj_count': row['dj_count'] or 0,
                     'avg_rating': round(row['avg_rating'] or 0, 1),
                     'total_ratings': row['total_ratings'] or 0,
                 }
-            return out
+            return {f: by_key[canon[f]] for f in fps if canon[f] in by_key}
         finally:
             conn.close()
 
     def get_my_rating(self, fingerprint: str, device_id: str) -> int:
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         c = conn.cursor()
         c.execute('SELECT rating FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
@@ -1207,16 +1290,20 @@ class AnalysisDB:
         fps = [f for f in (fingerprints or []) if f][:500]
         if not fps or not device_id:
             return {}
-        placeholders = ','.join('?' * len(fps))
+        # Query por el cluster acustico, devolver keyed por el original.
+        canon = self.canonical_community_keys(fps)          # {orig -> cluster}
+        keys = list({canon[f] for f in fps})
+        placeholders = ','.join('?' * len(keys))
         conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute(
                 'SELECT fingerprint, rating FROM track_ratings '
                 f'WHERE device_id = ? AND fingerprint IN ({placeholders})',
-                [device_id] + fps,
+                [device_id] + keys,
             )
-            return {row['fingerprint']: row['rating'] for row in c.fetchall()}
+            by_key = {row['fingerprint']: row['rating'] for row in c.fetchall()}
+            return {f: by_key[canon[f]] for f in fps if canon[f] in by_key}
         finally:
             conn.close()
 
@@ -1226,6 +1313,7 @@ class AnalysisDB:
                                      bpm_adjust: float, beat_offset: float,
                                      original_bpm: float):
         """Guarda o actualiza la correccion de beat grid de un DJ"""
+        fingerprint = self.canonical_community_key(fingerprint)
         from datetime import datetime
         now = datetime.utcnow().isoformat()
         conn = self._open_conn()
@@ -1244,6 +1332,7 @@ class AnalysisDB:
 
     def get_community_beat_grid(self, fingerprint: str) -> Dict:
         """Obtiene la correccion promedio de la comunidad para un track"""
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         c = conn.cursor()
         c.execute('''
@@ -1285,6 +1374,7 @@ class AnalysisDB:
         PK (fingerprint, device_id, field) -> un device puede votar 1 campo
         1 vez por track; segundo POST sobreescribe (cambio de opinion).
         """
+        fingerprint = self.canonical_community_key(fingerprint)
         from datetime import datetime
         now = datetime.utcnow().isoformat()
         conn = self._open_conn()
@@ -1310,6 +1400,7 @@ class AnalysisDB:
           - >= 3 votos totales al winner.
           - winner supera al 2do por >= 2 votos.
         """
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         try:
             c = conn.cursor()
@@ -1374,6 +1465,7 @@ class AnalysisDB:
         - Si algun valor no parsea a float se ignora (defensivo, los votos
           deberian estar normalizados por _validate_community_field).
         """
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         try:
             c = conn.cursor()
@@ -1434,6 +1526,7 @@ class AnalysisDB:
 
     def get_community_votes(self, fingerprint: str, field: str) -> Dict:
         """Distribucion bruta de votos por (fp, field). Siempre devuelve dict."""
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         try:
             c = conn.cursor()
@@ -1461,6 +1554,7 @@ class AnalysisDB:
         Returns:
             True si se elimino un row, False si no habia voto previo.
         """
+        fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         try:
             c = conn.cursor()

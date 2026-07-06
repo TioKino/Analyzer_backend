@@ -248,16 +248,23 @@ def register_community_endpoints(app, db):
 
             conn.commit()
 
-            # Devolver zonas actualizadas
+            # Devolver zonas actualizadas agregando TODO el cluster acustico
+            # (todas las versiones del mismo audio), no solo este fingerprint.
+            cluster = db.fingerprints_in_cluster(upload.fingerprint)
+            ph = ','.join('?' * len(cluster))
             c.execute(
-                f'SELECT {_CUES_COLUMNS} FROM community_cues WHERE fingerprint = ?',
-                (upload.fingerprint,)
+                f'SELECT {_CUES_COLUMNS} FROM community_cues WHERE fingerprint IN ({ph})',
+                cluster,
             )
             all_rows = c.fetchall()
             unique_devices = set(r['device_id'] for r in all_rows)
 
-            # Obtener duracion del track si existe
-            c.execute('SELECT duration FROM tracks WHERE fingerprint = ?', (upload.fingerprint,))
+            # Obtener duracion del track si existe (cualquier version del cluster)
+            c.execute(
+                f'SELECT duration FROM tracks WHERE fingerprint IN ({ph}) '
+                'AND duration IS NOT NULL LIMIT 1',
+                cluster,
+            )
             dur_row = c.fetchone()
             duration = dur_row['duration'] if dur_row else 0
 
@@ -284,9 +291,14 @@ def register_community_endpoints(app, db):
         conn = db.conn
         c = conn.cursor()
 
+        # Memoria colectiva por SONIDO: agregar los cues de TODAS las versiones
+        # del mismo audio (cluster acustico), no solo las de este fingerprint.
+        # Asi los cues que otro DJ marco en el flac aparecen al abrir el mp3.
+        cluster = db.fingerprints_in_cluster(fingerprint)
+        ph = ','.join('?' * len(cluster))
         c.execute(
-            f'SELECT {_CUES_COLUMNS} FROM community_cues WHERE fingerprint = ?',
-            (fingerprint,)
+            f'SELECT {_CUES_COLUMNS} FROM community_cues WHERE fingerprint IN ({ph})',
+            cluster,
         )
         rows = c.fetchall()
 
@@ -299,8 +311,12 @@ def register_community_endpoints(app, db):
 
         unique_devices = set(r['device_id'] for r in rows)
 
-        # Obtener duracion
-        c.execute('SELECT duration FROM tracks WHERE fingerprint = ?', (fingerprint,))
+        # Obtener duracion (de cualquier version del cluster).
+        c.execute(
+            f'SELECT duration FROM tracks WHERE fingerprint IN ({ph}) '
+            'AND duration IS NOT NULL LIMIT 1',
+            cluster,
+        )
         dur_row = c.fetchone()
         duration = dur_row['duration'] if dur_row else 0
 

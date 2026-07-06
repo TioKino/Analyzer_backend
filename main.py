@@ -205,6 +205,10 @@ def _upload_to_render_cache(track_data: dict):
                 # NULL -> _is_analysis_current trataba la fila como stale -> el
                 # fallback por fingerprint re-analizaba aunque el dato fuera bueno.
                 'analysis_version': track_data.get('analysis_version'),
+                # Huella acustica del audio (transferible entre BDs). Render
+                # RE-resuelve el cluster (acoustic_id) contra SU BD central en
+                # /cache-analysis; el acoustic_id local del motor no viaja.
+                'chromaprint': track_data.get('chromaprint'),
                 # Detalle COMPLETO del analisis. Antes mandabamos
                 # track_data.get('analysis_json', {}) que era SIEMPRE {} porque
                 # AnalysisResult no tiene campo 'analysis_json' -> se perdian
@@ -857,6 +861,32 @@ def calculate_fingerprint(file_path):
     with open(file_path, 'rb') as f:
         file_hash = hashlib.md5(f.read()).hexdigest()
     return file_hash
+
+
+def _attach_acoustic(track_data, audio_path):
+    """Enriquece track_data con la HUELLA ACUSTICA + su cluster antes de
+    guardar, para que la memoria colectiva agrupe por SONIDO (no por bytes).
+
+    - `chromaprint`: array Chromaprint del audio (fpcalc -raw), serializado.
+    - `acoustic_id`: cluster acustico resuelto contra la BD (Hamming tolerante:
+      mismo audio a otro codec/bitrate/tag cae en el mismo cluster).
+
+    Best-effort y NUNCA rompe /analyze: si fpcalc no esta o falla, deja
+    acoustic_id sin setear -> la memoria colectiva cae al fingerprint MD5 como
+    antes (fallback en canonical_community_key). El acoustic_id es LOCAL a esta
+    BD; al propagar a otra BD (Render via /cache-analysis) se re-resuelve alli.
+    """
+    try:
+        from acoustic_fingerprint import compute_raw_chromaprint, encode_raw
+        raw = compute_raw_chromaprint(audio_path)
+        if not raw:
+            return
+        track_data['chromaprint'] = encode_raw(raw)
+        track_data['acoustic_id'] = db.resolve_acoustic_cluster(
+            raw, track_data.get('duration'),
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort, no romper el analisis
+        logger.warning(f"[Acoustic] enrich fallo (no critico): {e}")
 
 def parse_filename(filename: str) -> dict:
     name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
@@ -2748,6 +2778,8 @@ async def analyze_track(
         track_data['fingerprint'] = fingerprint
         track_data['engine_source'] = 'local_engine' if IS_LOCAL_ENGINE else 'render'
         track_data['analysis_version'] = ANALYSIS_VERSION
+        # Huella acustica + cluster para la memoria colectiva por sonido.
+        _attach_acoustic(track_data, tmp_path)
         db.save_track(track_data)
 
         # Incrementar contador de popularidad
@@ -3259,7 +3291,9 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             'first_beat': 0,
             'beat_interval': 0,
         }
-        
+
+        # Huella acustica + cluster para la memoria colectiva por sonido.
+        _attach_acoustic(track_db_data, tmp_path)
         db.save_track(track_db_data)
         logger.info(f"  Guardado en BD con fingerprint: {fingerprint[:12]}...")
         
@@ -3694,6 +3728,23 @@ async def cache_analysis(request: Request):
         # Sin esto quedaba NULL -> _is_analysis_current la trataba como stale.
         'analysis_version': data.get('analysis_version') or nested.get('analysis_version'),
     }
+
+    # Huella acustica: el chromaprint (transferible) lo computo el motor local;
+    # llega en el payload (top-level) o dentro del detalle anidado. Render
+    # RE-resuelve el cluster contra SU BD central (el acoustic_id es local a
+    # cada BD). Best-effort: sin chromaprint -> acoustic_id NULL -> fallback.
+    _cp = data.get('chromaprint') or nested.get('chromaprint')
+    if _cp:
+        track_data['chromaprint'] = _cp
+        try:
+            from acoustic_fingerprint import decode_raw
+            _raw = decode_raw(_cp)
+            if _raw:
+                track_data['acoustic_id'] = db.resolve_acoustic_cluster(
+                    _raw, track_data.get('duration'),
+                )
+        except Exception as _e:  # noqa: BLE001 - best-effort
+            logger.warning(f"[Acoustic] cache resolve fallo: {_e}")
 
     db.save_track(track_data)
     logger.info(f"[Cache] Análisis local cacheado: {data.get('artist', '?')} - {data.get('title', '?')} ({fingerprint[:12]})")

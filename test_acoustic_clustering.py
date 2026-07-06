@@ -131,3 +131,75 @@ def test_track_without_acoustic_id_falls_back(db):
         # sin chromaprint ni acoustic_id (track pre-feature)
     })
     assert db.canonical_community_key('md5_legacy') == 'md5_legacy'
+
+
+# ── Integracion end-to-end: memoria colectiva compartida entre versiones ──
+
+@pytest.fixture
+def two_versions(db):
+    """Dos usuarios con el MISMO audio en distinto codec (flac/mp3) -> mismo
+    cluster acustico. Devuelve (db, fp_flac, fp_mp3)."""
+    original = _rand_fp(n=400, seed=7)
+    reencoded = _flip_bits(original, 12)
+    _analyze_and_save(db, 'flac', original, fingerprint='md5_flac')
+    _analyze_and_save(db, 'mp3', reencoded, fingerprint='md5_mp3')
+    return db, 'md5_flac', 'md5_mp3'
+
+
+def test_beatgrid_shared_across_versions(two_versions):
+    """Un DJ corrige el beat-grid en el flac, otro en el mp3 -> al leer desde
+    CUALQUIER version se ven los 2 contribuyentes (memoria compartida)."""
+    db, fp_flac, fp_mp3 = two_versions
+    db.submit_beat_grid_correction(fp_flac, 'devA', 0.5, 0.01, 128.0)
+    db.submit_beat_grid_correction(fp_mp3, 'devB', 0.5, 0.01, 128.0)
+
+    grid_from_mp3 = db.get_community_beat_grid(fp_mp3)
+    grid_from_flac = db.get_community_beat_grid(fp_flac)
+    assert grid_from_mp3['contributors'] == 2
+    assert grid_from_flac['contributors'] == 2
+    assert grid_from_mp3['validated'] is True  # >= 2 DJs
+
+
+def test_consensus_votes_merge_across_versions(two_versions):
+    """Votos de genero desde ambas versiones se SUMAN en el consenso."""
+    db, fp_flac, fp_mp3 = two_versions
+    db.submit_community_override(fp_flac, 'devA', 'genre', 'Techno')
+    db.submit_community_override(fp_mp3, 'devB', 'genre', 'Techno')
+    db.submit_community_override(fp_flac, 'devC', 'genre', 'Techno')
+
+    consensus = db.get_community_consensus(fp_mp3, 'genre')
+    assert consensus is not None, "3 votos del cluster deberian dar consenso"
+    assert consensus['value'] == 'Techno'
+    assert consensus['votes'] == 3
+
+
+def test_rating_merges_across_versions(two_versions):
+    """Ratings de ambas versiones cuentan como el mismo track."""
+    db, fp_flac, fp_mp3 = two_versions
+    db.rate_track(fp_flac, 'devA', 5)
+    db.rate_track(fp_mp3, 'devB', 3)
+    pop = db.get_track_popularity(fp_mp3)
+    assert pop['total_ratings'] == 2
+    assert pop['avg_rating'] == 4.0
+
+
+def test_fingerprints_in_cluster_unites_versions(two_versions):
+    """El helper de cues devuelve los fingerprints de todas las versiones."""
+    db, fp_flac, fp_mp3 = two_versions
+    cluster = set(db.fingerprints_in_cluster(fp_mp3))
+    # incluye ambos fingerprints (y los track ids flac/mp3)
+    assert fp_flac in cluster
+    assert fp_mp3 in cluster
+    assert 'flac' in cluster and 'mp3' in cluster
+
+
+def test_popularity_batch_rekeys_to_original(two_versions):
+    """El batch devuelve keyed por el fingerprint ORIGINAL del cliente, aunque
+    internamente agrupe por cluster."""
+    db, fp_flac, fp_mp3 = two_versions
+    db.rate_track(fp_flac, 'devA', 5)
+    out = db.get_track_popularity_batch([fp_flac, fp_mp3])
+    # Ambos fingerprints originales presentes, con los datos del cluster.
+    assert fp_flac in out and fp_mp3 in out
+    assert out[fp_flac]['total_ratings'] == 1
+    assert out[fp_mp3]['total_ratings'] == 1
