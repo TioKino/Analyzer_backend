@@ -889,40 +889,68 @@ def _attach_acoustic(track_data, audio_path):
         logger.warning(f"[Acoustic] enrich fallo (no critico): {e}")
 
 
-def _apply_cluster_best(result, acoustic_id):
-    """Adopta en `result` la metadata MAS FIABLE del cluster acustico: si otra
-    version del mismo audio (otro usuario) tiene el BPM/key/genero de una fuente
-    mejor (rekordbox/beatport/consenso vs analysis), la copia dudosa la hereda
-    AUTOMATICAMENTE. Solo sube de fiabilidad — nunca degrada (compara prioridad
-    de fuente). Best-effort: nunca rompe /analyze.
+def _adopt_better_metadata(result, best):
+    """Adopta en `result` (AnalysisResult) los campos de `best` cuya fuente sea
+    MAS FIABLE que la actual (analysis_ranking: rekordbox/beatport/consenso >
+    analysis). Solo SUBE de fiabilidad — nunca degrada. `best` es el dict que
+    devuelve best_cluster_analysis o el endpoint /cluster-best."""
+    if not best:
+        return
+    from analysis_ranking import get_source_priority
+    if ('bpm' in best and best.get('bpm') and get_source_priority(best.get('bpm_source'))
+            > get_source_priority(getattr(result, 'bpm_source', None))):
+        result.bpm = best['bpm']
+        result.bpm_source = best['bpm_source']
+    if ('key' in best and best.get('key') and get_source_priority(best.get('key_source'))
+            > get_source_priority(getattr(result, 'key_source', None))):
+        result.key = best['key']
+        if best.get('camelot'):
+            result.camelot = best['camelot']
+        result.key_source = best['key_source']
+    if ('genre' in best and best.get('genre') and get_source_priority(best.get('genre_source'))
+            > get_source_priority(getattr(result, 'genre_source', None))):
+        result.genre = best['genre']
+        result.genre_source = best['genre_source']
 
-    Debe llamarse DESPUES de save_track (para que el cluster incluya ya el track
-    recien analizado) y respeta el consenso comunitario ya aplicado (que tiene
-    prioridad alta en analysis_ranking).
-    """
+
+def _apply_cluster_best(result, acoustic_id):
+    """(Local) Adopta la metadata MAS FIABLE del cluster acustico de ESTA BD: si
+    otra version del mismo audio tiene el BPM/key/genero de una fuente mejor, la
+    copia dudosa la hereda. Debe llamarse DESPUES de save_track (para que el
+    cluster incluya ya el track recien analizado). Best-effort."""
     if not acoustic_id:
         return
     try:
-        from analysis_ranking import get_source_priority
-        best = db.best_cluster_analysis(acoustic_id)
-        if not best:
-            return
-        if ('bpm' in best and get_source_priority(best.get('bpm_source'))
-                > get_source_priority(getattr(result, 'bpm_source', None))):
-            result.bpm = best['bpm']
-            result.bpm_source = best['bpm_source']
-        if ('key' in best and get_source_priority(best.get('key_source'))
-                > get_source_priority(getattr(result, 'key_source', None))):
-            result.key = best['key']
-            if best.get('camelot'):
-                result.camelot = best['camelot']
-            result.key_source = best['key_source']
-        if ('genre' in best and get_source_priority(best.get('genre_source'))
-                > get_source_priority(getattr(result, 'genre_source', None))):
-            result.genre = best['genre']
-            result.genre_source = best['genre_source']
+        _adopt_better_metadata(result, db.best_cluster_analysis(acoustic_id))
     except Exception as e:  # noqa: BLE001 - best-effort
         logger.warning(f"[Cluster] adoptar mejor metadata fallo (no critico): {e}")
+
+
+def _apply_render_cluster_best(result, chromaprint_b64, duration):
+    """(Motor local) Pregunta a Render por el mejor analisis del cluster POR
+    SONIDO (chromaprint) y lo adopta. Cierra el hueco del motor local: adopta el
+    mejor analisis de OTRO usuario del mismo audio aunque sea otra copia (otro
+    MD5) — el `acoustic_id` es local a cada BD, pero el chromaprint es universal.
+    Best-effort: si Render duerme / no responde, el analisis local sigue igual."""
+    if not chromaprint_b64:
+        return
+    try:
+        resp = requests.post(
+            f"{RENDER_BACKEND_URL}/cluster-best",
+            json={"chromaprint": chromaprint_b64, "duration": duration},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return
+        best = resp.json()
+        if best.get('found'):
+            _adopt_better_metadata(result, best)
+            logger.info(
+                f"[Cluster] Render aporto mejor metadata "
+                f"(bpm_source={best.get('bpm_source')}, key_source={best.get('key_source')})"
+            )
+    except Exception as e:  # noqa: BLE001 - best-effort
+        logger.warning(f"[Cluster] consulta Render /cluster-best fallo (no critico): {e}")
 
 def parse_filename(filename: str) -> dict:
     name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
@@ -2820,6 +2848,12 @@ async def analyze_track(
         # Adoptar la metadata mas fiable del cluster (otra version del mismo
         # audio con fuente superior: rekordbox/beatport de otro usuario).
         _apply_cluster_best(result, track_data.get('acoustic_id'))
+        # Motor local: preguntar tambien al cluster de RENDER por sonido (su BD
+        # tiene la memoria colectiva de todos; el acoustic_id local no cruza).
+        if IS_LOCAL_ENGINE:
+            _apply_render_cluster_best(
+                result, track_data.get('chromaprint'), track_data.get('duration'),
+            )
 
         # Incrementar contador de popularidad
         try:
@@ -3789,6 +3823,45 @@ async def cache_analysis(request: Request):
     logger.info(f"[Cache] Análisis local cacheado: {data.get('artist', '?')} - {data.get('title', '?')} ({fingerprint[:12]})")
 
     return {"status": "cached", "fingerprint": fingerprint}
+
+
+class ClusterBestRequest(BaseModel):
+    chromaprint: str            # huella acustica serializada (encode_raw base64)
+    duration: Optional[float] = None
+
+
+@app.post("/cluster-best")
+async def cluster_best_endpoint(request: ClusterBestRequest):
+    """Dada la HUELLA ACUSTICA (chromaprint) de un track, resuelve el cluster en
+    ESTA BD (Render, con la memoria colectiva de todos) y devuelve la MEJOR
+    metadata (fuente mas fiable: rekordbox/beatport/consenso).
+
+    Lo consulta el MOTOR LOCAL al analizar: como el acoustic_id es local a cada
+    BD y el dedup por MD5 solo casa copias bit-identicas, este endpoint permite
+    que el motor local adopte el mejor analisis de OTRO usuario del mismo audio
+    aunque sea otra copia distinta. Solo lectura: no crea cluster ni guarda nada.
+    """
+    from acoustic_fingerprint import decode_raw
+    raw = decode_raw(request.chromaprint)
+    if not raw:
+        return {"found": False}
+    acoustic_id = db.find_acoustic_cluster(raw, request.duration)
+    if not acoustic_id:
+        return {"found": False}
+    best = db.best_cluster_analysis(acoustic_id)
+    if not best:
+        return {"found": False}
+    return {
+        "found": True,
+        "acoustic_id": acoustic_id,
+        "bpm": best.get('bpm'),
+        "bpm_source": best.get('bpm_source'),
+        "key": best.get('key'),
+        "camelot": best.get('camelot'),
+        "key_source": best.get('key_source'),
+        "genre": best.get('genre'),
+        "genre_source": best.get('genre_source'),
+    }
 
 
 # ==================== CACHE-LOOKUP / ARTWORK ====================

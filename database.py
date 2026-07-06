@@ -547,41 +547,39 @@ class AnalysisDB:
         conn.close()
         return self._row_to_dict(result)
 
-    def resolve_acoustic_cluster(self, raw_ints, duration=None):
-        """Devuelve el `acoustic_id` (cluster acustico) de un fingerprint.
-
-        Busca entre los tracks ya vistos uno cuyo Chromaprint este dentro del
-        umbral Hamming (mismo audio, aunque sea otro codec/bitrate/tag). Si lo
-        encuentra, el track nuevo hereda ESE cluster -> comparten memoria
-        colectiva. Si no, arranca un cluster nuevo cuyo id es la clave exacta
-        (MD5 del array) del primer miembro.
+    def find_acoustic_cluster(self, raw_ints, duration=None):
+        """Busca el `acoustic_id` de un cluster EXISTENTE cuyo Chromaprint
+        matchee `raw_ints` (Hamming < umbral). Devuelve None si no hay ninguno
+        — NO crea cluster nuevo. Para LOOKUPS (ej. /cluster-best) donde no
+        queremos materializar nada.
 
         El barrido se acota a tracks de duracion similar (+-2.5s): el mismo
-        audio dura lo mismo, asi que esto reduce O(N) a O(pocos) sin perder
-        matches. Best-effort: `raw_ints` None/vacio -> None (sin cluster).
+        audio dura lo mismo, reduce O(N) a O(pocos) sin perder matches.
         """
         from acoustic_fingerprint import (
-            MATCH_THRESHOLD, acoustic_key, decode_raw, hamming_distance,
+            MATCH_THRESHOLD, decode_raw, hamming_distance,
         )
         if not raw_ints:
             return None
 
         conn = self._open_conn()
-        c = conn.cursor()
-        if duration is not None and duration > 0:
-            c.execute(
-                'SELECT chromaprint, acoustic_id FROM tracks '
-                'WHERE chromaprint IS NOT NULL AND acoustic_id IS NOT NULL '
-                'AND duration IS NOT NULL AND ABS(duration - ?) <= 2.5',
-                (duration,),
-            )
-        else:
-            c.execute(
-                'SELECT chromaprint, acoustic_id FROM tracks '
-                'WHERE chromaprint IS NOT NULL AND acoustic_id IS NOT NULL'
-            )
-        rows = c.fetchall()
-        conn.close()
+        try:
+            c = conn.cursor()
+            if duration is not None and duration > 0:
+                c.execute(
+                    'SELECT chromaprint, acoustic_id FROM tracks '
+                    'WHERE chromaprint IS NOT NULL AND acoustic_id IS NOT NULL '
+                    'AND duration IS NOT NULL AND ABS(duration - ?) <= 2.5',
+                    (duration,),
+                )
+            else:
+                c.execute(
+                    'SELECT chromaprint, acoustic_id FROM tracks '
+                    'WHERE chromaprint IS NOT NULL AND acoustic_id IS NOT NULL'
+                )
+            rows = c.fetchall()
+        finally:
+            conn.close()
 
         best_id, best_dist = None, MATCH_THRESHOLD
         for row in rows:
@@ -591,8 +589,21 @@ class AnalysisDB:
             d = hamming_distance(raw_ints, cand)
             if d < best_dist:
                 best_dist, best_id = d, row['acoustic_id']
+        return best_id
 
-        return best_id if best_id is not None else acoustic_key(raw_ints)
+    def resolve_acoustic_cluster(self, raw_ints, duration=None):
+        """Devuelve el `acoustic_id` (cluster acustico) de un fingerprint.
+
+        Busca un cluster existente que matchee (find_acoustic_cluster); si lo
+        encuentra, el track nuevo hereda ESE cluster -> comparten memoria
+        colectiva. Si no, arranca un cluster nuevo cuyo id es la clave exacta
+        (MD5 del array) del primer miembro. Best-effort: None/vacio -> None.
+        """
+        from acoustic_fingerprint import acoustic_key
+        if not raw_ints:
+            return None
+        found = self.find_acoustic_cluster(raw_ints, duration)
+        return found if found is not None else acoustic_key(raw_ints)
 
     def canonical_community_key(self, fingerprint):
         """Normaliza el fingerprint que llega a un endpoint /community/* a la

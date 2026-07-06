@@ -260,3 +260,31 @@ def test_best_cluster_never_downgrades(db):
 def test_best_cluster_none_without_cluster(db):
     assert db.best_cluster_analysis(None) is None
     assert db.best_cluster_analysis('inexistente') is None
+
+
+# ── find_acoustic_cluster: lookup sin crear (para /cluster-best) ──────
+
+def test_find_acoustic_cluster_matches_existing(db):
+    """find_acoustic_cluster encuentra el cluster de una version ya guardada a
+    partir de la huella de OTRA copia del mismo audio."""
+    original = _rand_fp(seed=11)
+    aid = _analyze_and_save(db, 't', original, fingerprint='md5_t')
+    # Otra copia (re-encode) del mismo audio -> debe resolver al mismo cluster.
+    reenc = _flip_bits(original, 10)
+    found = db.find_acoustic_cluster(reenc, duration=300.0)
+    assert found == aid
+
+
+def test_find_acoustic_cluster_none_when_absent(db):
+    """Sin match, find devuelve None y NO crea cluster (a diferencia de
+    resolve_acoustic_cluster)."""
+    _analyze_and_save(db, 't', _rand_fp(seed=1), fingerprint='md5_t')
+    other = _rand_fp(seed=999)  # audio distinto
+    assert db.find_acoustic_cluster(other, duration=300.0) is None
+    # resolve SI crea (arranca cluster nuevo) — contraste.
+    assert db.resolve_acoustic_cluster(other, duration=300.0) is not None
+
+
+def test_find_acoustic_cluster_empty_input(db):
+    assert db.find_acoustic_cluster(None) is None
+    assert db.find_acoustic_cluster([]) is None
