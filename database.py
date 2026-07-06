@@ -202,6 +202,7 @@ class AnalysisDB:
                 analyzed_at TEXT,
                 fingerprint TEXT,
                 chromaprint TEXT,
+                acoustic_id TEXT,
                 analysis_version TEXT
             )
         ''')
@@ -209,6 +210,15 @@ class AnalysisDB:
         # Migracion: anadir columna chromaprint si no existe (BDs antiguas)
         try:
             c.execute('ALTER TABLE tracks ADD COLUMN chromaprint TEXT')
+        except sqlite3.OperationalError:
+            pass  # Ya existe
+
+        # Migracion: acoustic_id = id del CLUSTER ACUSTICO al que pertenece el
+        # track (memoria colectiva por sonido, no por bytes). NULL en tracks
+        # analizados antes de esta feature; se rellena al re-analizar. Ver
+        # resolve_acoustic_cluster / canonical_community_key.
+        try:
+            c.execute('ALTER TABLE tracks ADD COLUMN acoustic_id TEXT')
         except sqlite3.OperationalError:
             pass  # Ya existe
 
@@ -220,6 +230,9 @@ class AnalysisDB:
         c.execute('CREATE INDEX IF NOT EXISTS idx_key ON tracks(key)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_camelot ON tracks(camelot)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_chromaprint ON tracks(chromaprint)')
+        # idx_acoustic: lookup O(1) del cluster por fingerprint canonico +
+        # candidatos para el barrido Hamming acotado por duracion.
+        c.execute('CREATE INDEX IF NOT EXISTS idx_acoustic ON tracks(acoustic_id)')
 
         # Correcciones manuales (memoria colectiva)
         c.execute('''
@@ -534,16 +547,95 @@ class AnalysisDB:
         conn.close()
         return self._row_to_dict(result)
 
+    def resolve_acoustic_cluster(self, raw_ints, duration=None):
+        """Devuelve el `acoustic_id` (cluster acustico) de un fingerprint.
+
+        Busca entre los tracks ya vistos uno cuyo Chromaprint este dentro del
+        umbral Hamming (mismo audio, aunque sea otro codec/bitrate/tag). Si lo
+        encuentra, el track nuevo hereda ESE cluster -> comparten memoria
+        colectiva. Si no, arranca un cluster nuevo cuyo id es la clave exacta
+        (MD5 del array) del primer miembro.
+
+        El barrido se acota a tracks de duracion similar (+-2.5s): el mismo
+        audio dura lo mismo, asi que esto reduce O(N) a O(pocos) sin perder
+        matches. Best-effort: `raw_ints` None/vacio -> None (sin cluster).
+        """
+        from acoustic_fingerprint import (
+            MATCH_THRESHOLD, acoustic_key, decode_raw, hamming_distance,
+        )
+        if not raw_ints:
+            return None
+
+        conn = self._open_conn()
+        c = conn.cursor()
+        if duration is not None and duration > 0:
+            c.execute(
+                'SELECT chromaprint, acoustic_id FROM tracks '
+                'WHERE chromaprint IS NOT NULL AND acoustic_id IS NOT NULL '
+                'AND duration IS NOT NULL AND ABS(duration - ?) <= 2.5',
+                (duration,),
+            )
+        else:
+            c.execute(
+                'SELECT chromaprint, acoustic_id FROM tracks '
+                'WHERE chromaprint IS NOT NULL AND acoustic_id IS NOT NULL'
+            )
+        rows = c.fetchall()
+        conn.close()
+
+        best_id, best_dist = None, MATCH_THRESHOLD
+        for row in rows:
+            cand = decode_raw(row['chromaprint'])
+            if not cand:
+                continue
+            d = hamming_distance(raw_ints, cand)
+            if d < best_dist:
+                best_dist, best_id = d, row['acoustic_id']
+
+        return best_id if best_id is not None else acoustic_key(raw_ints)
+
+    def canonical_community_key(self, fingerprint):
+        """Normaliza el fingerprint que llega a un endpoint /community/* a la
+        clave del CLUSTER ACUSTICO, para que todas las versiones del mismo
+        audio (mp3/flac/otro tag) compartan memoria colectiva.
+
+        Cae al fingerprint original si el track no esta en BD o no tiene
+        acoustic_id (compat total con datos previos a esta feature: la memoria
+        vieja, guardada bajo el fingerprint MD5, sigue siendo accesible).
+        """
+        if not fingerprint:
+            return fingerprint
+        conn = self._open_conn()
+        c = conn.cursor()
+        c.execute(
+            'SELECT acoustic_id FROM tracks WHERE fingerprint = ? OR id = ? '
+            'LIMIT 1',
+            (fingerprint, fingerprint),
+        )
+        row = c.fetchone()
+        conn.close()
+        if row and row['acoustic_id']:
+            return row['acoustic_id']
+        return fingerprint
+
     def save_track(self, track_data):
         conn = self._open_conn()
         c = conn.cursor()
+
+        # `chromaprint` es un blob tecnico (base64 de varios KB) cuyo sitio es
+        # su columna dedicada; fuera del analysis_json para no duplicarlo ni
+        # engordar lo que se envia al cliente ni el AnalysisResult del cache-hit.
+        analysis_json_data = {
+            k: v for k, v in track_data.items() if k != 'chromaprint'
+        }
 
         c.execute('''
             INSERT OR REPLACE INTO tracks
             (id, filename, artist, title, duration, bpm, key, camelot,
              energy_dj, genre, track_type, analysis_json, analyzed_at,
-             fingerprint, engine_source, analysis_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             fingerprint, chromaprint, acoustic_id, engine_source,
+             analysis_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             track_data['id'],
             track_data['filename'],
@@ -556,9 +648,11 @@ class AnalysisDB:
             track_data['energy_dj'],
             track_data['genre'],
             track_data['track_type'],
-            json.dumps(track_data),
+            json.dumps(analysis_json_data),
             datetime.now().isoformat(),
             track_data.get('fingerprint'),
+            track_data.get('chromaprint'),
+            track_data.get('acoustic_id'),
             track_data.get('engine_source'),
             track_data.get('analysis_version'),
         ))
