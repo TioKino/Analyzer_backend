@@ -38,6 +38,7 @@ local_modules = [
     'beatport.py',
     'genre_detection.py',
     'spectral_genre_classifier.py',
+    'acoustic_fingerprint.py',
     'chunked_analyzer.py',
     'precision_analyzer.py',
     'preview_generator.py',
@@ -102,6 +103,32 @@ if ffmpeg_path:
 else:
     print("[SPEC] ADVERTENCIA: FFmpeg NO encontrado. Los previews no funcionaran.")
     print("[SPEC] Descarga ffmpeg.exe y ponlo en esta carpeta o en PATH.")
+
+# Localizar fpcalc.exe (Chromaprint) — HUELLA ACUSTICA de la memoria colectiva.
+# Sin el binario, los analisis LOCALES no obtienen cluster acustico y su
+# memoria colectiva cae al fingerprint MD5 (no agrupa por sonido). local_engine
+# lo resuelve en runtime via FPCALC_BIN (busca en _internal/, igual que ffmpeg).
+# NOTA: a diferencia de ffmpeg, el repo NO trae fpcalc.exe (assets/native/
+# windows/ esta vacio). Descargalo de https://acoustid.org/chromaprint y ponlo
+# en esta carpeta (./fpcalc.exe) o en el PATH antes de compilar.
+import shutil
+fpcalc_path = None
+for candidate in ['fpcalc.exe', 'fpcalc', '../Analyzer/assets/native/windows/fpcalc.exe']:
+    if os.path.exists(candidate):
+        fpcalc_path = candidate
+        break
+    found = shutil.which(candidate)
+    if found:
+        fpcalc_path = found
+        break
+if fpcalc_path:
+    binaries.append((fpcalc_path, '.'))
+    print(f"[SPEC] fpcalc encontrado: {fpcalc_path}")
+else:
+    print("[SPEC] ADVERTENCIA: fpcalc.exe NO encontrado. La memoria colectiva "
+          "NO agrupara por sonido en local (cae al fingerprint MD5).")
+    print("[SPEC] Descarga fpcalc de https://acoustid.org/chromaprint y ponlo "
+          "en ./fpcalc.exe o en el PATH.")
 
 binaries += librosa_binaries
 binaries += scipy_binaries
@@ -194,6 +221,7 @@ a = Analysis(
         'beatport',
         'genre_detection',
         'spectral_genre_classifier',
+        'acoustic_fingerprint',
         'chunked_analyzer',
         'precision_analyzer',
         'preview_generator',
