@@ -28,6 +28,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import struct
 import subprocess
 
@@ -56,10 +57,15 @@ def compute_raw_chromaprint(file_path, timeout=30):
     Devuelve una lista de int (subfingerprints uint32) o None si fpcalc no esta
     disponible / falla. Mismo binario que usa el cliente desktop, asi que el
     array es consistente entre backend y cliente.
+
+    Resuelve el binario via FPCALC_BIN (ruta absoluta que setea local_engine.py
+    desde el bundle PyInstaller, igual que FFMPEG_BIN) y cae a 'fpcalc' en PATH
+    (Render lo trae en el Aptfile: libchromaprint-tools).
     """
+    fpcalc_bin = os.environ.get('FPCALC_BIN', 'fpcalc')
     try:
         out = subprocess.run(
-            ['fpcalc', '-raw', '-json', file_path],
+            [fpcalc_bin, '-raw', '-json', file_path],
             capture_output=True, text=True, timeout=timeout,
         )
         if out.returncode != 0:

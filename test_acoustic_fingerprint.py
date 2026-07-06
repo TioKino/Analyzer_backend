@@ -10,6 +10,7 @@ que simulan los tres escenarios que importan:
 La extraccion `fpcalc -raw` (compute_raw_chromaprint) es I/O y se valida en
 Render, no aqui.
 """
+import os
 import random
 
 import pytest
@@ -17,6 +18,7 @@ import pytest
 from acoustic_fingerprint import (
     MATCH_THRESHOLD,
     acoustic_key,
+    compute_raw_chromaprint,
     decode_raw,
     encode_raw,
     fingerprints_match,
@@ -121,6 +123,22 @@ def test_acoustic_key_ignores_tag_but_key_differs_for_reencode():
     fp = _rand_fp()
     assert acoustic_key(fp) == acoustic_key(list(fp))       # idempotente
     assert acoustic_key(fp) != acoustic_key(_flip_bits(fp, 3))  # re-encode
+
+
+def test_compute_missing_fpcalc_is_none(tmp_path, monkeypatch):
+    """Sin fpcalc (binario inexistente) devuelve None sin lanzar -> el analisis
+    sigue y la memoria colectiva cae al fingerprint MD5 (best-effort)."""
+    monkeypatch.setenv('FPCALC_BIN', '/nonexistent/fpcalc-xyz')
+    f = tmp_path / "x.mp3"
+    f.write_bytes(b'not audio')
+    assert compute_raw_chromaprint(str(f)) is None
+
+
+def test_compute_respects_fpcalc_bin_env(monkeypatch):
+    """compute_raw_chromaprint lee FPCALC_BIN (lo setea local_engine desde el
+    bundle). Con un binario que no existe -> None, sin excepcion."""
+    monkeypatch.setenv('FPCALC_BIN', '/definitely/not/here')
+    assert compute_raw_chromaprint('/tmp/whatever.mp3') is None
 
 
 @pytest.mark.parametrize("n_flips,should_match", [
