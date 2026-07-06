@@ -3,343 +3,260 @@
 CLASIFICACIÓN DE GÉNERO POR ANÁLISIS ESPECTRAL
 ============================================================
 
-Sistema UNIVERSAL de clasificación de género basado en
-características de audio: BPM, energía, espectro, etc.
+Sistema UNIVERSAL de clasificación de género basado en características de audio
+(BPM, energía, espectro, etc.). Se usa como FALLBACK de MÍNIMA prioridad: lo
+pisan Discogs, MusicBrainz, ID3 y el consenso comunitario.
 
-Esta función se usa como FALLBACK cuando no hay información
-de Discogs, MusicBrainz o memoria colectiva.
+## De cascada de `return` a SCORING (2026-07-06)
+
+El diseño anterior era una cascada: `if 120 <= bpm <= 140: ... return "Techno"`.
+Cada banda terminaba en un `return` INCONDICIONAL, así que el primer rango de BPM
+que matcheaba decidía y tapaba a todos los géneros de rangos SOLAPADOS. Resultado:
+~17 géneros eran CÓDIGO MUERTO (un Reggae a 75 BPM salía "Hip Hop"; un Ambient,
+un Disco, un Dubstep a 140, un Jungle... jamás se alcanzaban en su rango).
+
+Ahora es SCORING sobre perfiles declarativos:
+  - Un perfil `(genero, bpm_lo, bpm_hi, [condiciones])` es CANDIDATO si el BPM
+    cae en su rango y se cumplen TODAS sus condiciones.
+  - Score = nº de condiciones cumplidas. El género MÁS ESPECÍFICO (más
+    condiciones) gana al fallback genérico de su familia. Empate -> el PRIMERO
+    en la lista (por eso el ORDEN de `_GENRE_PROFILES` es la "prioridad de
+    género": la decisión de producto sobre qué género posee cada zona de BPM
+    cuando las señales son neutras).
+  - Si ningún perfil matchea, cae al fallback por energía.
+
+Ningún género queda inalcanzable: si sus condiciones se cumplen en su rango de
+BPM, es candidato — haya o no otros géneros solapando ese rango.
 """
 
 import numpy as np
 
 
-def classify_genre_advanced(bpm: float, energy: float, has_bass: bool, 
-                           y, sr, percussion_density: float, 
-                           spectral_centroid, rolloff) -> str:
-    """
-    Clasifica el género musical basándose en análisis espectral.
-    
-    Parámetros:
-    - bpm: Tempo detectado
-    - energy: Nivel de energía normalizado (0-1)
-    - has_bass: Si tiene graves prominentes
-    - y: Señal de audio
-    - sr: Sample rate
-    - percussion_density: Densidad de percusión (0-1)
-    - spectral_centroid: Centroide espectral
-    - rolloff: Rolloff espectral
-    
-    Retorna:
-    - Género clasificado (string)
-    """
-    
+def _extract_features(bpm, energy, has_bass, percussion_density,
+                      spectral_centroid, rolloff):
+    """Deriva las señales que consumen los perfiles. Mismos umbrales que la
+    cascada original (is_melodic/is_dark/is_bright) para no mover los casos
+    core."""
     brightness = float(np.mean(spectral_centroid))
-    rolloff_mean = float(np.mean(rolloff))
-    
-    # Calcular características adicionales
     spectral_std = float(np.std(spectral_centroid))
-    is_melodic = spectral_std > 800  # Alta variación = más melódico
-    is_dark = brightness < 2000
-    is_bright = brightness > 3500
-    
-    # ============================================================
-    # DETECCIÓN POR RANGO DE BPM
-    # ============================================================
-    
-    # === HIP HOP / TRAP / R&B (60-100 BPM) ===
-    if 60 <= bpm < 100:
-        if percussion_density > 0.6 and has_bass:
-            if brightness > 2500:
-                return "Trap"
-            return "Hip Hop"
-        if is_melodic and energy < 0.5:
-            return "R&B"
-        if energy < 0.4:
-            return "Lo-Fi Hip Hop"
-        if has_bass and energy > 0.6:
-            return "Phonk"
-        return "Hip Hop"
-    
-    # === REGGAETON / DEMBOW / LATIN (90-110 BPM) ===
-    if 90 <= bpm < 115:
-        if percussion_density > 0.7:
-            if has_bass and energy > 0.6:
-                return "Reggaeton"
-            return "Dembow"
-        if is_melodic and energy < 0.5:
-            return "Bachata"
-        if energy > 0.7 and has_bass:
-            return "Latin Urban"
-        return "Latin"
-    
-    # === HOUSE (115-130 BPM) ===
-    if 115 <= bpm < 130:
-        if has_bass and energy > 0.7:
-            if percussion_density > 0.7:
-                return "Tech House"
-            if is_bright:
-                return "Bass House"
-            return "Tech House"
-        
-        if brightness > 3000:
-            if is_melodic:
-                return "Progressive House"
-            return "Electro House"
-        
-        if is_dark and energy < 0.5:
-            return "Deep House"
-        
-        if is_melodic and energy < 0.6:
-            if brightness < 2500:
-                return "Organic House"
-            return "Melodic House"
-        
-        if percussion_density < 0.4:
-            return "Minimal House"
-        
-        if has_bass and energy > 0.5:
-            return "Jackin House"
-        
-        return "House"
-    
-    # === TECHNO (120-140 BPM) ===
-    if 120 <= bpm <= 140:
-        # Hard Techno
-        if energy > 0.75 and percussion_density > 0.7:
-            if is_dark:
-                return "Industrial Techno"
-            return "Hard Techno"
-        
-        # Peak Time
-        if energy > 0.65 and 0.5 < percussion_density < 0.8:
-            return "Peak Time Techno"
-        
-        # Acid Techno
-        if brightness > 3500 and energy > 0.55:
-            return "Acid Techno"
-        
-        # Detroit Techno
-        if 0.4 < percussion_density < 0.7 and brightness > 2500:
-            return "Detroit Techno"
-        
-        # Melodic Techno
-        if is_melodic and brightness > 2800 and 0.4 < energy < 0.7:
-            return "Melodic Techno"
-        
-        # Dub Techno
-        if is_dark and energy < 0.5 and percussion_density < 0.5:
-            return "Dub Techno"
-        
-        # Hypnotic Techno
-        if energy < 0.5 and percussion_density < 0.5:
-            return "Hypnotic Techno"
-        
-        # Minimal Techno
-        if percussion_density < 0.4 and not is_melodic:
-            return "Minimal Techno"
-        
-        # Berlin/Warehouse
-        if has_bass and is_dark and energy > 0.5:
-            return "Berlin Techno"
-        
-        return "Techno"
-    
-    # === TRANCE (130-150 BPM) ===
-    if 130 <= bpm <= 150:
-        if is_bright and is_melodic:
-            if energy > 0.7:
-                return "Uplifting Trance"
-            return "Vocal Trance"
-        
-        if energy > 0.65 and brightness > 2500:
-            return "Progressive Trance"
-        
-        if is_dark and energy > 0.7:
-            return "Tech Trance"
-        
-        if bpm > 145:
-            return "Psytrance"
-        
-        return "Trance"
-    
-    # === DRUM & BASS (160-180 BPM) ===
-    # REORDEN (review 2026-06-28): DnB va ANTES de Hard Dance. Antes, la banda
-    # Hard Dance (145-180) con su `return "Hardstyle"` incondicional tapaba TODO
-    # 160-180, dejando este bloque DnB como CODIGO MUERTO — un track de DnB a
-    # 174 BPM salia "Speedcore". Ahora DnB reclama 160-180 (su rango), y Hard
-    # Dance recoge ~150-160 (Hardstyle real). TRADEOFF documentado: Gabber/
-    # Speedcore (170+, nicho) ahora caen como DnB; para la inmensa mayoria de
-    # bibliotecas 160-180 es DnB, no gabber. VALIDAR con tracks reales antes de
-    # mergear; si hay coleccion gabber relevante, añadir discriminador.
-    if 160 <= bpm <= 180:
-        if brightness > 3000 and is_melodic:
-            return "Liquid Drum & Bass"
+    return {
+        'bpm': bpm,
+        'energy': energy,
+        'has_bass': bool(has_bass),
+        'perc': percussion_density,
+        'brightness': brightness,
+        'rolloff': float(np.mean(rolloff)),
+        'spectral_std': spectral_std,
+        'is_melodic': spectral_std > 800,   # alta variación espectral
+        'is_dark': brightness < 2000,
+        'is_bright': brightness > 3500,
+    }
 
-        if is_dark and energy > 0.7:
-            return "Neurofunk"
 
-        if percussion_density > 0.8:
-            return "Jump Up"
+# ============================================================
+# PERFILES DE GÉNERO
+# ============================================================
+# (genero, bpm_lo, bpm_hi, [condiciones]). Candidato si bpm en [lo, hi] y TODAS
+# las condiciones (lambdas sobre el dict de features) se cumplen. El orden marca
+# la prioridad en empates. Traducido de la cascada original preservando umbrales.
+#
+# NOTA de rangos: las familias tienen un fallback de rango "propio" (Hip Hop
+# 60-100, House 115-128, Techno 128-140, Trance 140-150, Hard Dance 150-160, DnB
+# 160-185). Los sub-géneros que viven en tempos de otra familia (Dubstep a 140,
+# Disco a 120, Jungle a 165...) llevan condiciones, así que ganan por score
+# cuando sus señales encajan. DnB va ANTES que Hard Dance para que 160 exacto
+# caiga en DnB (tradeoff documentado: Gabber/Speedcore 170+ caen como DnB).
 
-        if is_dark and energy < 0.5:
-            return "Atmospheric DnB"
+_GENRE_PROFILES = [
+    # ── Hip Hop / Trap / R&B / Lo-Fi / Phonk (60-100) ──
+    ('Trap',            60, 100, [lambda f: f['perc'] > 0.6, lambda f: f['has_bass'], lambda f: f['brightness'] > 2500]),
+    ('Phonk',           60, 100, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6]),
+    ('Hip Hop',         60, 100, [lambda f: f['perc'] > 0.6, lambda f: f['has_bass']]),
+    ('R&B',             60, 100, [lambda f: f['is_melodic'], lambda f: f['energy'] < 0.5]),
+    ('Lo-Fi Hip Hop',   60, 100, [lambda f: f['energy'] < 0.4]),
+    ('Hip Hop',         60, 100, []),  # fallback de familia
 
-        return "Drum & Bass"
+    # ── Reggae / Dub (60-90) ──
+    ('Dub',             60, 90,  [lambda f: f['has_bass'], lambda f: f['energy'] < 0.6, lambda f: f['is_dark']]),
+    ('Reggae',          60, 90,  [lambda f: f['has_bass'], lambda f: f['energy'] < 0.6]),
 
-    # === HARD DANCE (145-180 BPM) ===
-    # Tras el reorden, 160-180 ya lo cogio DnB y 130-150 lo cogio Trance, asi
-    # que en la practica esta banda atiende ~150-160 (Hardstyle/Frenchcore).
-    if 145 <= bpm <= 180:
-        if bpm > 170:
-            if energy > 0.8:
-                return "Gabber"
-            return "Speedcore"
+    # ── Ambient / Downtempo (55-100, energía baja) ──
+    ('Dark Ambient',    55, 100, [lambda f: f['energy'] < 0.4, lambda f: f['perc'] < 0.2, lambda f: f['is_dark']]),
+    ('Ambient',         55, 100, [lambda f: f['energy'] < 0.4, lambda f: f['perc'] < 0.2]),
+    ('Downtempo',       55, 100, [lambda f: f['energy'] < 0.4, lambda f: f['is_melodic']]),
+    ('Chillout',        55, 100, [lambda f: f['energy'] < 0.4]),
 
-        if bpm > 160:
-            if is_melodic and brightness > 3000:
-                return "Happy Hardcore"
-            return "Hardcore"
+    # ── Synthwave (80-120) ──
+    ('Darksynth',       80, 120, [lambda f: f['brightness'] > 3000, lambda f: f['is_melodic'], lambda f: f['is_dark']]),
+    ('Synthwave',       80, 120, [lambda f: f['brightness'] > 3000, lambda f: f['is_melodic']]),
 
-        if energy > 0.8:
-            if is_melodic:
-                return "Euphoric Hardstyle"
-            return "Rawstyle"
+    # ── Latin / Reggaeton (100-115) ──
+    ('Reggaeton',       100, 115, [lambda f: f['perc'] > 0.7, lambda f: f['has_bass'], lambda f: f['energy'] > 0.6]),
+    ('Latin Urban',     100, 115, [lambda f: f['energy'] > 0.7, lambda f: f['has_bass']]),
+    ('Dembow',          100, 115, [lambda f: f['perc'] > 0.7]),
+    ('Bachata',         100, 115, [lambda f: f['is_melodic'], lambda f: f['energy'] < 0.5]),
+    ('Latin',           100, 115, []),  # fallback de familia
 
-        if is_dark and has_bass:
-            return "Frenchcore"
+    # ── Moombahton (100-112) ──
+    ('Moombahton',      100, 112, [lambda f: f['has_bass'], lambda f: f['perc'] > 0.6]),
 
-        return "Hardstyle"
-    
-    # === JUNGLE (150-170 BPM con breakbeats) ===
-    if 150 <= bpm <= 175:
-        if percussion_density > 0.75 and spectral_std > 1000:
-            return "Jungle"
-    
-    # === DUBSTEP (70 BPM o 140 BPM half-time) ===
-    if (68 <= bpm <= 75) or (136 <= bpm <= 145):
-        if has_bass and energy > 0.6:
-            if brightness > 3000:
-                return "Brostep"
-            if is_dark:
-                return "Deep Dubstep"
-            if percussion_density > 0.7:
-                return "Riddim"
-            return "Dubstep"
-        if is_melodic:
-            return "Melodic Dubstep"
-        if energy < 0.4:
-            return "Chillstep"
-    
-    # === BREAKBEAT / UK SOUND (130-145 BPM) ===
-    if 130 <= bpm <= 145:
-        if spectral_std > 1000 and percussion_density > 0.6:
-            if brightness > 2500:
-                return "Breakbeat"
-            return "UK Garage"
-    
-    # === AMBIENT / DOWNTEMPO (60-100 BPM bajo) ===
-    if bpm < 100 and energy < 0.4:
-        if percussion_density < 0.2:
-            if is_dark:
-                return "Dark Ambient"
-            return "Ambient"
-        if is_melodic:
-            return "Downtempo"
-        return "Chillout"
-    
-    # === POP / DANCE POP (100-130 BPM) ===
-    if 100 <= bpm <= 130:
-        if is_melodic and is_bright:
-            if energy > 0.6:
-                return "Dance Pop"
-            return "Pop"
-        if energy > 0.7 and brightness > 3000:
-            return "EDM"
-    
-    # === ROCK / METAL (Variable) ===
-    if 80 <= bpm <= 200:
-        # Características de rock/metal: distorsión, sustain largo
-        if brightness > 4000 and energy > 0.8:
-            if bpm > 160:
-                return "Thrash Metal"
-            if bpm > 140:
-                return "Heavy Metal"
-            return "Hard Rock"
-        
-        if is_melodic and 100 <= bpm <= 140:
-            if energy > 0.6:
-                return "Rock"
-            return "Alternative Rock"
-    
-    # === DISCO / FUNK (110-130 BPM) ===
-    if 110 <= bpm <= 130:
-        if is_melodic and brightness > 2500:
-            if energy > 0.6:
-                return "Disco"
-            return "Nu Disco"
-        if percussion_density > 0.5 and has_bass:
-            return "Funk"
-    
-    # === JAZZ (Variable, típicamente 80-200 BPM) ===
-    if spectral_std > 1200 and percussion_density < 0.5:
-        if is_melodic and not has_bass:
-            return "Jazz"
-    
-    # === REGGAE / DUB (60-90 BPM) ===
-    if 60 <= bpm <= 90:
-        if has_bass and energy < 0.6:
-            if is_dark:
-                return "Dub"
-            return "Reggae"
-    
-    # === SYNTHWAVE (80-120 BPM) ===
-    if 80 <= bpm <= 120:
-        if brightness > 3000 and is_melodic:
-            if is_dark:
-                return "Darksynth"
-            return "Synthwave"
-    
-    # === BIG ROOM / FESTIVAL (126-132 BPM) ===
-    if 126 <= bpm <= 132:
-        if energy > 0.8 and brightness > 3500:
-            return "Big Room"
-        if has_bass and energy > 0.7:
-            return "Festival Progressive"
-    
-    # === MOOMBAHTON (100-112 BPM) ===
-    if 100 <= bpm <= 112:
-        if has_bass and percussion_density > 0.6:
-            return "Moombahton"
-    
-    # === FUTURE BASS (140-160 BPM con características específicas) ===
-    if 140 <= bpm <= 160:
-        if is_bright and is_melodic and energy > 0.5:
-            return "Future Bass"
-    
-    # === ELECTRO (125-135 BPM) ===
-    if 125 <= bpm <= 135:
-        if brightness > 3000 and percussion_density > 0.5:
-            return "Electro"
-    
-    # === GRIME (140 BPM típico) ===
-    if 138 <= bpm <= 142:
-        if has_bass and energy > 0.6:
-            if brightness < 2500:
-                return "Grime"
-    
-    # === FALLBACK POR ENERGÍA ===
-    if energy > 0.7:
-        if bpm > 140:
-            return "Hard Dance"
-        return "EDM"
-    
-    if energy < 0.4:
-        if is_melodic:
-            return "Chillout"
-        return "Ambient"
-    
-    # === FALLBACK FINAL ===
-    return "Electronic"
+    # ── Pop / Dance Pop / EDM (100-130) ──
+    ('Dance Pop',       100, 130, [lambda f: f['is_melodic'], lambda f: f['is_bright'], lambda f: f['energy'] > 0.6]),
+    ('EDM',             100, 130, [lambda f: f['energy'] > 0.7, lambda f: f['brightness'] > 3000]),
+    ('Pop',             100, 130, [lambda f: f['is_melodic'], lambda f: f['is_bright']]),
+
+    # ── Disco / Funk (110-130) ──
+    ('Disco',           110, 130, [lambda f: f['is_melodic'], lambda f: f['brightness'] > 2500, lambda f: f['energy'] > 0.6]),
+    ('Nu Disco',        110, 130, [lambda f: f['is_melodic'], lambda f: f['brightness'] > 2500]),
+    ('Funk',            110, 130, [lambda f: f['perc'] > 0.5, lambda f: f['has_bass']]),
+
+    # ── House (115-128) ──
+    ('Tech House',      115, 128, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.7, lambda f: f['perc'] > 0.7]),
+    ('Bass House',      115, 128, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.7, lambda f: f['is_bright']]),
+    ('Progressive House', 115, 128, [lambda f: f['brightness'] > 3000, lambda f: f['is_melodic']]),
+    ('Electro House',   115, 128, [lambda f: f['brightness'] > 3000]),
+    ('Deep House',      115, 128, [lambda f: f['is_dark'], lambda f: f['energy'] < 0.5]),
+    ('Organic House',   115, 128, [lambda f: f['is_melodic'], lambda f: f['energy'] < 0.6, lambda f: f['brightness'] < 2500]),
+    ('Melodic House',   115, 128, [lambda f: f['is_melodic'], lambda f: f['energy'] < 0.6]),
+    ('Minimal House',   115, 128, [lambda f: f['perc'] < 0.4]),
+    ('Jackin House',    115, 128, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.5]),
+    ('House',           115, 128, []),  # fallback de familia
+
+    # ── Electro (125-135) ──
+    ('Electro',         125, 135, [lambda f: f['brightness'] > 3000, lambda f: f['perc'] > 0.5]),
+
+    # ── Big Room / Festival (126-132) ──
+    ('Big Room',        126, 132, [lambda f: f['energy'] > 0.8, lambda f: f['brightness'] > 3500]),
+    ('Festival Progressive', 126, 132, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.7]),
+
+    # ── Techno (128-140) ──
+    ('Industrial Techno', 128, 140, [lambda f: f['energy'] > 0.75, lambda f: f['perc'] > 0.7, lambda f: f['is_dark']]),
+    ('Hard Techno',     128, 140, [lambda f: f['energy'] > 0.75, lambda f: f['perc'] > 0.7]),
+    ('Peak Time Techno', 128, 140, [lambda f: f['energy'] > 0.65, lambda f: 0.5 < f['perc'] < 0.8]),
+    ('Acid Techno',     128, 140, [lambda f: f['brightness'] > 3500, lambda f: f['energy'] > 0.55]),
+    ('Detroit Techno',  128, 140, [lambda f: 0.4 < f['perc'] < 0.7, lambda f: f['brightness'] > 2500]),
+    ('Melodic Techno',  128, 140, [lambda f: f['is_melodic'], lambda f: f['brightness'] > 2800, lambda f: 0.4 < f['energy'] < 0.7]),
+    ('Dub Techno',      128, 140, [lambda f: f['is_dark'], lambda f: f['energy'] < 0.5, lambda f: f['perc'] < 0.5]),
+    ('Hypnotic Techno', 128, 140, [lambda f: f['energy'] < 0.5, lambda f: f['perc'] < 0.5]),
+    ('Minimal Techno',  128, 140, [lambda f: f['perc'] < 0.4]),
+    ('Berlin Techno',   128, 140, [lambda f: f['has_bass'], lambda f: f['is_dark'], lambda f: f['energy'] > 0.5]),
+    ('Techno',          128, 140, []),  # fallback de familia
+
+    # ── Dubstep half-time (136-145) — antes de Trance/Grime por especificidad ──
+    ('Brostep',         136, 145, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6, lambda f: f['brightness'] > 3000]),
+    ('Deep Dubstep',    136, 145, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6, lambda f: f['is_dark']]),
+    ('Riddim',          136, 145, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6, lambda f: f['perc'] > 0.7]),
+    ('Dubstep',         136, 145, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6]),
+    ('Melodic Dubstep', 136, 145, [lambda f: f['is_melodic'], lambda f: f['brightness'] > 3000]),
+
+    # ── Grime (138-142) ──
+    ('Grime',           138, 142, [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6, lambda f: f['brightness'] < 2500]),
+
+    # ── Breakbeat / UK Garage (130-145) ──
+    ('Breakbeat',       130, 145, [lambda f: f['spectral_std'] > 1000, lambda f: f['perc'] > 0.6, lambda f: f['brightness'] > 2500]),
+    ('UK Garage',       130, 145, [lambda f: f['spectral_std'] > 1000, lambda f: f['perc'] > 0.6]),
+
+    # ── Trance (140-150) + Psytrance ──
+    ('Uplifting Trance', 140, 150, [lambda f: f['is_bright'], lambda f: f['is_melodic'], lambda f: f['energy'] > 0.7]),
+    ('Vocal Trance',    140, 150, [lambda f: f['is_bright'], lambda f: f['is_melodic']]),
+    ('Progressive Trance', 140, 150, [lambda f: f['energy'] > 0.65, lambda f: f['brightness'] > 2500]),
+    ('Tech Trance',     140, 150, [lambda f: f['is_dark'], lambda f: f['energy'] > 0.7]),
+    ('Psytrance',       145, 150, [lambda f: f['energy'] > 0.6]),
+    ('Trance',          140, 150, []),  # fallback de familia
+
+    # ── Future Bass (140-160) ──
+    ('Future Bass',     140, 160, [lambda f: f['is_bright'], lambda f: f['is_melodic'], lambda f: f['energy'] > 0.5]),
+
+    # ── Dubstep 70 BPM (68-75) ──
+    ('Brostep',         68, 75,  [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6, lambda f: f['brightness'] > 3000]),
+    ('Deep Dubstep',    68, 75,  [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6, lambda f: f['is_dark']]),
+    ('Dubstep',         68, 75,  [lambda f: f['has_bass'], lambda f: f['energy'] > 0.6]),
+    ('Chillstep',       68, 75,  [lambda f: f['energy'] < 0.4]),
+
+    # ── Drum & Bass (160-185) — ANTES que Hard Dance para poseer 160 ──
+    ('Liquid Drum & Bass', 160, 185, [lambda f: f['brightness'] > 3000, lambda f: f['is_melodic']]),
+    ('Neurofunk',       160, 185, [lambda f: f['is_dark'], lambda f: f['energy'] > 0.7]),
+    ('Jump Up',         160, 185, [lambda f: f['perc'] > 0.8]),
+    ('Atmospheric DnB', 160, 185, [lambda f: f['is_dark'], lambda f: f['energy'] < 0.5]),
+    ('Drum & Bass',     160, 185, []),  # fallback de familia
+
+    # ── Jungle (150-175, breakbeats) ──
+    ('Jungle',          150, 175, [lambda f: f['perc'] > 0.75, lambda f: f['spectral_std'] > 1000]),
+
+    # ── Hard Dance (150-160) — Hardstyle/Frenchcore ──
+    ('Euphoric Hardstyle', 150, 160, [lambda f: f['energy'] > 0.8, lambda f: f['is_melodic']]),
+    ('Rawstyle',        150, 160, [lambda f: f['energy'] > 0.8]),
+    ('Frenchcore',      150, 160, [lambda f: f['is_dark'], lambda f: f['has_bass']]),
+    ('Hardstyle',       150, 160, []),  # fallback de familia
+
+    # ── Rock / Metal (80-200) ──
+    ('Thrash Metal',    160, 200, [lambda f: f['brightness'] > 4000, lambda f: f['energy'] > 0.8]),
+    ('Heavy Metal',     140, 200, [lambda f: f['brightness'] > 4000, lambda f: f['energy'] > 0.8]),
+    ('Hard Rock',       80, 200,  [lambda f: f['brightness'] > 4000, lambda f: f['energy'] > 0.8]),
+    ('Rock',            100, 140, [lambda f: f['is_melodic'], lambda f: f['energy'] > 0.6, lambda f: f['brightness'] > 3800]),
+    ('Alternative Rock', 100, 140, [lambda f: f['is_melodic'], lambda f: f['brightness'] > 3800]),
+
+    # ── Jazz (variable) ──
+    # Restrictivo A PROPOSITO: en una app de DJ el jazz es raro y sus señales
+    # espectrales (melodico, poca percusion, sin bajo) las comparte MUCHA
+    # electronica melodica. Sin acotar, sus 4 condiciones lo hacian ganar sobre
+    # Synthwave/Pop/Melodic House. Lo distinguimos por percusion MUY escasa
+    # (instrumentacion en vivo, no programada) + timbre acustico de rango medio
+    # (ni synth brillante ni sub pesado).
+    ('Jazz',            60, 200,  [lambda f: f['perc'] < 0.3, lambda f: not f['has_bass'], lambda f: f['spectral_std'] > 1200, lambda f: 1800 < f['brightness'] < 3000]),
+]
+
+
+def _energy_fallback(f):
+    """Último recurso cuando ningún perfil matchea: por nivel de energía."""
+    if f['energy'] > 0.7:
+        return 'Hard Dance' if f['bpm'] > 140 else 'EDM'
+    if f['energy'] < 0.4:
+        return 'Chillout' if f['is_melodic'] else 'Ambient'
+    return 'Electronic'
+
+
+def classify_genre_advanced(bpm: float, energy: float, has_bass: bool,
+                            y, sr, percussion_density: float,
+                            spectral_centroid, rolloff) -> str:
+    """
+    Clasifica el género musical por análisis espectral (fuente de MÍNIMA
+    prioridad; la pisan Discogs/MusicBrainz/ID3/consenso).
+
+    Parámetros (firma estable — la llama main.py:analyze):
+    - bpm: tempo detectado
+    - energy: energía normalizada (0-1)
+    - has_bass: graves prominentes
+    - y, sr: señal/sample-rate (no usados hoy; se conservan por compat)
+    - percussion_density: densidad de percusión (0-1)
+    - spectral_centroid, rolloff: arrays espectrales
+
+    Devuelve el género con más señales confirmadas en su rango de BPM (ver
+    docstring del módulo). Nunca deja un género inalcanzable.
+    """
+    f = _extract_features(bpm, energy, has_bass, percussion_density,
+                          spectral_centroid, rolloff)
+
+    best_genre = None
+    best_score = -1
+    for genre, lo, hi, conds in _GENRE_PROFILES:
+        if not (lo <= bpm <= hi):
+            continue
+        # Todas las condiciones deben cumplirse para ser candidato.
+        ok = True
+        for cond in conds:
+            if not cond(f):
+                ok = False
+                break
+        if not ok:
+            continue
+        score = len(conds)
+        # `>` estricto: en empate gana el PRIMERO de la lista (prioridad).
+        if score > best_score:
+            best_score = score
+            best_genre = genre
+
+    return best_genre if best_genre is not None else _energy_fallback(f)
 
 
 def get_genre_characteristics(genre: str) -> dict:
@@ -362,5 +279,5 @@ def get_genre_characteristics(genre: str) -> dict:
         'Jazz': {'bpm_range': (80, 200), 'energy': 'variable', 'melodic': True},
         'Ambient': {'bpm_range': (60, 100), 'energy': 'low', 'melodic': True},
     }
-    
+
     return characteristics.get(genre, {'bpm_range': (60, 200), 'energy': 'variable'})
