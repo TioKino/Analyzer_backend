@@ -203,3 +203,60 @@ def test_popularity_batch_rekeys_to_original(two_versions):
     assert fp_flac in out and fp_mp3 in out
     assert out[fp_flac]['total_ratings'] == 1
     assert out[fp_mp3]['total_ratings'] == 1
+
+
+# ── Metadata: la fuente mas fiable del cluster gana ──────────────────
+
+def _save_analyzed(db, track_id, raw, fingerprint, bpm, bpm_source,
+                   key=None, key_source=None, camelot=None,
+                   genre='Techno', genre_source='analysis', duration=300.0):
+    acoustic_id = db.resolve_acoustic_cluster(raw, duration)
+    db.save_track({
+        'id': track_id, 'filename': f'{track_id}.mp3', 'duration': duration,
+        'bpm': bpm, 'bpm_source': bpm_source,
+        'key': key, 'key_source': key_source, 'camelot': camelot,
+        'energy_dj': 5, 'genre': genre, 'genre_source': genre_source,
+        'track_type': 'peak', 'fingerprint': fingerprint,
+        'chromaprint': encode_raw(raw), 'acoustic_id': acoustic_id,
+    })
+    return acoustic_id
+
+
+def test_best_cluster_adopts_reliable_source(db):
+    """El escenario clave: una copia de fuente dudosa (analysis, BPM 129.2) y
+    otra de rekordbox (BPM 126) del MISMO audio -> best_cluster_analysis elige
+    el dato de rekordbox (fuente mas fiable)."""
+    original = _rand_fp(seed=42)
+    reenc = _flip_bits(original, 10)
+    aid = _save_analyzed(db, 'dudosa', original, 'md5_a', 129.2, 'analysis',
+                         key='D#', key_source='analysis', camelot='5B',
+                         genre_source='analysis')
+    _save_analyzed(db, 'rkb', reenc, 'md5_b', 126.0, 'rekordbox',
+                   key='D#m', key_source='rekordbox', camelot='2A',
+                   genre_source='discogs')
+
+    best = db.best_cluster_analysis(aid)
+    assert best is not None
+    assert best['bpm'] == 126.0, "debe adoptar el BPM de rekordbox"
+    assert best['bpm_source'] == 'rekordbox'
+    assert best['key'] == 'D#m' and best['camelot'] == '2A'
+    assert best['key_source'] == 'rekordbox'
+
+
+def test_best_cluster_never_downgrades(db):
+    """Si la unica version fiable es beatport, best la mantiene aunque llegue
+    despues una 'analysis' peor."""
+    a = _rand_fp(seed=7)
+    b = _flip_bits(a, 8)
+    aid = _save_analyzed(db, 'beat', a, 'md5_beat', 126.0, 'beatport',
+                         key='D#m', key_source='beatport')
+    _save_analyzed(db, 'ana', b, 'md5_ana', 130.0, 'analysis',
+                   key='F', key_source='analysis')
+    best = db.best_cluster_analysis(aid)
+    assert best['bpm'] == 126.0 and best['bpm_source'] == 'beatport'
+    assert best['key'] == 'D#m'
+
+
+def test_best_cluster_none_without_cluster(db):
+    assert db.best_cluster_analysis(None) is None
+    assert db.best_cluster_analysis('inexistente') is None

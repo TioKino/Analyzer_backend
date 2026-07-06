@@ -888,6 +888,42 @@ def _attach_acoustic(track_data, audio_path):
     except Exception as e:  # noqa: BLE001 - best-effort, no romper el analisis
         logger.warning(f"[Acoustic] enrich fallo (no critico): {e}")
 
+
+def _apply_cluster_best(result, acoustic_id):
+    """Adopta en `result` la metadata MAS FIABLE del cluster acustico: si otra
+    version del mismo audio (otro usuario) tiene el BPM/key/genero de una fuente
+    mejor (rekordbox/beatport/consenso vs analysis), la copia dudosa la hereda
+    AUTOMATICAMENTE. Solo sube de fiabilidad — nunca degrada (compara prioridad
+    de fuente). Best-effort: nunca rompe /analyze.
+
+    Debe llamarse DESPUES de save_track (para que el cluster incluya ya el track
+    recien analizado) y respeta el consenso comunitario ya aplicado (que tiene
+    prioridad alta en analysis_ranking).
+    """
+    if not acoustic_id:
+        return
+    try:
+        from analysis_ranking import get_source_priority
+        best = db.best_cluster_analysis(acoustic_id)
+        if not best:
+            return
+        if ('bpm' in best and get_source_priority(best.get('bpm_source'))
+                > get_source_priority(getattr(result, 'bpm_source', None))):
+            result.bpm = best['bpm']
+            result.bpm_source = best['bpm_source']
+        if ('key' in best and get_source_priority(best.get('key_source'))
+                > get_source_priority(getattr(result, 'key_source', None))):
+            result.key = best['key']
+            if best.get('camelot'):
+                result.camelot = best['camelot']
+            result.key_source = best['key_source']
+        if ('genre' in best and get_source_priority(best.get('genre_source'))
+                > get_source_priority(getattr(result, 'genre_source', None))):
+            result.genre = best['genre']
+            result.genre_source = best['genre_source']
+    except Exception as e:  # noqa: BLE001 - best-effort
+        logger.warning(f"[Cluster] adoptar mejor metadata fallo (no critico): {e}")
+
 def parse_filename(filename: str) -> dict:
     name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
     name = re.sub(r'^\d+[\s\-_.]+', '', name)
@@ -2781,6 +2817,9 @@ async def analyze_track(
         # Huella acustica + cluster para la memoria colectiva por sonido.
         _attach_acoustic(track_data, tmp_path)
         db.save_track(track_data)
+        # Adoptar la metadata mas fiable del cluster (otra version del mismo
+        # audio con fuente superior: rekordbox/beatport de otro usuario).
+        _apply_cluster_best(result, track_data.get('acoustic_id'))
 
         # Incrementar contador de popularidad
         try:

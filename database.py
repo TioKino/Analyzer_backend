@@ -687,6 +687,74 @@ class AnalysisDB:
             conn.close()
         return list(keys)
 
+    def best_cluster_analysis(self, acoustic_id):
+        """MEJOR metadata (por campo) entre TODAS las versiones del mismo
+        cluster acustico, eligiendo el valor de la fuente MAS FIABLE
+        (analysis_ranking). Permite que una copia de fuente dudosa ('analysis')
+        adopte automaticamente el BPM/key/genero de una version comprada
+        (beatport) o de rekordbox/traktor de OTRO usuario del mismo audio.
+
+        Devuelve un dict con los campos que tienen un valor fiable en el cluster
+        (bpm/bpm_source, key/camelot/key_source, genre/genre_source) o None si el
+        cluster no aporta nada. NO escribe nada — es de solo lectura; el llamador
+        decide si adopta cada campo comparando prioridades.
+        """
+        if not acoustic_id:
+            return None
+        from analysis_ranking import get_source_priority
+
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT bpm, key, camelot, genre, analysis_json FROM tracks '
+                'WHERE acoustic_id = ?',
+                (acoustic_id,),
+            )
+            rows = c.fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return None
+
+        best = {}
+        best_prio = {'bpm': -1, 'key': -1, 'genre': -1}
+        for row in rows:
+            aj = {}
+            if row['analysis_json']:
+                try:
+                    aj = json.loads(row['analysis_json'])
+                except (json.JSONDecodeError, TypeError):
+                    aj = {}
+            # BPM (la fuente vive en analysis_json.bpm_source).
+            bpm = row['bpm']
+            if bpm and bpm > 0:
+                p = get_source_priority(aj.get('bpm_source'))
+                if p > best_prio['bpm']:
+                    best_prio['bpm'] = p
+                    best['bpm'] = bpm
+                    best['bpm_source'] = aj.get('bpm_source')
+            # KEY + Camelot (van juntos; fuente = key_source).
+            key = row['key']
+            if key:
+                p = get_source_priority(aj.get('key_source'))
+                if p > best_prio['key']:
+                    best_prio['key'] = p
+                    best['key'] = key
+                    best['camelot'] = row['camelot']
+                    best['key_source'] = aj.get('key_source')
+            # GENRE (fuente = genre_source). Ignora vacios / 'Unknown'.
+            genre = row['genre']
+            if genre and genre not in ('', 'Unknown'):
+                p = get_source_priority(aj.get('genre_source'))
+                if p > best_prio['genre']:
+                    best_prio['genre'] = p
+                    best['genre'] = genre
+                    best['genre_source'] = aj.get('genre_source')
+
+        best['_priorities'] = best_prio
+        return best if (len(best) > 1) else None
+
     def save_track(self, track_data):
         conn = self._open_conn()
         c = conn.cursor()
