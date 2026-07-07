@@ -65,6 +65,35 @@ def init(database, is_analysis_current, artwork_cache_dir,
 router = APIRouter(tags=["analysis-artwork"])
 
 
+def _merge_cluster_best_into(result, acoustic_id):
+    """Sobre un dict de analisis, adopta la metadata MAS FIABLE del cluster
+    acustico (otra version del mismo audio con fuente superior). Solo sube de
+    fiabilidad (compara analysis_ranking); best-effort, nunca lanza."""
+    if not acoustic_id or not isinstance(result, dict):
+        return
+    try:
+        from analysis_ranking import get_source_priority
+        best = db.best_cluster_analysis(acoustic_id)
+        if not best:
+            return
+        if ('bpm' in best and get_source_priority(best.get('bpm_source'))
+                > get_source_priority(result.get('bpm_source'))):
+            result['bpm'] = best['bpm']
+            result['bpm_source'] = best['bpm_source']
+        if ('key' in best and get_source_priority(best.get('key_source'))
+                > get_source_priority(result.get('key_source'))):
+            result['key'] = best['key']
+            result['key_source'] = best['key_source']
+            if best.get('camelot'):
+                result['camelot'] = best['camelot']
+        if ('genre' in best and get_source_priority(best.get('genre_source'))
+                > get_source_priority(result.get('genre_source'))):
+            result['genre'] = best['genre']
+            result['genre_source'] = best['genre_source']
+    except Exception as e:  # noqa: BLE001 - best-effort
+        logger.warning(f"[Cluster] merge best (lookup) fallo: {e}")
+
+
 @router.post("/check-analyzed")
 async def check_analyzed(filenames: list[str]):
     """Verificar cules tracks ya estn analizados"""
@@ -141,34 +170,41 @@ async def get_analysis_by_fingerprint(fingerprint: str):
     if not existing:
         raise HTTPException(404, "fingerprint no encontrado")
     raw = existing.get('analysis_json')
+    result = None
     if raw:
         try:
             import json
-            return json.loads(raw)
+            result = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            pass
-    # Fallback: construir desde columnas. Incluir *_source para que el
-    # cliente sepa si vale la pena sobreescribir su analisis local (ranking
-    # "mejor gana" en sync comunitario, item 8).
-    return {
-        "id": existing.get('id'),
-        "filename": existing.get('filename'),
-        "artist": existing.get('artist'),
-        "title": existing.get('title'),
-        "duration": existing.get('duration') or 0,
-        "bpm": existing.get('bpm') or 0,
-        "key": existing.get('key'),
-        "camelot": existing.get('camelot'),
-        "energy_dj": existing.get('energy_dj') or 5,
-        "genre": existing.get('genre'),
-        "track_type": existing.get('track_type'),
-        "fingerprint": existing.get('fingerprint'),
-        "bpm_source": existing.get('bpm_source'),
-        "key_source": existing.get('key_source'),
-        "genre_source": existing.get('genre_source'),
-        "engine_source": existing.get('engine_source'),
-        "analysis_version": existing.get('analysis_version') or '1',
-    }
+            result = None
+    if result is None:
+        # Fallback: construir desde columnas. Incluir *_source para que el
+        # cliente sepa si vale la pena sobreescribir su analisis local (ranking
+        # "mejor gana" en sync comunitario, item 8).
+        result = {
+            "id": existing.get('id'),
+            "filename": existing.get('filename'),
+            "artist": existing.get('artist'),
+            "title": existing.get('title'),
+            "duration": existing.get('duration') or 0,
+            "bpm": existing.get('bpm') or 0,
+            "key": existing.get('key'),
+            "camelot": existing.get('camelot'),
+            "energy_dj": existing.get('energy_dj') or 5,
+            "genre": existing.get('genre'),
+            "track_type": existing.get('track_type'),
+            "fingerprint": existing.get('fingerprint'),
+            "bpm_source": existing.get('bpm_source'),
+            "key_source": existing.get('key_source'),
+            "genre_source": existing.get('genre_source'),
+            "engine_source": existing.get('engine_source'),
+            "analysis_version": existing.get('analysis_version') or '1',
+        }
+    # Corregir con la MEJOR metadata del cluster acustico (RETROACTIVO): si otra
+    # version del mismo audio (otro usuario) aporto una fuente superior despues
+    # de que este track se analizara, el cliente la recibe al re-consultar.
+    _merge_cluster_best_into(result, existing.get('acoustic_id'))
+    return result
 
 
 # ==================== ENDPOINTS DE ARTWORK ====================

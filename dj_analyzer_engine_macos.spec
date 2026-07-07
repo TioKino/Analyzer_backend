@@ -63,6 +63,7 @@ local_modules = [
     'beatport.py',
     'genre_detection.py',
     'spectral_genre_classifier.py',
+    'acoustic_fingerprint.py',
     'chunked_analyzer.py',
     'precision_analyzer.py',
     'preview_generator.py',
@@ -131,6 +132,34 @@ if ffmpeg_path:
 else:
     print("[SPEC] ADVERTENCIA: FFmpeg NO encontrado. Los previews no funcionaran.")
     print("[SPEC] Instala con `brew install ffmpeg` o pon un binario en ./ffmpeg")
+
+# Localizar fpcalc (Chromaprint) — HUELLA ACUSTICA de la memoria colectiva.
+# Sin el binario, los analisis LOCALES no obtienen cluster acustico y su
+# memoria colectiva cae al fingerprint MD5 (no agrupa por sonido). local_engine
+# lo resuelve en runtime via FPCALC_BIN (busca en _internal/, igual que ffmpeg).
+# Prioridad: ./fpcalc manual > el que ya bundlea el cliente Flutter > Homebrew.
+fpcalc_path = None
+for candidate in [
+    './fpcalc',
+    '../Analyzer/assets/native/macos/fpcalc',
+    '/opt/homebrew/bin/fpcalc',
+    '/usr/local/bin/fpcalc',
+]:
+    if os.path.isfile(candidate):
+        fpcalc_path = candidate
+        break
+if fpcalc_path is None:
+    fpcalc_path = shutil.which('fpcalc')
+
+if fpcalc_path:
+    binaries.append((fpcalc_path, '.'))
+    print(f"[SPEC] fpcalc encontrado: {fpcalc_path}")
+    print("[SPEC] AVISO: si fpcalc no es universal2, verifica con:")
+    print(f"[SPEC]   lipo -info {fpcalc_path}")
+else:
+    print("[SPEC] ADVERTENCIA: fpcalc NO encontrado. La memoria colectiva NO "
+          "agrupara por sonido en local (cae al fingerprint MD5).")
+    print("[SPEC] Instala con `brew install chromaprint` o pon un binario en ./fpcalc")
 
 binaries += librosa_binaries
 binaries += scipy_binaries
@@ -223,6 +252,7 @@ a = Analysis(
         'beatport',
         'genre_detection',
         'spectral_genre_classifier',
+        'acoustic_fingerprint',
         'chunked_analyzer',
         'precision_analyzer',
         'preview_generator',

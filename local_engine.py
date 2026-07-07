@@ -123,6 +123,31 @@ for _c in _ffmpeg_candidates:
 else:
     logger.warning("ffmpeg no encontrado — previews y waveforms fallaran")
 
+# Resolver fpcalc (Chromaprint) igual que ffmpeg. acoustic_fingerprint.py usa
+# `os.environ.get('FPCALC_BIN', 'fpcalc')` para la HUELLA ACUSTICA de la memoria
+# colectiva. Sin el binario, los tracks analizados en local NO obtienen cluster
+# acustico -> la memoria colectiva de esos tracks cae al fingerprint MD5 (no
+# agrupa por sonido). El .spec debe empaquetar fpcalc(.exe) junto al engine
+# (el binario esta en Analyzer/assets/native/<plataforma>/fpcalc).
+_fpcalc_candidates = [
+    os.path.join(BASE_DIR, '_internal', 'fpcalc.exe'),   # PyInstaller 6+ Windows
+    os.path.join(BASE_DIR, '_internal', 'fpcalc'),        # PyInstaller 6+ Linux/Mac
+    os.path.join(BASE_DIR, 'fpcalc.exe'),                 # PyInstaller <6 o manual
+    os.path.join(BASE_DIR, 'fpcalc'),
+    shutil.which('fpcalc.exe'),                           # PATH Windows
+    shutil.which('fpcalc'),                               # PATH Linux/Mac
+]
+for _c in _fpcalc_candidates:
+    if _c and os.path.isfile(_c):
+        os.environ['FPCALC_BIN'] = _c
+        logger.info(f"fpcalc resuelto a: {_c}")
+        break
+else:
+    logger.warning(
+        "fpcalc no encontrado — la memoria colectiva no agrupara por sonido "
+        "en este motor local (los tracks caen al fingerprint MD5)"
+    )
+
 # Configurar variables de entorno ANTES de importar main
 os.environ['PORT'] = '8000'
 os.environ['HOST'] = '0.0.0.0'
