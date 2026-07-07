@@ -934,6 +934,14 @@ def _apply_render_cluster_best(result, chromaprint_b64, duration):
     Best-effort: si Render duerme / no responde, el analisis local sigue igual."""
     if not chromaprint_b64:
         return
+    # Optimizacion premium: si el analisis local YA es de fuente fiable
+    # (beatport/rekordbox/traktor/consenso, prioridad >= 70), NO preguntamos a
+    # Render — dificilmente aporte algo mejor y ahorramos la llamada HTTP por
+    # track. Solo consultamos cuando el BPM local es de fuente debil (analysis,
+    # id3, discogs...), que es justo cuando el cluster puede corregirlo.
+    from analysis_ranking import get_source_priority
+    if get_source_priority(getattr(result, 'bpm_source', None)) >= 70:
+        return
     try:
         resp = requests.post(
             f"{RENDER_BACKEND_URL}/cluster-best",
