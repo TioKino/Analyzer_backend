@@ -3872,6 +3872,53 @@ async def cluster_best_endpoint(request: ClusterBestRequest):
     }
 
 
+class BackfillFingerprintRequest(BaseModel):
+    fingerprint: str            # id/fingerprint del track existente en la BD
+    chromaprint: str            # huella acustica (encode_raw base64) calculada por el CLIENTE
+    duration: Optional[float] = None
+
+
+@app.post("/backfill-fingerprint")
+async def backfill_fingerprint_endpoint(request: BackfillFingerprintRequest):
+    """Backfill LIGERO de la huella acustica de un track YA analizado.
+
+    El CLIENTE calcula el chromaprint localmente (fpcalc bundled) y lo manda con
+    el fingerprint del track. Aqui resolvemos/creamos el cluster (Hamming) y le
+    escribimos chromaprint + acoustic_id al track existente. NO re-analiza, NO
+    sube audio, NO gasta AudD -> permite activar la memoria colectiva por sonido
+    sobre la biblioteca vieja (analizada antes de que fpcalc estuviera vivo) de
+    forma barata. Devuelve el cluster + la mejor metadata del cluster para que el
+    cliente la adopte si sube de fiabilidad.
+    """
+    from acoustic_fingerprint import decode_raw
+    raw = decode_raw(request.chromaprint)
+    if not raw:
+        return {"ok": False, "reason": "chromaprint_invalido"}
+    try:
+        acoustic_id = db.resolve_acoustic_cluster(raw, request.duration)
+        updated = db.backfill_track_fingerprint(
+            request.fingerprint, request.chromaprint, acoustic_id,
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort, nunca 500 por esto
+        logger.warning(f"[Backfill] fallo (no critico): {e}")
+        return {"ok": False, "reason": "error"}
+    best = db.best_cluster_analysis(acoustic_id) if acoustic_id else None
+    return {
+        "ok": True,
+        "updated": updated,
+        "acoustic_id": acoustic_id,
+        "best": {
+            "bpm": best.get('bpm'),
+            "bpm_source": best.get('bpm_source'),
+            "key": best.get('key'),
+            "camelot": best.get('camelot'),
+            "key_source": best.get('key_source'),
+            "genre": best.get('genre'),
+            "genre_source": best.get('genre_source'),
+        } if best else None,
+    }
+
+
 # ==================== CACHE-LOOKUP / ARTWORK ====================
 # Movidos a routes/analysis_artwork.py (paso 5 del troceo de main.py). Se montan
 # via init_lookup(...) + app.include_router(lookup_router) arriba. _is_analysis_current

@@ -547,6 +547,30 @@ class AnalysisDB:
         conn.close()
         return self._row_to_dict(result)
 
+    def backfill_track_fingerprint(self, fingerprint, chromaprint_b64, acoustic_id):
+        """Backfill LIGERO: escribe chromaprint + acoustic_id en un track YA
+        existente (analizado antes de que fpcalc estuviera vivo), SIN re-analizar
+        ni tocar bpm/key/genero. La usa POST /backfill-fingerprint cuando el
+        CLIENTE calcula la huella localmente y solo hay que asignarle cluster.
+
+        Devuelve True si actualizo alguna fila. Busca por fingerprint O por id
+        (que a veces es el mismo valor). Best-effort.
+        """
+        if not fingerprint or not chromaprint_b64:
+            return False
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'UPDATE tracks SET chromaprint = ?, acoustic_id = ? '
+                'WHERE fingerprint = ? OR id = ?',
+                (chromaprint_b64, acoustic_id, fingerprint, fingerprint),
+            )
+            conn.commit()
+            return c.rowcount > 0
+        finally:
+            conn.close()
+
     def find_acoustic_cluster(self, raw_ints, duration=None):
         """Busca el `acoustic_id` de un cluster EXISTENTE cuyo Chromaprint
         matchee `raw_ints` (Hamming < umbral). Devuelve None si no hay ninguno
