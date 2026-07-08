@@ -48,6 +48,12 @@ MAX_DEVICES_PER_USER = 20
 # requieren header X-Signature con HMAC-SHA256(secret, body).
 # Si NO está configurado, auth se desactiva (modo desarrollo).
 
+# Ventana de frescura (segundos) para el esquema anti-replay con X-Timestamp.
+# Generosa por defecto para tolerar reloj desajustado del dispositivo; bajar
+# via env cuando se confirme que no genera 401s en campo.
+SYNC_REPLAY_WINDOW_SEC = int(os.getenv('SYNC_REPLAY_WINDOW_SEC', '3600'))
+
+
 async def _verify_sync_auth(request: Request):
     """Dependency de FastAPI que valida HMAC si el secret está configurado."""
     if not SYNC_AUTH_SECRET:
@@ -71,12 +77,37 @@ async def _verify_sync_auth(request: Request):
     # viejo) siguen sincronizando hasta que actualizan; luego quitas el viejo de
     # la env var. Un solo valor (sin coma) se comporta igual que antes.
     secrets = [s.strip() for s in SYNC_AUTH_SECRET.split(',') if s.strip()]
+
+    # ANTI-REPLAY (rollout por fases, backward-compatible):
+    # - Cliente NUEVO manda `X-Timestamp` (unix ms) y firma "<ts>.<body>". Aqui
+    #   verificamos freshness (rechaza peticiones viejas = replay) + esa firma.
+    # - Cliente VIEJO (sin `X-Timestamp`) firma solo "<body>": se acepta como antes
+    #   (SIN anti-replay) para NO romper sync durante la transicion.
+    # Cuando la mayoria este actualizada, endurecer = exigir X-Timestamp (fase 2).
+    # Ventana generosa (`SYNC_REPLAY_WINDOW_SEC`, default 3600s) para tolerar reloj
+    # desajustado del dispositivo; bajarla cuando se confirme que no da 401s.
+    ts = request.headers.get("X-Timestamp", "")
     valid = False
-    for secret in secrets:
-        expected = _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-        if _hmac.compare_digest(signature, expected):
-            valid = True
-            break
+    if ts:
+        try:
+            ts_ms = int(ts)
+        except (ValueError, TypeError):
+            ts_ms = 0
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if ts_ms <= 0 or abs(now_ms - ts_ms) > SYNC_REPLAY_WINDOW_SEC * 1000:
+            raise HTTPException(status_code=401, detail="Stale or invalid timestamp")
+        signed = ts.encode() + b"." + body
+        for secret in secrets:
+            expected = _hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+            if _hmac.compare_digest(signature, expected):
+                valid = True
+                break
+    else:
+        for secret in secrets:
+            expected = _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+            if _hmac.compare_digest(signature, expected):
+                valid = True
+                break
 
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid signature")
