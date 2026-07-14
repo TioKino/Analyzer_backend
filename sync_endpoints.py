@@ -129,8 +129,12 @@ def _get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
         os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-        _conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        _conn = sqlite3.connect(_DB_PATH, check_same_thread=False, timeout=30.0)
+        # journal_mode=WAL una vez (esta conexion singleton es el init de sync.db).
         _conn.execute("PRAGMA journal_mode=WAL")
+        # busy_timeout FALTABA: sin el, cualquier escritura de /sync/* fallaba al
+        # instante con "database is locked" bajo contienda (fix outage 2026-07-14).
+        _conn.execute("PRAGMA busy_timeout=30000")
         _init_tables(_conn)
     return _conn
 

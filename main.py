@@ -4084,7 +4084,8 @@ async def health():
     # Database check
     db_status = "ok"
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("SELECT 1")
         conn.close()
     except Exception as e:
@@ -4199,7 +4200,8 @@ async def reset_database(
             "track_ratings", "track_popularity",
             "beat_grid_corrections", "audd_call_log",
         )
-        conn = sqlite3.connect(db.db_path)
+        conn = sqlite3.connect(db.db_path, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=30000")
         c = conn.cursor()
         cleared_analysis = []
         for table in analysis_tables:
@@ -4220,7 +4222,8 @@ async def reset_database(
         cleared_sync = []
         sync_cleared = False
         if os.path.exists(sync_db_path):
-            sync_conn = sqlite3.connect(sync_db_path)
+            sync_conn = sqlite3.connect(sync_db_path, timeout=30.0)
+            sync_conn.execute("PRAGMA busy_timeout=30000")
             for table in sync_tables:
                 try:
                     sync_conn.execute(f"DELETE FROM {table}")

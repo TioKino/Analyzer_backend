@@ -139,12 +139,19 @@ class AnalysisDB:
         """
         # timeout=30 + busy_timeout: si otra conexion tiene la BD bloqueada,
         # esperamos hasta 30s en vez de fallar al instante con "database is
-        # locked". WAL permite lectores concurrentes con un escritor; el
-        # busy_timeout cubre la contienda entre escritores (save_track,
-        # delete_track_by_filename, corrections) bajo carga concurrente.
+        # locked". WAL permite lectores concurrentes con un escritor.
+        #
+        # CRITICO (fix outage "database is locked" 2026-07-14): NO ejecutar
+        # `PRAGMA journal_mode=WAL` aqui. El journal_mode es una propiedad
+        # PERSISTENTE del fichero (se fija una vez en init_db); re-aplicarlo en
+        # CADA apertura de conexion pide un lock exclusivo momentaneo y, con un
+        # solo worker + varias conexiones concurrentes (cada /analyze abre una
+        # para el clustering acustico), provocaba una tormenta de "database is
+        # locked". Por conexion solo fijamos lo que es per-conexion: busy_timeout
+        # y synchronous.
         conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -172,8 +179,10 @@ class AnalysisDB:
         conn = getattr(self._local, 'conn', None)
         if conn is None:
             conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
-            conn.execute("PRAGMA journal_mode=WAL")
+            # journal_mode=WAL se fija UNA vez en init_db (propiedad persistente
+            # del fichero). Aqui solo lo per-conexion. Ver nota en _open_conn.
             conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return conn
@@ -181,7 +190,12 @@ class AnalysisDB:
     def init_db(self):
         # En init_db no consultamos columnas, solo creamos tablas/indices,
         # asi que no hace falta row_factory.
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        # Fijar WAL AQUI, UNA sola vez: es una propiedad persistente del fichero
+        # (sobrevive a reinicios). Todas las conexiones posteriores lo heredan
+        # sin re-ejecutar el PRAGMA (que causaba el outage "database is locked").
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         c = conn.cursor()
 
         # Tabla de analisis

@@ -67,8 +67,11 @@ admin_panel_router = APIRouter(
 
 
 def _get_sync_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_SYNC_DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
+    # NO re-ejecutar `journal_mode=WAL` por llamada (sync.db ya esta en WAL desde
+    # sync_endpoints): re-aplicarlo pide lock exclusivo y contribuia al outage
+    # "database is locked". Solo lo per-conexion (fix 2026-07-14).
+    conn = sqlite3.connect(_SYNC_DB_PATH, check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
     return conn
 
