@@ -4152,46 +4152,68 @@ def _verify_admin_bearer(
 @app.delete("/admin/reset-database", dependencies=[Depends(_verify_admin_bearer)])
 async def reset_database(
     confirm: str = Query(..., description="Escribe 'CONFIRMAR' para borrar"),
+    wipe_assets: bool = Query(
+        False,
+        description="Si true, TAMBIEN borra previews+artwork del disco. Por "
+                    "DEFECTO false: los previews/artwork son assets DURABLES "
+                    "keyed por huella y sobreviven al reset (regenerarlos exige "
+                    "el audio original). Ver nota abajo.",
+    ),
 ):
     """
-    PELIGROSO: Borra TODA la base de datos (wipe brutal).
+    PELIGROSO: Borra la base de datos (wipe brutal de tablas).
 
     Requiere `Authorization: Bearer $ADMIN_TOKEN` y `?confirm=CONFIRMAR`.
 
-    Borra:
+    Borra SIEMPRE:
         analysis.db: tracks, corrections, dj_notes, community_cues,
             community_notes, track_ratings, track_popularity,
             beat_grid_corrections, audd_call_log
         sync.db: sync_items, device_seen, users, user_devices,
             link_codes, detected_tracks_sync
+
+    Borra SOLO con `?wipe_assets=true`:
         Filesystem: ARTWORK_CACHE_DIR, PREVIEWS_DIR (.mp3 cacheados)
 
+    Por que los assets se PRESERVAN por defecto (decision owner 2026-07-14):
+        Los previews (snippet 6s) y artwork son assets COMPARTIDOS keyed por
+        huella (MD5 del contenido), no datos personales. Regenerarlos exige el
+        AUDIO ORIGINAL + reanalisis. Que un reset de BD los borrara obligaba a
+        reanalizar toda la biblioteca (con los ficheros presentes) solo para
+        recuperar los previews, y dejaba en 404 a cualquier device SIN el
+        fichero (movil / HDD desconectado) hasta que alguien reanalizara. Ahora
+        el reset limpia la BD pero deja los .mp3/.jpg intactos: siguen
+        sirviendose por `GET /preview/{fp}` y `GET /artwork/{fp}`. Los ficheros
+        huerfanos (sin track en la BD nueva) son inocuos (se sirven si se piden
+        por huella; si molesta el disco, `wipe_assets=true` los purga).
+
     Tras este reset los devices vinculados pierden su user_id y deben
-    volver a /sync/register desde la app. La memoria colectiva (cues,
-    notes, ratings, popularity, beat-grid) tambien se borra.
+    volver a /sync/register desde la app.
     """
     if confirm != "CONFIRMAR":
         raise HTTPException(400, "Debes escribir 'CONFIRMAR' para borrar la base de datos")
 
     try:
-        # ── Borrar artwork cache (filesystem) ──
+        # ── Assets (previews + artwork): DURABLES por defecto ──
+        # Solo se borran si wipe_assets=true. Ver docstring: regenerarlos exige
+        # el audio original, asi que un reset de BD no debe destruirlos.
         artwork_cleared = False
-        if ARTWORK_CACHE_DIR and os.path.exists(ARTWORK_CACHE_DIR):
-            shutil.rmtree(ARTWORK_CACHE_DIR)
-            os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
-            artwork_cleared = True
-
-        # ── Borrar previews cache (filesystem, .mp3 cacheados) ──
         previews_cleared = False
         previews_count = 0
-        if PREVIEWS_DIR and os.path.exists(PREVIEWS_DIR):
-            try:
-                previews_count = sum(1 for _ in os.scandir(PREVIEWS_DIR))
-            except OSError:
-                previews_count = 0
-            shutil.rmtree(PREVIEWS_DIR)
-            os.makedirs(PREVIEWS_DIR, exist_ok=True)
-            previews_cleared = True
+        if wipe_assets:
+            if ARTWORK_CACHE_DIR and os.path.exists(ARTWORK_CACHE_DIR):
+                shutil.rmtree(ARTWORK_CACHE_DIR)
+                os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+                artwork_cleared = True
+
+            if PREVIEWS_DIR and os.path.exists(PREVIEWS_DIR):
+                try:
+                    previews_count = sum(1 for _ in os.scandir(PREVIEWS_DIR))
+                except OSError:
+                    previews_count = 0
+                shutil.rmtree(PREVIEWS_DIR)
+                os.makedirs(PREVIEWS_DIR, exist_ok=True)
+                previews_cleared = True
 
         # ── Wipe analysis DB ──
         analysis_tables = (
@@ -4236,11 +4258,16 @@ async def reset_database(
 
         return {
             "status": "ok",
-            "message": "Base de datos reseteada completamente (wipe brutal)",
-            "artwork_cache": "limpiado" if artwork_cleared else "no encontrado",
+            "message": "Base de datos reseteada (tablas)."
+                       + (" Assets (previews+artwork) TAMBIEN borrados."
+                          if wipe_assets
+                          else " Previews+artwork PRESERVADOS (durables)."),
+            "assets_wiped": wipe_assets,
+            "artwork_cache": ("limpiado" if artwork_cleared else "preservado"),
             "previews_cache": {
                 "cleared": previews_cleared,
                 "files_deleted": previews_count,
+                "preserved": not wipe_assets,
             },
             "analysis_tables_cleared": cleared_analysis,
             "sync_tables_cleared": cleared_sync if sync_cleared else "no encontrado",
