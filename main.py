@@ -1457,7 +1457,17 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     logger.info(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
     y, sr = robust_audio_load(file_path, sr=44100, mono=True)
 
-    
+    # Guard: fichero que decodifica a señal VACIA (upload corrupto/truncado).
+    # Cortamos ANTES del analisis pesado (BPM, onset, chroma_cqt) — si no,
+    # chroma_cqt revienta con "Input signal length=0 is too short for 7-octave
+    # CQT" y ademas gastamos CPU en vano. Se clasifica como dato del cliente
+    # (WARNING, sin telemetria) en el handler del endpoint.
+    if y is None or len(y) == 0:
+        raise ValueError(
+            "empty_audio_signal: el fichero decodifica a 0 muestras — "
+            "corrupto o truncado"
+        )
+
     # ==================== ID3 METADATA ====================
     id3_data = {}
     if ARTWORK_ENABLED:
@@ -2921,7 +2931,19 @@ async def analyze_track(
         # la telemetria de errores. El fallback de abajo igualmente devuelve un
         # resultado degradado (pending) + 200, asi que el track aparece con la
         # metadata del filename.
-        is_corrupt_audio = isinstance(e, subprocess.CalledProcessError)
+        # Tambien es "dato del cliente" (no bug del backend) cuando el fichero
+        # decodifica a una señal VACIA/demasiado corta: librosa revienta aguas
+        # abajo con ParameterError "Input signal length=0 is too short for
+        # 7-octave CQT". Antes caia en la rama de ERROR real y ensuciaba la
+        # telemetria del panel admin igual que el CalledProcessError. Mismo
+        # criterio: WARNING, sin telemetria, fallback degradado + 200.
+        _emsg = str(e).lower()
+        is_empty_signal = (
+            (type(e).__name__ == 'ParameterError'
+             and ('length=0' in _emsg or 'too short' in _emsg))
+            or _emsg.startswith('empty_audio_signal')
+        )
+        is_corrupt_audio = isinstance(e, subprocess.CalledProcessError) or is_empty_signal
 
         if is_corrupt_audio:
             logger.warning(
@@ -3508,20 +3530,65 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
         return False
 
 
+def _audd_clip_if_large(audio_path: str, threshold_mb: float = 4.0) -> Optional[str]:
+    """Si el fichero supera [threshold_mb], recorta ~20s a mp3 128k mono con
+    ffmpeg y devuelve la ruta del clip (el caller la borra). Devuelve None si
+    no hace falta recortar o si ffmpeg falla (→ el caller envía el original).
+
+    AudD rechaza payloads grandes con 413. El preprocesado de /recognize genera
+    WAV de pista COMPLETA (varios MB); AudD reconoce con un fragmento, así que
+    lo acotamos antes de enviar. Prueba 0:30→0:50 y cae a 0:00→0:20 en tracks
+    cortos.
+    """
+    import subprocess as _sp
+    try:
+        if os.path.getsize(audio_path) <= threshold_mb * 1024 * 1024:
+            return None
+    except OSError:
+        return None
+
+    clip_path = f"{audio_path}.audd20.mp3"
+    for seek in (['-ss', '30'], []):
+        try:
+            cmd = ['ffmpeg', '-y'] + seek + ['-i', audio_path, '-ac', '1',
+                   '-ar', '22050', '-b:a', '128k', '-t', '20', clip_path]
+            r = _sp.run(cmd, capture_output=True, timeout=30)
+            if r.returncode == 0 and os.path.exists(clip_path) \
+                    and os.path.getsize(clip_path) > 0:
+                return clip_path
+        except (OSError, _sp.SubprocessError):
+            break
+    if os.path.exists(clip_path):
+        try:
+            os.unlink(clip_path)
+        except OSError:
+            pass
+    return None
+
+
 def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optional[dict]:
     """
     Envía audio a AudD y devuelve track_data si se identifica, None si no.
     """
-    with open(audio_path, 'rb') as audio_file:
-        audd_response = requests.post(
-            'https://api.audd.io/',
-            data={
-                'api_token': api_token,
-                'return': 'spotify,deezer,apple_music,musicbrainz',
-            },
-            files={'file': audio_file},
-            timeout=timeout
-        )
+    clip_path = _audd_clip_if_large(audio_path)
+    send_path = clip_path or audio_path
+    try:
+        with open(send_path, 'rb') as audio_file:
+            audd_response = requests.post(
+                'https://api.audd.io/',
+                data={
+                    'api_token': api_token,
+                    'return': 'spotify,deezer,apple_music,musicbrainz',
+                },
+                files={'file': audio_file},
+                timeout=timeout
+            )
+    finally:
+        if clip_path and os.path.exists(clip_path):
+            try:
+                os.unlink(clip_path)
+            except OSError:
+                pass
 
     if audd_response.status_code != 200:
         logger.error(f"  [AudD] HTTP error: {audd_response.status_code}")
