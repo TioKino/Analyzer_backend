@@ -2479,7 +2479,21 @@ async def analyze_track(
     #  Validacin mejorada de archivo
     if not file.filename:
         raise HTTPException(400, "No se proporcion archivo")
-    
+
+    # AppleDouble (`._nombre`): macOS crea estos sidecars de resource-fork por
+    # cada fichero en volumenes NTFS/FAT (HDD tipico). NO son audio, pero llevan
+    # la MISMA extension (`._Abilene.m4a`) → pasan el filtro de extension de
+    # abajo y al decodificarlos revientan con CalledProcessError tras gastar un
+    # ciclo entero librosa->ffmpeg, que en el single-worker bloquea el
+    # threadpool. El cliente nuevo ya los filtra (desktop_import_handler.
+    # _isAudioFile), pero clientes viejos los siguen subiendo. Defensa en
+    # profundidad: rechazar ANTES de tocar disco/decodificar.
+    if os.path.basename(file.filename).startswith("._"):
+        raise HTTPException(
+            400,
+            "Fichero AppleDouble (._*), no es audio real",
+        )
+
     # AIFF (.aiff/.aif) es estandar en el mundo DJ Mac (Serato/Rekordbox lo
     # exportan a saco) y libsndfile lo decodifica nativo; opus/wma los abre
     # ffmpeg (fallback de robust_audio_load). Su ausencia causaba 400s en

@@ -191,6 +191,20 @@ class TestAnalyzeEndpoint:
         response = client.post("/analyze")
         assert response.status_code == 422  # Validation error
 
+    def test_analyze_rejects_appledouble(self, client):
+        """Rechaza ficheros AppleDouble (._*) ANTES de decodificar.
+
+        macOS crea `._nombre.m4a` en volumenes NTFS/FAT; llevan extension de
+        audio valida (pasan el filtro de extension) pero no son audio. Deben
+        cortarse temprano para no gastar un ciclo librosa->ffmpeg.
+        """
+        response = client.post(
+            "/analyze",
+            files={"file": ("._Abilene.m4a", b"\x00\x05\x16\x07garbage", "audio/mp4")},
+        )
+        assert response.status_code == 400
+        assert "AppleDouble" in response.json().get("detail", "")
+
 
 # ============================================================================
 # TESTS DE ENDPOINTS - SEARCH
