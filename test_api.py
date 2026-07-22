@@ -21,6 +21,7 @@ from main import (
     parse_filename,
     KEY_TO_CAMELOT,
     classify_track_type,
+    _send_to_audd,
 )
 
 
@@ -190,6 +191,38 @@ class TestAnalyzeEndpoint:
         """Test que requiere archivo"""
         response = client.post("/analyze")
         assert response.status_code == 422  # Validation error
+
+    def test_send_to_audd_skips_oversized_unclippable(self):
+        """Un payload >9MB que no se puede recortar (audio ilegible) se OMITE
+        sin llegar a AudD (evita el 413 seguro + gasto de cap global).
+
+        Bytes basura de 10MB: _audd_clip_if_large no puede decodificarlos con
+        ffmpeg → devuelve None → el guard duro corta antes de cualquier red.
+        Si el guard fallara, requests.post iría a la red y el test colgaría/
+        fallaría; que devuelva None rápido demuestra que no se envió nada.
+        """
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
+            tmp.write(b'\x00' * (10 * 1024 * 1024))  # 10 MB de basura
+            big_path = tmp.name
+        try:
+            result = _send_to_audd(big_path, 'fake-token', timeout=5)
+            assert result is None
+        finally:
+            os.unlink(big_path)
+
+    def test_analyze_rejects_appledouble(self, client):
+        """Rechaza ficheros AppleDouble (._*) ANTES de decodificar.
+
+        macOS crea `._nombre.m4a` en volumenes NTFS/FAT; llevan extension de
+        audio valida (pasan el filtro de extension) pero no son audio. Deben
+        cortarse temprano para no gastar un ciclo librosa->ffmpeg.
+        """
+        response = client.post(
+            "/analyze",
+            files={"file": ("._Abilene.m4a", b"\x00\x05\x16\x07garbage", "audio/mp4")},
+        )
+        assert response.status_code == 400
+        assert "AppleDouble" in response.json().get("detail", "")
 
 
 # ============================================================================

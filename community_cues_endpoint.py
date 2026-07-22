@@ -232,8 +232,13 @@ def register_community_endpoints(app, db):
             now = datetime.now().isoformat()
             sanitized = sanitize_cue_submissions(upload.cues)
             for cue_type, position_ms, end_position_ms, note in sanitized:
+                # OR REPLACE: si el mismo upload trae dos cues con igual
+                # (cue_type, position_ms) — o el DELETE previo no cubrió una
+                # colisión — no reventamos por el UNIQUE; nos quedamos con el
+                # último. (Bug visto en prod: "UNIQUE constraint failed:
+                # community_cues.fingerprint, device_id, cue_type, position_ms".)
                 c.execute('''
-                    INSERT INTO community_cues
+                    INSERT OR REPLACE INTO community_cues
                     (fingerprint, device_id, cue_type, position_ms, end_position_ms, note, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
