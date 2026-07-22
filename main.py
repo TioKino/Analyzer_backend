@@ -3586,6 +3586,29 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optiona
     """
     clip_path = _audd_clip_if_large(audio_path)
     send_path = clip_path or audio_path
+
+    # Guard duro: AudD rechaza payloads >10MB con 413 (y consume igual el cap
+    # global de llamadas). Si tras intentar recortar el fichero SIGUE por encima
+    # del límite —típico de un MP3 con basura/headers rotos que ni ffmpeg pudo
+    # decodificar para generar el clip— no lo mandamos: sería un 413 garantizado.
+    # Mejor omitir (el track no se identifica, pero no gastamos cuota ni ancho
+    # de banda ni bloqueamos el worker con un upload inútil).
+    try:
+        send_size = os.path.getsize(send_path)
+        if send_size > 9 * 1024 * 1024:
+            logger.warning(
+                f"  [AudD] payload {send_size // 1024 // 1024}MB > límite 10MB y "
+                f"el recorte no lo redujo (audio ilegible); se omite el envío."
+            )
+            if clip_path and os.path.exists(clip_path):
+                try:
+                    os.unlink(clip_path)
+                except OSError:
+                    pass
+            return None
+    except OSError:
+        pass
+
     try:
         with open(send_path, 'rb') as audio_file:
             audd_response = requests.post(
