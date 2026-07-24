@@ -36,7 +36,7 @@ import re
 from typing import List
 
 from fastapi import APIRouter, File, HTTPException, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -295,7 +295,18 @@ async def get_artwork(track_id: str):
     for ext in ['jpg', 'png', 'jpeg', 'webp', 'gif']:
         cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
         if os.path.exists(cache_path):
-            return FileResponse(cache_path, media_type=_artwork_media_type(ext))
+            # Leer los bytes AQUÍ (no FileResponse): FileResponse abre el
+            # fichero en la fase de envío ASGI, así que si el .jpg desaparece
+            # entre el os.path.exists y el envío (race con un wipe / borrado
+            # concurrente) lanza FileNotFoundError SIN capturar → 500 feo. Con
+            # la lectura en el handler, un fichero que se esfumó cae a la
+            # cascada (online / 404) en vez de reventar.
+            try:
+                with open(cache_path, 'rb') as f:
+                    data = f.read()
+                return Response(content=data, media_type=_artwork_media_type(ext))
+            except OSError:
+                continue
 
     # Fallback: buscar online por artist+title si tenemos el track en BD.
     try:
@@ -307,11 +318,13 @@ async def get_artwork(track_id: str):
                 logger.info(f"[Artwork] Cache MISS para {track_id[:8]}, buscando online...")
                 online = search_artwork_online(artist, title)
                 if online and online.get('data'):
-                    saved = save_artwork_to_cache(
+                    save_artwork_to_cache(
                         track_id, online['data'], online['mime_type'])
-                    saved_path = os.path.join(ARTWORK_CACHE_DIR, saved)
-                    media_type = online['mime_type']
-                    return FileResponse(saved_path, media_type=media_type)
+                    # Devolver los bytes que ya tenemos en memoria (no re-leer
+                    # el fichero recién guardado → no puede fallar por race).
+                    return Response(
+                        content=online['data'],
+                        media_type=online['mime_type'])
     except Exception as e:
         logger.warning(f"[Artwork] Fallback online error: {e}")
 
