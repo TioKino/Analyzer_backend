@@ -3207,7 +3207,8 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         label = track_data.get('label')
         release_date = track_data.get('release_date')
         year = release_date[:4] if release_date and len(release_date) >= 4 else None
-        
+        isrc = track_data.get('isrc')
+
         logger.info(f"  AudD identifico: {artist} - {title}")
         
         # ==================== PASO 2: BUSCAR GENERO EN DISCOGS ====================
@@ -3383,7 +3384,7 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             'genre_source': genre_source,
             'label': label,
             'year': year,
-            'isrc': None,
+            'isrc': isrc,
             'artwork_url': artwork_url,
             'artwork_embedded': False,
             'track_type': 'peak_time',
