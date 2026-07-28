@@ -109,3 +109,55 @@ def test_force_still_respects_cap_failure():
         FakeDB(cap_raises=True), force=True, daily_cap=50)
     assert fire is False
     assert "cap check error" in reason
+
+
+# ── Cooldown por CLUSTER acustico (memoria colectiva por sonido) ─────
+
+class ClusterDB:
+    """Backend con get_last_audd_call_cluster: el cooldown mira TODO el cluster.
+    get_last_audd_call (exacto) devuelve None a proposito para probar que el
+    camino preferido es el de cluster."""
+    def __init__(self, cluster_last_call=None, today_count=0):
+        self._cluster_last = cluster_last_call
+        self._today = today_count
+
+    def get_last_audd_call(self, fingerprint):
+        return None  # esta copia concreta nunca disparo AudD
+
+    def get_last_audd_call_cluster(self, fingerprint):
+        return self._cluster_last  # pero OTRA copia del mismo sonido si
+
+    def count_audd_calls_today(self):
+        return self._today
+
+
+def test_cluster_cooldown_blocks_even_if_exact_fingerprint_never_called():
+    """El caso que motiva la feature: esta copia (fp) nunca llamo a AudD, pero
+    OTRA version del mismo audio si, hace 2 dias. Con el cooldown por cluster
+    NO se vuelve a gastar AudD."""
+    import time
+    recent = time.time() - 2 * 86400
+    fire, reason = should_trigger_audd(
+        *GARBAGE, 120, "fp", ClusterDB(cluster_last_call=recent), cooldown_days=7)
+    assert fire is False
+    assert "cooldown" in reason
+
+
+def test_cluster_cooldown_expired_fires():
+    """Si la ultima llamada del cluster fue hace mas del cooldown, dispara."""
+    import time
+    old = time.time() - 30 * 86400
+    fire, _ = should_trigger_audd(
+        *GARBAGE, 120, "fp", ClusterDB(cluster_last_call=old), cooldown_days=7)
+    assert fire is True
+
+
+def test_cluster_getter_absent_falls_back_to_exact_fingerprint():
+    """Backend sin get_last_audd_call_cluster (fake viejo): sigue funcionando
+    via get_last_audd_call exacto, sin romper."""
+    import time
+    recent = time.time() - 2 * 86400
+    fire, reason = should_trigger_audd(
+        *GARBAGE, 120, "fp", FakeDB(last_call=recent), cooldown_days=7)
+    assert fire is False
+    assert "cooldown" in reason

@@ -1748,6 +1748,38 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def get_last_audd_call_cluster(self, fingerprint: str) -> Optional[float]:
+        """Como get_last_audd_call pero AGREGANDO todo el cluster acustico: la
+        ultima llamada AudD para CUALQUIER version del mismo audio (otro
+        codec/bitrate/tag). Asi si un usuario ya "limpio con AudD" una copia de
+        un tema, otra copia distinta del MISMO sonido respeta el cooldown y no
+        vuelve a gastar cuota de AudD por lo mismo — que es justo la promesa de
+        la memoria colectiva por sonido.
+
+        Cae al fingerprint exacto si el track aun no tiene cluster (compat total
+        con el comportamiento anterior: la copia bit-identica ya casaba por
+        fingerprint; esto solo AMPLIA la cobertura a las variantes ya
+        clusterizadas, nunca la reduce).
+        """
+        if not fingerprint:
+            return None
+        keys = self.fingerprints_in_cluster(fingerprint) or [fingerprint]
+        if fingerprint not in keys:
+            keys = list(keys) + [fingerprint]
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            placeholders = ','.join('?' * len(keys))
+            c.execute(
+                f'SELECT MAX(called_at) AS last FROM audd_call_log '
+                f'WHERE fingerprint IN ({placeholders})',
+                list(keys),
+            )
+            row = c.fetchone()
+            return row['last'] if row and row['last'] else None
+        finally:
+            conn.close()
+
     def count_audd_calls_today(self) -> int:
         """Cuenta llamadas AudD del dia UTC actual."""
         today_start = datetime.now(timezone.utc).replace(

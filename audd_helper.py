@@ -99,7 +99,12 @@ def should_trigger_audd(
 
     if not force and fingerprint and db is not None:
         try:
-            last_call = db.get_last_audd_call(fingerprint)
+            # Cooldown por CLUSTER acustico si el backend lo soporta: una copia
+            # distinta (otro codec/tag) del mismo sonido comparte el cooldown y
+            # no vuelve a gastar AudD por lo mismo. getattr para no romper fakes
+            # de test / backends viejos: cae al cooldown por fingerprint exacto.
+            cluster_getter = getattr(db, 'get_last_audd_call_cluster', None)
+            last_call = (cluster_getter or db.get_last_audd_call)(fingerprint)
             if last_call is not None:
                 elapsed_days = (datetime.now(timezone.utc).timestamp() - last_call) / 86400
                 if elapsed_days < cooldown_days:
