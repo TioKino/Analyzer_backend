@@ -3739,13 +3739,21 @@ async def recognize_audio(request: Request, file: UploadFile = File(...)):
         logger.info(f"[Recognize] Resultado: {artist} - {title}")
 
         # ── Buscar análisis existente en BD ──
+        # 1º por ISRC (identidad EXACTA de la grabacion, sin fuzzy artist/title):
+        # si ese mismo tema ya lo analizo/limpio otro usuario, lo casamos aunque
+        # los tags difieran. 2º fallback al match por artist+title de siempre.
         backend_analysis = None
-        existing_tracks = db.search_by_artist(artist, limit=50)
-        for track in existing_tracks:
-            if track.get('title', '').lower() == title.lower():
-                backend_analysis = track
-                logger.info(f"  Encontrado en biblioteca: {track.get('id')}")
-                break
+        if isrc:
+            backend_analysis = db.get_track_by_isrc(isrc)
+            if backend_analysis:
+                logger.info(f"  Encontrado por ISRC {isrc}: {backend_analysis.get('id')}")
+        if not backend_analysis:
+            existing_tracks = db.search_by_artist(artist, limit=50)
+            for track in existing_tracks:
+                if track.get('title', '').lower() == title.lower():
+                    backend_analysis = track
+                    logger.info(f"  Encontrado en biblioteca: {track.get('id')}")
+                    break
 
         response = {
             "status": "found",
@@ -3794,6 +3802,7 @@ async def recognize_audio(request: Request, file: UploadFile = File(...)):
                     'track_type': 'peak_time',
                     'bpm_source': 'pending',
                     'key_source': 'pending',
+                    'isrc': isrc,
                 }
                 existing = db.get_track_by_fingerprint(detect_id)
                 if not existing:

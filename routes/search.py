@@ -149,7 +149,8 @@ async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=2
 @search_router.get("/search-analyzed")
 async def search_analyzed_track(
     artist: str = Query(..., description="Nombre del artista"),
-    title: str = Query(..., description="Ttulo del track")
+    title: str = Query(..., description="Ttulo del track"),
+    isrc: Optional[str] = Query(None, description="ISRC (identidad exacta, opcional)")
 ):
     """
     Busca si un track ya fue analizado por algn usuario.
@@ -176,6 +177,21 @@ async def search_analyzed_track(
     ).lower().strip()
 
     try:
+        # 0) ISRC: identidad EXACTA de la grabacion. Si otro usuario ya analizo
+        # este mismo tema, lo casamos sin depender del fuzzy artist/title. Solo
+        # cuenta si tiene analisis real (bpm>0); un "pending" de /recognize no.
+        if isrc:
+            t = db.get_track_by_isrc(isrc)
+            if t:
+                if t.get('analysis_json'):
+                    try:
+                        t.update(json.loads(t['analysis_json']))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                t.pop('analysis_json', None)
+                if t.get('bpm'):
+                    return {"found": True, "in_collective": True, "track": t}
+
         conn = db.conn
         cursor = conn.cursor()
 

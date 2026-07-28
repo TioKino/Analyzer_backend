@@ -236,6 +236,15 @@ class AnalysisDB:
         except sqlite3.OperationalError:
             pass  # Ya existe
 
+        # Migracion: isrc = codigo unico de grabacion (International Standard
+        # Recording Code) que devuelve AudD. Clave de IDENTIDAD estable e
+        # inequivoca (no depende de artist/title fuzzy) para casar el mismo tema
+        # entre versiones/usuarios. NULL en tracks previos a esta feature.
+        try:
+            c.execute('ALTER TABLE tracks ADD COLUMN isrc TEXT')
+        except sqlite3.OperationalError:
+            pass  # Ya existe
+
         # Indices para busquedas rapidas
         c.execute('CREATE INDEX IF NOT EXISTS idx_artist ON tracks(artist)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_genre ON tracks(genre)')
@@ -247,6 +256,8 @@ class AnalysisDB:
         # idx_acoustic: lookup O(1) del cluster por fingerprint canonico +
         # candidatos para el barrido Hamming acotado por duracion.
         c.execute('CREATE INDEX IF NOT EXISTS idx_acoustic ON tracks(acoustic_id)')
+        # idx_isrc: lookup O(1) del track por su codigo de grabacion (AudD).
+        c.execute('CREATE INDEX IF NOT EXISTS idx_isrc ON tracks(isrc)')
 
         # Correcciones manuales (memoria colectiva)
         c.execute('''
@@ -561,6 +572,22 @@ class AnalysisDB:
         conn.close()
         return self._row_to_dict(result)
 
+    def get_track_by_isrc(self, isrc: str) -> Optional[Dict]:
+        """Busca un track por su ISRC (codigo unico de grabacion de AudD).
+        Identidad exacta, sin fuzzy artist/title. Devuelve el analizado mas
+        reciente si hay varias filas con el mismo ISRC (distintas copias)."""
+        if not isrc:
+            return None
+        conn = self._open_conn()
+        c = conn.cursor()
+        c.execute(
+            'SELECT * FROM tracks WHERE isrc = ? ORDER BY analyzed_at DESC LIMIT 1',
+            (isrc,),
+        )
+        result = c.fetchone()
+        conn.close()
+        return self._row_to_dict(result)
+
     def backfill_track_fingerprint(self, fingerprint, chromaprint_b64, acoustic_id):
         """Backfill LIGERO: escribe chromaprint + acoustic_id en un track YA
         existente (analizado antes de que fpcalc estuviera vivo), SIN re-analizar
@@ -820,8 +847,8 @@ class AnalysisDB:
             (id, filename, artist, title, duration, bpm, key, camelot,
              energy_dj, genre, track_type, analysis_json, analyzed_at,
              fingerprint, chromaprint, acoustic_id, engine_source,
-             analysis_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             analysis_version, isrc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             track_data['id'],
             track_data['filename'],
@@ -841,6 +868,7 @@ class AnalysisDB:
             track_data.get('acoustic_id'),
             track_data.get('engine_source'),
             track_data.get('analysis_version'),
+            track_data.get('isrc'),
         ))
 
         conn.commit()
