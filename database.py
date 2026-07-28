@@ -763,6 +763,29 @@ class AnalysisDB:
             conn.close()
         return list(keys)
 
+    def cluster_identities(self, acoustic_id):
+        """(artist, title) de las copias del cluster que tienen AMBOS campos no
+        vacios, mas reciente primero. Sirve para HEREDAR una identidad limpia de
+        otra version del mismo audio (rekordbox / AudD previo de otro usuario) y
+        AHORRAR la llamada a AudD. El llamador filtra las 'basura'
+        (is_garbage_metadata vive en audd_helper, no aqui). Lista vacia si el
+        cluster no existe o ninguna copia tiene artist+title."""
+        if not acoustic_id:
+            return []
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT artist, title FROM tracks WHERE acoustic_id = ? "
+                "AND artist IS NOT NULL AND TRIM(artist) != '' "
+                "AND title IS NOT NULL AND TRIM(title) != '' "
+                "ORDER BY analyzed_at DESC",
+                (acoustic_id,),
+            )
+            return [(r['artist'], r['title']) for r in c.fetchall()]
+        finally:
+            conn.close()
+
     def best_cluster_analysis(self, acoustic_id):
         """MEJOR metadata (por campo) entre TODAS las versiones del mismo
         cluster acustico, eligiendo el valor de la fuente MAS FIABLE

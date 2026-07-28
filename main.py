@@ -913,6 +913,37 @@ def _adopt_better_metadata(result, best):
         result.genre_source = best['genre_source']
 
 
+def _pick_clean_identity(identities):
+    """De una lista [(artist, title), ...] (mas fiable primero) devuelve la
+    primera que NO sea metadata basura, o None. Aislado del fpcalc/BD para poder
+    testearlo sin dependencias."""
+    from audd_helper import is_garbage_metadata
+    for artist, title in identities or []:
+        if not is_garbage_metadata(artist, title):
+            return (artist, title)
+    return None
+
+
+def _cluster_clean_identity(audio_path, duration):
+    """AHORRO AudD por SONIDO: si el cluster acustico de este audio ya tiene una
+    identidad LIMPIA (otra copia con buenos tags / AudD previo de otro usuario),
+    la devuelve (artist, title) para HEREDARLA y saltarnos la llamada a AudD.
+    None si no hay cluster o toda su identidad es basura. Best-effort — nunca
+    rompe el analisis (si fpcalc no esta, cae a AudD como antes)."""
+    try:
+        from acoustic_fingerprint import compute_raw_chromaprint
+        raw = compute_raw_chromaprint(audio_path)
+        if not raw:
+            return None
+        acoustic_id = db.find_acoustic_cluster(raw, duration)
+        if not acoustic_id:
+            return None
+        return _pick_clean_identity(db.cluster_identities(acoustic_id))
+    except Exception as e:  # noqa: BLE001 - best-effort, no romper el analisis
+        logger.warning(f"[AudD-skip] cluster identity fallo (no critico): {e}")
+        return None
+
+
 def _apply_cluster_best(result, acoustic_id):
     """(Local) Adopta la metadata MAS FIABLE del cluster acustico de ESTA BD: si
     otra version del mismo audio tiene el BPM/key/genero de una fuente mejor, la
@@ -1768,6 +1799,21 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # ultimo recurso (con presupuesto y cooldown). Discogs/iTunes/MusicBrainz
     # requieren artist+title para arrancar, asi que recuperar la identidad
     # aqui desbloquea el resto.
+    # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
+    # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
+    # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
+    # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
+    # siendo basura y no es una peticion force del usuario.
+    if AUDD_AUTO_ENABLED and not force_audd:
+        from audd_helper import is_garbage_metadata
+        if is_garbage_metadata(artist_name, title_name):
+            _inherited = _cluster_clean_identity(file_path, duration)
+            if _inherited:
+                artist_name, title_name = _inherited
+                logger.info(
+                    f"[AudD-skip] identidad heredada del cluster: "
+                    f"{artist_name} - {title_name}")
+
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
@@ -2182,6 +2228,21 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
     # ==================== AUDD AUTO-TRIGGER ====================
     # Mismo trigger que en analyze_audio: si tras ID3+filename seguimos sin
     # artist/title utilizable, AudD como ultimo recurso.
+    # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
+    # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
+    # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
+    # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
+    # siendo basura y no es una peticion force del usuario.
+    if AUDD_AUTO_ENABLED and not force_audd:
+        from audd_helper import is_garbage_metadata
+        if is_garbage_metadata(artist_name, title_name):
+            _inherited = _cluster_clean_identity(file_path, duration)
+            if _inherited:
+                artist_name, title_name = _inherited
+                logger.info(
+                    f"[AudD-skip] identidad heredada del cluster: "
+                    f"{artist_name} - {title_name}")
+
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
