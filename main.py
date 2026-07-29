@@ -47,6 +47,30 @@ from typing import Any, Dict, List, Optional
 import logging
 logger = logging.getLogger('dj_analyzer')
 logger.setLevel(logging.INFO)
+
+
+# Silencia el SPAM de acceso de /artwork y /preview en el access log de uvicorn.
+# Un cliente con ~5000 tracks dispara cientos de GET por conexion (200 y 404 de
+# huerfanos inocuos) que inundan los logs de Render sin aportar nada. El resto
+# del access log (endpoints reales) se mantiene intacto. Overridable por env:
+# QUIET_ASSET_LOGS=0 lo desactiva si algun dia hace falta depurar esos GET.
+import os as _os_log
+
+
+class _QuietAssetAccessFilter(logging.Filter):
+    _NOISY = ('/artwork/', '/preview/')
+
+    def filter(self, record):  # noqa: A003 - firma de logging.Filter
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(p in msg for p in self._NOISY)
+
+
+if _os_log.getenv('QUIET_ASSET_LOGS', '1') not in ('0', 'false', 'False'):
+    logging.getLogger('uvicorn.access').addFilter(_QuietAssetAccessFilter())
+
 from pydantic import BaseModel
 from audio_helpers import silence_native_stderr
 from spectral_genre_classifier import classify_genre_advanced
