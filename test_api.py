@@ -205,8 +205,12 @@ class TestAnalyzeEndpoint:
             tmp.write(b'\x00' * (10 * 1024 * 1024))  # 10 MB de basura
             big_path = tmp.name
         try:
-            result = _send_to_audd(big_path, 'fake-token', timeout=5)
-            assert result is None
+            # _send_to_audd devuelve (track_data, processed_ok). Oversized ->
+            # no se envio -> (None, False): no hubo match Y no se proceso, asi
+            # que el caller puede reintentar con otro preprocesado.
+            track_data, processed_ok = _send_to_audd(big_path, 'fake-token', timeout=5)
+            assert track_data is None
+            assert processed_ok is False
         finally:
             os.unlink(big_path)
 

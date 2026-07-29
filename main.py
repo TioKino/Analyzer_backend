@@ -3655,9 +3655,17 @@ def _audd_clip_if_large(audio_path: str, threshold_mb: float = 4.0) -> Optional[
     return None
 
 
-def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optional[dict]:
+def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30):
     """
-    Envía audio a AudD y devuelve track_data si se identifica, None si no.
+    Envía audio a AudD. Devuelve (track_data, processed_ok):
+      - track_data: dict del match o None si no se identifica.
+      - processed_ok: True si AudD PROCESO el audio (status='success', haya match
+        o no). False si AudD no pudo generar huella (audio invalido/silencioso) o
+        hubo error HTTP / no se envio.
+    La distincion importa para el fan-out de estrategias: si AudD proceso el
+    audio pero no hubo match, el track NO esta en su base — reintentar con otro
+    preprocesado del MISMO contenido no va a crear un match (se ahorran llamadas).
+    Solo merece la pena reintentar cuando AudD no pudo fingerprintear.
     """
     clip_path = _audd_clip_if_large(audio_path)
     send_path = clip_path or audio_path
@@ -3680,7 +3688,7 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optiona
                     os.unlink(clip_path)
                 except OSError:
                     pass
-            return None
+            return None, False  # no se envio -> otro preprocesado podria valer
     except OSError:
         pass
 
@@ -3704,7 +3712,7 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optiona
 
     if audd_response.status_code != 200:
         logger.error(f"  [AudD] HTTP error: {audd_response.status_code}")
-        return None
+        return None, False
 
     result = audd_response.json()
 
@@ -3716,13 +3724,17 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optiona
         # es un bug nuestro y tenemos fallback con preprocesamiento.
         short_msg = error_msg.split('.')[0][:140] if error_msg else 'unknown'
         logger.warning(f"  [AudD] API rechazo audio: {short_msg}")
-        return None
+        return None, False  # no pudo fingerprintear -> reintentar SI vale la pena
 
     track_data = result.get('result')
     if track_data:
         logger.info(f"  [AudD] ✓ Identificado: {track_data.get('artist')} - {track_data.get('title')}")
+    else:
+        # status=success pero sin match: AudD fingerprinteo bien y no conoce el
+        # track. processed_ok=True -> el caller NO reintenta (seria en balde).
+        logger.info("  [AudD] audio procesado pero sin match (track no en AudD)")
 
-    return track_data
+    return track_data, True
 
 
 @app.post("/recognize")
@@ -3779,7 +3791,7 @@ async def recognize_audio(
     # contabilidad real del gasto y para el cap por device. Antes /recognize no
     # se logueaba → el panel admin infravaloraba el gasto de la feature estrella.
     def _audd_and_log(path):
-        td = _send_to_audd(path, AUDD_API_TOKEN, timeout=30)
+        td, processed_ok = _send_to_audd(path, AUDD_API_TOKEN, timeout=30)
         try:
             db.log_audd_call(
                 fingerprint='recognize', success=bool(td),
@@ -3788,7 +3800,7 @@ async def recognize_audio(
             )
         except Exception as e:
             logger.warning(f"[Recognize] log_audd_call fallo: {e}")
-        return td
+        return td, processed_ok
 
     tmp_path = None
     processed_paths = []
@@ -3809,10 +3821,16 @@ async def recognize_audio(
         if total_bytes < 1000:
             return {"status": "not_found", "message": "Audio demasiado corto o vacío"}
 
-        # ── Estrategia multi-intento ──
+        # ── Estrategia multi-intento con FAN-OUT INTELIGENTE ──
         # Intento 1: Audio normalizado + filtro de ruido ambiente
         # Intento 2: Filtrado agresivo (banda vocal/melódica) + compresión
         # Intento 3: WAV sin procesar (por si los filtros eliminaron info útil)
+        # Las estrategias solo se escalan si AudD NO PUDO fingerprintear el audio
+        # (audio malo -> otro preprocesado puede ayudar). Si AudD proceso el
+        # audio pero no hubo match, el track NO esta en AudD y reintentar con
+        # otro preprocesado del mismo contenido es tirar cuota -> paramos. Caso
+        # comun del DJ: temas underground/promo que AudD no conoce (huella OK,
+        # sin match) -> 1 llamada en vez de 3.
         strategies = ["normalize", "aggressive", "raw_wav"]
         track_data = None
 
@@ -3822,25 +3840,29 @@ async def recognize_audio(
 
             logger.info(f"[Recognize] Intento {i+1}/3 - estrategia: {strategy}")
 
+            processed_ok = False
             if _preprocess_audio_for_recognition(tmp_path, processed_path, strategy):
                 processed_size = os.path.getsize(processed_path)
                 logger.info(f"  Procesado: {processed_size} bytes")
-
-                track_data = _audd_and_log(processed_path)
-                if track_data:
-                    logger.info(f"[Recognize] ✓ Éxito en intento {i+1} ({strategy})")
-                    break
-                else:
-                    logger.info(f"  Intento {i+1} ({strategy}): no identificado")
+                track_data, processed_ok = _audd_and_log(processed_path)
             else:
                 logger.info(f"  Intento {i+1} ({strategy}): preprocesamiento falló")
-                # Si normalize falla, intentar enviar el original directamente
+                # Si normalize falla, intentar enviar el original directamente.
                 if strategy == "normalize":
                     logger.info(f"  Intentando enviar archivo original sin procesar...")
-                    track_data = _audd_and_log(tmp_path)
-                    if track_data:
-                        logger.info(f"[Recognize] ✓ Éxito con archivo original")
-                        break
+                    track_data, processed_ok = _audd_and_log(tmp_path)
+
+            if track_data:
+                logger.info(f"[Recognize] ✓ Éxito en intento {i+1} ({strategy})")
+                break
+            if processed_ok:
+                # AudD proceso el audio y no hubo match -> el track no esta en su
+                # base. Otro preprocesado no va a crear un match: paramos.
+                logger.info(
+                    f"[Recognize] AudD sin match con audio válido (intento {i+1})"
+                    f" -> no reintentar (track no está en AudD)")
+                break
+            logger.info(f"  Intento {i+1} ({strategy}): audio no procesable, reintentando")
 
         # Marcador de SESION (una pulsacion de Escuchar que llego a AudD), base
         # del cap por dispositivo. Se registra tanto si identifico como si no
