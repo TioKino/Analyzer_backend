@@ -3950,6 +3950,20 @@ async def recognize_audio(
         }
 
         if backend_analysis:
+            # Aplanar analysis_json al top-level (igual que /search-analyzed) para
+            # que el movil tenga TODA la info rica lista sin re-parsear un blob:
+            # BPM/key/camelot/energia + has_drop/estructura/cues/confidences. Es
+            # el material del DIFERENCIADOR vs Shazam — la ficha de Escuchar puede
+            # mostrar datos REALES de la comunidad, no solo un link a Spotify.
+            try:
+                _aj = backend_analysis.get('analysis_json')
+                if _aj:
+                    _detail = json.loads(_aj) if isinstance(_aj, str) else _aj
+                    if isinstance(_detail, dict):
+                        backend_analysis.update(_detail)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            backend_analysis.pop('analysis_json', None)
             response["backend_analysis"] = backend_analysis
 
         # Guardar reconocimiento en BD colectiva para enriquecer futuras consultas
