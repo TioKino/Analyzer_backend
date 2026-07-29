@@ -303,6 +303,7 @@ def enrich_with_audd_if_needed(
                 fingerprint, success,
                 artist=(track_data or {}).get('artist'),
                 title=(track_data or {}).get('title'),
+                source='analyze',
             )
         except Exception as e:
             logger.warning(f"[AudD-auto] log_audd_call fallo: {e}")

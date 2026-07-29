@@ -61,6 +61,16 @@ AUDD_COOLDOWN_DAYS: int = int(os.getenv('AUDD_COOLDOWN_DAYS', '7'))
 AUDD_MIN_DURATION: float = float(os.getenv('AUDD_MIN_DURATION', '30'))
 AUDD_MAX_DURATION: float = float(os.getenv('AUDD_MAX_DURATION', '720'))
 
+# ==================== ESCUCHAR (/recognize) — cap por DISPOSITIVO/dia ====================
+# El auto-AudD de /analyze tiene su propio cap GLOBAL (AUDD_DAILY_CAP). Escuchar
+# (/recognize, feature tipo Shazam) va por otra via: es la herramienta estrella,
+# GRATIS como gancho pero con tope para acotar coste/abuso. Dos niveles cableados
+# para el paywall: free (bajo) y Pro (mucho mas amplio; NO ilimitado, protege
+# tambien de abuso Pro). Se cuenta por device_id/dia sobre audd_call_log
+# (source='recognize'). Cuando el paywall este activo, el cliente manda is_pro.
+RECOGNIZE_FREE_DAILY_CAP: int = int(os.getenv('RECOGNIZE_FREE_DAILY_CAP', '30'))
+RECOGNIZE_PRO_DAILY_CAP: int = int(os.getenv('RECOGNIZE_PRO_DAILY_CAP', '500'))
+
 
 # ==================== BASE DE DATOS ====================
 

@@ -13,7 +13,7 @@ Estructura:
 - api_config.py / config.py - Configuracin
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sync_endpoints import sync_router
 from routes.admin_panel import admin_panel_router
@@ -57,6 +57,8 @@ from config import (
     AUDD_COOLDOWN_DAYS,
     AUDD_MIN_DURATION,
     AUDD_MAX_DURATION,
+    RECOGNIZE_FREE_DAILY_CAP,
+    RECOGNIZE_PRO_DAILY_CAP,
     DISCOGS_TOKEN,
     print_config,
     BASE_URL,
@@ -3251,11 +3253,22 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             raise HTTPException(500, f"Error AudD: {audd_response.status_code}")
         
         result = audd_response.json()
-        
+
+        # Contabilidad del gasto AudD tambien en /identify (antes no se logueaba).
+        _identify_ok = result.get('status') == 'success' and bool(result.get('result'))
+        try:
+            _td = result.get('result') or {}
+            db.log_audd_call(
+                fingerprint=fingerprint, success=_identify_ok,
+                artist=_td.get('artist'), title=_td.get('title'),
+                source='identify')
+        except Exception as _e:
+            logger.warning(f"[Identify] log_audd_call fallo: {_e}")
+
         if result.get('status') != 'success':
             error_msg = result.get('error', {}).get('error_message', 'Unknown')
             return {"status": "error", "message": error_msg}
-        
+
         track_data = result.get('result')
         
         if not track_data:
@@ -3713,11 +3726,22 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30) -> Optiona
 
 
 @app.post("/recognize")
-async def recognize_audio(request: Request, file: UploadFile = File(...)):
+async def recognize_audio(
+    request: Request,
+    file: UploadFile = File(...),
+    device_id: Optional[str] = Form(None),
+    is_pro: bool = Form(True),
+):
     """
     Reconoce una canción a partir de audio grabado usando AudD API.
     Preprocesa el audio (normalización, filtrado de ruido) y reintenta
     con diferentes estrategias si el primer intento falla.
+
+    `device_id` + `is_pro`: cableado del paywall. Escuchar es GRATIS pero con un
+    cap por dispositivo/dia (RECOGNIZE_FREE_DAILY_CAP); Pro tiene uno mucho mas
+    amplio (RECOGNIZE_PRO_DAILY_CAP). Sin device_id no se capa (compat con
+    clientes viejos; el rate-limit por IP cubre el anonimato). El auto-AudD de
+    /analyze tiene su propio cap GLOBAL, independiente de este.
     """
     # Rate limiting — endpoint caro (preprocesado + AudD retries).
     check_rate_limit(get_client_ip(request))
@@ -3729,6 +3753,42 @@ async def recognize_audio(request: Request, file: UploadFile = File(...)):
 
     if not AUDD_API_TOKEN:
         raise HTTPException(500, "AudD API token no configurado en api_config.py")
+
+    # Cap por dispositivo/dia ANTES de gastar AudD/CPU. Sin device_id no capamos.
+    recognize_cap = RECOGNIZE_PRO_DAILY_CAP if is_pro else RECOGNIZE_FREE_DAILY_CAP
+    if device_id:
+        try:
+            used_today = db.count_recognitions_today(device_id)
+        except Exception:
+            used_today = 0
+        if used_today >= recognize_cap:
+            logger.info(
+                f"[Recognize] cap alcanzado device={device_id[:8]} "
+                f"used={used_today} cap={recognize_cap} pro={is_pro}")
+            return {
+                "status": "cap_reached",
+                "is_pro": is_pro,
+                "cap": recognize_cap,
+                "used": used_today,
+                "message": "Límite diario de Escuchar alcanzado. Vuelve mañana."
+                if is_pro else
+                "Has alcanzado el límite diario gratuito de Escuchar.",
+            }
+
+    # Cada llamada a AudD de Escuchar se REGISTRA (source='recognize') para la
+    # contabilidad real del gasto y para el cap por device. Antes /recognize no
+    # se logueaba → el panel admin infravaloraba el gasto de la feature estrella.
+    def _audd_and_log(path):
+        td = _send_to_audd(path, AUDD_API_TOKEN, timeout=30)
+        try:
+            db.log_audd_call(
+                fingerprint='recognize', success=bool(td),
+                artist=(td or {}).get('artist'), title=(td or {}).get('title'),
+                source='recognize', device_id=device_id,
+            )
+        except Exception as e:
+            logger.warning(f"[Recognize] log_audd_call fallo: {e}")
+        return td
 
     tmp_path = None
     processed_paths = []
@@ -3766,7 +3826,7 @@ async def recognize_audio(request: Request, file: UploadFile = File(...)):
                 processed_size = os.path.getsize(processed_path)
                 logger.info(f"  Procesado: {processed_size} bytes")
 
-                track_data = _send_to_audd(processed_path, AUDD_API_TOKEN, timeout=30)
+                track_data = _audd_and_log(processed_path)
                 if track_data:
                     logger.info(f"[Recognize] ✓ Éxito en intento {i+1} ({strategy})")
                     break
@@ -3777,7 +3837,7 @@ async def recognize_audio(request: Request, file: UploadFile = File(...)):
                 # Si normalize falla, intentar enviar el original directamente
                 if strategy == "normalize":
                     logger.info(f"  Intentando enviar archivo original sin procesar...")
-                    track_data = _send_to_audd(tmp_path, AUDD_API_TOKEN, timeout=30)
+                    track_data = _audd_and_log(tmp_path)
                     if track_data:
                         logger.info(f"[Recognize] ✓ Éxito con archivo original")
                         break

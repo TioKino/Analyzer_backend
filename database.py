@@ -456,6 +456,19 @@ class AnalysisDB:
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_audd_fp ON audd_call_log(fingerprint)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_audd_at ON audd_call_log(called_at)')
+        # Migracion: source ('analyze'/'recognize'/'identify') + device_id para
+        # (a) contabilidad REAL del gasto AudD por via (antes solo /analyze se
+        # logueaba → el panel infravaloraba el gasto de Escuchar) y (b) cap por
+        # dispositivo/dia en /recognize. Filas legacy: source NULL = 'analyze'.
+        for _col in ('source TEXT', 'device_id TEXT'):
+            try:
+                conn.execute(f'ALTER TABLE audd_call_log ADD COLUMN {_col}')
+            except sqlite3.OperationalError:
+                pass  # ya existe
+        # Cap por device/dia de /recognize: filtro (source, device_id, called_at).
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_audd_src_dev '
+            'ON audd_call_log(source, device_id, called_at)')
 
         # Tabla de errores de analisis (privacy-first: filename hasheado).
         # Captura fallos de /analyze y /identify para diagnostico operacional
@@ -1768,16 +1781,25 @@ class AnalysisDB:
 
     def log_audd_call(self, fingerprint: str, success: bool,
                       artist: Optional[str] = None,
-                      title: Optional[str] = None) -> None:
-        """Registra una llamada AudD (incluso fallidas) para honrar cooldown y cap."""
+                      title: Optional[str] = None,
+                      source: str = 'analyze',
+                      device_id: Optional[str] = None) -> None:
+        """Registra una llamada AudD (incluso fallidas) para honrar cooldown/cap
+        y para CONTABILIDAD real del gasto por via. `source`:
+          - 'analyze'   → auto-trigger de /analyze (cuenta para AUDD_DAILY_CAP).
+          - 'recognize' → Escuchar (/recognize); cuenta para el cap por device.
+          - 'identify'  → /identify manual (solo visibilidad).
+        Antes solo se logueaba 'analyze' → el panel infravaloraba el gasto."""
         if not fingerprint:
             return
         conn = self._open_conn()
         try:
             conn.execute(
-                'INSERT INTO audd_call_log (fingerprint, called_at, success, artist, title) '
-                'VALUES (?, ?, ?, ?, ?)',
-                (fingerprint, time.time(), 1 if success else 0, artist, title),
+                'INSERT INTO audd_call_log '
+                '(fingerprint, called_at, success, artist, title, source, device_id) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (fingerprint, time.time(), 1 if success else 0, artist, title,
+                 source, device_id),
             )
             conn.commit()
         finally:
@@ -1831,17 +1853,44 @@ class AnalysisDB:
         finally:
             conn.close()
 
-    def count_audd_calls_today(self) -> int:
-        """Cuenta llamadas AudD del dia UTC actual."""
-        today_start = datetime.now(timezone.utc).replace(
+    @staticmethod
+    def _utc_today_start() -> float:
+        return datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp()
+
+    def count_audd_calls_today(self) -> int:
+        """Cuenta llamadas AudD del auto-trigger de /analyze del dia UTC (para
+        AUDD_DAILY_CAP). EXCLUYE Escuchar (/recognize) e /identify, que tienen su
+        propia contabilidad — antes contaban todas juntas y una racha de Escuchar
+        podia agotar el cap de /analyze. Filas legacy (source NULL) = 'analyze'."""
         conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute(
-                'SELECT COUNT(*) AS n FROM audd_call_log WHERE called_at >= ?',
-                (today_start,),
+                "SELECT COUNT(*) AS n FROM audd_call_log "
+                "WHERE called_at >= ? AND (source IS NULL OR source = 'analyze')",
+                (self._utc_today_start(),),
+            )
+            row = c.fetchone()
+            return row['n'] if row else 0
+        finally:
+            conn.close()
+
+    def count_recognitions_today(self, device_id: str) -> int:
+        """Llamadas AudD de Escuchar (/recognize) hechas HOY (UTC) por este
+        device_id. Base del cap por dispositivo (free vs Pro). Sin device_id
+        devuelve 0 (no capamos lo que no podemos atribuir; el rate-limit por IP
+        cubre el anonimato)."""
+        if not device_id:
+            return 0
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COUNT(*) AS n FROM audd_call_log "
+                "WHERE called_at >= ? AND source = 'recognize' AND device_id = ?",
+                (self._utc_today_start(), device_id),
             )
             row = c.fetchone()
             return row['n'] if row else 0
