@@ -919,11 +919,18 @@ async def telemetry(request: Request):
     audd_success = 0
     audd_last_7d = 0
     audd_last_30d = 0
+    audd_by_source_30d = {}   # {'analyze': n, 'recognize': n, 'identify': n}
+    recognize_sessions_30d = 0
+    # Filtro comun: 'recognize_session' es un MARCADOR de sesion (uso de la
+    # feature Escuchar), NO una llamada AudD -> se EXCLUYE de los contadores de
+    # llamadas para no inflar el coste. Filas legacy (source NULL) = 'analyze'.
+    NOT_SESSION = "(source IS NULL OR source != 'recognize_session')"
     if os.path.exists(analysis_db_path):
         adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
         try:
             r = adb.execute(
-                "SELECT COUNT(*), COALESCE(SUM(success),0) FROM audd_call_log"
+                f"SELECT COUNT(*), COALESCE(SUM(success),0) FROM audd_call_log "
+                f"WHERE {NOT_SESSION}"
             ).fetchone()
             if r:
                 audd_total, audd_success = int(r[0] or 0), int(r[1] or 0)
@@ -934,15 +941,33 @@ async def telemetry(request: Request):
             import time as _time
             now_ts = _time.time()
             r7 = adb.execute(
-                "SELECT COUNT(*) FROM audd_call_log WHERE called_at >= ?",
+                f"SELECT COUNT(*) FROM audd_call_log "
+                f"WHERE called_at >= ? AND {NOT_SESSION}",
                 (now_ts - 7 * 86400,),
             ).fetchone()
             audd_last_7d = int(r7[0]) if r7 else 0
             r30 = adb.execute(
-                "SELECT COUNT(*) FROM audd_call_log WHERE called_at >= ?",
+                f"SELECT COUNT(*) FROM audd_call_log "
+                f"WHERE called_at >= ? AND {NOT_SESSION}",
                 (now_ts - 30 * 86400,),
             ).fetchone()
             audd_last_30d = int(r30[0]) if r30 else 0
+            # Desglose por VIA (30d): de donde viene el gasto AudD real. Antes
+            # solo /analyze se logueaba -> el panel infravaloraba Escuchar.
+            for row in adb.execute(
+                f"SELECT COALESCE(source,'analyze') AS s, COUNT(*) "
+                f"FROM audd_call_log WHERE called_at >= ? AND {NOT_SESSION} "
+                f"GROUP BY s",
+                (now_ts - 30 * 86400,),
+            ).fetchall():
+                audd_by_source_30d[row[0]] = int(row[1])
+            # Sesiones de Escuchar (uso de la feature, no llamadas).
+            rs = adb.execute(
+                "SELECT COUNT(*) FROM audd_call_log "
+                "WHERE source = 'recognize_session' AND called_at >= ?",
+                (now_ts - 30 * 86400,),
+            ).fetchone()
+            recognize_sessions_30d = int(rs[0]) if rs else 0
         except sqlite3.OperationalError:
             # Tabla no existe en BDs antiguas — skip silencioso.
             pass
@@ -1055,6 +1080,10 @@ async def telemetry(request: Request):
             "success_rate": round(audd_success_rate, 3),
             "calls_last_7d": audd_last_7d,
             "calls_last_30d": audd_last_30d,
+            # De donde viene el gasto AudD (30d): analyze / recognize / identify.
+            "by_source_30d": audd_by_source_30d,
+            # Uso de Escuchar como feature (sesiones, no llamadas) en 30d.
+            "recognize_sessions_30d": recognize_sessions_30d,
         },
         "coverage": {
             "total_tracks": total_tracks,
