@@ -523,6 +523,15 @@ class AnalysisDB:
         conn.commit()
         conn.close()
 
+        # Retencion: purga las filas viejas de audd_call_log al arrancar. La
+        # tabla crece con cada llamada AudD (sobre todo /recognize); cooldown y
+        # caps solo miran HOY, asi que lo viejo es peso muerto. Best-effort: un
+        # fallo aqui NO debe abortar el arranque de la BD.
+        try:
+            self.prune_audd_call_log()
+        except Exception:
+            pass
+
     def _row_to_dict(self, row) -> Optional[Dict]:
         """Convierte una sqlite3.Row de la tabla `tracks` a dict.
 
@@ -1899,6 +1908,30 @@ class AnalysisDB:
             )
             row = c.fetchone()
             return row['n'] if row else 0
+        finally:
+            conn.close()
+
+    def prune_audd_call_log(self, days: Optional[int] = None) -> int:
+        """Borra filas de audd_call_log mas viejas que `days` (default env
+        AUDD_LOG_RETENTION_DAYS o 90). La tabla crece con CADA llamada AudD
+        (sobre todo /recognize + su marcador de sesion); el cooldown y los caps
+        solo consultan el dia actual, asi que las filas viejas son peso muerto.
+        Se llama al arranque (init_db). Best-effort; devuelve nº de filas
+        borradas. days<=0 desactiva la purga (conservar todo)."""
+        if days is None:
+            try:
+                days = int(os.getenv('AUDD_LOG_RETENTION_DAYS', '90'))
+            except (TypeError, ValueError):
+                days = 90
+        if days <= 0:
+            return 0
+        cutoff = time.time() - days * 86400
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('DELETE FROM audd_call_log WHERE called_at < ?', (cutoff,))
+            conn.commit()
+            return c.rowcount if (c.rowcount and c.rowcount > 0) else 0
         finally:
             conn.close()
 

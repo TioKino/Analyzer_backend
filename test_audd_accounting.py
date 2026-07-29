@@ -98,3 +98,43 @@ def test_recognize_does_not_touch_analyze_cap():
                          source='recognize_session', device_id='devA')
     assert db.count_audd_calls_today() == 0
     assert db.count_recognition_sessions_today('devA') == 50
+
+
+# ── Retencion: prune_audd_call_log ──────────────────────────────────
+
+def test_prune_deletes_old_keeps_recent():
+    import time as _t
+    db = _db()
+    conn = db._open_conn()
+    now = _t.time()
+    # 2 viejas (100 dias) + 2 recientes (1 dia).
+    for age_days in (100, 100, 1, 1):
+        conn.execute(
+            'INSERT INTO audd_call_log (fingerprint, called_at, success, source) '
+            'VALUES (?,?,?,?)',
+            ('x', now - age_days * 86400, 1, 'recognize'))
+    conn.commit()
+    conn.close()
+    deleted = db.prune_audd_call_log(days=90)
+    assert deleted == 2  # solo las 2 viejas
+    # Quedan las 2 recientes.
+    conn = db._open_conn()
+    n = conn.execute('SELECT COUNT(*) FROM audd_call_log').fetchone()[0]
+    conn.close()
+    assert n == 2
+
+
+def test_prune_days_zero_keeps_all():
+    import time as _t
+    db = _db()
+    conn = db._open_conn()
+    conn.execute(
+        'INSERT INTO audd_call_log (fingerprint, called_at, success) VALUES (?,?,?)',
+        ('x', _t.time() - 999 * 86400, 1))
+    conn.commit()
+    conn.close()
+    assert db.prune_audd_call_log(days=0) == 0
+    conn = db._open_conn()
+    n = conn.execute('SELECT COUNT(*) FROM audd_call_log').fetchone()[0]
+    conn.close()
+    assert n == 1
