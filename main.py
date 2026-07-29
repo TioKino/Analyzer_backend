@@ -3833,6 +3833,7 @@ async def recognize_audio(
         # sin match) -> 1 llamada en vez de 3.
         strategies = ["normalize", "aggressive", "raw_wav"]
         track_data = None
+        audio_processed = False  # ¿AudD llego a fingerprintear algun intento?
 
         for i, strategy in enumerate(strategies):
             processed_path = tmp_path.replace('.m4a', f'_processed_{strategy}.wav')
@@ -3852,6 +3853,7 @@ async def recognize_audio(
                     logger.info(f"  Intentando enviar archivo original sin procesar...")
                     track_data, processed_ok = _audd_and_log(tmp_path)
 
+            audio_processed = audio_processed or processed_ok
             if track_data:
                 logger.info(f"[Recognize] ✓ Éxito en intento {i+1} ({strategy})")
                 break
@@ -3880,8 +3882,28 @@ async def recognize_audio(
             logger.warning(f"[Recognize] log sesion fallo: {_e}")
 
         if not track_data:
-            logger.info("[Recognize] ✗ No identificado tras todos los intentos")
-            return {"status": "not_found", "message": "No se pudo identificar la canción"}
+            # Distinguimos DOS fallos muy distintos para un mensaje honesto y
+            # para que el movil decida si merece la pena reintentar:
+            #   - audio_ok=True : AudD proceso el audio y NO conoce el track
+            #     (no esta en su base). Reintentar es en balde -> el movil deberia
+            #     parar. Mensaje: "no encontrado" (no es culpa del micro).
+            #   - audio_ok=False: AudD no pudo generar huella (ruido/silencio/
+            #     audio muy corto). Reintentar/acercar el micro SI puede ayudar.
+            if audio_processed:
+                logger.info("[Recognize] ✗ audio válido pero sin match (track no en AudD)")
+                return {
+                    "status": "not_found",
+                    "audio_ok": True,
+                    "reason": "no_match",
+                    "message": "No encontramos esta canción en la base de datos.",
+                }
+            logger.info("[Recognize] ✗ audio no procesable (ruido/silencio)")
+            return {
+                "status": "not_found",
+                "audio_ok": False,
+                "reason": "audio_unusable",
+                "message": "No se captó bien el audio. Acerca el micro y evita el ruido.",
+            }
 
         # ── Extraer datos del resultado ──
         artist = track_data.get('artist', 'Unknown Artist')
