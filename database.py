@@ -1877,11 +1877,15 @@ class AnalysisDB:
         finally:
             conn.close()
 
-    def count_recognitions_today(self, device_id: str) -> int:
-        """Llamadas AudD de Escuchar (/recognize) hechas HOY (UTC) por este
-        device_id. Base del cap por dispositivo (free vs Pro). Sin device_id
-        devuelve 0 (no capamos lo que no podemos atribuir; el rate-limit por IP
-        cubre el anonimato)."""
+    def count_recognition_sessions_today(self, device_id: str) -> int:
+        """SESIONES de Escuchar (cada pulsacion de /recognize que llego a AudD)
+        hechas HOY (UTC) por este device_id. Base del cap por dispositivo (free
+        vs Pro). Se cuenta por SESION, no por llamada AudD: una sesion puede
+        gastar hasta 3 llamadas (las 3 estrategias en un fallo), pero para el
+        usuario es UN uso -> capar por llamada haria el cupo gratis tacaño. El
+        coste real se mide aparte con source='recognize' (una fila por llamada).
+        Sin device_id devuelve 0 (no capamos lo que no podemos atribuir; el
+        rate-limit por IP cubre el anonimato)."""
         if not device_id:
             return 0
         conn = self._open_conn()
@@ -1889,7 +1893,8 @@ class AnalysisDB:
             c = conn.cursor()
             c.execute(
                 "SELECT COUNT(*) AS n FROM audd_call_log "
-                "WHERE called_at >= ? AND source = 'recognize' AND device_id = ?",
+                "WHERE called_at >= ? AND source = 'recognize_session' "
+                "AND device_id = ?",
                 (self._utc_today_start(), device_id),
             )
             row = c.fetchone()

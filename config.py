@@ -66,8 +66,11 @@ AUDD_MAX_DURATION: float = float(os.getenv('AUDD_MAX_DURATION', '720'))
 # (/recognize, feature tipo Shazam) va por otra via: es la herramienta estrella,
 # GRATIS como gancho pero con tope para acotar coste/abuso. Dos niveles cableados
 # para el paywall: free (bajo) y Pro (mucho mas amplio; NO ilimitado, protege
-# tambien de abuso Pro). Se cuenta por device_id/dia sobre audd_call_log
-# (source='recognize'). Cuando el paywall este activo, el cliente manda is_pro.
+# tambien de abuso Pro). Se cuenta por SESION (cada pulsacion de Escuchar), no
+# por llamada AudD — una sesion puede gastar hasta 3 llamadas y para el usuario
+# es UN uso. Base: audd_call_log source='recognize_session' por device_id/dia.
+# El coste real se mide aparte (source='recognize', una fila por llamada).
+# Cuando el paywall este activo, el cliente manda is_pro.
 RECOGNIZE_FREE_DAILY_CAP: int = int(os.getenv('RECOGNIZE_FREE_DAILY_CAP', '30'))
 RECOGNIZE_PRO_DAILY_CAP: int = int(os.getenv('RECOGNIZE_PRO_DAILY_CAP', '500'))
 

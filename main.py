@@ -3758,7 +3758,7 @@ async def recognize_audio(
     recognize_cap = RECOGNIZE_PRO_DAILY_CAP if is_pro else RECOGNIZE_FREE_DAILY_CAP
     if device_id:
         try:
-            used_today = db.count_recognitions_today(device_id)
+            used_today = db.count_recognition_sessions_today(device_id)
         except Exception:
             used_today = 0
         if used_today >= recognize_cap:
@@ -3841,6 +3841,21 @@ async def recognize_audio(
                     if track_data:
                         logger.info(f"[Recognize] ✓ Éxito con archivo original")
                         break
+
+        # Marcador de SESION (una pulsacion de Escuchar que llego a AudD), base
+        # del cap por dispositivo. Se registra tanto si identifico como si no
+        # (un fallo tambien cuenta como uso), pero NO cuando salto el cap arriba
+        # (ahi devolvimos antes sin llegar aqui). Independiente del log por
+        # llamada (source='recognize') que mide el coste real.
+        try:
+            db.log_audd_call(
+                fingerprint='recognize_session', success=bool(track_data),
+                artist=(track_data or {}).get('artist'),
+                title=(track_data or {}).get('title'),
+                source='recognize_session', device_id=device_id,
+            )
+        except Exception as _e:
+            logger.warning(f"[Recognize] log sesion fallo: {_e}")
 
         if not track_data:
             logger.info("[Recognize] ✗ No identificado tras todos los intentos")
