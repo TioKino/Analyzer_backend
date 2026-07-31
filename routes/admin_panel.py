@@ -1227,6 +1227,22 @@ async def funnel(request: Request):
     }
 
 
+# ── GET /admin/retention ───────────────────────────────────
+# Retencion D1/D7/D28 (mismo criterio que App Store) derivada de los eventos
+# `app_opened`: de los que abrieron por primera vez el dia D0, cuantos volvieron
+# EXACTAMENTE N dias despues. Solo cuentan cohorts con edad suficiente. Es la
+# metrica que dice si las mejoras de onboarding hacen que la gente VUELVA.
+
+@admin_panel_router.get("/retention")
+async def retention(request: Request):
+    await _verify_admin_secret(request)
+    try:
+        cohorts = _get_db().get_retention_cohorts()
+    except Exception:  # noqa: BLE001 - best-effort, tabla vieja / sin datos
+        cohorts = {}
+    return {"cohorts": cohorts}
+
+
 # ── GET /admin/activity ────────────────────────────────────
 # Feed cronologico de actividad reciente (analisis + AudD + errores) para ver
 # "que esta pasando ahora" desde el panel SIN abrir los logs de Render. Solo

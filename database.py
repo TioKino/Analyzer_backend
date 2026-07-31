@@ -2036,6 +2036,64 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def get_retention_cohorts(self) -> dict:
+        """Retencion D1/D7/D28 derivada de los eventos `app_opened` (mismo
+        criterio que App Store: de los que instalaron el dia D0, cuantos
+        volvieron a abrir EXACTAMENTE N dias despues).
+
+        - install_day (D0) = primer `app_opened` del device.
+        - DN retenido = el device tiene un `app_opened` en date(D0, '+N days').
+        - Solo cuentan los cohorts con edad suficiente (>= N dias) para poder
+          medir DN — si no, el ratio saldria artificialmente bajo.
+
+        Devuelve {'d1':{'cohort','retained','rate'}, 'd7':{...}, 'd28':{...}}.
+        `rate` en % (0-100). Best-effort: {} si la tabla no existe."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            out = {}
+            for label, n in (('d1', 1), ('d7', 7), ('d28', 28)):
+                # firsts: primer dia de apertura por device.
+                # eligible: cohorts con D0 <= hoy - N (ya medibles).
+                # retained: device con apertura en D0 + N dias exactos.
+                c.execute(
+                    """
+                    WITH firsts AS (
+                        SELECT device_id, MIN(day) AS d0
+                        FROM events
+                        WHERE event_name = 'app_opened' AND device_id IS NOT NULL
+                        GROUP BY device_id
+                    )
+                    SELECT
+                        COUNT(*) AS cohort,
+                        COALESCE(SUM(
+                            CASE WHEN EXISTS (
+                                SELECT 1 FROM events e
+                                WHERE e.device_id = f.device_id
+                                  AND e.event_name = 'app_opened'
+                                  AND e.day = date(f.d0, ?)
+                            ) THEN 1 ELSE 0 END
+                        ), 0) AS retained
+                    FROM firsts f
+                    WHERE f.d0 <= date('now', ?)
+                    """,
+                    (f'+{n} days', f'-{n} days'),
+                )
+                row = c.fetchone()
+                cohort = int(row['cohort'] or 0) if row else 0
+                retained = int(row['retained'] or 0) if row else 0
+                rate = round(100.0 * retained / cohort, 1) if cohort else 0.0
+                out[label] = {
+                    'cohort': cohort,
+                    'retained': retained,
+                    'rate': rate,
+                }
+            return out
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     # ─────────────── analysis_errors helpers ───────────────
 
     def log_analysis_error(

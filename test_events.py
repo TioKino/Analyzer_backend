@@ -114,3 +114,65 @@ class TestPurge:
 class TestEmptyFunnel:
     def test_no_events_returns_empty(self, db):
         assert db.get_funnel_counts(days=30) == {}
+
+
+def _open(db, device, days_ago):
+    """Inserta un app_opened para `device` hace `days_ago` dias."""
+    conn = db._open_conn()
+    try:
+        conn.execute(
+            "INSERT INTO events (timestamp, device_id, event_name) "
+            "VALUES (datetime('now', ?), ?, 'app_opened')",
+            (f'-{days_ago} days', device),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestRetention:
+    def test_d1_d7_d28_basic(self, db):
+        # ret_a: vuelve en D0+1, D0+7 y D0+28 -> retenido en los tres.
+        _open(db, 'ret_a', 30)   # D0
+        _open(db, 'ret_a', 29)   # D0+1
+        _open(db, 'ret_a', 23)   # D0+7
+        _open(db, 'ret_a', 2)    # D0+28
+        # ret_b: solo el dia de install -> nunca vuelve.
+        _open(db, 'ret_b', 30)
+        # ret_c: instalo HOY -> aun no medible (excluido de todos los cohorts).
+        _open(db, 'ret_c', 0)
+
+        r = db.get_retention_cohorts()
+        # c excluido por edad; cohort = {a, b} = 2 en los tres.
+        assert r['d1']['cohort'] == 2
+        assert r['d1']['retained'] == 1  # solo a
+        assert r['d1']['rate'] == 50.0
+        assert r['d7']['cohort'] == 2
+        assert r['d7']['retained'] == 1
+        assert r['d28']['cohort'] == 2
+        assert r['d28']['retained'] == 1
+
+    def test_recent_cohort_excluded_until_measurable(self, db):
+        # Device que instalo hace 3 dias: medible para D1 (>=1d) pero NO para
+        # D7/D28 (aun no han pasado 7/28 dias).
+        _open(db, 'young', 3)   # D0
+        _open(db, 'young', 2)   # D0+1 -> D1 retenido
+        r = db.get_retention_cohorts()
+        assert r['d1']['cohort'] == 1
+        assert r['d1']['retained'] == 1
+        # No elegible aun para D7/D28.
+        assert r['d7']['cohort'] == 0
+        assert r['d28']['cohort'] == 0
+
+    def test_no_return_is_zero_rate(self, db):
+        _open(db, 'solo', 10)  # instalo, nunca volvio
+        r = db.get_retention_cohorts()
+        assert r['d1']['cohort'] == 1
+        assert r['d1']['retained'] == 0
+        assert r['d1']['rate'] == 0.0
+
+    def test_empty_events_zero_cohorts(self, db):
+        r = db.get_retention_cohorts()
+        assert r['d1'] == {'cohort': 0, 'retained': 0, 'rate': 0.0}
+        assert r['d7']['cohort'] == 0
+        assert r['d28']['cohort'] == 0
