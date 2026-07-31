@@ -975,6 +975,14 @@ async def telemetry(request: Request):
             adb.close()
     audd_success_rate = (audd_success / audd_total) if audd_total else 0.0
 
+    # Desglose success/fail POR VIA (30d): para ver DONDE se concentran los
+    # 'fallos' de AudD, que en su mayoria son 'sin match' (normal en musica
+    # underground), no errores. Helper testeable en AnalysisDB.
+    try:
+        audd_by_source_stats_30d = _get_db().get_audd_stats_by_source(days=30)
+    except Exception:  # noqa: BLE001 - best-effort
+        audd_by_source_stats_30d = {}
+
     # 2) Cobertura preview + artwork sobre el total de tracks sync.
     conn = _get_sync_conn()
     try:
@@ -1082,6 +1090,9 @@ async def telemetry(request: Request):
             "calls_last_30d": audd_last_30d,
             # De donde viene el gasto AudD (30d): analyze / recognize / identify.
             "by_source_30d": audd_by_source_30d,
+            # Success/fail por via (30d): {source: {total, success, fail}}. La
+            # mayoria de 'fail' = AudD sin match (normal), NO errores.
+            "by_source_stats_30d": audd_by_source_stats_30d,
             # Uso de Escuchar como feature (sesiones, no llamadas) en 30d.
             "recognize_sessions_30d": recognize_sessions_30d,
         },

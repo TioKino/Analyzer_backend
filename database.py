@@ -1908,6 +1908,41 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def get_audd_stats_by_source(self, *, days: int = 30) -> dict:
+        """Por VIA (analyze/recognize/identify), cuantas llamadas AudD y cuantas
+        con MATCH (success) en los ultimos `days`. Excluye el marcador de sesion
+        (recognize_session, que no es una llamada). Sirve para ver DONDE se
+        concentran los 'fallos' — que en su mayoria son 'AudD sin match' (normal
+        en musica underground, no un error). Devuelve
+        {source: {'total','success','fail'}}. Best-effort: {} si no hay tabla."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            cutoff = time.time() - int(days) * 86400
+            c.execute(
+                "SELECT COALESCE(source,'analyze') AS s, COUNT(*) AS total, "
+                "COALESCE(SUM(success),0) AS ok "
+                "FROM audd_call_log "
+                "WHERE called_at >= ? "
+                "AND (source IS NULL OR source != 'recognize_session') "
+                "GROUP BY s",
+                (cutoff,),
+            )
+            out = {}
+            for r in c.fetchall():
+                total = int(r['total'] or 0)
+                ok = int(r['ok'] or 0)
+                out[r['s']] = {
+                    'total': total,
+                    'success': ok,
+                    'fail': total - ok,
+                }
+            return out
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def count_recognition_sessions_today(self, device_id: str) -> int:
         """SESIONES de Escuchar (cada pulsacion de /recognize que llego a AudD)
         hechas HOY (UTC) por este device_id. Base del cap por dispositivo (free
