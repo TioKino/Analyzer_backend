@@ -1161,6 +1161,72 @@ async def telemetry(request: Request):
     }
 
 
+# ── GET /admin/funnel ──────────────────────────────────────
+# Embudo de onboarding/retencion: cuantos DISPOSITIVOS UNICOS llegaron a cada
+# paso en los ultimos 30d, para ver DONDE se cae el usuario. Lee la tabla
+# `events` (poblada por /client-event). Privacy-first: solo cuenta device_id
+# distintos, nunca devuelve props ni ids.
+
+# Orden canonico del embudo de adquisicion. Los eventos que existan se pintan;
+# los que falten salen a 0 (aun no instrumentados / nadie llego).
+_FUNNEL_STEPS = [
+    ("app_opened", "Abrio la app"),
+    ("onboarding_completed", "Completo onboarding"),
+    ("import_started", "Empezo a importar"),
+    ("import_completed", "Importo musica"),
+    ("first_track_viewed", "Vio su 1er track"),
+]
+
+
+@admin_panel_router.get("/funnel")
+async def funnel(request: Request):
+    await _verify_admin_secret(request)
+    analysis_db_path = os.environ.get(
+        "DATABASE_PATH",
+        os.environ.get("ANALYSIS_DB_PATH", "analysis.db"),
+    )
+    counts = {}
+    if os.path.exists(analysis_db_path):
+        adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        try:
+            rows = adb.execute(
+                "SELECT event_name, COUNT(DISTINCT device_id) AS devices "
+                "FROM events WHERE timestamp >= datetime('now','-30 days') "
+                "GROUP BY event_name"
+            ).fetchall()
+            counts = {r[0]: int(r[1] or 0) for r in rows}
+        except sqlite3.OperationalError:
+            counts = {}  # tabla events aun no existe (BD vieja)
+        finally:
+            adb.close()
+
+    # Construir el embudo ordenado con drop-off relativo al primer paso.
+    top = counts.get(_FUNNEL_STEPS[0][0], 0) or 0
+    steps = []
+    prev = None
+    for name, label in _FUNNEL_STEPS:
+        devices = counts.get(name, 0)
+        pct_of_top = round(100.0 * devices / top, 1) if top else 0.0
+        drop_from_prev = (
+            round(100.0 * (prev - devices) / prev, 1)
+            if prev not in (None, 0) else 0.0
+        )
+        steps.append({
+            "event": name,
+            "label": label,
+            "devices": devices,
+            "pct_of_top": pct_of_top,       # % que llega respecto a los que abrieron
+            "drop_from_prev": drop_from_prev,  # % que se cae desde el paso anterior
+        })
+        prev = devices
+
+    return {
+        "window_days": 30,
+        "steps": steps,
+        "raw": counts,  # todos los eventos (incluye los no-embudo: session_start, etc.)
+    }
+
+
 # ── GET /admin/activity ────────────────────────────────────
 # Feed cronologico de actividad reciente (analisis + AudD + errores) para ver
 # "que esta pasando ahora" desde el panel SIN abrir los logs de Render. Solo
