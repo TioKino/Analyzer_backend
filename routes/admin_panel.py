@@ -1189,21 +1189,43 @@ _FUNNEL_STEPS = [
 ]
 
 
+# Grupos de plataforma: la mayoria de DJs tienen la musica en PC/discos, no en
+# el movil -> el embudo de 'desktop' es el que mide valor real. `?platform=`
+# acepta un grupo (desktop/mobile) o una plataforma concreta (macos/windows/...).
+_PLATFORM_GROUPS = {
+    "desktop": ("macos", "windows", "linux"),
+    "mobile": ("ios", "android"),
+}
+
+
+def _platform_filter(platform):
+    """Devuelve (sql_extra, params) para filtrar events por plataforma. `platform`
+    puede ser None (todas), un grupo ('desktop'/'mobile') o un valor concreto."""
+    if not platform:
+        return "", []
+    values = _PLATFORM_GROUPS.get(platform.lower(), (platform.lower(),))
+    placeholders = ",".join("?" for _ in values)
+    return f" AND LOWER(platform) IN ({placeholders})", list(values)
+
+
 @admin_panel_router.get("/funnel")
-async def funnel(request: Request):
+async def funnel(request: Request, platform: str = None):
     await _verify_admin_secret(request)
     analysis_db_path = os.environ.get(
         "DATABASE_PATH",
         os.environ.get("ANALYSIS_DB_PATH", "analysis.db"),
     )
+    plat_sql, plat_params = _platform_filter(platform)
     counts = {}
     if os.path.exists(analysis_db_path):
         adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
         try:
             rows = adb.execute(
                 "SELECT event_name, COUNT(DISTINCT device_id) AS devices "
-                "FROM events WHERE timestamp >= datetime('now','-30 days') "
-                "GROUP BY event_name"
+                "FROM events WHERE timestamp >= datetime('now','-30 days')"
+                + plat_sql +
+                " GROUP BY event_name",
+                plat_params,
             ).fetchall()
             counts = {r[0]: int(r[1] or 0) for r in rows}
         except sqlite3.OperationalError:
@@ -1233,6 +1255,7 @@ async def funnel(request: Request):
 
     return {
         "window_days": 30,
+        "platform": platform or "all",  # que subconjunto se esta mirando
         "steps": steps,
         "raw": counts,  # todos los eventos (incluye los no-embudo: session_start, etc.)
     }
