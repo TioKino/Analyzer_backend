@@ -288,3 +288,27 @@ def test_find_acoustic_cluster_none_when_absent(db):
 def test_find_acoustic_cluster_empty_input(db):
     assert db.find_acoustic_cluster(None) is None
     assert db.find_acoustic_cluster([]) is None
+
+
+# ── backfill_track_fingerprint (backfill ligero del owner) ──────────────
+def test_backfill_writes_chromaprint_and_cluster_to_existing(db):
+    # Track ya analizado SIN huella (pre-fpcalc).
+    db.save_track({
+        'id': 'bf1', 'filename': 'bf1.mp3', 'artist': 'A', 'title': 'T',
+        'bpm': 128.0, 'duration': 300.0, 'fingerprint': 'bf1',
+        'energy_dj': 5, 'genre': 'Techno', 'track_type': 'peak',
+    })
+    ok = db.backfill_track_fingerprint('bf1', 'CHROMA_B64', 'aid_xyz')
+    assert ok is True
+    row = db.get_track_by_fingerprint('bf1')
+    assert row['chromaprint'] == 'CHROMA_B64'
+    assert row['acoustic_id'] == 'aid_xyz'
+
+
+def test_backfill_no_track_returns_false(db):
+    assert db.backfill_track_fingerprint('nope', 'C', 'aid') is False
+
+
+def test_backfill_empty_args_safe(db):
+    assert db.backfill_track_fingerprint('', 'C', 'aid') is False
+    assert db.backfill_track_fingerprint('fp', '', 'aid') is False

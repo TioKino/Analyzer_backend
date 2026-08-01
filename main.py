@@ -644,8 +644,60 @@ async def report_client_error(payload: ClientErrorPayload, request: Request):
     return JSONResponse(status_code=202, content={"ok": True, "logged": True})
 
 
+class ClientEventPayload(BaseModel):
+    """Evento de producto (embudo onboarding/retencion). NO es un error.
+
+    `props` es un dict pequeno con metadatos del evento (ej. {"count": 42} en
+    import_completed). Privacy-first: sin PII, solo device_id anonimo."""
+    event_name: str  # "app_opened", "onboarding_completed", "import_completed", ...
+    props: Optional[dict] = None
+    platform: Optional[str] = None
+    app_version: Optional[str] = None
+
+
+@app.post("/client-event")
+async def report_client_event(payload: ClientEventPayload, request: Request):
+    """Recibe un evento de uso del cliente y lo persiste en `events`.
+
+    Espeja /client-error: fire-and-forget (202 siempre que la forma sea valida),
+    device_id via header X-Device-Id, tolerante a fallos de BD. Alimenta el
+    embudo del panel admin (/admin/funnel)."""
+    event_name = (payload.event_name or 'unknown')[:80]
+    platform = (payload.platform or '')[:20] or None
+    app_version = (payload.app_version or '')[:20] or None
+    props_json = None
+    if payload.props:
+        try:
+            props_json = json.dumps(payload.props, ensure_ascii=False)[:2000]
+        except (TypeError, ValueError):
+            props_json = None
+
+    try:
+        db.log_event(
+            device_id=request.headers.get('X-Device-Id'),
+            event_name=event_name,
+            props=props_json,
+            platform=platform,
+            app_version=app_version,
+        )
+    except Exception as e:
+        logger.warning(f"[ClientEvent] log fallo: {e}")
+        return JSONResponse(status_code=202, content={"ok": False, "logged": False})
+
+    return JSONResponse(status_code=202, content={"ok": True, "logged": True})
+
+
 # Inicializar BD con path de config (no hardcoded)
 db = AnalysisDB(db_path=DATABASE_PATH)
+
+# Purga best-effort de eventos viejos (>90d) para que la tabla `events` del
+# embudo no crezca sin limite. No bloquea el arranque si falla.
+try:
+    _purged = db.purge_old_events(keep_days=90)
+    if _purged:
+        logger.info(f"[Events] purgados {_purged} eventos > 90d al arranque")
+except Exception as _e:  # noqa: BLE001 - best-effort
+    logger.warning(f"[Events] purga al arranque fallo: {_e}")
 
 # Registrar endpoints de community cues (/community-cues, /user-cues).
 # El modulo community_cues_endpoint.py expone register_community_endpoints

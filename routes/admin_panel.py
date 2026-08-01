@@ -975,6 +975,14 @@ async def telemetry(request: Request):
             adb.close()
     audd_success_rate = (audd_success / audd_total) if audd_total else 0.0
 
+    # Desglose success/fail POR VIA (30d): para ver DONDE se concentran los
+    # 'fallos' de AudD, que en su mayoria son 'sin match' (normal en musica
+    # underground), no errores. Helper testeable en AnalysisDB.
+    try:
+        audd_by_source_stats_30d = _get_db().get_audd_stats_by_source(days=30)
+    except Exception:  # noqa: BLE001 - best-effort
+        audd_by_source_stats_30d = {}
+
     # 2) Cobertura preview + artwork sobre el total de tracks sync.
     conn = _get_sync_conn()
     try:
@@ -1082,6 +1090,9 @@ async def telemetry(request: Request):
             "calls_last_30d": audd_last_30d,
             # De donde viene el gasto AudD (30d): analyze / recognize / identify.
             "by_source_30d": audd_by_source_30d,
+            # Success/fail por via (30d): {source: {total, success, fail}}. La
+            # mayoria de 'fail' = AudD sin match (normal), NO errores.
+            "by_source_stats_30d": audd_by_source_stats_30d,
             # Uso de Escuchar como feature (sesiones, no llamadas) en 30d.
             "recognize_sessions_30d": recognize_sessions_30d,
         },
@@ -1159,6 +1170,88 @@ async def telemetry(request: Request):
         # tienen ALGUNA fuente de artwork".
         "artwork_real": artwork_coverage_real,
     }
+
+
+# ── GET /admin/funnel ──────────────────────────────────────
+# Embudo de onboarding/retencion: cuantos DISPOSITIVOS UNICOS llegaron a cada
+# paso en los ultimos 30d, para ver DONDE se cae el usuario. Lee la tabla
+# `events` (poblada por /client-event). Privacy-first: solo cuenta device_id
+# distintos, nunca devuelve props ni ids.
+
+# Orden canonico del embudo de adquisicion. Los eventos que existan se pintan;
+# los que falten salen a 0 (aun no instrumentados / nadie llego).
+_FUNNEL_STEPS = [
+    ("app_opened", "Abrio la app"),
+    ("onboarding_completed", "Completo onboarding"),
+    ("import_started", "Empezo a importar"),
+    ("import_completed", "Importo musica"),
+    ("first_track_viewed", "Vio su 1er track"),
+]
+
+
+@admin_panel_router.get("/funnel")
+async def funnel(request: Request):
+    await _verify_admin_secret(request)
+    analysis_db_path = os.environ.get(
+        "DATABASE_PATH",
+        os.environ.get("ANALYSIS_DB_PATH", "analysis.db"),
+    )
+    counts = {}
+    if os.path.exists(analysis_db_path):
+        adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+        try:
+            rows = adb.execute(
+                "SELECT event_name, COUNT(DISTINCT device_id) AS devices "
+                "FROM events WHERE timestamp >= datetime('now','-30 days') "
+                "GROUP BY event_name"
+            ).fetchall()
+            counts = {r[0]: int(r[1] or 0) for r in rows}
+        except sqlite3.OperationalError:
+            counts = {}  # tabla events aun no existe (BD vieja)
+        finally:
+            adb.close()
+
+    # Construir el embudo ordenado con drop-off relativo al primer paso.
+    top = counts.get(_FUNNEL_STEPS[0][0], 0) or 0
+    steps = []
+    prev = None
+    for name, label in _FUNNEL_STEPS:
+        devices = counts.get(name, 0)
+        pct_of_top = round(100.0 * devices / top, 1) if top else 0.0
+        drop_from_prev = (
+            round(100.0 * (prev - devices) / prev, 1)
+            if prev not in (None, 0) else 0.0
+        )
+        steps.append({
+            "event": name,
+            "label": label,
+            "devices": devices,
+            "pct_of_top": pct_of_top,       # % que llega respecto a los que abrieron
+            "drop_from_prev": drop_from_prev,  # % que se cae desde el paso anterior
+        })
+        prev = devices
+
+    return {
+        "window_days": 30,
+        "steps": steps,
+        "raw": counts,  # todos los eventos (incluye los no-embudo: session_start, etc.)
+    }
+
+
+# ── GET /admin/retention ───────────────────────────────────
+# Retencion D1/D7/D28 (mismo criterio que App Store) derivada de los eventos
+# `app_opened`: de los que abrieron por primera vez el dia D0, cuantos volvieron
+# EXACTAMENTE N dias despues. Solo cuentan cohorts con edad suficiente. Es la
+# metrica que dice si las mejoras de onboarding hacen que la gente VUELVA.
+
+@admin_panel_router.get("/retention")
+async def retention(request: Request):
+    await _verify_admin_secret(request)
+    try:
+        cohorts = _get_db().get_retention_cohorts()
+    except Exception:  # noqa: BLE001 - best-effort, tabla vieja / sin datos
+        cohorts = {}
+    return {"cohorts": cohorts}
 
 
 # ── GET /admin/activity ────────────────────────────────────

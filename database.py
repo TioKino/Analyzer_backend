@@ -496,6 +496,28 @@ class AnalysisDB:
         conn.execute('CREATE INDEX IF NOT EXISTS idx_aerr_device ON analysis_errors(device_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_aerr_class ON analysis_errors(error_class)')
 
+        # Eventos de producto (embudo de onboarding/retencion). Privacy-first:
+        # solo device_id (anonimo) + nombre de evento + props minimas (JSON,
+        # sin PII). Alimenta /admin/funnel para ver DONDE se cae el usuario
+        # (abrio -> onboarding -> import -> primer track -> volvio). No confundir
+        # con analysis_errors (eso son errores; esto es telemetria de uso).
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                device_id TEXT,
+                event_name TEXT NOT NULL,
+                props TEXT,
+                platform TEXT,
+                app_version TEXT,
+                day TEXT GENERATED ALWAYS AS (substr(timestamp,1,10)) VIRTUAL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_events_name ON events(event_name)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_events_name_day ON events(event_name, day)')
+
         # Engine source: que motor analizo este track (render | local_engine).
         # Permite calcular ratios desde el panel admin. ALTER TABLE idempotente
         # para no romper BDs antiguas. Default NULL = origen desconocido
@@ -1886,6 +1908,41 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def get_audd_stats_by_source(self, *, days: int = 30) -> dict:
+        """Por VIA (analyze/recognize/identify), cuantas llamadas AudD y cuantas
+        con MATCH (success) en los ultimos `days`. Excluye el marcador de sesion
+        (recognize_session, que no es una llamada). Sirve para ver DONDE se
+        concentran los 'fallos' — que en su mayoria son 'AudD sin match' (normal
+        en musica underground, no un error). Devuelve
+        {source: {'total','success','fail'}}. Best-effort: {} si no hay tabla."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            cutoff = time.time() - int(days) * 86400
+            c.execute(
+                "SELECT COALESCE(source,'analyze') AS s, COUNT(*) AS total, "
+                "COALESCE(SUM(success),0) AS ok "
+                "FROM audd_call_log "
+                "WHERE called_at >= ? "
+                "AND (source IS NULL OR source != 'recognize_session') "
+                "GROUP BY s",
+                (cutoff,),
+            )
+            out = {}
+            for r in c.fetchall():
+                total = int(r['total'] or 0)
+                ok = int(r['ok'] or 0)
+                out[r['s']] = {
+                    'total': total,
+                    'success': ok,
+                    'fail': total - ok,
+                }
+            return out
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def count_recognition_sessions_today(self, device_id: str) -> int:
         """SESIONES de Escuchar (cada pulsacion de /recognize que llego a AudD)
         hechas HOY (UTC) por este device_id. Base del cap por dispositivo (free
@@ -1932,6 +1989,143 @@ class AnalysisDB:
             c.execute('DELETE FROM audd_call_log WHERE called_at < ?', (cutoff,))
             conn.commit()
             return c.rowcount if (c.rowcount and c.rowcount > 0) else 0
+        finally:
+            conn.close()
+
+    # ─────────────── events (embudo de producto) helpers ───────────────
+
+    def log_event(
+        self,
+        *,
+        device_id: Optional[str],
+        event_name: str,
+        props: Optional[str] = None,
+        platform: Optional[str] = None,
+        app_version: Optional[str] = None,
+    ) -> int:
+        """Registra un evento de producto (embudo onboarding/retencion).
+
+        `props` es un string JSON ya serializado (o None). Best-effort: si la
+        tabla no existe en una BD muy antigua, devuelve 0 sin lanzar."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'INSERT INTO events '
+                '(device_id, event_name, props, platform, app_version) '
+                'VALUES (?,?,?,?,?)',
+                (
+                    device_id,
+                    (event_name or 'unknown')[:80],
+                    (props or None) and props[:2000],
+                    (platform or None) and platform[:20],
+                    (app_version or None) and app_version[:20],
+                ),
+            )
+            conn.commit()
+            return c.lastrowid or 0
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def get_funnel_counts(self, *, days: int = 30) -> dict:
+        """Devuelve, para los ultimos `days` dias, cuantos DISPOSITIVOS UNICOS
+        dispararon cada evento del embudo. Distinct por device_id → mide
+        personas, no repeticiones. La UI calcula el drop-off entre pasos."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT event_name, COUNT(DISTINCT device_id) AS devices, "
+                "       COUNT(*) AS total "
+                "FROM events "
+                "WHERE timestamp >= datetime('now', ?) "
+                "GROUP BY event_name",
+                (f'-{int(days)} days',),
+            )
+            rows = c.fetchall()
+            return {
+                r['event_name']: {'devices': r['devices'], 'total': r['total']}
+                for r in rows
+            }
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
+    def purge_old_events(self, *, keep_days: int = 90) -> int:
+        """Borra eventos mas viejos de `keep_days`. Llamar al arranque para
+        que la tabla no crezca sin limite. Devuelve filas borradas."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                "DELETE FROM events WHERE timestamp < datetime('now', ?)",
+                (f'-{int(keep_days)} days',),
+            )
+            conn.commit()
+            return c.rowcount or 0
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def get_retention_cohorts(self) -> dict:
+        """Retencion D1/D7/D28 derivada de los eventos `app_opened` (mismo
+        criterio que App Store: de los que instalaron el dia D0, cuantos
+        volvieron a abrir EXACTAMENTE N dias despues).
+
+        - install_day (D0) = primer `app_opened` del device.
+        - DN retenido = el device tiene un `app_opened` en date(D0, '+N days').
+        - Solo cuentan los cohorts con edad suficiente (>= N dias) para poder
+          medir DN — si no, el ratio saldria artificialmente bajo.
+
+        Devuelve {'d1':{'cohort','retained','rate'}, 'd7':{...}, 'd28':{...}}.
+        `rate` en % (0-100). Best-effort: {} si la tabla no existe."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            out = {}
+            for label, n in (('d1', 1), ('d7', 7), ('d28', 28)):
+                # firsts: primer dia de apertura por device.
+                # eligible: cohorts con D0 <= hoy - N (ya medibles).
+                # retained: device con apertura en D0 + N dias exactos.
+                c.execute(
+                    """
+                    WITH firsts AS (
+                        SELECT device_id, MIN(day) AS d0
+                        FROM events
+                        WHERE event_name = 'app_opened' AND device_id IS NOT NULL
+                        GROUP BY device_id
+                    )
+                    SELECT
+                        COUNT(*) AS cohort,
+                        COALESCE(SUM(
+                            CASE WHEN EXISTS (
+                                SELECT 1 FROM events e
+                                WHERE e.device_id = f.device_id
+                                  AND e.event_name = 'app_opened'
+                                  AND e.day = date(f.d0, ?)
+                            ) THEN 1 ELSE 0 END
+                        ), 0) AS retained
+                    FROM firsts f
+                    WHERE f.d0 <= date('now', ?)
+                    """,
+                    (f'+{n} days', f'-{n} days'),
+                )
+                row = c.fetchone()
+                cohort = int(row['cohort'] or 0) if row else 0
+                retained = int(row['retained'] or 0) if row else 0
+                rate = round(100.0 * retained / cohort, 1) if cohort else 0.0
+                out[label] = {
+                    'cohort': cohort,
+                    'retained': retained,
+                    'rate': rate,
+                }
+            return out
+        except sqlite3.OperationalError:
+            return {}
         finally:
             conn.close()
 
