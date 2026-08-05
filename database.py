@@ -2072,12 +2072,17 @@ class AnalysisDB:
             conn.close()
 
     def get_retention_cohorts(self) -> dict:
-        """Retencion D1/D7/D28 derivada de los eventos `app_opened` (mismo
+        """Retencion D1/D7/D28 derivada de los eventos de apertura (mismo
         criterio que App Store: de los que instalaron el dia D0, cuantos
         volvieron a abrir EXACTAMENTE N dias despues).
 
-        - install_day (D0) = primer `app_opened` del device.
-        - DN retenido = el device tiene un `app_opened` en date(D0, '+N days').
+        - install_day (D0) = primer `app_opened` del device (arranque en frio =
+          mejor proxy de "instalo").
+        - DN retenido = el device tiene un `app_opened` O `session_start` en
+          date(D0, '+N days'). Se incluye `session_start` porque capta tambien
+          los foreground desde background (dia activo sin arranque en frio), que
+          `app_opened` (solo cold start) se perderia. Retrocompatible: datos
+          viejos con solo `app_opened` cuentan igual.
         - Solo cuentan los cohorts con edad suficiente (>= N dias) para poder
           medir DN — si no, el ratio saldria artificialmente bajo.
 
@@ -2105,7 +2110,7 @@ class AnalysisDB:
                             CASE WHEN EXISTS (
                                 SELECT 1 FROM events e
                                 WHERE e.device_id = f.device_id
-                                  AND e.event_name = 'app_opened'
+                                  AND e.event_name IN ('app_opened', 'session_start')
                                   AND e.day = date(f.d0, ?)
                             ) THEN 1 ELSE 0 END
                         ), 0) AS retained

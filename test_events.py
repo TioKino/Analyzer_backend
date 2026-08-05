@@ -176,3 +176,24 @@ class TestRetention:
         assert r['d1'] == {'cohort': 0, 'retained': 0, 'rate': 0.0}
         assert r['d7']['cohort'] == 0
         assert r['d28']['cohort'] == 0
+
+    def test_session_start_cuenta_como_dia_activo(self, db):
+        # El device instala (app_opened D0) y al dia siguiente NO hace cold start
+        # pero sí trae la app a primer plano -> session_start en D0+1. Debe
+        # contar como retenido D1 (antes se perdia porque solo miraba app_opened).
+        conn = db._open_conn()
+        try:
+            conn.execute(
+                "INSERT INTO events (timestamp, device_id, event_name) "
+                "VALUES (datetime('now','-10 days'), 'warm', 'app_opened')",
+            )
+            conn.execute(
+                "INSERT INTO events (timestamp, device_id, event_name) "
+                "VALUES (datetime('now','-9 days'), 'warm', 'session_start')",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        r = db.get_retention_cohorts()
+        assert r['d1']['cohort'] == 1
+        assert r['d1']['retained'] == 1  # retenido gracias a session_start
