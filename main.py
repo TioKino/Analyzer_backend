@@ -448,7 +448,7 @@ def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset
 
 # ==================== APP ====================
 
-app = FastAPI(title="DJ Analyzer Pro API", version="2.9.6", default_response_class=SafeJSONResponse)
+app = FastAPI(title="DJ Analyzer Pro API", version="2.9.7", default_response_class=SafeJSONResponse)
 _startup_time = time.time()
 app.include_router(sync_router)
 app.include_router(admin_panel_router)
@@ -4404,7 +4404,7 @@ if SIMILAR_TRACKS_ENABLED:
 async def root():
     return {
         "name": "DJ Analyzer Pro API",
-        "version": "2.9.6",
+        "version": "2.9.7",
         "status": "running",
         "modules": {
             "artwork": ARTWORK_ENABLED,
@@ -4498,7 +4498,7 @@ async def health():
 
     return {
         "status": "ok",
-        "version": "2.9.6",
+        "version": "2.9.7",
         "uptime_seconds": uptime_seconds,
         "checks": {
             "database": db_status,
