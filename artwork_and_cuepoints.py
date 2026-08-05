@@ -291,7 +291,11 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
         
         # M4A/MP4/AAC
         elif isinstance(audio, MP4) or file_path.lower().endswith(('.m4a', '.mp4', '.aac')):
-            if 'covr' in audio.tags:
+            # audio.tags puede ser None en un MP4 truncado/incompleto (descarga
+            # de nube a medias): mutagen lo reconoce como MP4 pero sin atomos de
+            # metadata. `'covr' in None` reventaria con TypeError → aqui se
+            # guarda antes de indexar.
+            if audio.tags and 'covr' in audio.tags:
                 covers = audio.tags['covr']
                 if covers:
                     artwork_data = bytes(covers[0])
@@ -320,6 +324,13 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
         return None
     except (FileNotFoundError, IOError, OSError) as e:
         logger.error(f"Error extrayendo artwork: {e}")
+        return None
+    except Exception as e:
+        # Extraer artwork es AUXILIAR: un contenedor corrupto/truncado del
+        # cliente (mutagen MP4MetadataError, TypeError sobre tags None, etc.)
+        # NO debe tumbar el analisis ni ensuciar la telemetria de errores del
+        # backend. Best-effort: warning y seguimos sin artwork.
+        logger.warning(f"Artwork ilegible (fichero corrupto?): {type(e).__name__}: {e}")
         return None
 
 
@@ -395,11 +406,13 @@ def extract_id3_metadata(file_path: str) -> Dict:
                 if 'TSRC' in tags:
                     metadata['isrc'] = str(tags['TSRC'])
                     
-            except (FileNotFoundError, IOError, OSError, ValueError, KeyError) as e:
+            except Exception as e:
                 # Warning, no error: muchos MP3s validos no tienen tag ID3
-                # (ej. exportados sin metadata). El flujo principal cae a
-                # parse_filename y sigue analizando sin problema.
-                logger.warning(f"Sin ID3 valido: {e}")
+                # (ej. exportados sin metadata), y un ID3 corrupto/truncado del
+                # cliente (ID3NoHeaderError y otros MutagenError NO son subclase
+                # de IOError/ValueError) tampoco debe tumbar el analisis. El
+                # flujo principal cae a parse_filename y sigue sin problema.
+                logger.warning(f"Sin ID3 valido: {type(e).__name__}: {e}")
         
         elif file_path.lower().endswith('.flac'):
             try:
@@ -418,8 +431,10 @@ def extract_id3_metadata(file_path: str) -> Dict:
                     metadata['genre'] = audio['genre'][0]
                 if 'bpm' in audio:
                     metadata['bpm'] = float(audio['bpm'][0])
-            except (FileNotFoundError, IOError, OSError, ValueError, KeyError) as e:
-                logger.error(f"Error leyendo FLAC: {e}")
+            except Exception as e:
+                # Best-effort: un FLAC corrupto/truncado (mutagen FLACError y
+                # otros MutagenError no son IOError) no debe tumbar el analisis.
+                logger.warning(f"Error leyendo FLAC: {type(e).__name__}: {e}")
         
         elif file_path.lower().endswith(('.m4a', '.mp4')):
             try:
@@ -436,8 +451,13 @@ def extract_id3_metadata(file_path: str) -> Dict:
                     metadata['genre'] = audio['\xa9gen'][0]
                 if 'tmpo' in audio:
                     metadata['bpm'] = float(audio['tmpo'][0])
-            except (FileNotFoundError, IOError, OSError, ValueError, KeyError) as e:
-                logger.error(f"Error leyendo M4A: {e}")
+            except Exception as e:
+                # Best-effort: un M4A/MP4 truncado del cliente (descarga de nube
+                # incompleta) lanza MP4MetadataError / MP4StreamInfoError
+                # ("not a MP4 file", "moov not found"), que NO son subclase de
+                # IOError/ValueError → escapaban y ensuciaban la telemetria de
+                # errores del backend. Warning y seguimos con parse_filename.
+                logger.warning(f"Error leyendo M4A: {type(e).__name__}: {e}")
     
     except ImportError:
         logger.warning("mutagen no instalado. Ejecuta: pip install mutagen")
