@@ -267,11 +267,18 @@ def enrich_with_audd_if_needed(
     daily_cap: int = 50,
     cooldown_days: int = 7,
     force: bool = False,
+    device_id: Optional[str] = None,
 ) -> Optional[Dict]:
     """Si el trigger lo permite, llama a AudD y devuelve track_data crudo.
 
     Tambien registra cada intento (exito o fallo) en la BD para honrar el
     cooldown y el daily cap.
+
+    `device_id` (groundwork paywall): se PERSISTE en audd_call_log en cada
+    llamada de /analyze (antes se guardaba NULL). El cap sigue siendo GLOBAL
+    hoy; cuando se active "Pro = AudD ilimitado", el dato per-device ya estará
+    acumulado y capar por usuario será inmediato (count_audd_calls_today acepta
+    device_id). No cambia el comportamiento actual.
 
     force=True salta el cooldown por fingerprint y el check de garbage
     metadata. Lo usa el endpoint `/analyze?force_audd=true` cuando el usuario
@@ -304,6 +311,7 @@ def enrich_with_audd_if_needed(
                 artist=(track_data or {}).get('artist'),
                 title=(track_data or {}).get('title'),
                 source='analyze',
+                device_id=device_id,
             )
         except Exception as e:
             logger.warning(f"[AudD-auto] log_audd_call fallo: {e}")

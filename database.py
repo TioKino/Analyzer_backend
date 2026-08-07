@@ -1890,19 +1890,36 @@ class AnalysisDB:
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp()
 
-    def count_audd_calls_today(self) -> int:
+    def count_audd_calls_today(self, device_id: Optional[str] = None) -> int:
         """Cuenta llamadas AudD del auto-trigger de /analyze del dia UTC (para
         AUDD_DAILY_CAP). EXCLUYE Escuchar (/recognize) e /identify, que tienen su
         propia contabilidad — antes contaban todas juntas y una racha de Escuchar
-        podia agotar el cap de /analyze. Filas legacy (source NULL) = 'analyze'."""
+        podia agotar el cap de /analyze. Filas legacy (source NULL) = 'analyze'.
+
+        GROUNDWORK PAYWALL: `device_id` opcional. Sin él (default) cuenta GLOBAL
+        — el comportamiento de HOY, todos comparten AUDD_DAILY_CAP. Al activar el
+        paywall ("Pro = AudD ilimitado en /analyze") el cap pasa a per-device:
+        basta llamar con device_id para que cada usuario tenga su propio cupo.
+        La columna device_id ya se registra en cada llamada (ver log_audd_call
+        desde enrich_with_audd_if_needed), así que el dato per-device se acumula
+        desde ya y el flip es de una línea."""
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            c.execute(
-                "SELECT COUNT(*) AS n FROM audd_call_log "
-                "WHERE called_at >= ? AND (source IS NULL OR source = 'analyze')",
-                (self._utc_today_start(),),
-            )
+            if device_id:
+                c.execute(
+                    "SELECT COUNT(*) AS n FROM audd_call_log "
+                    "WHERE called_at >= ? "
+                    "AND (source IS NULL OR source = 'analyze') "
+                    "AND device_id = ?",
+                    (self._utc_today_start(), device_id),
+                )
+            else:
+                c.execute(
+                    "SELECT COUNT(*) AS n FROM audd_call_log "
+                    "WHERE called_at >= ? AND (source IS NULL OR source = 'analyze')",
+                    (self._utc_today_start(),),
+                )
             row = c.fetchone()
             return row['n'] if row else 0
         finally:

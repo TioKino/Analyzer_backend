@@ -45,6 +45,52 @@ def test_analyze_cap_excludes_other_sources():
     assert db.count_audd_calls_today() == 2
 
 
+def test_analyze_cap_global_default_unchanged():
+    """GROUNDWORK PAYWALL: sin device_id, count_audd_calls_today cuenta GLOBAL
+    (comportamiento de HOY, todos comparten AUDD_DAILY_CAP)."""
+    db = _db()
+    db.log_audd_call('fp1', True, source='analyze', device_id='devA')
+    db.log_audd_call('fp2', True, source='analyze', device_id='devB')
+    db.log_audd_call('fp3', False, source='analyze')  # sin device
+    assert db.count_audd_calls_today() == 3  # global: suma todos
+
+
+def test_analyze_cap_per_device_ready_for_flip():
+    """GROUNDWORK PAYWALL: con device_id, el cap de /analyze se puede capar por
+    usuario (el flip cuando 'Pro = AudD ilimitado'). El dato per-device ya se
+    registra hoy vía log_audd_call(device_id=...)."""
+    db = _db()
+    db.log_audd_call('fp1', True, source='analyze', device_id='devA')
+    db.log_audd_call('fp2', False, source='analyze', device_id='devA')
+    db.log_audd_call('fp3', True, source='analyze', device_id='devB')
+    db.log_audd_call('fp4', True, source='analyze')  # legacy sin device
+    assert db.count_audd_calls_today('devA') == 2
+    assert db.count_audd_calls_today('devB') == 1
+    assert db.count_audd_calls_today('devC') == 0
+    # Otras vias NO cuentan aunque compartan device_id.
+    db.log_audd_call('rec', True, source='recognize', device_id='devA')
+    assert db.count_audd_calls_today('devA') == 2
+
+
+def test_enrich_persists_device_id_on_analyze():
+    """El auto-AudD de /analyze ahora registra device_id (antes NULL). Se
+    verifica vía la ruta real enrich_with_audd_if_needed con AudD stubbeado."""
+    import audd_helper
+    db = _db()
+    orig = audd_helper.call_audd
+    audd_helper.call_audd = lambda *a, **k: {'artist': 'A', 'title': 'B'}
+    try:
+        audd_helper.enrich_with_audd_if_needed(
+            file_path='/x.mp3', fingerprint='fpZ', duration=180.0,
+            artist=None, title=None, api_token='tok', db=db,
+            force=True, device_id='devZ',
+        )
+    finally:
+        audd_helper.call_audd = orig
+    assert db.count_audd_calls_today('devZ') == 1
+    assert db.count_audd_calls_today() == 1  # global también lo ve
+
+
 def test_legacy_null_source_counts_as_analyze():
     db = _db()
     conn = db._open_conn()

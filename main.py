@@ -1527,7 +1527,8 @@ def robust_audio_load(file_path: str, sr: int = 44100, mono: bool = True):
 
 
 def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = False,
-                  original_filename: Optional[str] = None) -> AnalysisResult:
+                  original_filename: Optional[str] = None,
+                  device_id: Optional[str] = None) -> AnalysisResult:
     import warnings
     warnings.filterwarnings('ignore')
 
@@ -1560,7 +1561,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     if CHUNKED_ANALYZER_ENABLED and duration > CHUNK_ANALYSIS_THRESHOLD:
         logger.info(f" Track largo ({duration/60:.1f} min) - Usando anlisis por chunks")
         return analyze_audio_chunked(file_path, fingerprint, duration, force_audd=force_audd,
-                                     original_filename=original_filename)
+                                     original_filename=original_filename,
+                                     device_id=device_id)
 
     # Track corto: anlisis tradicional (carga todo en RAM)
     logger.info(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
@@ -1909,6 +1911,7 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                 daily_cap=AUDD_DAILY_CAP,
                 cooldown_days=AUDD_COOLDOWN_DAYS,
                 force=force_audd,
+                device_id=device_id,
             )
             if audd_track:
                 if audd_track.get('artist'):
@@ -2194,7 +2197,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     )
 
 def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, force_audd: bool = False,
-                          original_filename: Optional[str] = None) -> AnalysisResult:
+                          original_filename: Optional[str] = None,
+                          device_id: Optional[str] = None) -> AnalysisResult:
     """
     Analiza tracks largos por chunks para reducir uso de RAM.
     Usado automticamente para tracks > 4 minutos.
@@ -2338,6 +2342,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
                 daily_cap=AUDD_DAILY_CAP,
                 cooldown_days=AUDD_COOLDOWN_DAYS,
                 force=force_audd,
+                device_id=device_id,
             )
             if audd_track:
                 if audd_track.get('artist'):
@@ -2894,6 +2899,10 @@ async def analyze_track(
                 fingerprint,
                 force_audd=force_audd,
                 original_filename=file.filename,
+                # Groundwork paywall: se registra en audd_call_log para acumular
+                # gasto per-device (el cap sigue global hoy). Ver
+                # count_audd_calls_today(device_id) en database.py.
+                device_id=request.headers.get('X-Device-Id'),
             )
 
         # Señal honesta de cap para la UI de "Limpiar con AudD" (force_audd):
