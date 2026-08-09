@@ -16,9 +16,10 @@ se BORRAN -> sin duplicacion stale.
 """
 
 import logging
+import os
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,56 @@ def init(database):
 community_router = APIRouter(tags=["community"])
 
 
+# ── Mitigación SEC-12: consenso Sybil-abierto ────────────────
+#
+# Los endpoints de comunidad reciben `device_id` como campo PLANO del cuerpo,
+# sin autenticar, así que "un dispositivo, un voto" es autodeclarado: mandar
+# tres ids inventados produce un `consensus_3` (prioridad 80) que gana al motor
+# local (50), y con diez un `consensus_10` (95). Un solo actor podía fabricar el
+# consenso de BPM, tonalidad, género, track type, beat grid y ratings de
+# cualquier track, y eso se sirve a todos como "validado por la comunidad".
+#
+# EL ARREGLO DE FONDO es derivar el device_id de la identidad de sync, que ya
+# está autenticada por HMAC. Eso obliga a tocar el cliente y las dos partes
+# tienen que desplegarse a la vez, así que va aparte (ver PENDING.md).
+#
+# ESTO es la mitigación que se puede desplegar sola: contar cuántas identidades
+# DISTINTAS usa una misma IP para votar el MISMO track. Un usuario real vota un
+# track concreto desde uno o dos dispositivos; fabricar consenso exige tres o
+# más. Al superar el umbral se rechaza con 429.
+#
+# No es infalible —quien use proxies rota de IP— pero sube el coste del ataque
+# de "un curl en bucle" a "una botnet", que para el tamaño del proyecto es la
+# diferencia entre pasar y no pasar. Se registra en log cada corte para poder
+# ver si hay falsos positivos antes de endurecer.
+MAX_VOTE_IDENTITIES_PER_IP = int(os.getenv('MAX_VOTE_IDENTITIES_PER_IP', '3'))
+
+
+def _guard_vote_source(request, fingerprint: str, device_id: str) -> None:
+    """Rechaza con 429 si esta IP ya votó este track con demasiadas identidades."""
+    if not fingerprint or not device_id:
+        return
+    try:
+        from validation import get_client_ip
+
+        ip_hash = db.hash_ip(get_client_ip(request))
+        distintas = db.register_vote_source(ip_hash, fingerprint, device_id)
+    except Exception as e:  # noqa: BLE001 - la mitigación nunca tumba el voto
+        logger.warning(f"[Community] guard de procedencia falló (se deja pasar): {e}")
+        return
+
+    if distintas > MAX_VOTE_IDENTITIES_PER_IP:
+        logger.warning(
+            f"[Community] posible Sybil: ip_hash={ip_hash} ha usado {distintas} "
+            f"identidades sobre fp={fingerprint[:12]} (max {MAX_VOTE_IDENTITIES_PER_IP})"
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiados dispositivos distintos votando este track desde "
+                   "la misma conexión.",
+        )
+
+
 # ==================== COMMUNITY BEAT GRID ====================
 
 class BeatGridCorrectionRequest(BaseModel):
@@ -48,8 +99,9 @@ class BeatGridCorrectionRequest(BaseModel):
     original_bpm: float = 0.0
 
 @community_router.post("/community/beat-grid")
-async def submit_beat_grid_correction(request: BeatGridCorrectionRequest):
+async def submit_beat_grid_correction(request: BeatGridCorrectionRequest, http: Request):
     """Recibe correccion de beat grid de un DJ"""
+    _guard_vote_source(http, request.fingerprint, request.device_id)
     try:
         db.submit_beat_grid_correction(
             fingerprint=request.fingerprint,
@@ -212,7 +264,7 @@ def _community_override_response(fingerprint: str, field: str) -> dict:
 
 
 @community_router.post("/community/override")
-async def submit_community_override(request: CommunityOverrideRequest):
+async def submit_community_override(request: CommunityOverrideRequest, http: Request = None):
     """Recibe un voto de un DJ sobre cualquier campo categorico de un track.
 
     Campos soportados: track_type, key, camelot, genre, subgenre.
@@ -223,6 +275,8 @@ async def submit_community_override(request: CommunityOverrideRequest):
     try:
         if not request.fingerprint or not request.device_id or not request.field:
             raise HTTPException(400, "fingerprint, device_id y field requeridos")
+        if http is not None:
+            _guard_vote_source(http, request.fingerprint, request.device_id)
         normalized, error = _validate_community_field(request.field, request.value)
         if error:
             raise HTTPException(400, error)

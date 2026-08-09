@@ -391,6 +391,32 @@ class AnalysisDB:
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_co_fp_field ON community_overrides(fingerprint, field)')
+
+        # Procedencia de los votos comunitarios (mitigacion SEC-12, auditoria
+        # 2026-08-09). El `device_id` de /community/* llega como campo PLANO del
+        # cuerpo y sin autenticar, asi que "un dispositivo, un voto" es
+        # autodeclarado: tres ids inventados fabrican un consensus_3 (prioridad
+        # 80) que gana al motor local (50). El arreglo de fondo es derivar el
+        # device_id de la identidad de sync, que ya esta autenticada, pero eso
+        # obliga a tocar el cliente. Mientras tanto registramos de que ORIGEN
+        # viene cada voto para poder cortar el caso barato: una sola maquina
+        # votando el mismo track bajo muchas identidades.
+        #
+        # La IP se guarda HASHEADA (sha256 truncado): sirve para agrupar, no
+        # para identificar a nadie, en linea con el resto del backend.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_vote_sources (
+                ip_hash     TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                device_id   TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (ip_hash, fingerprint, device_id)
+            )
+        ''')
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_cvs_ip_fp '
+            'ON community_vote_sources(ip_hash, fingerprint)'
+        )
         # Migracion idempotente: si la tabla legacy tiene votos y la nueva
         # esta vacia para ese fp, copiar como field='track_type'. Sin LOCK
         # porque ON CONFLICT DO NOTHING garantiza idempotencia si se llama
@@ -1662,6 +1688,43 @@ class AnalysisDB:
     # Sistema unificado para CUALQUIER campo categorico: track_type, key,
     # camelot, genre, subgenre. Mismas reglas de consensus (>=3 votos al
     # winner, supera al 2do por >=2). Whitelist por campo en main.py.
+
+    @staticmethod
+    def hash_ip(ip: str) -> str:
+        """Hash corto y estable de una IP. Agrupa sin identificar."""
+        import hashlib as _h
+        return _h.sha256((ip or '').encode()).hexdigest()[:16]
+
+    def register_vote_source(self, ip_hash: str, fingerprint: str,
+                             device_id: str) -> int:
+        """Registra que `ip_hash` ha votado `fingerprint` como `device_id` y
+        devuelve cuantas identidades DISTINTAS lleva usadas esa IP para ese
+        track (incluida esta).
+
+        Base de la mitigacion SEC-12: un usuario real vota un track concreto
+        desde uno o dos dispositivos; alguien fabricando consenso necesita
+        tres o mas identidades. Ver `community_vote_sources` en init_db.
+        """
+        if not ip_hash or not fingerprint or not device_id:
+            return 0
+        from datetime import datetime
+        fingerprint = self.canonical_community_key(fingerprint)
+        conn = self._open_conn()
+        try:
+            conn.execute(
+                'INSERT OR IGNORE INTO community_vote_sources '
+                '(ip_hash, fingerprint, device_id, created_at) VALUES (?, ?, ?, ?)',
+                (ip_hash, fingerprint, device_id, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+            row = conn.execute(
+                'SELECT COUNT(DISTINCT device_id) FROM community_vote_sources '
+                'WHERE ip_hash = ? AND fingerprint = ?',
+                (ip_hash, fingerprint),
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
 
     def submit_community_override(
         self, fingerprint: str, device_id: str, field: str, value: str,
