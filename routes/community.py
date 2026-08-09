@@ -63,7 +63,9 @@ async def submit_beat_grid_correction(request: BeatGridCorrectionRequest):
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"[Community] Error saving beat grid: {e}")
-        raise HTTPException(500, f"Error: {str(e)}")
+        # El texto de la excepción (rutas, SQL, internals) no debe viajar a un
+        # cliente anónimo: ya queda en el log de arriba con el detalle completo.
+        raise HTTPException(500, "Error interno")
 
 @community_router.get("/community/beat-grid/{fingerprint}")
 async def get_community_beat_grid(fingerprint: str):
@@ -239,7 +241,9 @@ async def submit_community_override(request: CommunityOverrideRequest):
         raise
     except Exception as e:
         logger.error(f"[Community] Error saving override: {e}")
-        raise HTTPException(500, f"Error: {str(e)}")
+        # El texto de la excepción (rutas, SQL, internals) no debe viajar a un
+        # cliente anónimo: ya queda en el log de arriba con el detalle completo.
+        raise HTTPException(500, "Error interno")
 
 
 @community_router.get("/community/override/{field}/{fingerprint}")
@@ -292,7 +296,9 @@ async def delete_community_override(field: str, fingerprint: str, device_id: str
         raise
     except Exception as e:
         logger.error(f"[Community] Error deleting {field} vote: {e}")
-        raise HTTPException(500, f"Error: {str(e)}")
+        # El texto de la excepción (rutas, SQL, internals) no debe viajar a un
+        # cliente anónimo: ya queda en el log de arriba con el detalle completo.
+        raise HTTPException(500, "Error interno")
 
 
 # ==================== COMMUNITY TRACK TYPE (Fase 2 backwards-compat) ====================
