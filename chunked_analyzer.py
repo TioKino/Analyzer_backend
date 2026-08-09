@@ -416,9 +416,20 @@ class ChunkedAudioAnalyzer:
         if not chunk_results:
             return {'key': 'C', 'camelot': '8B', 'confidence': 0.0}
 
-        # Si no hay pesos de energía, usar confianza
+        # Si no hay pesos de energía, usar confianza.
+        #
+        # `r.get('confidence') or 0.5`, NO `r.get('confidence', 0.5)`: el
+        # segundo solo aplica el default si la CLAVE no existe, no si su valor
+        # es None — y los chunks degenerados traen `'confidence': None` literal.
+        # Con el default de dict, `sum(energy_weights)` unas lineas mas abajo
+        # petaba con "TypeError: unsupported operand type(s) for +: 'int' and
+        # 'NoneType'" y se llevaba por delante el analisis del track entero.
+        #
+        # Es EL MISMO fallo que ya se corrigio para 'key' en el bucle de votos
+        # de mas abajo (panel admin 2026-05-20); alli se arreglo y aqui se
+        # quedo a medias. Lo destapo test_chunked_analyzer.py.
         if energy_weights is None:
-            energy_weights = [r.get('confidence', 0.5) for r in chunk_results]
+            energy_weights = [(r.get('confidence') or 0.5) for r in chunk_results]
 
         # Normalizar pesos
         total_weight = sum(energy_weights) + 1e-10
