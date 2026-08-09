@@ -1,3 +1,9 @@
+# ==========================================================================
+# MODULO MUERTO (auditoria 2026-08-09). La funcion viva es
+# `main.generate_preview_snippet`; este fichero solo se menciona en
+# comentarios. Cobertura 0%. Para borrarlo, quitarlo de los dos .spec.
+# ==========================================================================
+
 """
 Preview snippet generator — creates 6-second MP3 previews from tracks.
 """

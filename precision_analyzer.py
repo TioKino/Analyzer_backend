@@ -1,3 +1,13 @@
+# ==========================================================================
+# MODULO MUERTO (auditoria 2026-08-09). Cero referencias en todo el repo: no
+# lo importa nadie, ni produccion ni tests, ni aparece en comentarios. Su
+# cobertura es 0% sobre 837 lineas. Sigue listado en los .spec de PyInstaller,
+# asi que se empaqueta en el motor local sin usarse nunca.
+# PARA BORRARLO: quitarlo tambien de dj_analyzer_engine.spec y
+# dj_analyzer_engine_macos.spec (datas + hiddenimports) y rehacer el build del
+# DMG/EXE para confirmar. No se borro aqui por no poder verificar ese build.
+# ==========================================================================
+
 """
 DJ Analyzer Pro - Precision Structure & Cue Point Analysis v3.0
 ================================================================

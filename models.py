@@ -1,3 +1,12 @@
+# ==========================================================================
+# MODULO MUERTO Y DIVERGENTE (auditoria 2026-08-09). Solo lo importa
+# test_full_audit.py. Su `AnalysisResult` es una copia ANTIGUA del real
+# (main.py:821): declara 19 campos como obligatorios que en produccion llevan
+# default, y le faltan track_type_confidence y track_type_alternatives. O sea:
+# el mayor fichero de tests valida un modelo que produccion no usa.
+# Al borrarlo hay que apuntar test_full_audit.py a `main.AnalysisResult`.
+# ==========================================================================
+
 """
 Pydantic models and key mappings for DJ Analyzer Pro API.
 """

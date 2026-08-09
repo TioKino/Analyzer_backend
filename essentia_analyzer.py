@@ -1,3 +1,10 @@
+# ==========================================================================
+# MODULO MUERTO (auditoria 2026-08-09). Nadie lo importa: solo aparece en un
+# docstring de main.py y en un test que comprueba que el fichero parsea.
+# Cobertura 0% sobre 347 lineas. Mismo procedimiento de borrado que
+# precision_analyzer.py (tocar los dos .spec) mas ajustar test_full_audit.py.
+# ==========================================================================
+
 """
 Audio Analyzer Pro para DJ Analyzer Pro
 ========================================
