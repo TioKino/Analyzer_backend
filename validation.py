@@ -421,26 +421,53 @@ import threading
 
 
 class MemoryRateLimiterBackend:
-    """In-memory rate limiter (single worker only)."""
+    """In-memory rate limiter (single worker only).
+
+    Las claves (una por IP) se EVICTAN cuando su ventana queda vacia. Antes se
+    podaban los timestamps dentro de cada clave pero la clave nunca se borraba,
+    asi que el dict crecia con cada IP vista en la vida del proceso — y
+    `count_recent` sobre un defaultdict CREABA la clave al consultarla, con lo
+    que hasta las peticiones que solo leian el contador dejaban residuo. En un
+    proceso de larga vida expuesto a escaneo desde muchas IPs, eso es una fuga
+    de memoria lenta pero sin techo.
+    """
+
+    # Barrido periodico de claves muertas: sin el, una IP que hace UNA peticion
+    # y no vuelve deja su entrada hasta el proximo acceso con esa misma clave
+    # (que no llegara nunca).
+    _SWEEP_EVERY_SEC = 300
 
     def __init__(self):
-        self._requests = defaultdict(list)
+        self._requests = {}
         self._lock = threading.Lock()
+        self._last_sweep = time.time()
+
+    def _sweep(self, now: float, window: int) -> None:
+        """Borra claves cuya ventana esta vacia. Con el lock ya tomado."""
+        if now - self._last_sweep < self._SWEEP_EVERY_SEC:
+            return
+        self._last_sweep = now
+        for key in [k for k, v in self._requests.items()
+                    if not v or now - v[-1] >= window]:
+            del self._requests[key]
 
     def check_and_increment(self, key: str, max_requests: int, window: int) -> bool:
         now = time.time()
         with self._lock:
-            self._requests[key] = [t for t in self._requests[key] if now - t < window]
-            if len(self._requests[key]) >= max_requests:
+            self._sweep(now, window)
+            recent = [t for t in self._requests.get(key, ()) if now - t < window]
+            if len(recent) >= max_requests:
+                self._requests[key] = recent
                 return False
-            self._requests[key].append(now)
+            recent.append(now)
+            self._requests[key] = recent
             return True
 
     def count_recent(self, key: str, window: int) -> int:
         now = time.time()
         with self._lock:
-            recent = [t for t in self._requests[key] if now - t < window]
-            return len(recent)
+            # `.get` y no `[key]`: consultar NO debe materializar la clave.
+            return len([t for t in self._requests.get(key, ()) if now - t < window])
 
 
 class RedisRateLimiterBackend:

@@ -77,7 +77,13 @@ RECOGNIZE_PRO_DAILY_CAP: int = int(os.getenv('RECOGNIZE_PRO_DAILY_CAP', '500'))
 
 # ==================== BASE DE DATOS ====================
 
-DATABASE_PATH: str = os.getenv('DATABASE_PATH', 'analysis.db')
+# En Render el default DEBE apuntar al disco persistente, igual que artwork y
+# previews justo debajo. Con el default relativo ('analysis.db'), si algun dia
+# falta la env var la memoria colectiva ENTERA cae en el filesystem efimero y
+# se pierde en el siguiente deploy, sin ningun error visible. Es el mismo bug
+# que ya se sufrio con el cache de artwork; aqui faltaba cerrarlo.
+_default_db = '/data/analysis.db' if os.getenv('RENDER') else 'analysis.db'
+DATABASE_PATH: str = os.getenv('DATABASE_PATH', _default_db)
 # On Render, use persistent disk to survive redeploys. Artwork tenia el
 # mismo problema que tuvieron los previews antes: default relativo que
 # se borraba en cada deploy, por eso el panel admin reportaba ratios

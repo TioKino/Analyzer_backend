@@ -830,6 +830,23 @@ try:
 except Exception as _e:  # noqa: BLE001 - best-effort
     logger.warning(f"[Events] purga al arranque fallo: {_e}")
 
+# Purga best-effort de errores viejos. `events` y `audd_call_log` ya se purgaban
+# solos; `analysis_errors` era la unica tabla de telemetria que SOLO se limpiaba
+# a mano desde /admin/errors/prune (y por defecto solo los resueltos), asi que
+# los NO resueltos se acumulaban para siempre — con hasta 2000 caracteres de
+# stack por fila — en el mismo disco persistente que las BD y los previews.
+# Solo se borran los RESUELTOS y antiguos: un error sin resolver se conserva
+# aunque sea viejo, porque sigue siendo un bug abierto.
+_ERRORS_KEEP_DAYS = int(os.environ.get('ERRORS_KEEP_DAYS', '180'))
+try:
+    _pruned_err = db.prune_old_errors(days=_ERRORS_KEEP_DAYS, only_resolved=True)
+    if _pruned_err:
+        logger.info(
+            f"[Errors] purgados {_pruned_err} errores resueltos > {_ERRORS_KEEP_DAYS}d"
+        )
+except Exception as _e:  # noqa: BLE001 - best-effort
+    logger.warning(f"[Errors] purga al arranque fallo: {_e}")
+
 # Registrar endpoints de community cues (/community-cues, /user-cues).
 # El modulo community_cues_endpoint.py expone register_community_endpoints
 # pero NUNCA se cableaba aqui -> el cliente recibia 404 al subir/leer cues
@@ -1066,10 +1083,19 @@ def camelot_to_key(camelot: str) -> str:
 # ==================== HELPERS ====================
 
 def calculate_fingerprint(file_path):
-    """Calcular fingerprint simple del archivo"""
+    """MD5 del contenido del fichero, leido por bloques.
+
+    Antes hacia `hashlib.md5(f.read())`: cargaba el fichero ENTERO en memoria
+    (hasta 100 MB con el limite de subida) en el mismo proceso que a
+    continuacion iba a cargar el audio con librosa. En los 512 MB de Render eso
+    es un pico gratuito. Leyendo en bloques de 1 MB el hash es identico y el
+    pico de memoria es constante.
+    """
+    h = hashlib.md5()
     with open(file_path, 'rb') as f:
-        file_hash = hashlib.md5(f.read()).hexdigest()
-    return file_hash
+        for block in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
 
 
 def _attach_acoustic(track_data, audio_path):
@@ -3453,27 +3479,37 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         # ==================== PASO 1: IDENTIFICAR CON AUDD ====================
         audio_to_send = tmp_path
         
-        try:
+        def _extract_fragment():
+            """Recorte de 20 s con librosa (CPU-bound) + escritura a disco."""
             with silence_native_stderr():
                 y, sr = librosa.load(tmp_path, sr=22050, mono=True, duration=20, offset=30)
             import soundfile as sf
-            fragment_path = tmp_path + "_fragment.wav"
-            sf.write(fragment_path, y, sr)
+            out = tmp_path + "_fragment.wav"
+            sf.write(out, y, sr)
+            return out
+
+        try:
+            # librosa es CPU-bound y sincrono: fuera del event loop.
+            fragment_path = await run_in_threadpool(_extract_fragment)
             audio_to_send = fragment_path
             logger.info(f"Fragmento extrado: 20 seg desde 0:30")
         except Exception as e:
             logger.info(f"No se pudo extraer fragmento, usando archivo completo: {e}")
-        
-        with open(audio_to_send, 'rb') as audio_file:
-            audd_response = requests.post(
-                'https://api.audd.io/',
-                data={
-                    'api_token': AUDD_API_TOKEN,
-                    'return': 'spotify,deezer,apple_music,musicbrainz',
-                },
-                files={'file': audio_file},
-                timeout=30
-            )
+
+        def _post_to_audd(path):
+            """POST a AudD (30 s de timeout) — red sincrona, al threadpool."""
+            with open(path, 'rb') as audio_file:
+                return requests.post(
+                    'https://api.audd.io/',
+                    data={
+                        'api_token': AUDD_API_TOKEN,
+                        'return': 'spotify,deezer,apple_music,musicbrainz',
+                    },
+                    files={'file': audio_file},
+                    timeout=30,
+                )
+
+        audd_response = await run_in_threadpool(_post_to_audd, audio_to_send)
         
         if audd_response.status_code != 200:
             raise HTTPException(500, f"Error AudD: {audd_response.status_code}")
@@ -3518,7 +3554,13 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         if GENRE_DETECTOR_ENABLED and genre_detector and artist and title:
             logger.info(f"Buscando g(c)nero: {artist} - {title}")
             try:
-                discogs_result = genre_detector.get_discogs_genre(artist, title)
+                # Discogs y MusicBrainz son HTTP sincrono (MB ademas duerme 1 s
+                # incondicional por su rate-limit, y reintenta con timeout=20).
+                # Desde este handler async bloqueaban el event loop del unico
+                # worker hasta ~40 s por peticion.
+                discogs_result = await run_in_threadpool(
+                    genre_detector.get_discogs_genre, artist, title
+                )
                 if discogs_result and discogs_result.get('genre'):
                     genre = discogs_result['genre']
                     genre_source = "discogs"
@@ -3532,7 +3574,9 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             
             if genre_source != "discogs":
                 try:
-                    mb_result = genre_detector.get_musicbrainz_info(artist, title)
+                    mb_result = await run_in_threadpool(
+                        genre_detector.get_musicbrainz_info, artist, title
+                    )
                     if mb_result and mb_result.get('genre'):
                         genre = mb_result['genre']
                         genre_source = "musicbrainz"
@@ -4018,8 +4062,14 @@ async def recognize_audio(
     # Cada llamada a AudD de Escuchar se REGISTRA (source='recognize') para la
     # contabilidad real del gasto y para el cap por device. Antes /recognize no
     # se logueaba → el panel admin infravaloraba el gasto de la feature estrella.
-    def _audd_and_log(path):
-        td, processed_ok = _send_to_audd(path, AUDD_API_TOKEN, timeout=30)
+    async def _audd_and_log(path):
+        # AudD con timeout=30 es I/O de red SINCRONA. Llamarla directa desde este
+        # handler async BLOQUEA el event loop del unico worker: una sesion de
+        # Escuchar encadena hasta 3 intentos, o sea hasta 90 s con la API entera
+        # congelada (mismo patron que ya se corrigio para librosa en /analyze).
+        td, processed_ok = await run_in_threadpool(
+            _send_to_audd, path, AUDD_API_TOKEN, 30
+        )
         try:
             db.log_audd_call(
                 fingerprint='recognize', success=bool(td),
@@ -4076,16 +4126,19 @@ async def recognize_audio(
             logger.info(f"[Recognize] Intento {i+1}/3 - estrategia: {strategy}")
 
             processed_ok = False
-            if _preprocess_audio_for_recognition(tmp_path, processed_path, strategy):
+            # ffmpeg: subproceso bloqueante, fuera del loop igual que AudD.
+            if await run_in_threadpool(
+                _preprocess_audio_for_recognition, tmp_path, processed_path, strategy
+            ):
                 processed_size = os.path.getsize(processed_path)
                 logger.info(f"  Procesado: {processed_size} bytes")
-                track_data, processed_ok = _audd_and_log(processed_path)
+                track_data, processed_ok = await _audd_and_log(processed_path)
             else:
                 logger.info(f"  Intento {i+1} ({strategy}): preprocesamiento falló")
                 # Si normalize falla, intentar enviar el original directamente.
                 if strategy == "normalize":
                     logger.info(f"  Intentando enviar archivo original sin procesar...")
-                    track_data, processed_ok = _audd_and_log(tmp_path)
+                    track_data, processed_ok = await _audd_and_log(tmp_path)
 
             audio_processed = audio_processed or processed_ok
             if track_data:
