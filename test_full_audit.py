@@ -367,23 +367,57 @@ class TestA017_AdminAuthTimingAttack:
 # SECTION R: REGRESSION TESTS
 # ============================================================================
 
-class TestR001_EssentiaImports:
-    """R-001: essentia_analyzer.py se importa sin SyntaxError"""
+class TestR001_TodoElRepoParsea:
+    """R-001: ning\u00fan fuente Python del repo tiene SyntaxError ni comillas
+    tipogr\u00e1ficas.
+
+    ANTES vigilaba SOLO `essentia_analyzer.py`, que se borr\u00f3 en la limpieza de
+    2026-08-10 por llevar meses sin que nadie lo importara. El fallo original
+    \u2014comillas \u201cinteligentes\u201d pegadas desde un editor o un chat, que revientan
+    el fichero con SyntaxError\u2014 no ten\u00eda nada de espec\u00edfico de ese m\u00f3dulo:
+    puede pasarle a cualquiera. As\u00ed que en vez de borrar la cobertura con el
+    fichero, se generaliza al repo entero, que es lo que la regresi\u00f3n ped\u00eda
+    desde el principio.
+    """
+
+    def _fuentes(self):
+        raiz = os.path.dirname(os.path.abspath(__file__))
+        omitir = {'.git', '__pycache__', 'build', 'dist', '.venv', 'venv',
+                  'node_modules', '.pytest_cache'}
+        for base, dirs, ficheros in os.walk(raiz):
+            dirs[:] = [d for d in dirs if d not in omitir]
+            for f in ficheros:
+                if f.endswith('.py'):
+                    yield os.path.join(base, f)
 
     def test_no_syntax_error(self):
         import ast
-        path = os.path.join(os.path.dirname(__file__), "essentia_analyzer.py")
-        with open(path, "r", encoding="utf-8") as f:
-            source = f.read()
-        # Must parse without SyntaxError
-        ast.parse(source)
+
+        revisados = 0
+        for path in self._fuentes():
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+            try:
+                ast.parse(source)
+            except SyntaxError as e:
+                rel = os.path.relpath(path, os.path.dirname(os.path.abspath(__file__)))
+                raise AssertionError(f"{rel}:{e.lineno} no parsea: {e.msg}") from e
+            revisados += 1
+        assert revisados > 20, f"solo se revisaron {revisados} ficheros, \u00bfruta mal?"
 
     def test_no_curly_quotes(self):
-        path = os.path.join(os.path.dirname(__file__), "essentia_analyzer.py")
-        with open(path, "r", encoding="utf-8") as f:
-            source = f.read()
-        assert "\u201c" not in source, "Found left curly quote"
-        assert "\u201d" not in source, "Found right curly quote"
+        """Las comillas tipogr\u00e1ficas dentro de un STRING son legales; lo que
+        rompe es que sustituyan a las rectas que delimitan el string. Eso ya lo
+        caza el test de arriba, as\u00ed que aqu\u00ed s\u00f3lo se avisa del car\u00e1cter en
+        c\u00f3digo fuente para que no se cuele por copiar y pegar."""
+        culpables = []
+        for path in self._fuentes():
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+            if "\u201c" in source or "\u201d" in source:
+                culpables.append(os.path.relpath(
+                    path, os.path.dirname(os.path.abspath(__file__))))
+        assert not culpables, f"comillas tipogr\u00e1ficas en: {', '.join(culpables)}"
 
 
 class TestR002_CompatibleKeysEndpoint:

@@ -35,28 +35,20 @@ local_modules = [
     'audd_helper.py',
     'audio_helpers.py',
     'bpm_utils.py',
-    'beatport.py',
     'genre_detection.py',
     'spectral_genre_classifier.py',
     'acoustic_fingerprint.py',
     'chunked_analyzer.py',
-    'precision_analyzer.py',
-    'preview_generator.py',
     'similar_tracks_endpoint.py',
-    'search_analyzed_endpoint.py',
     'sync_endpoints.py',
     'api_config.py',
-    'essentia_analyzer.py',
 ]
 
 # Archivos de rutas (routes/)
 route_modules = [
     'routes/__init__.py',
-    'routes/admin.py',
     'routes/admin_panel.py',
     'routes/community.py',
-    'routes/library.py',
-    'routes/media.py',
     'routes/preview.py',
     'routes/search.py',
 ]
@@ -71,6 +63,19 @@ for mod in route_modules:
         datas.append((mod, 'routes' if 'routes/' in mod else '.'))
 
 # Agregar archivos de datos del proyecto
+# Detector de podredumbre: las listas de arriba se filtran con os.path.exists,
+# asi que un modulo borrado del repo desaparece del bundle EN SILENCIO y su
+# entrada se queda aqui para siempre. Asi se acumularon 5 referencias muertas
+# (beatport, search_analyzed_endpoint, routes/admin, routes/library,
+# routes/media) sin que ningun build se quejara. Esto no rompe nada: solo
+# imprime la lista al compilar para que se vea y se limpie.
+_faltan = [m for m in local_modules + route_modules if not os.path.exists(m)]
+if _faltan:
+    print("[SPEC] AVISO: estos modulos estan listados pero NO existen; "
+          "quitalos de local_modules/route_modules y de hiddenimports:")
+    for _m in _faltan:
+        print(f"[SPEC]   - {_m}")
+
 if os.path.isdir('data'):
     for f in os.listdir('data'):
         fpath = os.path.join('data', f)
@@ -218,25 +223,18 @@ a = Analysis(
         'audd_helper',
         'audio_helpers',
         'bpm_utils',
-        'beatport',
         'genre_detection',
         'spectral_genre_classifier',
         'acoustic_fingerprint',
         'chunked_analyzer',
-        'precision_analyzer',
-        'preview_generator',
         'similar_tracks_endpoint',
-        'search_analyzed_endpoint',
         'sync_endpoints',
         'api_config',
 
         # Routes
         'routes',
-        'routes.admin',
         'routes.admin_panel',
         'routes.community',
-        'routes.library',
-        'routes.media',
         'routes.preview',
         'routes.search',
     ] + librosa_hiddenimports + scipy_hiddenimports + soundfile_hiddenimports,
