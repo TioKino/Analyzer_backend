@@ -229,6 +229,91 @@ class TestUpvotesDeNotas:
         assert r.json()["upvotes"] == 1
 
 
+class TestObservacionDeRegistroSEC12:
+    """Fase 1 del arreglo de fondo. NO cambia comportamiento: solo mide cuántas
+    identidades votantes están vinculadas a un usuario (`user_devices`), que es
+    justo la gente que se quedaría fuera si la fase 2 exigiera registro.
+
+    Sin este número la decisión sería a ojo: podría ser el 2 % de los votos o
+    el 90 %, y de eso depende que exigir registro sea razonable o una purga."""
+
+    def test_un_device_sin_vincular_vota_igual(self, client):
+        """Lo esencial: observar no puede bloquear. Hoy nadie está obligado a
+        vincular para votar y eso NO cambia."""
+        r = _vote(client, _fp(), "device-sin-vincular", ip="198.51.100.5")
+        assert r.status_code == 200
+
+    def test_se_anota_como_no_registrado(self, client, app_mod):
+        fp = _fp()
+        _vote(client, fp, "sin-vincular-1", ip="198.51.100.6")
+        stats = app_mod.db.vote_registration_stats(days=30)
+        assert stats["unregistered"] >= 1
+
+    def test_se_anota_como_registrado_si_lo_esta(self, client, app_mod):
+        """Un device que pasó por /sync/register debe contarse en el otro lado
+        del reparto — si no, el porcentaje diría que nadie está vinculado."""
+        import sync_endpoints
+
+        dev = f"vinculado-{uuid.uuid4().hex[:8]}"
+        sync_endpoints.SYNC_AUTH_SECRET = ""  # dev mode: sin firma
+        reg = client.post("/sync/register",
+                          json={"device_id": dev, "device_type": "desktop"})
+        assert reg.status_code == 200, reg.text
+
+        antes = app_mod.db.vote_registration_stats(days=30)["registered"]
+        _vote(client, _fp(), dev, ip="198.51.100.7")
+        assert app_mod.db.vote_registration_stats(days=30)["registered"] == antes + 1
+
+    def test_no_confunde_desconocido_con_no_registrado(self, app_mod):
+        """`registered=None` (no se pudo comprobar) va a su propio contador y
+        NO al de no-registrados. Si se mezclaran, el porcentaje saldría inflado
+        —hoy casi todo es NULL— y llevaría a descartar la fase 2 por un miedo
+        inventado.
+
+        Se mide por DELTAS: la BD es compartida por el módulo, así que los
+        valores absolutos arrastran lo de otros tests. Comprobar sólo que
+        `unknown` sube no vale: si el NULL se contara además como no
+        registrado, ambos subirían y el test pasaría igual."""
+        db = app_mod.db
+        antes = db.vote_registration_stats(days=30)
+
+        h = db.hash_ip("192.0.2.77")
+        db.register_vote_source(h, _fp(), "sin-dato")  # registered=None
+
+        despues = db.vote_registration_stats(days=30)
+        assert despues["unknown"] == antes["unknown"] + 1
+        assert despues["unregistered"] == antes["unregistered"], (
+            "un voto sin comprobar se está contando como NO registrado"
+        )
+        assert despues["registered"] == antes["registered"]
+
+    def test_el_porcentaje_es_None_si_no_hay_nada_comprobado(self, app_mod):
+        """Con cero comprobaciones NO se devuelve 0.0: un 0 % se leería como
+        'no hay problema, actívalo' justo cuando no sabemos nada."""
+        stats = app_mod.db.vote_registration_stats(days=0)
+        if stats["registered"] + stats["unregistered"] == 0:
+            assert stats["unregistered_pct"] is None
+
+    def test_vincular_despues_actualiza_la_anotacion(self, app_mod):
+        """El usuario vota, y LUEGO vincula el device. La fila ya existe y el
+        INSERT OR IGNORE no la toca, así que sin el UPDATE se quedaría contada
+        como no registrada para siempre y el dato envejecería mal."""
+        db = app_mod.db
+        fp = _fp()
+        h = db.hash_ip("192.0.2.88")
+        db.register_vote_source(h, fp, "tarde", registered=False)
+        antes = db.vote_registration_stats(days=30)["registered"]
+        db.register_vote_source(h, fp, "tarde", registered=True)
+        assert db.vote_registration_stats(days=30)["registered"] == antes + 1
+
+    def test_el_panel_admin_expone_el_reparto(self, app_mod):
+        from routes.admin_panel import _vote_registration_stats
+
+        stats = _vote_registration_stats()
+        for clave in ("registered", "unregistered", "unknown", "unregistered_pct"):
+            assert clave in stats, f"falta '{clave}' en el telemetry del panel"
+
+
 class TestRegistroDeProcedencia:
     def test_cuenta_identidades_distintas_por_ip_y_track(self, app_mod):
         db = app_mod.db

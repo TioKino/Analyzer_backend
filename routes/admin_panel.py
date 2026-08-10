@@ -756,6 +756,19 @@ def _get_db():
     return main.db
 
 
+def _vote_registration_stats() -> dict:
+    """Reparto registrado/no-registrado de las identidades que votan en
+    /community/* (SEC-12 fase 1). Best-effort: el panel nunca debe caerse por
+    una metrica de observacion, y en BDs anteriores al cambio la columna puede
+    no existir todavia."""
+    try:
+        return _get_db().vote_registration_stats(days=30)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Admin] vote_registration_stats no disponible: {e}")
+        return {"days": 30, "registered": 0, "unregistered": 0,
+                "unknown": 0, "unregistered_pct": None}
+
+
 @admin_panel_router.get("/users/{device_id}/errors")
 async def user_errors(device_id: str, request: Request, resolved: Optional[int] = None):
     await _verify_admin_secret(request)
@@ -1103,6 +1116,12 @@ async def telemetry(request: Request):
             "preview_rate": round(preview_rate, 3),
             "artwork_rate": round(artwork_rate, 3),
         },
+        # SEC-12 fase 1 — el dato que decide si se puede exigir registro para
+        # votar en /community/*. `unregistered` es EXACTAMENTE la gente que se
+        # quedaria fuera al activar la fase 2. `unknown` son votos anteriores a
+        # esta instrumentacion (o donde no se pudo comprobar); mientras domine,
+        # el porcentaje aun no es representativo.
+        "community_votes": _vote_registration_stats(),
         "errors": {
             "unresolved": len(unresolved_errs),
             "resolved": len(resolved_errs),

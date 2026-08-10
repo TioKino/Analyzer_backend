@@ -417,6 +417,17 @@ class AnalysisDB:
             'CREATE INDEX IF NOT EXISTS idx_cvs_ip_fp '
             'ON community_vote_sources(ip_hash, fingerprint)'
         )
+        # SEC-12 fase 1 (observación). El arreglo de fondo es contar el consenso
+        # por `user_id` y exigir que el device esté en `user_devices`, pero eso
+        # deja fuera a quien nunca vinculó, y hoy NADIE sabe cuántos son. Esta
+        # columna anota, por cada identidad que vota, si estaba registrada:
+        #   1 = sí, 0 = no, NULL = no se pudo comprobar (o fila anterior al cambio).
+        # No cambia ningún comportamiento; solo da el dato para decidir la fase 2
+        # con números en vez de a ojo.
+        try:
+            conn.execute('ALTER TABLE community_vote_sources ADD COLUMN registered INTEGER')
+        except sqlite3.OperationalError:
+            pass  # ya existe
         # Migracion idempotente: si la tabla legacy tiene votos y la nueva
         # esta vacia para ese fp, copiar como field='track_type'. Sin LOCK
         # porque ON CONFLICT DO NOTHING garantiza idempotencia si se llama
@@ -1737,7 +1748,7 @@ class AnalysisDB:
         return _h.sha256((ip or '').encode()).hexdigest()[:16]
 
     def register_vote_source(self, ip_hash: str, fingerprint: str,
-                             device_id: str) -> int:
+                             device_id: str, registered: Optional[bool] = None) -> int:
         """Registra que `ip_hash` ha votado `fingerprint` como `device_id` y
         devuelve cuantas identidades DISTINTAS lleva usadas esa IP para ese
         track (incluida esta).
@@ -1745,18 +1756,35 @@ class AnalysisDB:
         Base de la mitigacion SEC-12: un usuario real vota un track concreto
         desde uno o dos dispositivos; alguien fabricando consenso necesita
         tres o mas identidades. Ver `community_vote_sources` en init_db.
+
+        `registered` es solo OBSERVACION (fase 1): dice si ese device_id estaba
+        en `user_devices` al votar. None = no se pudo comprobar. No influye en
+        el conteo ni en el corte; alimenta `vote_registration_stats`.
         """
         if not ip_hash or not fingerprint or not device_id:
             return 0
         from datetime import datetime
         fingerprint = self.canonical_community_key(fingerprint)
+        reg = None if registered is None else (1 if registered else 0)
         conn = self._open_conn()
         try:
             conn.execute(
                 'INSERT OR IGNORE INTO community_vote_sources '
-                '(ip_hash, fingerprint, device_id, created_at) VALUES (?, ?, ?, ?)',
-                (ip_hash, fingerprint, device_id, datetime.utcnow().isoformat()),
+                '(ip_hash, fingerprint, device_id, created_at, registered) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (ip_hash, fingerprint, device_id, datetime.utcnow().isoformat(), reg),
             )
+            # Si la fila ya existia (voto repetido) el INSERT no hace nada, pero
+            # el estado de registro SI puede haber cambiado: el usuario pudo
+            # vincular el device despues de su primer voto. Se refresca cuando
+            # tenemos dato, nunca se pisa un valor conocido con NULL.
+            if reg is not None:
+                conn.execute(
+                    'UPDATE community_vote_sources SET registered = ? '
+                    'WHERE ip_hash = ? AND fingerprint = ? AND device_id = ? '
+                    'AND (registered IS NULL OR registered != ?)',
+                    (reg, ip_hash, fingerprint, device_id, reg),
+                )
             conn.commit()
             row = conn.execute(
                 'SELECT COUNT(DISTINCT device_id) FROM community_vote_sources '
@@ -1764,6 +1792,40 @@ class AnalysisDB:
                 (ip_hash, fingerprint),
             ).fetchone()
             return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def vote_registration_stats(self, days: int = 30) -> dict:
+        """Cuantas identidades votantes estaban registradas en `user_devices`.
+
+        El dato que decide la fase 2 de SEC-12: si se exige registro para votar,
+        `unregistered` es EXACTAMENTE la gente que se queda fuera. Con esto se
+        decide con numeros, no a ojo.
+        """
+        from datetime import datetime, timedelta
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        conn = self._open_conn()
+        try:
+            row = conn.execute(
+                'SELECT '
+                '  SUM(CASE WHEN registered = 1 THEN 1 ELSE 0 END), '
+                '  SUM(CASE WHEN registered = 0 THEN 1 ELSE 0 END), '
+                '  SUM(CASE WHEN registered IS NULL THEN 1 ELSE 0 END) '
+                'FROM community_vote_sources WHERE created_at >= ?',
+                (since,),
+            ).fetchone()
+            reg, unreg, unknown = (int(v or 0) for v in (row or (0, 0, 0)))
+            conocidos = reg + unreg
+            return {
+                'days': days,
+                'registered': reg,
+                'unregistered': unreg,
+                'unknown': unknown,
+                # % sobre los que SI se pudieron comprobar; con 0 comprobados no
+                # se inventa un 0% que se leeria como "no hay problema".
+                'unregistered_pct': (round(100.0 * unreg / conocidos, 1)
+                                     if conocidos else None),
+            }
         finally:
             conn.close()
 

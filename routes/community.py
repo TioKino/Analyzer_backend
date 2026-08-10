@@ -87,15 +87,52 @@ community_router = APIRouter(tags=["community"])
 MAX_VOTE_IDENTITIES_PER_IP = int(os.getenv('MAX_VOTE_IDENTITIES_PER_IP', '3'))
 
 
+def _device_is_registered(device_id: str):
+    """¿Está este device_id vinculado a un usuario en `user_devices`?
+
+    SOLO OBSERVACIÓN (fase 1 de SEC-12). Devuelve True/False, o None si no se
+    pudo comprobar — y `None` es un valor real, no un fallo silencioso: se
+    contabiliza aparte para no confundir "no registrado" con "no lo sabemos".
+
+    Vive en `sync.db`, que es OTRA base que la de comunidad (`analysis.db`), de
+    ahí el import perezoso a sync_endpoints en vez de tocar `db`.
+    """
+    if not device_id:
+        return None
+    try:
+        import sync_endpoints
+
+        return sync_endpoints._get_user_id_for_device(
+            sync_endpoints._get_conn(), device_id
+        ) is not None
+    except Exception as e:  # noqa: BLE001 - observar nunca puede tumbar un voto
+        logger.debug(f"[Community] no se pudo comprobar registro de device: {e}")
+        return None
+
+
 def _guard_vote_source(request, fingerprint: str, device_id: str) -> None:
-    """Rechaza con 429 si esta IP ya votó este track con demasiadas identidades."""
+    """Rechaza con 429 si esta IP ya votó este track con demasiadas identidades.
+
+    De paso anota si el device estaba registrado (fase 1 de SEC-12, ver
+    `_device_is_registered`): es el dato que falta para decidir si se puede
+    exigir registro sin dejar fuera a media base de usuarios.
+    """
     if not fingerprint or not device_id:
         return
     try:
         from validation import get_client_ip
 
         ip_hash = db.hash_ip(get_client_ip(request))
-        distintas = db.register_vote_source(ip_hash, fingerprint, device_id)
+        registrado = _device_is_registered(device_id)
+        distintas = db.register_vote_source(
+            ip_hash, fingerprint, device_id, registered=registrado,
+        )
+        if registrado is False:
+            logger.info(
+                f"[Community][SEC-12 obs] voto de device NO registrado "
+                f"({device_id[:8]}…) sobre fp={fingerprint[:12]}. Exigir registro "
+                f"hoy lo rechazaría."
+            )
     except Exception as e:  # noqa: BLE001 - la mitigación nunca tumba el voto
         logger.warning(f"[Community] guard de procedencia falló (se deja pasar): {e}")
         return
