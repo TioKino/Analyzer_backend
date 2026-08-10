@@ -35,6 +35,7 @@ import os
 import re
 from typing import List
 
+from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, File, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -316,7 +317,13 @@ async def get_artwork(track_id: str):
             title = existing.get('title')
             if artist and title and search_artwork_online:
                 logger.info(f"[Artwork] Cache MISS para {track_id[:8]}, buscando online...")
-                online = search_artwork_online(artist, title)
+                # search_artwork_online encadena hasta 8 peticiones HTTP
+                # SINCRONAS (iTunes busqueda + descarga, Deezer x2, Last.fm x2)
+                # con timeouts de 5-8 s. Llamarla directa desde este handler
+                # async congelaba el event loop del unico worker hasta ~45 s, y
+                # el endpoint es anonimo: bastaba iterar fingerprints sin
+                # caratula cacheada para tumbar la API entera.
+                online = await run_in_threadpool(search_artwork_online, artist, title)
                 if online and online.get('data'):
                     save_artwork_to_cache(
                         track_id, online['data'], online['mime_type'])

@@ -18,6 +18,7 @@
 
 import hmac as _hmac
 import logging
+import secrets
 import uuid
 import random
 import string
@@ -310,9 +311,50 @@ def _require_user_id(conn: sqlite3.Connection, device_id: str) -> str:
 
 
 def _generate_link_code() -> str:
-    """Genera un código alfanumérico de 6 caracteres (sin ambigüedades)."""
+    """Genera un código alfanumérico de 6 caracteres (sin ambigüedades).
+
+    Usa `secrets`, NO `random`: un código de vinculación da acceso COMPLETO a
+    la cuenta (pull de toda la biblioteca y push a todos sus dispositivos), así
+    que es material criptográfico. `random.choices` usa Mersenne Twister, cuyo
+    estado interno se puede reconstruir observando suficientes salidas — y
+    cualquiera puede pedir códigos propios para obtenerlas.
+    """
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I
-    return "".join(random.choices(chars, k=6))
+    return "".join(secrets.choice(chars) for _ in range(6))
+
+
+# Fuerza bruta contra /sync/link/join: el espacio es 32^6 (~1.07e9) pero los
+# códigos viven 10 minutos y puede haber varios activos a la vez, así que sin
+# límite de intentos el ataque es viable con paciencia. Ventana deslizante en
+# memoria por IP; el proceso es único (un worker) así que basta con un dict.
+_JOIN_MAX_ATTEMPTS = int(os.getenv('LINK_JOIN_MAX_ATTEMPTS', '20'))
+_JOIN_WINDOW_SEC = int(os.getenv('LINK_JOIN_WINDOW_SEC', '600'))
+_join_attempts: dict = {}
+
+
+def _check_join_attempts(ip: str) -> None:
+    """Cuenta intentos FALLIDOS de join por IP y corta al superar el umbral."""
+    import time as _time
+
+    now = _time.time()
+    recent = [t for t in _join_attempts.get(ip, []) if now - t < _JOIN_WINDOW_SEC]
+    # Purga de claves vacías: sin esto el dict crece con cada IP vista.
+    if recent:
+        _join_attempts[ip] = recent
+    else:
+        _join_attempts.pop(ip, None)
+    if len(recent) >= _JOIN_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiados intentos de vinculación. Espera unos minutos.",
+            headers={"Retry-After": str(_JOIN_WINDOW_SEC)},
+        )
+
+
+def _record_join_failure(ip: str) -> None:
+    import time as _time
+
+    _join_attempts.setdefault(ip, []).append(_time.time())
 
 
 def _is_collective(data_type: str) -> bool:
@@ -432,11 +474,16 @@ class LinkJoinRequest(BaseModel):
 
 
 @sync_router.post("/link/join")
-async def sync_link_join(req: LinkJoinRequest):
+async def sync_link_join(req: LinkJoinRequest, request: Request):
     """
     Vincula un dispositivo a un usuario existente usando el código de 6 caracteres.
     Si el dispositivo ya está registrado con otro usuario, se re-vincula.
     """
+    from validation import get_client_ip
+
+    ip = get_client_ip(request)
+    _check_join_attempts(ip)
+
     conn = _get_conn()
 
     # Buscar código válido
@@ -446,12 +493,14 @@ async def sync_link_join(req: LinkJoinRequest):
     ).fetchone()
 
     if not row:
+        _record_join_failure(ip)
         raise HTTPException(status_code=404, detail="Invalid or expired link code")
 
     target_user_id, expires_at = row
     if expires_at < _now_iso():
         conn.execute("DELETE FROM link_codes WHERE code = ?", (req.code.upper(),))
         conn.commit()
+        _record_join_failure(ip)
         raise HTTPException(status_code=410, detail="Link code expired")
 
     now = _now_iso()
@@ -762,11 +811,34 @@ async def sync_pull(
             (key, item_hash, payload_json),
         ))
 
-    # Paginación: si limit>0, recortar al rango [offset, offset+limit)
+    # Paginación. Los dos modos usan cursores DISTINTOS y mezclarlos pierde
+    # items en silencio (SYNC-01 de la auditoría 2026-08-09):
+    #
+    #   full=true  -> NO se filtra por device_seen, así que `all_items` es
+    #                 estable entre páginas y `offset` ES el cursor correcto.
+    #                 Es la ruta que usa hoy _paginatedPullMobile (solo se
+    #                 pagina cuando _forceFullPull), y funciona bien.
+    #
+    #   full=false -> `device_seen` YA actúa de cursor: cada página entregada
+    #                 se marca como vista, así que la siguiente petición
+    #                 arranca donde acabó la anterior. Honrar ADEMÁS el
+    #                 `offset` suma dos avances y salta `limit` items por
+    #                 página. Medido: 5000 tracks paginados de 200 en 200
+    #                 entregaban 2600. Por eso aquí el offset se IGNORA.
+    #
+    # Hoy ningún llamador combina full=false con offset, así que esto es
+    # blindaje: deja el endpoint correcto sea cual sea el modo, para que un
+    # cambio futuro en el cliente (o un script) no reabra el agujero.
+    #
+    # `has_more` sale además del `if` interior: antes vivía dentro de
+    # `limit < len(all_items)`, así que cuando quedaban menos items que el
+    # `limit` el recorte NO se aplicaba y se devolvía la lista entera desde
+    # el principio, ignorando el offset.
+    effective_offset = offset if full else 0
     has_more = False
-    if limit > 0 and limit < len(all_items):
-        has_more = len(all_items) > offset + limit
-        all_items = all_items[offset:offset + limit]
+    if limit > 0:
+        has_more = len(all_items) > effective_offset + limit
+        all_items = all_items[effective_offset:effective_offset + limit]
 
     changes = [item[0] for item in all_items]
     update_seen = [item[1] for item in all_items]

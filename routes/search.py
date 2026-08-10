@@ -40,6 +40,28 @@ from validation import (
 
 logger = logging.getLogger(__name__)
 
+
+def _require_admin(request: Request) -> None:
+    """Auth Bearer contra ADMIN_TOKEN para los endpoints destructivos de aquí.
+
+    Mismo esquema que `main._verify_admin_bearer` y `sync_endpoints._verify_admin`,
+    reimplementado en local para no crear un import circular
+    (main importa este módulo). En dev sin ADMIN_TOKEN se deja pasar; en
+    Render/Railway sin token se falla rápido con 500, igual que el resto.
+    """
+    import hmac as _hmac
+    import os as _os
+
+    token = _os.environ.get('ADMIN_TOKEN', '')
+    if not token:
+        if _os.getenv('RENDER') or _os.getenv('RAILWAY_ENVIRONMENT'):
+            raise HTTPException(500, "ADMIN_TOKEN required in production")
+        return
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer ') or not _hmac.compare_digest(auth[7:], token):
+        raise HTTPException(401, "Admin token requerido")
+
+
 # ── Dependencias inyectadas desde main.py ────────────────────
 db = None
 CAMELOT_COMPATIBLE = {}
@@ -303,8 +325,18 @@ async def search_advanced(search_request: SearchRequest):
 # ==================== ENDPOINTS DE BIBLIOTECA ====================
 
 @search_router.get("/library/all")
-async def get_all_tracks(limit: int = Query(1000, ge=1, le=5000)):
-    #  Validar lmite
+async def get_all_tracks(request: Request, limit: int = Query(1000, ge=1, le=5000)):
+    """Volcado completo de la base colectiva. SOLO admin.
+
+    Devolvía hasta 5000 tracks con sus fingerprints a cualquiera que llamara.
+    La memoria colectiva es el activo diferencial del producto y se podía
+    clonar con un curl; además los fingerprints obtenidos aquí servían para
+    cebar el fallback online de /artwork (auditoría 2026-08-09, SEC-13).
+    Ningún cliente lo consume — el panel admin usa /admin/all-tracks — así que
+    cerrarlo no rompe nada. Las agregaciones (/library/artists, /genres,
+    /stats) siguen abiertas: no exponen la biblioteca fila a fila.
+    """
+    _require_admin(request)
     limit = validate_limit(limit, max_limit=5000)
 
     return {"tracks": db.get_all_tracks(limit)}
@@ -335,8 +367,16 @@ async def get_track(track_id: str):
     return track
 
 @search_router.delete("/track/{track_id}")
-async def delete_track(track_id: str):
-    """Eliminar un track de la base de datos"""
+async def delete_track(track_id: str, request: Request):
+    """Eliminar un track de la base de datos. SOLO admin.
+
+    `tracks` es la memoria colectiva COMPARTIDA por todos los usuarios, no la
+    biblioteca de quien llama. Sin auth, cualquiera podía borrar el análisis de
+    cualquier track para todo el mundo (verificado en la auditoría 2026-08-09:
+    DELETE anónimo -> 200 y la fila desaparecía). Ningún cliente consume este
+    endpoint; se mantiene como herramienta de mantenimiento del owner.
+    """
+    _require_admin(request)
     deleted = db.delete_track(track_id)
     if not deleted:
         raise HTTPException(404, "Track no encontrado")

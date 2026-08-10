@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: pytest backend
@@ -13,21 +17,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 3.11 es lo que corre en producción (.python-version = 3.11.9). Antes
+      # CI usaba 3.10, así que probábamos un intérprete distinto al desplegado.
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
-      - name: Install system deps (libchromaprint-tools, ffmpeg)
+      - name: Install system deps (ffmpeg)
         run: |
           sudo apt-get update
+          # libchromaprint-tools NO existe en el Debian de Render (verificado
+          # 2026-07-07), por eso acoustic_fingerprint.py auto-descarga el fpcalc
+          # estático de acoustid. En Ubuntu de Actions sí está, y tenerlo aquí
+          # permite que los tests que tocan fpcalc corran de verdad.
           sudo apt-get install -y libchromaprint-tools ffmpeg
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-minimal.txt
+          # requirements.txt, NO requirements-minimal.txt: es lo que se instala
+          # en Render. Con el mínimo, soundfile y pyacoustid (dependencias
+          # reales de producción) nunca llegaban a importarse en CI.
+          pip install -r requirements.txt
           pip install -r requirements-test.txt
 
+      # Sin `-x`: cortar en el primer fallo oculta el resto y obliga a iterar
+      # de uno en uno. Mejor ver el panorama completo en una sola pasada.
       - name: Run pytest
-        run: pytest -x --tb=short --ignore=test_beatport.py
+        run: pytest -q --tb=short
+
+      # Informativo: no bloquea el merge por una CVE recién publicada en una
+      # dependencia transitoria, pero deja el aviso a la vista. requests 2.31.0
+      # y fastapi 0.109.0 (starlette 0.35.x, multipart sin límite) ya arrastran
+      # avisos conocidos.
+      - name: Auditoría de dependencias (informativo)
+        if: always()
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          pip-audit --progress-spinner off || true

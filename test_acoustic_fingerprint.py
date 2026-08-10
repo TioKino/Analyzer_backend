@@ -155,3 +155,49 @@ def test_threshold_boundary(n_flips, should_match):
     fp = _rand_fp(n=400)
     other = _flip_bits(fp, n_flips)
     assert fingerprints_match(fp, other) is should_match
+
+
+# ==================== Equivalencia numpy <-> Python puro ====================
+# `hamming_distance` se vectorizo con numpy (x19) porque era el cuello de
+# botella del clustering. La vectorizacion NO puede cambiar ni un bit del
+# resultado: aqui se compara contra la implementacion de referencia sobre
+# entradas aleatorias, identicas, desplazadas y de longitudes distintas.
+
+import random as _random
+
+from acoustic_fingerprint import _hamming_py, hamming_distance as _hd
+
+
+def _seeded_fp(n, seed):
+    r = _random.Random(seed)
+    return [r.getrandbits(32) for _ in range(n)]
+
+
+def test_numpy_y_python_puro_dan_el_mismo_resultado():
+    casos = [
+        (_seeded_fp(950, 1), _seeded_fp(950, 2)),          # distintos
+        (_seeded_fp(500, 3), _seeded_fp(500, 3)),          # identicos
+        (_seeded_fp(400, 4), _seeded_fp(700, 5)),          # longitudes distintas
+        (_seeded_fp(20, 6), _seeded_fp(20, 7)),            # cortos
+        ([1, 2, 3], [1, 2, 3]),                        # por debajo de _MIN_OVERLAP
+        ([], [1, 2, 3]),                               # vacio
+    ]
+    for a, b in casos:
+        assert abs(_hd(a, b) - _hamming_py(a, b)) < 1e-12 or (not a or not b), (
+            f"divergencia con len={len(a)}/{len(b)}"
+        )
+
+
+def test_copia_desplazada_sigue_casando():
+    """El alineado por desplazamiento debe absorber el encoder delay."""
+    base = _seeded_fp(600, 11)
+    desplazada = base[2:]
+    assert _hd(base, desplazada) < 0.01
+    assert abs(_hd(base, desplazada) - _hamming_py(base, desplazada)) < 1e-12
+
+
+def test_un_bit_distinto_no_rompe_el_match():
+    base = _seeded_fp(600, 12)
+    casi = list(base)
+    casi[100] ^= 1
+    assert _hd(base, casi) < MATCH_THRESHOLD

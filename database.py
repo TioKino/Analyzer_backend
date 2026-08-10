@@ -391,6 +391,43 @@ class AnalysisDB:
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_co_fp_field ON community_overrides(fingerprint, field)')
+
+        # Procedencia de los votos comunitarios (mitigacion SEC-12, auditoria
+        # 2026-08-09). El `device_id` de /community/* llega como campo PLANO del
+        # cuerpo y sin autenticar, asi que "un dispositivo, un voto" es
+        # autodeclarado: tres ids inventados fabrican un consensus_3 (prioridad
+        # 80) que gana al motor local (50). El arreglo de fondo es derivar el
+        # device_id de la identidad de sync, que ya esta autenticada, pero eso
+        # obliga a tocar el cliente. Mientras tanto registramos de que ORIGEN
+        # viene cada voto para poder cortar el caso barato: una sola maquina
+        # votando el mismo track bajo muchas identidades.
+        #
+        # La IP se guarda HASHEADA (sha256 truncado): sirve para agrupar, no
+        # para identificar a nadie, en linea con el resto del backend.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_vote_sources (
+                ip_hash     TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                device_id   TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (ip_hash, fingerprint, device_id)
+            )
+        ''')
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_cvs_ip_fp '
+            'ON community_vote_sources(ip_hash, fingerprint)'
+        )
+        # SEC-12 fase 1 (observación). El arreglo de fondo es contar el consenso
+        # por `user_id` y exigir que el device esté en `user_devices`, pero eso
+        # deja fuera a quien nunca vinculó, y hoy NADIE sabe cuántos son. Esta
+        # columna anota, por cada identidad que vota, si estaba registrada:
+        #   1 = sí, 0 = no, NULL = no se pudo comprobar (o fila anterior al cambio).
+        # No cambia ningún comportamiento; solo da el dato para decidir la fase 2
+        # con números en vez de a ojo.
+        try:
+            conn.execute('ALTER TABLE community_vote_sources ADD COLUMN registered INTEGER')
+        except sqlite3.OperationalError:
+            pass  # ya existe
         # Migracion idempotente: si la tabla legacy tiene votos y la nueva
         # esta vacia para ese fp, copiar como field='track_type'. Sin LOCK
         # porque ON CONFLICT DO NOTHING garantiza idempotencia si se llama
@@ -417,6 +454,20 @@ class AnalysisDB:
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_cnotes_fp ON community_notes(fingerprint)')
+
+        # Quien ha votado cada nota. `community_notes.upvotes` era un contador
+        # CIEGO: POST /community/notes/{id}/upvote no recibia identidad ninguna
+        # y hacia `upvotes = upvotes + 1`, asi que un curl en bucle colocaba
+        # cualquier nota la primera. Con esta tabla el upvote es idempotente por
+        # votante (device_id si el cliente lo manda, hash de IP si no).
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_note_upvotes (
+                note_id    INTEGER NOT NULL,
+                voter      TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (note_id, voter)
+            )
+        ''')
 
         # Popularidad de tracks
         conn.execute('''
@@ -590,31 +641,37 @@ class AnalysisDB:
 
     def get_track_by_filename(self, filename):
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('SELECT * FROM tracks WHERE filename = ?', (filename,))
-        result = c.fetchone()
-        conn.close()
-        return result
+        try:
+            c = conn.cursor()
+            c.execute('SELECT * FROM tracks WHERE filename = ?', (filename,))
+            result = c.fetchone()
+            return result
+        finally:
+            conn.close()
 
     def get_track_by_id(self, track_id: str) -> Optional[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('SELECT * FROM tracks WHERE id = ?', (track_id,))
-        result = c.fetchone()
-        conn.close()
-        return self._row_to_dict(result)
+        try:
+            c = conn.cursor()
+            c.execute('SELECT * FROM tracks WHERE id = ?', (track_id,))
+            result = c.fetchone()
+            return self._row_to_dict(result)
+        finally:
+            conn.close()
 
     def get_track_by_fingerprint(self, fingerprint: str) -> Optional[Dict]:
         """Busca un track por su fingerprint de audio (memoria colectiva)"""
         if not fingerprint:
             return None
         conn = self._open_conn()
-        c = conn.cursor()
-        # Buscar por fingerprint O por id (que a veces es el fingerprint)
-        c.execute('SELECT * FROM tracks WHERE fingerprint = ? OR id = ?', (fingerprint, fingerprint))
-        result = c.fetchone()
-        conn.close()
-        return self._row_to_dict(result)
+        try:
+            c = conn.cursor()
+            # Buscar por fingerprint O por id (que a veces es el fingerprint)
+            c.execute('SELECT * FROM tracks WHERE fingerprint = ? OR id = ?', (fingerprint, fingerprint))
+            result = c.fetchone()
+            return self._row_to_dict(result)
+        finally:
+            conn.close()
 
     def get_track_by_isrc(self, isrc: str) -> Optional[Dict]:
         """Busca un track por su ISRC (codigo unico de grabacion de AudD).
@@ -623,14 +680,16 @@ class AnalysisDB:
         if not isrc:
             return None
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute(
-            'SELECT * FROM tracks WHERE isrc = ? ORDER BY analyzed_at DESC LIMIT 1',
-            (isrc,),
-        )
-        result = c.fetchone()
-        conn.close()
-        return self._row_to_dict(result)
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT * FROM tracks WHERE isrc = ? ORDER BY analyzed_at DESC LIMIT 1',
+                (isrc,),
+            )
+            result = c.fetchone()
+            return self._row_to_dict(result)
+        finally:
+            conn.close()
 
     def backfill_track_fingerprint(self, fingerprint, chromaprint_b64, acoustic_id):
         """Backfill LIGERO: escribe chromaprint + acoustic_id en un track YA
@@ -666,7 +725,7 @@ class AnalysisDB:
         audio dura lo mismo, reduce O(N) a O(pocos) sin perder matches.
         """
         from acoustic_fingerprint import (
-            MATCH_THRESHOLD, decode_raw, hamming_distance,
+            MATCH_THRESHOLD, decode_raw, decode_raw_np, hamming_distance,
         )
         if not raw_ints:
             return None
@@ -690,12 +749,27 @@ class AnalysisDB:
         finally:
             conn.close()
 
+        # Camino caliente: se compara `raw_ints` contra CADA candidato de
+        # duracion similar. Convertimos la consulta a ndarray UNA vez (no una
+        # por candidato) y decodificamos cada candidato directo a ndarray, para
+        # no pagar una conversion lista->array por comparacion. Con numpy
+        # ausente, decode_raw_np devuelve None y caemos al camino de listas.
+        query = raw_ints
+        try:
+            import numpy as _np
+
+            query = _np.asarray(raw_ints, dtype=_np.uint32)
+        except Exception:  # noqa: BLE001 - sin numpy seguimos con listas
+            pass
+
         best_id, best_dist = None, MATCH_THRESHOLD
         for row in rows:
-            cand = decode_raw(row['chromaprint'])
-            if not cand:
+            cand = decode_raw_np(row['chromaprint'])
+            if cand is None:
+                cand = decode_raw(row['chromaprint'])
+            if cand is None or len(cand) == 0:
                 continue
-            d = hamming_distance(raw_ints, cand)
+            d = hamming_distance(query, cand)
             if d < best_dist:
                 best_dist, best_id = d, row['acoustic_id']
         return best_id
@@ -726,17 +800,19 @@ class AnalysisDB:
         if not fingerprint:
             return fingerprint
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute(
-            'SELECT acoustic_id FROM tracks WHERE fingerprint = ? OR id = ? '
-            'LIMIT 1',
-            (fingerprint, fingerprint),
-        )
-        row = c.fetchone()
-        conn.close()
-        if row and row['acoustic_id']:
-            return row['acoustic_id']
-        return fingerprint
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT acoustic_id FROM tracks WHERE fingerprint = ? OR id = ? '
+                'LIMIT 1',
+                (fingerprint, fingerprint),
+            )
+            row = c.fetchone()
+            if row and row['acoustic_id']:
+                return row['acoustic_id']
+            return fingerprint
+        finally:
+            conn.close()
 
     def canonical_community_keys(self, fingerprints):
         """Version batch de canonical_community_key: mapa {fingerprint ->
@@ -900,72 +976,76 @@ class AnalysisDB:
 
     def save_track(self, track_data):
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        # `chromaprint` es un blob tecnico (base64 de varios KB) cuyo sitio es
-        # su columna dedicada; fuera del analysis_json para no duplicarlo ni
-        # engordar lo que se envia al cliente ni el AnalysisResult del cache-hit.
-        analysis_json_data = {
-            k: v for k, v in track_data.items() if k != 'chromaprint'
-        }
+            # `chromaprint` es un blob tecnico (base64 de varios KB) cuyo sitio es
+            # su columna dedicada; fuera del analysis_json para no duplicarlo ni
+            # engordar lo que se envia al cliente ni el AnalysisResult del cache-hit.
+            analysis_json_data = {
+                k: v for k, v in track_data.items() if k != 'chromaprint'
+            }
 
-        c.execute('''
-            INSERT OR REPLACE INTO tracks
-            (id, filename, artist, title, duration, bpm, key, camelot,
-             energy_dj, genre, track_type, analysis_json, analyzed_at,
-             fingerprint, chromaprint, acoustic_id, engine_source,
-             analysis_version, isrc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            track_data['id'],
-            track_data['filename'],
-            track_data.get('artist'),
-            track_data.get('title'),
-            track_data['duration'],
-            track_data['bpm'],
-            track_data.get('key'),
-            track_data.get('camelot'),
-            track_data['energy_dj'],
-            track_data['genre'],
-            track_data['track_type'],
-            json.dumps(analysis_json_data),
-            datetime.now().isoformat(),
-            track_data.get('fingerprint'),
-            track_data.get('chromaprint'),
-            track_data.get('acoustic_id'),
-            track_data.get('engine_source'),
-            track_data.get('analysis_version'),
-            track_data.get('isrc'),
-        ))
+            c.execute('''
+                INSERT OR REPLACE INTO tracks
+                (id, filename, artist, title, duration, bpm, key, camelot,
+                 energy_dj, genre, track_type, analysis_json, analyzed_at,
+                 fingerprint, chromaprint, acoustic_id, engine_source,
+                 analysis_version, isrc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                track_data['id'],
+                track_data['filename'],
+                track_data.get('artist'),
+                track_data.get('title'),
+                track_data['duration'],
+                track_data['bpm'],
+                track_data.get('key'),
+                track_data.get('camelot'),
+                track_data['energy_dj'],
+                track_data['genre'],
+                track_data['track_type'],
+                json.dumps(analysis_json_data),
+                datetime.now().isoformat(),
+                track_data.get('fingerprint'),
+                track_data.get('chromaprint'),
+                track_data.get('acoustic_id'),
+                track_data.get('engine_source'),
+                track_data.get('analysis_version'),
+                track_data.get('isrc'),
+            ))
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
 
     def save_correction(self, track_id, field, old_value, new_value, fingerprint=None, device_id=None):
         # Memoria colectiva por SONIDO: agrupar bajo el cluster acustico.
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        if device_id and fingerprint:
-            c.execute('''
-                DELETE FROM corrections
-                WHERE fingerprint = ? AND field = ? AND track_id = ?
-                AND corrected_at IN (
-                    SELECT corrected_at FROM corrections
+            if device_id and fingerprint:
+                c.execute('''
+                    DELETE FROM corrections
                     WHERE fingerprint = ? AND field = ? AND track_id = ?
-                    ORDER BY corrected_at DESC LIMIT 1
-                )
-            ''', (fingerprint, field, track_id, fingerprint, field, track_id))
+                    AND corrected_at IN (
+                        SELECT corrected_at FROM corrections
+                        WHERE fingerprint = ? AND field = ? AND track_id = ?
+                        ORDER BY corrected_at DESC LIMIT 1
+                    )
+                ''', (fingerprint, field, track_id, fingerprint, field, track_id))
 
-        c.execute('''
-            INSERT INTO corrections
-            (track_id, field, old_value, new_value, corrected_at, fingerprint)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (track_id, field, old_value, new_value, datetime.now().isoformat(), fingerprint))
+            c.execute('''
+                INSERT INTO corrections
+                (track_id, field, old_value, new_value, corrected_at, fingerprint)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (track_id, field, old_value, new_value, datetime.now().isoformat(), fingerprint))
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_consensus(self, fingerprint, field, min_votes=1):
         """
@@ -977,23 +1057,25 @@ class AnalysisDB:
         fingerprint = self.canonical_community_key(fingerprint)
 
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('''
-            SELECT new_value, COUNT(DISTINCT track_id || corrected_at) as vote_count
-            FROM corrections
-            WHERE fingerprint = ? AND field = ?
-            GROUP BY new_value
-            ORDER BY vote_count DESC
-            LIMIT 1
-        ''', (fingerprint, field))
+            c.execute('''
+                SELECT new_value, COUNT(DISTINCT track_id || corrected_at) as vote_count
+                FROM corrections
+                WHERE fingerprint = ? AND field = ?
+                GROUP BY new_value
+                ORDER BY vote_count DESC
+                LIMIT 1
+            ''', (fingerprint, field))
 
-        result = c.fetchone()
-        conn.close()
+            result = c.fetchone()
 
-        if result and result['vote_count'] >= min_votes:
-            return result['new_value'], result['vote_count']
-        return None, 0
+            if result and result['vote_count'] >= min_votes:
+                return result['new_value'], result['vote_count']
+            return None, 0
+        finally:
+            conn.close()
 
     def get_collective_genre(self, fingerprint):
         """Legacy: usa get_consensus con minimo 3 votos."""
@@ -1010,123 +1092,137 @@ class AnalysisDB:
         fingerprint = self.canonical_community_key(fingerprint)
 
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('''
-            SELECT field, new_value, COUNT(DISTINCT track_id || corrected_at) as vote_count
-            FROM corrections
-            WHERE fingerprint = ?
-            GROUP BY field, new_value
-            ORDER BY field, vote_count DESC
-        ''', (fingerprint,))
+            c.execute('''
+                SELECT field, new_value, COUNT(DISTINCT track_id || corrected_at) as vote_count
+                FROM corrections
+                WHERE fingerprint = ?
+                GROUP BY field, new_value
+                ORDER BY field, vote_count DESC
+            ''', (fingerprint,))
 
-        rows = c.fetchall()
-        conn.close()
+            rows = c.fetchall()
 
-        result = {}
-        for row in rows:
-            field = row['field']
-            value = row['new_value']
-            count = row['vote_count']
-            if field not in result or count > result[field][1]:
-                result[field] = (value, count)
+            result = {}
+            for row in rows:
+                field = row['field']
+                value = row['new_value']
+                count = row['vote_count']
+                if field not in result or count > result[field][1]:
+                    result[field] = (value, count)
 
-        return result
+            return result
+        finally:
+            conn.close()
 
     # ==================== BUSQUEDAS ====================
 
     def search_by_artist_title(self, artist: str, title: str):
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        artist_pattern = f"%{artist.lower()}%"
-        title_pattern = f"%{title.lower()}%"
+            artist_pattern = f"%{artist.lower()}%"
+            title_pattern = f"%{title.lower()}%"
 
-        c.execute('''
-            SELECT * FROM tracks
-            WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
-            ORDER BY analyzed_at DESC
-            LIMIT 10
-        ''', (artist_pattern, title_pattern))
+            c.execute('''
+                SELECT * FROM tracks
+                WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
+                ORDER BY analyzed_at DESC
+                LIMIT 10
+            ''', (artist_pattern, title_pattern))
 
-        results = c.fetchall()
-        conn.close()
-        return results
+            results = c.fetchall()
+            return results
+        finally:
+            conn.close()
 
     def search_by_artist(self, artist: str, limit: int = 50) -> List[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('''
-            SELECT * FROM tracks
-            WHERE artist LIKE ? COLLATE NOCASE
-            ORDER BY artist, title
-            LIMIT ?
-        ''', (f'%{artist}%', limit))
+            c.execute('''
+                SELECT * FROM tracks
+                WHERE artist LIKE ? COLLATE NOCASE
+                ORDER BY artist, title
+                LIMIT ?
+            ''', (f'%{artist}%', limit))
 
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     def search_by_genre(self, genre: str, limit: int = 100) -> List[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('''
-            SELECT * FROM tracks
-            WHERE genre LIKE ? COLLATE NOCASE
-            ORDER BY energy_dj DESC, bpm
-            LIMIT ?
-        ''', (f'%{genre}%', limit))
+            c.execute('''
+                SELECT * FROM tracks
+                WHERE genre LIKE ? COLLATE NOCASE
+                ORDER BY energy_dj DESC, bpm
+                LIMIT ?
+            ''', (f'%{genre}%', limit))
 
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     def search_by_bpm_range(self, min_bpm: float, max_bpm: float, limit: int = 100) -> List[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('''
-            SELECT * FROM tracks
-            WHERE bpm BETWEEN ? AND ?
-            ORDER BY bpm
-            LIMIT ?
-        ''', (min_bpm, max_bpm, limit))
+            c.execute('''
+                SELECT * FROM tracks
+                WHERE bpm BETWEEN ? AND ?
+                ORDER BY bpm
+                LIMIT ?
+            ''', (min_bpm, max_bpm, limit))
 
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     def search_by_energy(self, min_energy: int, max_energy: int = 10, limit: int = 100) -> List[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('''
-            SELECT * FROM tracks
-            WHERE energy_dj BETWEEN ? AND ?
-            ORDER BY energy_dj DESC, bpm
-            LIMIT ?
-        ''', (min_energy, max_energy, limit))
+            c.execute('''
+                SELECT * FROM tracks
+                WHERE energy_dj BETWEEN ? AND ?
+                ORDER BY energy_dj DESC, bpm
+                LIMIT ?
+            ''', (min_energy, max_energy, limit))
 
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     def search_by_key(self, key: str, limit: int = 100) -> List[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('''
-            SELECT * FROM tracks
-            WHERE key = ? COLLATE NOCASE OR camelot = ? COLLATE NOCASE
-            ORDER BY bpm, energy_dj
-            LIMIT ?
-        ''', (key, key, limit))
+            c.execute('''
+                SELECT * FROM tracks
+                WHERE key = ? COLLATE NOCASE OR camelot = ? COLLATE NOCASE
+                ORDER BY bpm, energy_dj
+                LIMIT ?
+            ''', (key, key, limit))
 
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     def search_compatible_keys(self, camelot: str, limit: int = 50) -> List[Dict]:
         if not camelot or len(camelot) < 2:
@@ -1147,34 +1243,38 @@ class AnalysisDB:
         compatible.append(f'{number}{other_letter}')
 
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        placeholders = ','.join(['?' for _ in compatible])
-        c.execute(f'''
-            SELECT * FROM tracks
-            WHERE camelot IN ({placeholders})
-            ORDER BY CASE camelot WHEN ? THEN 0 ELSE 1 END, energy_dj DESC
-            LIMIT ?
-        ''', (*compatible, camelot, limit))
+            placeholders = ','.join(['?' for _ in compatible])
+            c.execute(f'''
+                SELECT * FROM tracks
+                WHERE camelot IN ({placeholders})
+                ORDER BY CASE camelot WHEN ? THEN 0 ELSE 1 END, energy_dj DESC
+                LIMIT ?
+            ''', (*compatible, camelot, limit))
 
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     def search_by_track_type(self, track_type: str, limit: int = 100) -> List[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('''
-            SELECT * FROM tracks
-            WHERE track_type LIKE ? COLLATE NOCASE
-            ORDER BY energy_dj, bpm
-            LIMIT ?
-        ''', (f'%{track_type}%', limit))
+            c.execute('''
+                SELECT * FROM tracks
+                WHERE track_type LIKE ? COLLATE NOCASE
+                ORDER BY energy_dj, bpm
+                LIMIT ?
+            ''', (f'%{track_type}%', limit))
 
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     # Columnas validas para busquedas - whitelist de seguridad
     _VALID_COLUMNS = frozenset({
@@ -1188,153 +1288,171 @@ class AnalysisDB:
         SEGURIDAD: Las condiciones WHERE usan columnas hardcoded (no de user input).
         Los valores siempre van por parametros '?' (nunca interpolados)."""
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        conditions = []
-        params = []
+            conditions = []
+            params = []
 
-        if artist:
-            conditions.append('artist LIKE ? COLLATE NOCASE')
-            params.append(f'%{artist}%')
-        if genre:
-            conditions.append('genre LIKE ? COLLATE NOCASE')
-            params.append(f'%{genre}%')
-        if min_bpm is not None:
-            conditions.append('bpm >= ?')
-            params.append(min_bpm)
-        if max_bpm is not None:
-            conditions.append('bpm <= ?')
-            params.append(max_bpm)
-        if min_energy is not None:
-            conditions.append('energy_dj >= ?')
-            params.append(min_energy)
-        if max_energy is not None:
-            conditions.append('energy_dj <= ?')
-            params.append(max_energy)
-        if key:
-            conditions.append('(key = ? COLLATE NOCASE OR camelot = ? COLLATE NOCASE)')
-            params.extend([key, key])
-        if track_type:
-            conditions.append('track_type LIKE ? COLLATE NOCASE')
-            params.append(f'%{track_type}%')
+            if artist:
+                conditions.append('artist LIKE ? COLLATE NOCASE')
+                params.append(f'%{artist}%')
+            if genre:
+                conditions.append('genre LIKE ? COLLATE NOCASE')
+                params.append(f'%{genre}%')
+            if min_bpm is not None:
+                conditions.append('bpm >= ?')
+                params.append(min_bpm)
+            if max_bpm is not None:
+                conditions.append('bpm <= ?')
+                params.append(max_bpm)
+            if min_energy is not None:
+                conditions.append('energy_dj >= ?')
+                params.append(min_energy)
+            if max_energy is not None:
+                conditions.append('energy_dj <= ?')
+                params.append(max_energy)
+            if key:
+                conditions.append('(key = ? COLLATE NOCASE OR camelot = ? COLLATE NOCASE)')
+                params.extend([key, key])
+            if track_type:
+                conditions.append('track_type LIKE ? COLLATE NOCASE')
+                params.append(f'%{track_type}%')
 
-        where_clause = ' AND '.join(conditions) if conditions else '1=1'
+            where_clause = ' AND '.join(conditions) if conditions else '1=1'
 
-        c.execute(f'''
-            SELECT * FROM tracks
-            WHERE {where_clause}
-            ORDER BY energy_dj DESC, bpm
-            LIMIT ?
-        ''', (*params, limit))
+            c.execute(f'''
+                SELECT * FROM tracks
+                WHERE {where_clause}
+                ORDER BY energy_dj DESC, bpm
+                LIMIT ?
+            ''', (*params, limit))
 
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     def get_all_tracks(self, limit: int = 1000) -> List[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('SELECT * FROM tracks ORDER BY analyzed_at DESC LIMIT ?', (limit,))
-        results = c.fetchall()
-        conn.close()
-        return self._rows_to_list(results)
+        try:
+            c = conn.cursor()
+            c.execute('SELECT * FROM tracks ORDER BY analyzed_at DESC LIMIT ?', (limit,))
+            results = c.fetchall()
+            return self._rows_to_list(results)
+        finally:
+            conn.close()
 
     def get_unique_artists(self) -> List[str]:
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('''
-            SELECT DISTINCT artist FROM tracks
-            WHERE artist IS NOT NULL AND artist != ''
-            ORDER BY artist COLLATE NOCASE
-        ''')
-        results = [row['artist'] for row in c.fetchall()]
-        conn.close()
-        return results
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT DISTINCT artist FROM tracks
+                WHERE artist IS NOT NULL AND artist != ''
+                ORDER BY artist COLLATE NOCASE
+            ''')
+            results = [row['artist'] for row in c.fetchall()]
+            return results
+        finally:
+            conn.close()
 
     def get_unique_genres(self) -> List[str]:
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('''
-            SELECT DISTINCT genre FROM tracks
-            WHERE genre IS NOT NULL AND genre != ''
-            ORDER BY genre COLLATE NOCASE
-        ''')
-        results = [row['genre'] for row in c.fetchall()]
-        conn.close()
-        return results
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT DISTINCT genre FROM tracks
+                WHERE genre IS NOT NULL AND genre != ''
+                ORDER BY genre COLLATE NOCASE
+            ''')
+            results = [row['genre'] for row in c.fetchall()]
+            return results
+        finally:
+            conn.close()
 
     def get_stats(self) -> Dict:
         conn = self._open_conn()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        c.execute('SELECT COUNT(*) AS n FROM tracks')
-        total_tracks = c.fetchone()['n']
+            c.execute('SELECT COUNT(*) AS n FROM tracks')
+            total_tracks = c.fetchone()['n']
 
-        c.execute('SELECT COUNT(DISTINCT artist) AS n FROM tracks WHERE artist IS NOT NULL')
-        unique_artists = c.fetchone()['n']
+            c.execute('SELECT COUNT(DISTINCT artist) AS n FROM tracks WHERE artist IS NOT NULL')
+            unique_artists = c.fetchone()['n']
 
-        c.execute('SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre IS NOT NULL')
-        unique_genres = c.fetchone()['n']
+            c.execute('SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre IS NOT NULL')
+            unique_genres = c.fetchone()['n']
 
-        c.execute('SELECT AVG(bpm) AS v FROM tracks')
-        avg_bpm = c.fetchone()['v'] or 0
+            c.execute('SELECT AVG(bpm) AS v FROM tracks')
+            avg_bpm = c.fetchone()['v'] or 0
 
-        c.execute('SELECT AVG(energy_dj) AS v FROM tracks')
-        avg_energy = c.fetchone()['v'] or 0
+            c.execute('SELECT AVG(energy_dj) AS v FROM tracks')
+            avg_energy = c.fetchone()['v'] or 0
 
-        c.execute('SELECT SUM(duration) AS v FROM tracks')
-        total_duration = c.fetchone()['v'] or 0
+            c.execute('SELECT SUM(duration) AS v FROM tracks')
+            total_duration = c.fetchone()['v'] or 0
 
-        conn.close()
 
-        return {
-            'total_tracks': total_tracks,
-            'unique_artists': unique_artists,
-            'unique_genres': unique_genres,
-            'avg_bpm': round(avg_bpm, 1),
-            'avg_energy': round(avg_energy, 1),
-            'total_duration_hours': round(total_duration / 3600, 1)
-        }
+            return {
+                'total_tracks': total_tracks,
+                'unique_artists': unique_artists,
+                'unique_genres': unique_genres,
+                'avg_bpm': round(avg_bpm, 1),
+                'avg_energy': round(avg_energy, 1),
+                'total_duration_hours': round(total_duration / 3600, 1)
+            }
+        finally:
+            conn.close()
 
     def save_dj_note(self, track_id: str, note: str, fingerprint: Optional[str] = None):
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO dj_notes (track_id, fingerprint, note, created_at)
-            VALUES (?, ?, ?, ?)
-        ''', (track_id, fingerprint, note, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO dj_notes (track_id, fingerprint, note, created_at)
+                VALUES (?, ?, ?, ?)
+            ''', (track_id, fingerprint, note, datetime.now().isoformat()))
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_dj_notes(self, track_id: str) -> List[Dict]:
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('''
-            SELECT note, created_at FROM dj_notes
-            WHERE track_id = ? ORDER BY created_at DESC
-        ''', (track_id,))
-        results = [{'note': row['note'], 'created_at': row['created_at']} for row in c.fetchall()]
-        conn.close()
-        return results
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT note, created_at FROM dj_notes
+                WHERE track_id = ? ORDER BY created_at DESC
+            ''', (track_id,))
+            results = [{'note': row['note'], 'created_at': row['created_at']} for row in c.fetchall()]
+            return results
+        finally:
+            conn.close()
 
     def delete_track(self, track_id: str) -> bool:
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('DELETE FROM tracks WHERE id = ?', (track_id,))
-        deleted = c.rowcount > 0
-        conn.commit()
-        conn.close()
-        return deleted
+        try:
+            c = conn.cursor()
+            c.execute('DELETE FROM tracks WHERE id = ?', (track_id,))
+            deleted = c.rowcount > 0
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
 
     def delete_track_by_filename(self, filename: str) -> bool:
         """Elimina un track por su filename para permitir reanalisis completo"""
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('DELETE FROM tracks WHERE filename = ?', (filename,))
-        deleted = c.rowcount > 0
-        conn.commit()
-        conn.close()
-        return deleted
+        try:
+            c = conn.cursor()
+            c.execute('DELETE FROM tracks WHERE filename = ?', (filename,))
+            deleted = c.rowcount > 0
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
 
     # ==================== COMMUNITY NOTES ====================
 
@@ -1344,44 +1462,77 @@ class AnalysisDB:
         from datetime import datetime
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('''
-            INSERT OR REPLACE INTO community_notes
-            (fingerprint, device_id, display_name, note_text, note_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (fingerprint, device_id, display_name, note_text, note_type,
-              datetime.utcnow().isoformat()))
-        note_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        return note_id
+        try:
+            c = conn.cursor()
+            c.execute('''
+                INSERT OR REPLACE INTO community_notes
+                (fingerprint, device_id, display_name, note_text, note_type, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (fingerprint, device_id, display_name, note_text, note_type,
+                  datetime.utcnow().isoformat()))
+            note_id = c.lastrowid
+            conn.commit()
+            return note_id
+        finally:
+            conn.close()
 
     def get_community_notes(self, fingerprint: str) -> List[Dict]:
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('''
-            SELECT id, device_id, display_name, note_text, note_type, upvotes, created_at
-            FROM community_notes WHERE fingerprint = ?
-            ORDER BY upvotes DESC, created_at DESC
-        ''', (fingerprint,))
-        results = [{
-            'id': r['id'],
-            'device_id': r['device_id'][:8] + '...',
-            'display_name': r['display_name'],
-            'note_text': r['note_text'],
-            'note_type': r['note_type'],
-            'upvotes': r['upvotes'],
-            'created_at': r['created_at'],
-        } for r in c.fetchall()]
-        conn.close()
-        return results
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT id, device_id, display_name, note_text, note_type, upvotes, created_at
+                FROM community_notes WHERE fingerprint = ?
+                ORDER BY upvotes DESC, created_at DESC
+            ''', (fingerprint,))
+            results = [{
+                'id': r['id'],
+                'device_id': r['device_id'][:8] + '...',
+                'display_name': r['display_name'],
+                'note_text': r['note_text'],
+                'note_type': r['note_type'],
+                'upvotes': r['upvotes'],
+                'created_at': r['created_at'],
+            } for r in c.fetchall()]
+            return results
+        finally:
+            conn.close()
 
-    def upvote_community_note(self, note_id: int):
+    def upvote_community_note(self, note_id: int, voter: str = '') -> dict:
+        """Suma un upvote a una nota, UNA VEZ por votante.
+
+        Antes esto era `upvotes = upvotes + 1` a pelo, sin identidad: cualquiera
+        podia repetir la llamada en bucle y fijar la nota que quisiera arriba.
+        Ahora la identidad (device_id del cliente, o hash de IP si no lo manda)
+        se registra en `community_note_upvotes` y el contador solo sube cuando
+        el votante es nuevo. Repetir es idempotente, no un error: la UI puede
+        reintentar sin inflar nada.
+
+        Devuelve {'counted': bool, 'upvotes': int}.
+        """
+        from datetime import datetime
+        voter = (voter or '').strip() or 'anon'
         conn = self._open_conn()
-        conn.execute('UPDATE community_notes SET upvotes = upvotes + 1 WHERE id = ?', (note_id,))
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO community_note_upvotes '
+                '(note_id, voter, created_at) VALUES (?, ?, ?)',
+                (note_id, voter, datetime.utcnow().isoformat()),
+            )
+            counted = cur.rowcount > 0
+            if counted:
+                conn.execute(
+                    'UPDATE community_notes SET upvotes = upvotes + 1 WHERE id = ?',
+                    (note_id,),
+                )
+            conn.commit()
+            row = conn.execute(
+                'SELECT upvotes FROM community_notes WHERE id = ?', (note_id,)
+            ).fetchone()
+            return {'counted': counted, 'upvotes': (row[0] if row else 0)}
+        finally:
+            conn.close()
 
     # ==================== TRACK POPULARITY & RATINGS ====================
 
@@ -1389,66 +1540,72 @@ class AnalysisDB:
         from datetime import datetime
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('SELECT analysis_count FROM track_popularity WHERE fingerprint = ?', (fingerprint,))
-        row = c.fetchone()
-        now = datetime.utcnow().isoformat()
-        if row:
-            c.execute('''UPDATE track_popularity
-                         SET analysis_count = analysis_count + 1, last_analyzed = ?
-                         WHERE fingerprint = ?''', (now, fingerprint))
-        else:
-            c.execute('''INSERT INTO track_popularity (fingerprint, analysis_count, dj_count, last_analyzed)
-                         VALUES (?, 1, 1, ?)''', (fingerprint, now))
-        conn.commit()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute('SELECT analysis_count FROM track_popularity WHERE fingerprint = ?', (fingerprint,))
+            row = c.fetchone()
+            now = datetime.utcnow().isoformat()
+            if row:
+                c.execute('''UPDATE track_popularity
+                             SET analysis_count = analysis_count + 1, last_analyzed = ?
+                             WHERE fingerprint = ?''', (now, fingerprint))
+            else:
+                c.execute('''INSERT INTO track_popularity (fingerprint, analysis_count, dj_count, last_analyzed)
+                             VALUES (?, 1, 1, ?)''', (fingerprint, now))
+            conn.commit()
+        finally:
+            conn.close()
 
     def rate_track(self, fingerprint: str, device_id: str, rating: int) -> Dict:
         from datetime import datetime
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
-        c = conn.cursor()
-        if rating <= 0:
-            # rating 0 = el DJ QUITA su valoracion (toggle off en la UI).
-            c.execute('DELETE FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
-                      (fingerprint, device_id))
-        else:
+        try:
+            c = conn.cursor()
+            if rating <= 0:
+                # rating 0 = el DJ QUITA su valoracion (toggle off en la UI).
+                c.execute('DELETE FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
+                          (fingerprint, device_id))
+            else:
+                c.execute('''
+                    INSERT INTO track_ratings (fingerprint, device_id, rating, rated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(fingerprint, device_id) DO UPDATE SET rating = ?, rated_at = ?
+                ''', (fingerprint, device_id, rating, datetime.utcnow().isoformat(),
+                      rating, datetime.utcnow().isoformat()))
+            # Recalcular media (con count=0 -> avg NULL -> 0)
+            c.execute('SELECT AVG(rating) AS avg, COUNT(*) AS cnt FROM track_ratings WHERE fingerprint = ?', (fingerprint,))
+            agg = c.fetchone()
+            avg = agg['avg']
+            count = agg['cnt']
             c.execute('''
-                INSERT INTO track_ratings (fingerprint, device_id, rating, rated_at)
+                INSERT INTO track_popularity (fingerprint, avg_rating, total_ratings, last_analyzed)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(fingerprint, device_id) DO UPDATE SET rating = ?, rated_at = ?
-            ''', (fingerprint, device_id, rating, datetime.utcnow().isoformat(),
-                  rating, datetime.utcnow().isoformat()))
-        # Recalcular media (con count=0 -> avg NULL -> 0)
-        c.execute('SELECT AVG(rating) AS avg, COUNT(*) AS cnt FROM track_ratings WHERE fingerprint = ?', (fingerprint,))
-        agg = c.fetchone()
-        avg = agg['avg']
-        count = agg['cnt']
-        c.execute('''
-            INSERT INTO track_popularity (fingerprint, avg_rating, total_ratings, last_analyzed)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(fingerprint) DO UPDATE SET avg_rating = ?, total_ratings = ?
-        ''', (fingerprint, avg or 0, count or 0, datetime.utcnow().isoformat(), avg or 0, count or 0))
-        conn.commit()
-        conn.close()
-        return {'avg_rating': round(avg or 0, 1), 'total_ratings': count or 0}
+                ON CONFLICT(fingerprint) DO UPDATE SET avg_rating = ?, total_ratings = ?
+            ''', (fingerprint, avg or 0, count or 0, datetime.utcnow().isoformat(), avg or 0, count or 0))
+            conn.commit()
+            return {'avg_rating': round(avg or 0, 1), 'total_ratings': count or 0}
+        finally:
+            conn.close()
 
     def get_track_popularity(self, fingerprint: str) -> Dict:
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('SELECT analysis_count, dj_count, avg_rating, total_ratings FROM track_popularity WHERE fingerprint = ?',
-                  (fingerprint,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            return {
-                'analysis_count': row['analysis_count'],
-                'dj_count': row['dj_count'],
-                'avg_rating': round(row['avg_rating'] or 0, 1),
-                'total_ratings': row['total_ratings'] or 0,
-            }
-        return {'analysis_count': 0, 'dj_count': 0, 'avg_rating': 0, 'total_ratings': 0}
+        try:
+            c = conn.cursor()
+            c.execute('SELECT analysis_count, dj_count, avg_rating, total_ratings FROM track_popularity WHERE fingerprint = ?',
+                      (fingerprint,))
+            row = c.fetchone()
+            if row:
+                return {
+                    'analysis_count': row['analysis_count'],
+                    'dj_count': row['dj_count'],
+                    'avg_rating': round(row['avg_rating'] or 0, 1),
+                    'total_ratings': row['total_ratings'] or 0,
+                }
+            return {'analysis_count': 0, 'dj_count': 0, 'avg_rating': 0, 'total_ratings': 0}
+        finally:
+            conn.close()
 
     def get_track_popularity_batch(self, fingerprints: List[str]) -> Dict[str, Dict]:
         """Popularidad de varios fingerprints en UNA query (columna de libreria
@@ -1487,12 +1644,14 @@ class AnalysisDB:
     def get_my_rating(self, fingerprint: str, device_id: str) -> int:
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('SELECT rating FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
-                  (fingerprint, device_id))
-        row = c.fetchone()
-        conn.close()
-        return row['rating'] if row else 0
+        try:
+            c = conn.cursor()
+            c.execute('SELECT rating FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
+                      (fingerprint, device_id))
+            row = c.fetchone()
+            return row['rating'] if row else 0
+        finally:
+            conn.close()
 
     def get_my_ratings_batch(self, fingerprints: List[str], device_id: str) -> Dict[str, int]:
         """Rating PROPIO (de este device_id) de varios tracks en UNA query.
@@ -1529,54 +1688,146 @@ class AnalysisDB:
         from datetime import datetime
         now = datetime.utcnow().isoformat()
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO beat_grid_corrections (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(fingerprint, device_id) DO UPDATE SET
-                bpm_adjust = excluded.bpm_adjust,
-                beat_offset = excluded.beat_offset,
-                original_bpm = excluded.original_bpm,
-                updated_at = excluded.updated_at
-        ''', (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, now, now))
-        conn.commit()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO beat_grid_corrections (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint, device_id) DO UPDATE SET
+                    bpm_adjust = excluded.bpm_adjust,
+                    beat_offset = excluded.beat_offset,
+                    original_bpm = excluded.original_bpm,
+                    updated_at = excluded.updated_at
+            ''', (fingerprint, device_id, bpm_adjust, beat_offset, original_bpm, now, now))
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_community_beat_grid(self, fingerprint: str) -> Dict:
         """Obtiene la correccion promedio de la comunidad para un track"""
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
-        c = conn.cursor()
-        c.execute('''
-            SELECT AVG(bpm_adjust) AS bpm_adj, AVG(beat_offset) AS beat_off,
-                   COUNT(*) AS contributors, AVG(original_bpm) AS orig_bpm
-            FROM beat_grid_corrections
-            WHERE fingerprint = ?
-        ''', (fingerprint,))
-        row = c.fetchone()
-        conn.close()
-        if row and row['contributors'] and row['contributors'] > 0:
-            contributors = row['contributors']
-            # Validado si >= 2 DJs con ajustes similares
-            validated = contributors >= 2
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT AVG(bpm_adjust) AS bpm_adj, AVG(beat_offset) AS beat_off,
+                       COUNT(*) AS contributors, AVG(original_bpm) AS orig_bpm
+                FROM beat_grid_corrections
+                WHERE fingerprint = ?
+            ''', (fingerprint,))
+            row = c.fetchone()
+            if row and row['contributors'] and row['contributors'] > 0:
+                contributors = row['contributors']
+                # Validado si >= 2 DJs con ajustes similares
+                validated = contributors >= 2
+                return {
+                    'bpm_adjust': round(row['bpm_adj'] or 0.0, 4),
+                    'beat_offset': round(row['beat_off'] or 0.0, 6),
+                    'contributors': contributors,
+                    'validated': validated,
+                    'original_bpm': round(row['orig_bpm'] or 0.0, 2),
+                }
             return {
-                'bpm_adjust': round(row['bpm_adj'] or 0.0, 4),
-                'beat_offset': round(row['beat_off'] or 0.0, 6),
-                'contributors': contributors,
-                'validated': validated,
-                'original_bpm': round(row['orig_bpm'] or 0.0, 2),
+                'bpm_adjust': 0.0,
+                'beat_offset': 0.0,
+                'contributors': 0,
+                'validated': False,
             }
-        return {
-            'bpm_adjust': 0.0,
-            'beat_offset': 0.0,
-            'contributors': 0,
-            'validated': False,
-        }
+        finally:
+            conn.close()
 
     # ==================== COMMUNITY OVERRIDES GENERICOS (Fase 4) ====================
     # Sistema unificado para CUALQUIER campo categorico: track_type, key,
     # camelot, genre, subgenre. Mismas reglas de consensus (>=3 votos al
     # winner, supera al 2do por >=2). Whitelist por campo en main.py.
+
+    @staticmethod
+    def hash_ip(ip: str) -> str:
+        """Hash corto y estable de una IP. Agrupa sin identificar."""
+        import hashlib as _h
+        return _h.sha256((ip or '').encode()).hexdigest()[:16]
+
+    def register_vote_source(self, ip_hash: str, fingerprint: str,
+                             device_id: str, registered: Optional[bool] = None) -> int:
+        """Registra que `ip_hash` ha votado `fingerprint` como `device_id` y
+        devuelve cuantas identidades DISTINTAS lleva usadas esa IP para ese
+        track (incluida esta).
+
+        Base de la mitigacion SEC-12: un usuario real vota un track concreto
+        desde uno o dos dispositivos; alguien fabricando consenso necesita
+        tres o mas identidades. Ver `community_vote_sources` en init_db.
+
+        `registered` es solo OBSERVACION (fase 1): dice si ese device_id estaba
+        en `user_devices` al votar. None = no se pudo comprobar. No influye en
+        el conteo ni en el corte; alimenta `vote_registration_stats`.
+        """
+        if not ip_hash or not fingerprint or not device_id:
+            return 0
+        from datetime import datetime
+        fingerprint = self.canonical_community_key(fingerprint)
+        reg = None if registered is None else (1 if registered else 0)
+        conn = self._open_conn()
+        try:
+            conn.execute(
+                'INSERT OR IGNORE INTO community_vote_sources '
+                '(ip_hash, fingerprint, device_id, created_at, registered) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (ip_hash, fingerprint, device_id, datetime.utcnow().isoformat(), reg),
+            )
+            # Si la fila ya existia (voto repetido) el INSERT no hace nada, pero
+            # el estado de registro SI puede haber cambiado: el usuario pudo
+            # vincular el device despues de su primer voto. Se refresca cuando
+            # tenemos dato, nunca se pisa un valor conocido con NULL.
+            if reg is not None:
+                conn.execute(
+                    'UPDATE community_vote_sources SET registered = ? '
+                    'WHERE ip_hash = ? AND fingerprint = ? AND device_id = ? '
+                    'AND (registered IS NULL OR registered != ?)',
+                    (reg, ip_hash, fingerprint, device_id, reg),
+                )
+            conn.commit()
+            row = conn.execute(
+                'SELECT COUNT(DISTINCT device_id) FROM community_vote_sources '
+                'WHERE ip_hash = ? AND fingerprint = ?',
+                (ip_hash, fingerprint),
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def vote_registration_stats(self, days: int = 30) -> dict:
+        """Cuantas identidades votantes estaban registradas en `user_devices`.
+
+        El dato que decide la fase 2 de SEC-12: si se exige registro para votar,
+        `unregistered` es EXACTAMENTE la gente que se queda fuera. Con esto se
+        decide con numeros, no a ojo.
+        """
+        from datetime import datetime, timedelta
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        conn = self._open_conn()
+        try:
+            row = conn.execute(
+                'SELECT '
+                '  SUM(CASE WHEN registered = 1 THEN 1 ELSE 0 END), '
+                '  SUM(CASE WHEN registered = 0 THEN 1 ELSE 0 END), '
+                '  SUM(CASE WHEN registered IS NULL THEN 1 ELSE 0 END) '
+                'FROM community_vote_sources WHERE created_at >= ?',
+                (since,),
+            ).fetchone()
+            reg, unreg, unknown = (int(v or 0) for v in (row or (0, 0, 0)))
+            conocidos = reg + unreg
+            return {
+                'days': days,
+                'registered': reg,
+                'unregistered': unreg,
+                'unknown': unknown,
+                # % sobre los que SI se pudieron comprobar; con 0 comprobados no
+                # se inventa un 0% que se leeria como "no hay problema".
+                'unregistered_pct': (round(100.0 * unreg / conocidos, 1)
+                                     if conocidos else None),
+            }
+        finally:
+            conn.close()
 
     def submit_community_override(
         self, fingerprint: str, device_id: str, field: str, value: str,

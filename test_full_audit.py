@@ -545,18 +545,18 @@ class TestR009_SessionDuration:
             pytest.skip("Frontend files not accessible")
 
 
-class TestR010_FileExtensionStripping:
-    """R-010: Extension stripping usa regex genérico"""
-
-    def test_audio_analysis_service_strips_any_extension(self):
-        path = os.path.join(os.path.dirname(__file__), "..", "Analyzer", "lib", "services", "audio_player_service.dart")
-        if os.path.exists(path):
-            with open(path) as f:
-                content = f.read()
-            assert r"\.[^.]+$" in content or "replaceAll(RegExp" in content, \
-                "Should use regex to strip any file extension"
-        else:
-            pytest.skip("Frontend files not accessible")
+# R-010 (extension stripping) RETIRADO en la auditoría 2026-08-09.
+#
+# Comprobaba `Analyzer/lib/services/audio_player_service.dart`, que resultó ser
+# código INALCANZABLE (ningún import en todo el repo) y se borró en la limpieza
+# del cliente. El test validaba, por tanto, código que no se ejecutaba nunca.
+#
+# OJO con el resto de tests de este fichero que abren rutas `../Analyzer/...`:
+# solo pasan cuando los dos repos están clonados uno al lado del otro. En
+# GitHub Actions se checkoutea SOLO el backend, así que caen en
+# `pytest.skip("Frontend files not accessible")` y no se ejecutan jamás en CI —
+# aparentan cobertura que allí no existe. Si se quiere cobertura real del
+# cliente, tiene que vivir en la suite de Flutter, no aquí.
 
 
 class TestR011_SyncClearAuthorization:

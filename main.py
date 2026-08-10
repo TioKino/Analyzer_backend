@@ -183,6 +183,15 @@ from analysis_ranking import (
 # =1 mantiene el MISMO perfil CPU/RAM que el modelo bloqueante actual (un solo
 # analisis a la vez) pero deja de bloquear el loop. Subir SOLO si hay RAM de
 # sobra (cada analisis carga el track entero en memoria a sr=44100).
+# ==================== TOPE DE SUBIDA ====================
+# Techo unico para TODOS los endpoints que aceptan audio (/analyze, /identify,
+# /recognize). Antes solo /analyze lo aplicaba; los otros dos contaban bytes
+# pero no comparaban con nada, asi que un endpoint anonimo podia llenar el
+# disco persistente de Render con una peticion. Tenerlo en una constante evita
+# que el proximo endpoint que acepte audio se olvide otra vez.
+MAX_UPLOAD_MB = int(os.environ.get('MAX_UPLOAD_MB', '100'))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
 _ANALYSIS_CONCURRENCY = max(1, int(os.environ.get('ANALYSIS_CONCURRENCY', '1')))
 _analysis_semaphore: Optional[asyncio.Semaphore] = None
 
@@ -198,6 +207,95 @@ def _get_analysis_semaphore() -> asyncio.Semaphore:
     if _analysis_semaphore is None:
         _analysis_semaphore = asyncio.Semaphore(_ANALYSIS_CONCURRENCY)
     return _analysis_semaphore
+
+
+# ==================== AUTH DE ESCRITURA (rollout por fases) ====================
+#
+# Los endpoints que ESCRIBEN en la memoria colectiva (/cache-analysis,
+# /backfill-fingerprint, /preview/upload, /artwork/upload) nacieron sin
+# autenticacion. La auditoria 2026-08-09 demostro que con un solo curl se puede
+# sobreescribir el analisis de cualquier huella mandando bpm_source='rekordbox'
+# (prioridad 110, gana a todo) y que _apply_cluster_best lo propaga a TODO el
+# cluster acustico -> envenenamiento permanente para todos los usuarios.
+#
+# No se puede exigir firma de golpe: los clientes YA publicados (<=2.9.7) no
+# firman y romperiamos el auto-upload del motor local en produccion. Rollout en
+# dos fases, igual que se hizo con el anti-replay del sync:
+#
+#   FASE 1 (esta, por defecto): se VERIFICA la firma si viene, se RECHAZA si
+#     viene y es invalida, y se DEJA PASAR si no viene — registrando la
+#     peticion sin firmar para poder medir la adopcion en los logs.
+#   FASE 2 (cuando los logs muestren que casi nadie llega sin firmar):
+#     REQUIRE_WRITE_AUTH=1 y las peticiones sin firma pasan a 401.
+#
+# Mientras tanto, el vector concreto de envenenamiento SI queda cerrado hoy:
+# ver _clamp_untrusted_source en /cache-analysis.
+REQUIRE_WRITE_AUTH = os.environ.get('REQUIRE_WRITE_AUTH', '0').lower() in ('1', 'true', 'yes')
+
+try:
+    from config import SYNC_AUTH_SECRET as _WRITE_AUTH_SECRET
+except ImportError:  # pragma: no cover - config siempre existe
+    _WRITE_AUTH_SECRET = ''
+
+
+def _write_signature_ok(body: bytes, signature: str, timestamp: str) -> bool:
+    """Valida HMAC-SHA256 sobre "<ts>.<body>" (o "<body>" sin ts, legacy).
+
+    Mismo esquema y mismo secreto que /sync/*, para no introducir una segunda
+    credencial que gestionar. Acepta lista separada por comas (rotacion).
+    """
+    if not _WRITE_AUTH_SECRET or not signature:
+        return False
+    secrets_list = [s.strip() for s in _WRITE_AUTH_SECRET.split(',') if s.strip()]
+    signed = (timestamp.encode() + b'.' + body) if timestamp else body
+    for secret in secrets_list:
+        expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(signature, expected):
+            return True
+    return False
+
+
+async def verify_write_auth(request: Request) -> bool:
+    """Dependency de los endpoints de escritura colectiva.
+
+    Devuelve True si la peticion venia FIRMADA y valida. Lanza 401 si la firma
+    viene y es incorrecta, o si falta y REQUIRE_WRITE_AUTH esta activo.
+    En fase 1 una peticion sin firma devuelve False y sigue adelante — el
+    llamador decide que privilegios recorta (ver _clamp_untrusted_source).
+    """
+    signature = request.headers.get('X-Signature', '')
+    if signature:
+        try:
+            body = await request.body()
+        except ClientDisconnect:
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        if not _write_signature_ok(body, signature, request.headers.get('X-Timestamp', '')):
+            raise HTTPException(401, "Invalid signature")
+        return True
+    if REQUIRE_WRITE_AUTH and _WRITE_AUTH_SECRET:
+        raise HTTPException(401, "Missing X-Signature header")
+    logger.info(f"[WriteAuth] sin firma: {request.url.path} (fase 1, permitido)")
+    return False
+
+
+def _sign_write_payload(body: bytes) -> Dict[str, str]:
+    """Cabeceras de firma para las peticiones que ESTE proceso hace a Render.
+
+    El motor local ya recibe SYNC_AUTH_SECRET por env (LocalEngineService se lo
+    pasa), asi que puede firmar su auto-upload y entrar desde el dia uno en el
+    grupo "firmado" — subiendo la adopcion que decide cuando activar la fase 2.
+    """
+    if not _WRITE_AUTH_SECRET:
+        return {}
+    secret = _WRITE_AUTH_SECRET.split(',')[0].strip()
+    if not secret:
+        return {}
+    ts = str(int(time.time() * 1000))
+    signed = ts.encode() + b'.' + body
+    return {
+        'X-Timestamp': ts,
+        'X-Signature': hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest(),
+    }
 
 
 def _upload_to_render_cache(track_data: dict):
@@ -243,9 +341,17 @@ def _upload_to_render_cache(track_data: dict):
                 # "[Cache] corrupto" + re-analisis al re-subir el track por filename).
                 'analysis_json': {k: v for k, v in track_data.items() if k != 'analysis_json'},
             }
+            # Serializamos a bytes AQUI (en vez de pasar json=) para poder
+            # firmar exactamente el mismo cuerpo que viaja: si dejaramos que
+            # requests re-serializara, cualquier diferencia de separadores
+            # invalidaria el HMAC.
+            body = json.dumps(payload, default=str).encode('utf-8')
+            headers = {'Content-Type': 'application/json'}
+            headers.update(_sign_write_payload(body))
             resp = requests.post(
                 f"{RENDER_BACKEND_URL}/cache-analysis",
-                json=payload,
+                data=body,
+                headers=headers,
                 timeout=10,
             )
             if resp.status_code == 200:
@@ -448,7 +554,23 @@ def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset
 
 # ==================== APP ====================
 
-app = FastAPI(title="DJ Analyzer Pro API", version="2.9.7", default_response_class=SafeJSONResponse)
+# Swagger/ReDoc/OpenAPI: utiles en local, pero en produccion publicaban el mapa
+# COMPLETO de la API (92 rutas, incluidos los endpoints de escritura) a
+# cualquiera que abriera /docs. Se apagan cuando corremos en Render/Railway y se
+# mantienen en dev. Overridable con ENABLE_API_DOCS=1 para depurar en caliente.
+_DOCS_ON = (
+    os.getenv('ENABLE_API_DOCS', '').lower() in ('1', 'true', 'yes')
+    or not (os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'))
+)
+
+app = FastAPI(
+    title="DJ Analyzer Pro API",
+    version="2.9.7",
+    default_response_class=SafeJSONResponse,
+    docs_url="/docs" if _DOCS_ON else None,
+    redoc_url="/redoc" if _DOCS_ON else None,
+    openapi_url="/openapi.json" if _DOCS_ON else None,
+)
 _startup_time = time.time()
 app.include_router(sync_router)
 app.include_router(admin_panel_router)
@@ -553,10 +675,19 @@ if _BLOCKED_IPS:
 
 
 def _client_ip(request: Request) -> str:
-    xff = request.headers.get('x-forwarded-for')
-    if xff:
-        return xff.split(',')[0].strip()
-    return request.client.host if request.client else ''
+    """IP real del cliente, resistente al spoof de X-Forwarded-For.
+
+    Antes tomaba `xff.split(',')[0]` — la entrada de la IZQUIERDA, que la pone
+    el propio cliente y es falseable. Bastaba mandar `X-Forwarded-For: 1.1.1.1`
+    para saltarse la blacklist (verificado en la auditoría 2026-08-09: la IP
+    bloqueada daba 403, la misma IP con la cabecera daba 200).
+
+    `get_client_ip` (validation.py) ya resuelve esto tomando la entrada que
+    añadió nuestro proxy más cercano, contando `TRUSTED_PROXY_HOPS` desde la
+    derecha. Reutilizarla mantiene UNA sola definición de "IP del cliente"
+    para blacklist y rate-limit, en vez de dos que divergen.
+    """
+    return get_client_ip(request)
 
 
 @app.middleware("http")
@@ -698,6 +829,23 @@ try:
         logger.info(f"[Events] purgados {_purged} eventos > 90d al arranque")
 except Exception as _e:  # noqa: BLE001 - best-effort
     logger.warning(f"[Events] purga al arranque fallo: {_e}")
+
+# Purga best-effort de errores viejos. `events` y `audd_call_log` ya se purgaban
+# solos; `analysis_errors` era la unica tabla de telemetria que SOLO se limpiaba
+# a mano desde /admin/errors/prune (y por defecto solo los resueltos), asi que
+# los NO resueltos se acumulaban para siempre — con hasta 2000 caracteres de
+# stack por fila — en el mismo disco persistente que las BD y los previews.
+# Solo se borran los RESUELTOS y antiguos: un error sin resolver se conserva
+# aunque sea viejo, porque sigue siendo un bug abierto.
+_ERRORS_KEEP_DAYS = int(os.environ.get('ERRORS_KEEP_DAYS', '180'))
+try:
+    _pruned_err = db.prune_old_errors(days=_ERRORS_KEEP_DAYS, only_resolved=True)
+    if _pruned_err:
+        logger.info(
+            f"[Errors] purgados {_pruned_err} errores resueltos > {_ERRORS_KEEP_DAYS}d"
+        )
+except Exception as _e:  # noqa: BLE001 - best-effort
+    logger.warning(f"[Errors] purga al arranque fallo: {_e}")
 
 # Registrar endpoints de community cues (/community-cues, /user-cues).
 # El modulo community_cues_endpoint.py expone register_community_endpoints
@@ -935,10 +1083,19 @@ def camelot_to_key(camelot: str) -> str:
 # ==================== HELPERS ====================
 
 def calculate_fingerprint(file_path):
-    """Calcular fingerprint simple del archivo"""
+    """MD5 del contenido del fichero, leido por bloques.
+
+    Antes hacia `hashlib.md5(f.read())`: cargaba el fichero ENTERO en memoria
+    (hasta 100 MB con el limite de subida) en el mismo proceso que a
+    continuacion iba a cargar el audio con librosa. En los 512 MB de Render eso
+    es un pico gratuito. Leyendo en bloques de 1 MB el hash es identico y el
+    pico de memoria es constante.
+    """
+    h = hashlib.md5()
     with open(file_path, 'rb') as f:
-        file_hash = hashlib.md5(f.read()).hexdigest()
-    return file_hash
+        for block in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
 
 
 def _attach_acoustic(track_data, audio_path):
@@ -2657,7 +2814,7 @@ async def analyze_track(
     # — con 512 MB de Render + librosa + chunked_analyzer nos llevaba a OOM
     # en tracks largos. Ahora el pico en memoria durante el upload es ~1 MB.
     # El análisis posterior ya usa chunked_analyzer para tracks >4 min.
-    max_size = 100 * 1024 * 1024  # 100 MB
+    max_size = MAX_UPLOAD_BYTES  # techo compartido con /identify y /recognize
     min_size = 1000
     total_bytes = 0
     with tempfile.NamedTemporaryFile(
@@ -3295,12 +3452,22 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
     try:
         # Upload streaming a disco en bloques de 1 MB (mismo patrón que /analyze)
         # para no cargar el archivo entero en RAM de Render.
+        #
+        # El tope de tamaño FALTABA aquí (lo tenía /analyze pero no /identify ni
+        # /recognize): el bucle escribía a disco sin comparar contra ningún
+        # máximo, así que un endpoint anónimo permitía llenar el disco
+        # persistente de Render con una sola petición. Mismo límite que
+        # /analyze para que el contrato sea uniforme.
+        total_bytes = 0
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
             tmp_path = tmp.name
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(400, "Archivo demasiado grande. Máximo: 100 MB")
                 tmp.write(chunk)
 
         logger.info(f"Identificando track: {file.filename}")
@@ -3312,27 +3479,37 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         # ==================== PASO 1: IDENTIFICAR CON AUDD ====================
         audio_to_send = tmp_path
         
-        try:
+        def _extract_fragment():
+            """Recorte de 20 s con librosa (CPU-bound) + escritura a disco."""
             with silence_native_stderr():
                 y, sr = librosa.load(tmp_path, sr=22050, mono=True, duration=20, offset=30)
             import soundfile as sf
-            fragment_path = tmp_path + "_fragment.wav"
-            sf.write(fragment_path, y, sr)
+            out = tmp_path + "_fragment.wav"
+            sf.write(out, y, sr)
+            return out
+
+        try:
+            # librosa es CPU-bound y sincrono: fuera del event loop.
+            fragment_path = await run_in_threadpool(_extract_fragment)
             audio_to_send = fragment_path
             logger.info(f"Fragmento extrado: 20 seg desde 0:30")
         except Exception as e:
             logger.info(f"No se pudo extraer fragmento, usando archivo completo: {e}")
-        
-        with open(audio_to_send, 'rb') as audio_file:
-            audd_response = requests.post(
-                'https://api.audd.io/',
-                data={
-                    'api_token': AUDD_API_TOKEN,
-                    'return': 'spotify,deezer,apple_music,musicbrainz',
-                },
-                files={'file': audio_file},
-                timeout=30
-            )
+
+        def _post_to_audd(path):
+            """POST a AudD (30 s de timeout) — red sincrona, al threadpool."""
+            with open(path, 'rb') as audio_file:
+                return requests.post(
+                    'https://api.audd.io/',
+                    data={
+                        'api_token': AUDD_API_TOKEN,
+                        'return': 'spotify,deezer,apple_music,musicbrainz',
+                    },
+                    files={'file': audio_file},
+                    timeout=30,
+                )
+
+        audd_response = await run_in_threadpool(_post_to_audd, audio_to_send)
         
         if audd_response.status_code != 200:
             raise HTTPException(500, f"Error AudD: {audd_response.status_code}")
@@ -3377,7 +3554,13 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         if GENRE_DETECTOR_ENABLED and genre_detector and artist and title:
             logger.info(f"Buscando g(c)nero: {artist} - {title}")
             try:
-                discogs_result = genre_detector.get_discogs_genre(artist, title)
+                # Discogs y MusicBrainz son HTTP sincrono (MB ademas duerme 1 s
+                # incondicional por su rate-limit, y reintenta con timeout=20).
+                # Desde este handler async bloqueaban el event loop del unico
+                # worker hasta ~40 s por peticion.
+                discogs_result = await run_in_threadpool(
+                    genre_detector.get_discogs_genre, artist, title
+                )
                 if discogs_result and discogs_result.get('genre'):
                     genre = discogs_result['genre']
                     genre_source = "discogs"
@@ -3391,7 +3574,9 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             
             if genre_source != "discogs":
                 try:
-                    mb_result = genre_detector.get_musicbrainz_info(artist, title)
+                    mb_result = await run_in_threadpool(
+                        genre_detector.get_musicbrainz_info, artist, title
+                    )
                     if mb_result and mb_result.get('genre'):
                         genre = mb_result['genre']
                         genre_source = "musicbrainz"
@@ -3617,7 +3802,9 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             )
         except Exception:
             pass
-        raise HTTPException(500, f"Error: {str(e)}")
+        # El texto de la excepción (rutas, SQL, internals) no debe viajar a un
+        # cliente anónimo: ya queda en el log de arriba con el detalle completo.
+        raise HTTPException(500, "Error interno")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -3875,8 +4062,14 @@ async def recognize_audio(
     # Cada llamada a AudD de Escuchar se REGISTRA (source='recognize') para la
     # contabilidad real del gasto y para el cap por device. Antes /recognize no
     # se logueaba → el panel admin infravaloraba el gasto de la feature estrella.
-    def _audd_and_log(path):
-        td, processed_ok = _send_to_audd(path, AUDD_API_TOKEN, timeout=30)
+    async def _audd_and_log(path):
+        # AudD con timeout=30 es I/O de red SINCRONA. Llamarla directa desde este
+        # handler async BLOQUEA el event loop del unico worker: una sesion de
+        # Escuchar encadena hasta 3 intentos, o sea hasta 90 s con la API entera
+        # congelada (mismo patron que ya se corrigio para librosa en /analyze).
+        td, processed_ok = await run_in_threadpool(
+            _send_to_audd, path, AUDD_API_TOKEN, 30
+        )
         try:
             db.log_audd_call(
                 fingerprint='recognize', success=bool(td),
@@ -3891,6 +4084,10 @@ async def recognize_audio(
     processed_paths = []
     try:
         # Upload streaming a disco (1 MB por bloque) para no saturar RAM.
+        # El tope FALTABA: se contaban los bytes pero nunca se comparaban con un
+        # máximo, así que este endpoint anónimo podía llenar el disco de Render.
+        # Una captura de micro son ~100 KB; 100 MB es el mismo techo que /analyze
+        # y sobra por varios órdenes de magnitud.
         total_bytes = 0
         with tempfile.NamedTemporaryFile(delete=False, suffix='.m4a') as tmp:
             tmp_path = tmp.name
@@ -3899,6 +4096,8 @@ async def recognize_audio(
                 if not chunk:
                     break
                 total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(400, "Audio demasiado grande. Máximo: 100 MB")
                 tmp.write(chunk)
 
         logger.info(f"[Recognize] Audio recibido: {file.filename} ({total_bytes} bytes)")
@@ -3927,16 +4126,19 @@ async def recognize_audio(
             logger.info(f"[Recognize] Intento {i+1}/3 - estrategia: {strategy}")
 
             processed_ok = False
-            if _preprocess_audio_for_recognition(tmp_path, processed_path, strategy):
+            # ffmpeg: subproceso bloqueante, fuera del loop igual que AudD.
+            if await run_in_threadpool(
+                _preprocess_audio_for_recognition, tmp_path, processed_path, strategy
+            ):
                 processed_size = os.path.getsize(processed_path)
                 logger.info(f"  Procesado: {processed_size} bytes")
-                track_data, processed_ok = _audd_and_log(processed_path)
+                track_data, processed_ok = await _audd_and_log(processed_path)
             else:
                 logger.info(f"  Intento {i+1} ({strategy}): preprocesamiento falló")
                 # Si normalize falla, intentar enviar el original directamente.
                 if strategy == "normalize":
                     logger.info(f"  Intentando enviar archivo original sin procesar...")
-                    track_data, processed_ok = _audd_and_log(tmp_path)
+                    track_data, processed_ok = await _audd_and_log(tmp_path)
 
             audio_processed = audio_processed or processed_ok
             if track_data:
@@ -4093,13 +4295,20 @@ async def recognize_audio(
 
         return response
 
+    except HTTPException:
+        # Los 4xx que lanzamos a propósito (p.ej. el tope de subida) tienen que
+        # llegar al cliente tal cual. Sin esta rama caían en el `except
+        # Exception` de abajo y se convertían en un 500 con el mensaje
+        # reempaquetado, dando un error del servidor por lo que en realidad era
+        # una petición inválida — y ensuciando la telemetría de errores.
+        raise
     except requests.Timeout:
         logger.info("[Recognize] AudD timeout")
         raise HTTPException(504, "Timeout conectando con AudD")
     except Exception as e:
         import traceback
         logger.error(f"[Recognize] Error: {traceback.format_exc()}")
-        raise HTTPException(500, f"Error: {str(e)}")
+        raise HTTPException(500, "Error interno procesando el audio")
     finally:
         # Limpiar todos los archivos temporales
         for path in [tmp_path] + processed_paths:
@@ -4111,8 +4320,37 @@ async def recognize_audio(
 
 # ==================== CACHE COMUNITARIO (LOCAL ENGINE → RENDER) ====================
 
+# Fuentes "profesionales" (rekordbox/traktor/virtualdj, prioridad >=100 en
+# analysis_ranking). Solo pueden nacer de un import de biblioteca LOCAL en el
+# cliente; el backend nunca las genera por su cuenta y los ghosts importados
+# jamas pasan por /cache-analysis. Por tanto, si llegan por red SIN firmar, o
+# son un cliente muy raro o son el ataque de envenenamiento.
+_UNTRUSTED_SOURCE_CEILING = 100
+_CLAMPED_SOURCE = 'local_engine'
+
+
+def _clamp_untrusted_source(data: dict, signed: bool) -> None:
+    """Degrada in-place las fuentes de maxima prioridad en payloads sin firmar.
+
+    Se DEGRADA en lugar de rechazar para no tirar analisis legitimos de un
+    cliente inesperado: el dato se guarda igual, pero con la prioridad de un
+    motor local (50) en vez de la de Rekordbox (110). Asi deja de poder pisar
+    el consenso comunitario y el resto del cluster acustico.
+    """
+    if signed:
+        return
+    for field in ('bpm_source', 'key_source', 'genre_source'):
+        src = data.get(field)
+        if get_source_priority(src) >= _UNTRUSTED_SOURCE_CEILING:
+            logger.warning(
+                f"[Cache] fuente '{src}' sin firmar en {field} -> degradada a "
+                f"'{_CLAMPED_SOURCE}' (fp={str(data.get('fingerprint'))[:12]})"
+            )
+            data[field] = _CLAMPED_SOURCE
+
+
 @app.post("/cache-analysis")
-async def cache_analysis(request: Request):
+async def cache_analysis(request: Request, signed: bool = Depends(verify_write_auth)):
     """
     Recibe resultado de análisis desde motor local y lo guarda como cache comunitario.
     Esto permite que tracks analizados localmente estén disponibles para todos los usuarios
@@ -4129,6 +4367,12 @@ async def cache_analysis(request: Request):
     fingerprint = data.get('fingerprint')
     if not fingerprint:
         raise HTTPException(400, "fingerprint requerido")
+
+    # Cortar el envenenamiento ANTES de que el ranking mire las prioridades.
+    _clamp_untrusted_source(data, signed)
+    nested_pre = data.get('analysis_json')
+    if isinstance(nested_pre, dict):
+        _clamp_untrusted_source(nested_pre, signed)
 
     # Ranking "mejor gana": comparamos bpm_source nuevo vs existente y
     # solo sobreescribimos si la nueva fuente tiene mayor prioridad (o
@@ -4482,7 +4726,11 @@ async def health():
         conn.execute("SELECT 1")
         conn.close()
     except Exception as e:
-        db_status = f"error: {e}"
+        # /health es público: el texto de la excepción de SQLite delata la ruta
+        # del fichero en disco ("unable to open database file: /data/..."). El
+        # detalle va al log; al cliente solo el estado.
+        logger.error(f"[Health] fallo comprobando la BD: {e}")
+        db_status = "error"
 
     # FFmpeg check: solo verificar que es accesible como archivo.
     # NO usamos subprocess.run porque en Windows 11 24H2+ lanza WinError 448
@@ -4678,7 +4926,9 @@ async def clear_artwork_cache():
             os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
         return {"status": "ok", "message": "Caché de artwork limpiado"}
     except (OSError, PermissionError) as e:
-        raise HTTPException(500, f"Error: {str(e)}")
+        # El texto de la excepción (rutas, SQL, internals) no debe viajar a un
+        # cliente anónimo: ya queda en el log de arriba con el detalle completo.
+        raise HTTPException(500, "Error interno")
 
 # ==================== COMMUNITY (beat-grid / overrides / notes / ratings) ====================
 # Movidos a routes/community.py (paso 3 del troceo de main.py). Se montan via
