@@ -3,7 +3,11 @@
 # `analysis.db.\0c\0o\0v\0e\0r\0a\0g\0e\0`. Efecto: el patron `analysis.db` NO
 # ignoraba nada (lo salvaba el `*.db` de un bloque duplicado mas abajo) y las
 # reglas del bloque pegado eran basura para git. Ademas venia todo duplicado.
-# Aqui va limpio, en UTF-8, sin repetir.
+#
+# CUIDADO AL AUDITARLO CON grep: los bytes nulos hacian que grep tratara el
+# fichero como BINARIO y no listara las coincidencias. Por eso una comprobacion
+# con grep concluyo que `build/` y `dist/` no estaban cuando SI estaban, y la
+# primera version de este commit los presento como reglas nuevas. No lo eran.
 
 # Secretos y entornos
 .env
@@ -22,29 +26,40 @@ __pycache__/
 *.db-wal
 *.db-shm
 
-# Logs. FALTABA, y por eso `engine.log` —que genera local_engine al arrancar—
-# acabo commiteado por un `git add -A`. Un log trackeado ademas BLOQUEA
-# `git checkout` a cualquier rama que no lo tenga ("archivos sin seguimiento
-# seran sobrescritos"), que es justo lo que paso el 2026-08-10.
+# Logs. Esto SI faltaba de verdad, y por eso `engine.log` —que genera
+# local_engine al arrancar— acabo commiteado por un `git add -A`. Un log
+# trackeado ademas BLOQUEA `git checkout` a cualquier rama que no lo tenga
+# ("archivos sin seguimiento seran sobrescritos"), que es justo lo que paso.
 *.log
 
-# Salida de PyInstaller. TAMPOCO estaban, asi que un `git add -A` despues de
-# compilar el motor local podia meter cientos de MB de binarios en el repo.
+# Salida de PyInstaller (ya estaba, se conserva)
 build/
 dist/
 *.manifest
+chromaprint-fpcalc-*/
+
+# Los .spec se ignoran porque PyInstaller GENERA uno cada vez que compilas sin
+# pasarle el nuestro. Pero los dos de este repo son FUENTE mantenida a mano
+# (empaquetan el motor local), asi que se re-incluyen explicitamente. Antes
+# dependian de estar ya trackeados, que funciona hasta que alguien clona y
+# regenera uno: entonces desapareceria del control de versiones sin avisar.
+*.spec
+!dj_analyzer_engine.spec
+!dj_analyzer_engine_macos.spec
 
 # Caches de assets generados en runtime
 artwork_cache/
 artworks/
 previews/
+previews_cache/
 
 # OJO: `data/` esta ignorado, pero `data/genre_mappings.json` y `data/README.md`
-# SI estan trackeados (gitignore solo afecta a ficheros untracked, y esos se
-# anadieron antes). El .spec los empaqueta en el motor local. NO los borres
-# pensando que son basura ignorada: si desaparecen, la deteccion de genero se
-# queda sin su tabla de 915+ entradas.
+# SI estan trackeados. La negacion de abajo venia en el fichero original y es la
+# que garantiza que el JSON siga entrando aunque alguien lo borre y lo recree.
+# NO la quites: el .spec lo empaqueta en el motor local y sin el la deteccion de
+# genero se queda sin su tabla de 915+ entradas.
 data/
+!data/genre_mappings.json
 
 # macOS
 .DS_Store
