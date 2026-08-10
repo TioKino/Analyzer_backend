@@ -105,6 +105,130 @@ class TestGuardDeProcedencia:
             assert r.status_code == 200, "revotar con el mismo id nunca se corta"
 
 
+class TestQueNingunaViaSeSalteElGuard:
+    """El guard no vale de nada si queda una puerta sin cerrar: basta apuntar
+    el mismo curl a otra ruta que escriba el mismo consenso."""
+
+    def test_la_ruta_legacy_de_track_type_no_es_un_atajo(self, client):
+        """REGRESIÓN (auditoría 2026-08-10): `/community/track-type` delegaba en
+        el endpoint genérico con `http=None`, y el genérico solo llama al guard
+        si recibe la Request. O sea que la mitigación se saltaba entera
+        cambiando la URL. Escribe en la MISMA tabla que `/community/override`."""
+        fp = _fp()
+        aceptados = 0
+        for i in range(8):
+            r = client.post(
+                "/community/track-type",
+                json={"fingerprint": fp, "device_id": f"legacy-{i}",
+                      "track_type": "peak_time"},
+                headers={"X-Forwarded-For": "203.0.113.31"},
+            )
+            if r.status_code == 200:
+                aceptados += 1
+            else:
+                assert r.status_code == 429
+                break
+        assert aceptados <= 3, (
+            f"{aceptados} identidades por la ruta legacy: sigue siendo un bypass"
+        )
+
+    def test_las_valoraciones_tambien_estan_capadas(self, client):
+        """La media de rating se muestra a todo el mundo; con ids inventados se
+        empuja a donde se quiera."""
+        fp = _fp()
+        aceptados = 0
+        for i in range(8):
+            r = client.post(
+                "/community/rate",
+                json={"fingerprint": fp, "device_id": f"falso-{i}", "rating": 5},
+                headers={"X-Forwarded-For": "203.0.113.32"},
+            )
+            if r.status_code == 200:
+                aceptados += 1
+            else:
+                assert r.status_code == 429
+                break
+        assert aceptados <= 3, f"{aceptados} identidades valorando desde una IP"
+
+    def test_los_cues_comunitarios_tambien(self, client):
+        """Las zonas se devuelven con `dj_count` y `confidence`: es consenso
+        agregado igual que un override, y se fabricaba igual de fácil."""
+        fp = _fp()
+        aceptados = 0
+        for i in range(8):
+            r = client.post(
+                "/community-cues",
+                json={"fingerprint": fp, "device_id": f"cue-falso-{i}",
+                      "cues": [{"type": "drop", "position_ms": 60000}]},
+                headers={"X-Forwarded-For": "203.0.113.33"},
+            )
+            if r.status_code == 200:
+                aceptados += 1
+            else:
+                assert r.status_code == 429
+                break
+        assert aceptados <= 3, f"{aceptados} identidades subiendo cues desde una IP"
+
+    def test_un_dj_real_sigue_pudiendo_subir_sus_cues(self, client):
+        r = client.post(
+            "/community-cues",
+            json={"fingerprint": _fp(), "device_id": "mi-desktop",
+                  "cues": [{"type": "mixIn", "position_ms": 15000}]},
+            headers={"X-Forwarded-For": "198.51.100.77"},
+        )
+        assert r.status_code == 200
+        assert r.json().get("status") != "error"
+
+
+class TestUpvotesDeNotas:
+    """`community_notes.upvotes` era un contador ciego: el endpoint no recibía
+    identidad y hacía `upvotes = upvotes + 1`. Un bucle de curl colocaba
+    cualquier nota la primera."""
+
+    def _nota(self, client, texto="Sube el filtro en el break"):
+        fp = _fp()
+        r = client.post("/community/notes", json={
+            "fingerprint": fp, "device_id": "autor", "note_text": texto,
+        })
+        assert r.status_code == 200, r.text
+        return fp, r.json()["note_id"]
+
+    def test_el_mismo_votante_no_suma_dos_veces(self, client):
+        _, note_id = self._nota(client)
+        primero = client.post(f"/community/notes/{note_id}/upvote",
+                              params={"device_id": "dj-1"})
+        segundo = client.post(f"/community/notes/{note_id}/upvote",
+                              params={"device_id": "dj-1"})
+        assert primero.json()["counted"] is True
+        assert segundo.json()["counted"] is False, "repetir sumó otra vez"
+        assert segundo.json()["upvotes"] == 1
+
+    def test_repetir_no_es_un_error(self, client):
+        """La UI puede reintentar (red mala, doble tap): idempotente, no 4xx."""
+        _, note_id = self._nota(client)
+        for _ in range(4):
+            r = client.post(f"/community/notes/{note_id}/upvote",
+                            params={"device_id": "dj-nervioso"})
+            assert r.status_code == 200
+
+    def test_votantes_distintos_si_suman(self, client):
+        _, note_id = self._nota(client)
+        for dev in ("dj-a", "dj-b", "dj-c"):
+            client.post(f"/community/notes/{note_id}/upvote", params={"device_id": dev})
+        r = client.post(f"/community/notes/{note_id}/upvote", params={"device_id": "dj-d"})
+        assert r.json()["upvotes"] == 4
+
+    def test_sin_device_id_cae_a_la_ip_y_tampoco_se_repite(self, client):
+        """El cliente actual llama sin cuerpo. Grano peor (un hogar cuenta como
+        uno) pero el bucle de curl deja de funcionar, que es lo que importaba."""
+        _, note_id = self._nota(client)
+        for _ in range(5):
+            r = client.post(f"/community/notes/{note_id}/upvote",
+                            headers={"X-Forwarded-For": "203.0.113.44"})
+            assert r.status_code == 200
+        assert r.json()["upvotes"] == 1
+
+
 class TestRegistroDeProcedencia:
     def test_cuenta_identidades_distintas_por_ip_y_track(self, app_mod):
         db = app_mod.db

@@ -14,7 +14,7 @@
 import sqlite3
 from pydantic import BaseModel
 from typing import List, Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 import logging
 
 logger = logging.getLogger(__name__)
@@ -207,16 +207,26 @@ def register_community_endpoints(app, db):
 
     @app.post("/community-cues", response_model=dict)
     @app.post("/community/cues", response_model=dict)  # alias: el cliente llama con barra
-    async def upload_community_cues(upload: CueUpload):
+    async def upload_community_cues(upload: CueUpload, http: Request = None):
         """
         Un DJ sube sus cues para un track (por fingerprint).
         Se borran cues anteriores del mismo device_id para ese fingerprint
         y se insertan los nuevos.
+
+        Pasa por el guard SEC-12 como los demas votos: las zonas que se
+        devuelven llevan `dj_count` y `confidence`, o sea que esto TAMBIEN es
+        consenso agregado, y con ids inventados desde una IP se inventaban
+        zonas "validadas por N DJs".
         """
         from datetime import datetime
 
         if not upload.fingerprint or not upload.cues:
             return {"status": "error", "message": "fingerprint y cues requeridos"}
+
+        if http is not None:
+            from routes.community import _guard_vote_source
+
+            _guard_vote_source(http, upload.fingerprint, upload.device_id)
 
         conn = db.conn
         c = conn.cursor()

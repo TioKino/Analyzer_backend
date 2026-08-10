@@ -444,6 +444,20 @@ class AnalysisDB:
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_cnotes_fp ON community_notes(fingerprint)')
 
+        # Quien ha votado cada nota. `community_notes.upvotes` era un contador
+        # CIEGO: POST /community/notes/{id}/upvote no recibia identidad ninguna
+        # y hacia `upvotes = upvotes + 1`, asi que un curl en bucle colocaba
+        # cualquier nota la primera. Con esta tabla el upvote es idempotente por
+        # votante (device_id si el cliente lo manda, hash de IP si no).
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_note_upvotes (
+                note_id    INTEGER NOT NULL,
+                voter      TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (note_id, voter)
+            )
+        ''')
+
         # Popularidad de tracks
         conn.execute('''
             CREATE TABLE IF NOT EXISTS track_popularity (
@@ -1474,11 +1488,38 @@ class AnalysisDB:
         finally:
             conn.close()
 
-    def upvote_community_note(self, note_id: int):
+    def upvote_community_note(self, note_id: int, voter: str = '') -> dict:
+        """Suma un upvote a una nota, UNA VEZ por votante.
+
+        Antes esto era `upvotes = upvotes + 1` a pelo, sin identidad: cualquiera
+        podia repetir la llamada en bucle y fijar la nota que quisiera arriba.
+        Ahora la identidad (device_id del cliente, o hash de IP si no lo manda)
+        se registra en `community_note_upvotes` y el contador solo sube cuando
+        el votante es nuevo. Repetir es idempotente, no un error: la UI puede
+        reintentar sin inflar nada.
+
+        Devuelve {'counted': bool, 'upvotes': int}.
+        """
+        from datetime import datetime
+        voter = (voter or '').strip() or 'anon'
         conn = self._open_conn()
         try:
-            conn.execute('UPDATE community_notes SET upvotes = upvotes + 1 WHERE id = ?', (note_id,))
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO community_note_upvotes '
+                '(note_id, voter, created_at) VALUES (?, ?, ?)',
+                (note_id, voter, datetime.utcnow().isoformat()),
+            )
+            counted = cur.rowcount > 0
+            if counted:
+                conn.execute(
+                    'UPDATE community_notes SET upvotes = upvotes + 1 WHERE id = ?',
+                    (note_id,),
+                )
             conn.commit()
+            row = conn.execute(
+                'SELECT upvotes FROM community_notes WHERE id = ?', (note_id,)
+            ).fetchone()
+            return {'counted': counted, 'upvotes': (row[0] if row else 0)}
         finally:
             conn.close()
 

@@ -48,9 +48,32 @@ community_router = APIRouter(tags=["community"])
 # consenso de BPM, tonalidad, género, track type, beat grid y ratings de
 # cualquier track, y eso se sirve a todos como "validado por la comunidad".
 #
-# EL ARREGLO DE FONDO es derivar el device_id de la identidad de sync, que ya
-# está autenticada por HMAC. Eso obliga a tocar el cliente y las dos partes
-# tienen que desplegarse a la vez, así que va aparte (ver PENDING.md).
+# EL ARREGLO DE FONDO — CORREGIDO 2026-08-10, la versión anterior de este
+# comentario decía una cosa que NO se sostiene al mirar el código:
+#
+#   ❌ "derivar el device_id de la identidad de sync, que ya está autenticada
+#      por HMAC". NO SIRVE. `SYNC_AUTH_SECRET` es un secreto COMPARTIDO,
+#      embebido por dart-define en TODOS los builds (y admite lista para
+#      rotarlo, `sync_endpoints.py:80`). Su HMAC demuestra "esto es un cliente
+#      legítimo", no "esto es el dispositivo X". Derivar identidad de ahí es
+#      imposible: la firma es idéntica para todos los usuarios del mundo.
+#
+#   ✅ Lo que SÍ existe es un registro real de dispositivos: `user_devices`
+#      (device_id → user_id), que se puebla en POST /sync/register, exige
+#      código de vinculación para unir un device a un user y está topado en
+#      MAX_DEVICES_PER_USER = 20. El arreglo es (a) exigir que el device_id que
+#      llega a /community/* esté registrado ahí, y (b) contar el consenso por
+#      user_id, NO por device_id.
+#
+#      (b) es lo que de verdad cierra el agujero, y además arregla un sesgo que
+#      hoy tenemos: el DJ con desktop + móvil + tablet cuenta como TRES votos
+#      cuando es una sola opinión. Fabricar consensus_3 pasaría a exigir tres
+#      CUENTAS distintas, con su vinculación cada una.
+#
+#      Ojo al desplegarlo: (a) deja fuera a quien use la app sin haber vinculado
+#      nunca. Va con el mismo rollout por fases que el HMAC de escritura —
+#      primero contar en log cuántos votos llegan de devices no registrados, y
+#      solo entonces rechazar. No lo actives de golpe. (Ver PENDING.md.)
 #
 # ESTO es la mitigación que se puede desplegar sola: contar cuántas identidades
 # DISTINTAS usa una misma IP para votar el MISMO track. Un usuario real vota un
@@ -365,15 +388,22 @@ class TrackTypeOverrideRequest(BaseModel):
     track_type: str
 
 @community_router.post("/community/track-type")
-async def submit_track_type_override(request: TrackTypeOverrideRequest):
-    """Legacy Fase 2: voto de track_type. Delega al endpoint generico."""
+async def submit_track_type_override(request: TrackTypeOverrideRequest, http: Request = None):
+    """Legacy Fase 2: voto de track_type. Delega al endpoint generico.
+
+    OJO: `http` se propaga al generico A PROPOSITO. Sin ello este endpoint era
+    un BYPASS COMPLETO del guard SEC-12: el generico solo llama a
+    `_guard_vote_source` si recibe la Request, y aqui se delegaba con
+    `http=None`, asi que bastaba apuntar el curl a /community/track-type en vez
+    de a /community/override para fabricar consenso de track_type sin limite.
+    """
     proxy = CommunityOverrideRequest(
         fingerprint=request.fingerprint,
         device_id=request.device_id,
         field='track_type',
         value=request.track_type,
     )
-    result = await submit_community_override(proxy)
+    result = await submit_community_override(proxy, http)
     # Shape Fase 2: 'consensus' string (no objeto con field).
     return {
         "status": result.get("status", "ok"),
@@ -450,21 +480,43 @@ async def get_community_notes(fingerprint: str):
 
 
 @community_router.post("/community/notes/{note_id}/upvote")
-async def upvote_note(note_id: int):
-    """Sube un voto a una nota comunitaria."""
+async def upvote_note(note_id: int, device_id: str = "", http: Request = None):
+    """Sube un voto a una nota comunitaria. Uno por votante.
+
+    `device_id` es opcional para no romper al cliente actual, que llama sin
+    cuerpo. Cuando no viene, la identidad es el hash de la IP: peor grano (un
+    hogar entero cuenta como uno) pero acota el bucle de curl, que era lo que
+    dejaba el contador a merced de cualquiera.
+    """
+    voter = (device_id or "").strip()
+    if not voter and http is not None:
+        try:
+            from validation import get_client_ip
+
+            voter = db.hash_ip(get_client_ip(http))
+        except Exception:  # noqa: BLE001 - sin identidad, el INSERT cae en 'anon'
+            voter = ""
     try:
-        db.upvote_community_note(note_id)
-        return {"status": "ok"}
+        result = db.upvote_community_note(note_id, voter)
+        return {"status": "ok", **result}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        logger.error(f"[Community] Error en upvote de nota {note_id}: {e}")
+        raise HTTPException(500, "Error interno")
 
 
 @community_router.post("/community/rate")
-async def rate_track_endpoint(req: TrackRatingRequest):
+async def rate_track_endpoint(req: TrackRatingRequest, http: Request = None):
     """Un DJ puntua un track (1-5 estrellas). Una valoracion por DJ por track.
-    rating=0 QUITA la valoracion del DJ (toggle off desde la UI)."""
+    rating=0 QUITA la valoracion del DJ (toggle off desde la UI).
+
+    El guard SEC-12 aplica aqui igual que en los overrides: la media de rating
+    es un dato agregado que se muestra a todo el mundo, y con ids inventados
+    desde una sola IP se empuja donde se quiera.
+    """
     if req.rating < 0 or req.rating > 5:
         raise HTTPException(400, "Rating debe ser 0-5 (0 = quitar)")
+    if http is not None:
+        _guard_vote_source(http, req.fingerprint, req.device_id)
     try:
         result = db.rate_track(req.fingerprint, req.device_id, req.rating)
         logger.info(f"[Community] Rating: fp={req.fingerprint[:8]}... = {req.rating} (avg {result.get('avg_rating')})")
