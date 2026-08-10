@@ -756,6 +756,16 @@ def _get_db():
     return main.db
 
 
+def _acoustic_coverage() -> dict:
+    """Cobertura de huella acustica. Best-effort: una metrica de observacion
+    nunca debe tumbar el panel entero."""
+    try:
+        return _get_db().acoustic_coverage()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Admin] acoustic_coverage no disponible: {e}")
+        return {}
+
+
 def _vote_registration_stats() -> dict:
     """Reparto registrado/no-registrado de las identidades que votan en
     /community/* (SEC-12 fase 1). Best-effort: el panel nunca debe caerse por
@@ -1116,6 +1126,12 @@ async def telemetry(request: Request):
             "preview_rate": round(preview_rate, 3),
             "artwork_rate": round(artwork_rate, 3),
         },
+        # Estado de la memoria colectiva POR SONIDO. Faltaba: el panel medía
+        # preview y artwork pero no la huella, asi que no habia forma de saber
+        # si el backfill (automatico en el cliente desktop) iba por la mitad,
+        # atascado o sin arrancar. Mirar `tracks_in_multi_clusters`, no
+        # `with_chromaprint`: una huella sola no comparte nada con nadie.
+        "acoustic": _acoustic_coverage(),
         # SEC-12 fase 1 — el dato que decide si se puede exigir registro para
         # votar en /community/*. `unregistered` es EXACTAMENTE la gente que se
         # quedaria fuera al activar la fase 2. `unknown` son votos anteriores a
