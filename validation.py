@@ -533,6 +533,38 @@ SimpleRateLimiter = RateLimiter
 # Instancia global del rate limiter
 rate_limiter = RateLimiter(max_requests=60, window_seconds=60)
 
+# Cupo APARTE para el fallback ONLINE de /artwork (SEC-13).
+#
+# No se capa el endpoint entero a proposito: servir una caratula ya cacheada es
+# leer un fichero local, y la app pide decenas o cientos de golpe al pintar la
+# biblioteca. Capar eso romperia el uso normal.
+#
+# Lo que hay que acotar es el CAMINO CARO: cuando no hay cache, el handler sale
+# a internet (iTunes + Deezer + Last.fm, hasta 8 peticiones con timeouts de
+# 5-8 s). Ya no congela el event loop —corre en threadpool— pero sigue siendo
+# anonimo, quema hilos y, sobre todo, genera trafico saliente desde la IP de
+# Render: un bucle sobre fingerprints sin caratula puede acabar con esas APIs
+# limitando o baneando al servidor, que afecta a TODOS los usuarios.
+#
+# 12/min por IP es holgado para un usuario real (la inmensa mayoria de sus
+# caratulas salen de cache) y mata el bucle de scraping.
+ARTWORK_ONLINE_MAX_PER_MIN = int(os.getenv('ARTWORK_ONLINE_MAX_PER_MIN', '12'))
+artwork_online_limiter = RateLimiter(
+    max_requests=ARTWORK_ONLINE_MAX_PER_MIN, window_seconds=60,
+)
+
+
+def artwork_online_allowed(client_ip: str) -> bool:
+    """¿Puede esta IP disparar OTRA busqueda online de caratula?
+
+    Devuelve bool en vez de lanzar 429 a proposito: el llamador degrada a 404
+    (que es la respuesta normal de "no hay caratula" y que los clientes ya
+    saben pintar como placeholder) en lugar de introducir un estado de error
+    nuevo que la UI no maneja. El limite protege el trafico saliente; no tiene
+    por que ser visible para quien solo esta mirando su biblioteca.
+    """
+    return artwork_online_limiter.is_allowed(client_ip)
+
 
 def check_rate_limit(client_ip: str) -> None:
     """
