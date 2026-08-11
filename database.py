@@ -2692,6 +2692,63 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def acoustic_coverage(self) -> Dict[str, int]:
+        """Estado real de la memoria colectiva POR SONIDO.
+
+        El backfill de huella corre solo en el cliente desktop (automatico,
+        2s/track, resumible) y nadie sabia cuanto llevaba hecho: el panel
+        reportaba cobertura de preview y artwork, pero no de huella. Sin este
+        numero no se puede decidir si el backfill esta terminado, atascado o si
+        jamas llego a arrancar.
+
+        La metrica que IMPORTA no es `with_chromaprint` sino
+        `tracks_in_multi_clusters`: un track con huella pero solo en su cluster
+        no comparte nada con nadie. Lo que cumple la promesa del producto —cues,
+        beat-grid y correcciones compartidos entre copias distintas del mismo
+        audio— son los tracks agrupados con AL MENOS otro.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COUNT(*) AS total,"
+                "       SUM(CASE WHEN chromaprint IS NOT NULL AND chromaprint != ''"
+                "                THEN 1 ELSE 0 END) AS con_huella,"
+                "       SUM(CASE WHEN acoustic_id IS NOT NULL THEN 1 ELSE 0 END)"
+                "                AS con_cluster"
+                "  FROM tracks"
+            )
+            r = c.fetchone()
+            total = int(r['total'] or 0)
+            con_huella = int(r['con_huella'] or 0)
+            con_cluster = int(r['con_cluster'] or 0)
+
+            # Clusters con 2+ miembros = copias del mismo audio que YA comparten
+            # memoria. Los de 1 son huella calculada que aun no ha encontrado
+            # pareja (normal y esperado en buena parte de la biblioteca).
+            c.execute(
+                "SELECT COUNT(*) AS grupos, COALESCE(SUM(n), 0) AS tracks FROM ("
+                "  SELECT COUNT(*) AS n FROM tracks"
+                "   WHERE acoustic_id IS NOT NULL"
+                "   GROUP BY acoustic_id HAVING COUNT(*) > 1)"
+            )
+            r2 = c.fetchone()
+            return {
+                'total_tracks': total,
+                'with_chromaprint': con_huella,
+                'without_chromaprint': total - con_huella,
+                'with_cluster': con_cluster,
+                'chromaprint_pct': (round(100.0 * con_huella / total, 1)
+                                    if total else None),
+                'multi_clusters': int(r2['grupos'] or 0),
+                'tracks_in_multi_clusters': int(r2['tracks'] or 0),
+            }
+        except sqlite3.OperationalError:
+            # BD antigua sin las columnas chromaprint/acoustic_id.
+            return {}
+        finally:
+            conn.close()
+
     def count_engine_sources(self) -> Dict[str, int]:
         """Counts de tracks por engine_source.
 
