@@ -9,7 +9,6 @@ Estructura:
 - genre_detection.py - Deteccin de g(c)nero con mltiples fuentes
 - artwork_and_cuepoints.py - Extraccin artwork + cue points
 - similar_tracks_endpoint.py - Bsqueda de tracks similares
-- essentia_analyzer.py - Anlisis con Essentia (opcional)
 - api_config.py / config.py - Configuracin
 """
 
@@ -1619,7 +1618,8 @@ def generate_preview_snippet(
     except subprocess.CalledProcessError as e:
         # stderr[:200] solo recoge el banner "ffmpeg version 5.1.8..." y
         # disparaba alertas falsas. Filtramos lineas que parecen error real
-        # o caemos al tail. Mismo patron que preview_generator.py y
+        # o caemos al tail. (El viejo preview_generator.py, que seguia el
+        # mismo patron, se borro en 2026-08-10 por no usarlo nadie.)
         # _preprocess_audio_for_recognition.
         stderr_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
         err_lines = [

@@ -2,8 +2,10 @@
 Precisión del motor de análisis — BPM, tonalidad, energía y estructura.
 
 POR QUÉ EXISTE (auditoría 2026-08-09): la suite tenía 506 tests verdes y corría
-en 3 segundos porque NO TOCABA AUDIO. `precision_analyzer.py`,
-`spectral_classifier.py` y `essentia_analyzer.py` estaban al 0 % de cobertura, y
+en 3 segundos porque NO TOCABA AUDIO. `spectral_genre_classifier.py` estaba al
+0 % de cobertura y `chunked_analyzer.py` al 15 %. (`precision_analyzer.py` y
+`essentia_analyzer.py`, tambien al 0 %, resultaron estar MUERTOS del todo y se
+borraron el 2026-08-10 en vez de cubrirlos.) Y
 `chunked_analyzer.py` al 15 %. O sea: lo que decide la calidad del producto
 —que el BPM y la tonalidad salgan bien— era exactamente lo único sin probar.
 Una regresión de precisión al tocar el analizador habría pasado inadvertida

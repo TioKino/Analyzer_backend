@@ -99,7 +99,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Resolver FFmpeg a ruta absoluta antes de importar main.
-# main.py y preview_generator.py usan `os.environ.get('FFMPEG_BIN', 'ffmpeg')`
+# main.py usa `os.environ.get('FFMPEG_BIN', 'ffmpeg')`
 # en todas sus subprocess.run. La ruta absoluta evita WinError 448 en
 # Windows 11 24H2+ cuando el PATH contiene reparse points (OneDrive,
 # junctions, symlinks). El .spec empaqueta ffmpeg.exe junto al engine.
