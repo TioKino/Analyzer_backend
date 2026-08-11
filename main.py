@@ -3240,9 +3240,14 @@ async def analyze_track(
                 result, track_data.get('chromaprint'), track_data.get('duration'),
             )
 
-        # Incrementar contador de popularidad
+        # Incrementar contador de popularidad. El device_id va AHORA (BUG-01):
+        # la cabecera ya se leia unas lineas mas arriba para la contabilidad de
+        # AudD, pero aqui no se pasaba, asi que `dj_count` no podia contar DJs
+        # distintos y devolvia 1 para siempre.
         try:
-            db.increment_popularity(fingerprint)
+            db.increment_popularity(
+                fingerprint, request.headers.get('X-Device-Id') or '',
+            )
         except Exception:
             pass
 

@@ -481,6 +481,20 @@ class AnalysisDB:
             )
         ''')
 
+        # Quien ha analizado cada track (BUG-01). `track_popularity.dj_count`
+        # se creaba con DEFAULT 1 y NO SE INCREMENTABA NUNCA: increment_popularity
+        # recibia `device_id` y lo ignoraba, asi que /community/popularity
+        # devolvia 1 para todo el mundo, siempre. Para contar DJs distintos hay
+        # que saber QUIENES son; sin registro no se puede deducir.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS track_analyzers (
+                fingerprint TEXT NOT NULL,
+                device_id   TEXT NOT NULL,
+                first_seen  TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, device_id)
+            )
+        ''')
+
         # Ratings individuales por DJ
         conn.execute('''
             CREATE TABLE IF NOT EXISTS track_ratings (
@@ -1537,21 +1551,53 @@ class AnalysisDB:
     # ==================== TRACK POPULARITY & RATINGS ====================
 
     def increment_popularity(self, fingerprint: str, device_id: str = ''):
+        """Suma una reproduccion/analisis y recalcula cuantos DJs DISTINTOS lo
+        han analizado.
+
+        BUG-01: `device_id` se recibia y se IGNORABA. `dj_count` entraba con
+        DEFAULT 1 y el UPDATE solo tocaba `analysis_count`, asi que
+        /community/popularity devolvia 1 para todos los tracks, siempre. El
+        mismo DJ analizando un track diez veces tampoco debe contar como diez,
+        de ahi que haga falta registrar QUIEN (`track_analyzers`) y no un
+        contador ciego.
+
+        `device_id` vacio (cliente que no manda la cabecera) NO se registra: no
+        se puede distinguir a un anonimo de otro y contarlos inflaria el dato.
+        Por eso el suelo es 1 — si existe fila de popularidad es porque alguien
+        lo analizo, aunque no sepamos quien. Ese suelo cubre tambien las filas
+        historicas, anteriores a esta tabla: se quedan en 1 (lo que ya decian)
+        en vez de caer a 0, que seria peor que el bug.
+        """
         from datetime import datetime
         fingerprint = self.canonical_community_key(fingerprint)
+        device_id = (device_id or '').strip()
         conn = self._open_conn()
         try:
             c = conn.cursor()
+            now = datetime.utcnow().isoformat()
+
+            if device_id:
+                c.execute(
+                    'INSERT OR IGNORE INTO track_analyzers '
+                    '(fingerprint, device_id, first_seen) VALUES (?, ?, ?)',
+                    (fingerprint, device_id, now),
+                )
+            c.execute(
+                'SELECT COUNT(*) FROM track_analyzers WHERE fingerprint = ?',
+                (fingerprint,),
+            )
+            djs = max(1, int((c.fetchone() or [0])[0] or 0))
+
             c.execute('SELECT analysis_count FROM track_popularity WHERE fingerprint = ?', (fingerprint,))
             row = c.fetchone()
-            now = datetime.utcnow().isoformat()
             if row:
                 c.execute('''UPDATE track_popularity
-                             SET analysis_count = analysis_count + 1, last_analyzed = ?
-                             WHERE fingerprint = ?''', (now, fingerprint))
+                             SET analysis_count = analysis_count + 1,
+                                 dj_count = ?, last_analyzed = ?
+                             WHERE fingerprint = ?''', (djs, now, fingerprint))
             else:
                 c.execute('''INSERT INTO track_popularity (fingerprint, analysis_count, dj_count, last_analyzed)
-                             VALUES (?, 1, 1, ?)''', (fingerprint, now))
+                             VALUES (?, 1, ?, ?)''', (fingerprint, djs, now))
             conn.commit()
         finally:
             conn.close()
