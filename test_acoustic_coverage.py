@@ -144,3 +144,46 @@ class TestPanelAdmin:
 
         monkeypatch.setattr(ap, "_get_db", lambda: BDRota())
         assert ap._acoustic_coverage() == {}
+
+
+class TestRadioDeImpactoDeSEC01:
+    """`rows_without_md5_fingerprint` mide cuantas filas dejaron de poder dar
+    cache-hit tras SEC-01. Es un numero operativo: decide si el arreglo provoca
+    una tormenta de reanalisis en un Render de un solo worker o si es inocuo.
+
+    OJO con los dos "fingerprint" del proyecto: `chromaprint` es la huella
+    ACUSTICA (agrupa por sonido) y `fingerprint` es el MD5 del CONTENIDO. Este
+    contador va del segundo."""
+
+    def test_cuenta_las_filas_sin_md5(self, db):
+        _track(db, chromaprint="AQAA")           # con MD5 (lo pone _track)
+        conn = db._open_conn()
+        try:
+            conn.execute(
+                "INSERT INTO tracks (fingerprint, filename, bpm, duration) "
+                "VALUES ('', 'sin_md5.mp3', 128.0, 300.0)")
+            conn.execute(
+                "INSERT INTO tracks (fingerprint, filename, bpm, duration) "
+                "VALUES (NULL, 'null_md5.mp3', 128.0, 300.0)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        c = db.acoustic_coverage()
+        assert c['rows_without_md5_fingerprint'] == 2, (
+            "la cadena vacia y el NULL cuentan igual: ninguna de las dos "
+            "permite verificar que el track sea tuyo"
+        )
+
+    def test_no_se_confunde_con_la_huella_acustica(self, db):
+        """Una fila puede tener MD5 y no tener chromaprint — es de hecho el
+        caso mayoritario hoy (28,5% de cobertura acustica). Contarlas aqui
+        inflaria el radio de impacto y daria una falsa alarma."""
+        for _ in range(5):
+            _track(db)  # MD5 si, chromaprint no
+        c = db.acoustic_coverage()
+        assert c['without_chromaprint'] == 5
+        assert c['rows_without_md5_fingerprint'] == 0, (
+            "se estan contando filas sin huella ACUSTICA como si les faltara "
+            "el MD5: son cosas distintas"
+        )

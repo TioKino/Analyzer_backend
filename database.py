@@ -2761,13 +2761,16 @@ class AnalysisDB:
                 "       SUM(CASE WHEN chromaprint IS NOT NULL AND chromaprint != ''"
                 "                THEN 1 ELSE 0 END) AS con_huella,"
                 "       SUM(CASE WHEN acoustic_id IS NOT NULL THEN 1 ELSE 0 END)"
-                "                AS con_cluster"
+                "                AS con_cluster,"
+                "       SUM(CASE WHEN fingerprint IS NULL OR fingerprint = ''"
+                "                THEN 1 ELSE 0 END) AS sin_md5"
                 "  FROM tracks"
             )
             r = c.fetchone()
             total = int(r['total'] or 0)
             con_huella = int(r['con_huella'] or 0)
             con_cluster = int(r['con_cluster'] or 0)
+            sin_md5 = int(r['sin_md5'] or 0)
 
             # Clusters con 2+ miembros = copias del mismo audio que YA comparten
             # memoria. Los de 1 son huella calculada que aun no ha encontrado
@@ -2788,6 +2791,17 @@ class AnalysisDB:
                                     if total else None),
                 'multi_clusters': int(r2['grupos'] or 0),
                 'tracks_in_multi_clusters': int(r2['tracks'] or 0),
+                # OJO: `fingerprint` NO es `chromaprint`. Son dos cosas
+                # distintas con nombres que se confunden constantemente:
+                #   chromaprint -> huella ACUSTICA (agrupa por sonido)
+                #   fingerprint -> MD5 del CONTENIDO del fichero (identidad
+                #                  exacta de bytes)
+                # Este contador mide el radio de impacto de SEC-01: desde ese
+                # arreglo, una fila sin MD5 ya no puede dar cache-hit por
+                # nombre (no se puede verificar que sea tuya) y se REANALIZA.
+                # En un Render de un worker, si el numero fuera grande habria
+                # que afinar el arreglo; si es residual, no hay nada que hacer.
+                'rows_without_md5_fingerprint': sin_md5,
             }
         except sqlite3.OperationalError:
             # BD antigua sin las columnas chromaprint/acoustic_id.
