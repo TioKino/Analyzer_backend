@@ -36,8 +36,10 @@ import re
 from typing import List
 
 from fastapi.concurrency import run_in_threadpool
-from fastapi import APIRouter, File, HTTPException, Response, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, Response
+
+from validation import artwork_online_allowed, get_client_ip
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -282,7 +284,7 @@ def _artwork_media_type(ext: str) -> str:
 
 
 @router.get("/artwork/{track_id}")
-async def get_artwork(track_id: str):
+async def get_artwork(track_id: str, request: Request = None):
     """Devuelve el artwork de un track como imagen.
 
     Cascade:
@@ -316,22 +318,43 @@ async def get_artwork(track_id: str):
             artist = existing.get('artist')
             title = existing.get('title')
             if artist and title and search_artwork_online:
-                logger.info(f"[Artwork] Cache MISS para {track_id[:8]}, buscando online...")
-                # search_artwork_online encadena hasta 8 peticiones HTTP
-                # SINCRONAS (iTunes busqueda + descarga, Deezer x2, Last.fm x2)
-                # con timeouts de 5-8 s. Llamarla directa desde este handler
-                # async congelaba el event loop del unico worker hasta ~45 s, y
-                # el endpoint es anonimo: bastaba iterar fingerprints sin
-                # caratula cacheada para tumbar la API entera.
-                online = await run_in_threadpool(search_artwork_online, artist, title)
-                if online and online.get('data'):
-                    save_artwork_to_cache(
-                        track_id, online['data'], online['mime_type'])
-                    # Devolver los bytes que ya tenemos en memoria (no re-leer
-                    # el fichero recién guardado → no puede fallar por race).
-                    return Response(
-                        content=online['data'],
-                        media_type=online['mime_type'])
+                # SEC-13: el camino caro lleva cupo APARTE por IP. Servir una
+                # caratula cacheada (bloque de arriba) NO se capa —la app pide
+                # cientos al pintar la biblioteca y capar eso romperia el uso
+                # normal— pero salir a internet si: son hasta 8 peticiones a
+                # iTunes/Deezer/Last.fm desde la IP de Render, y un bucle sobre
+                # fingerprints sin caratula puede hacer que esas APIs nos
+                # limiten o baneen, lo que degradaria el servicio para TODOS.
+                #
+                # Al agotarse el cupo NO se lanza 429: se salta la busqueda y se
+                # cae al 404 del final, que es la respuesta normal de "no hay
+                # caratula" y que el cliente ya pinta como placeholder. Meter un
+                # estado de error nuevo romperia UI que hoy funciona.
+                #
+                # OJO: aqui NO se puede `raise` — este bloque vive dentro de un
+                # `try/except Exception` que se lo tragaria y loguearia
+                # "Fallback online error", que es un mensaje falso.
+                if request is not None and not artwork_online_allowed(
+                        get_client_ip(request)):
+                    logger.warning(
+                        f"[Artwork] Cupo de busqueda online agotado para esta IP; "
+                        f"no se sale a internet ({track_id[:8]})"
+                    )
+                else:
+                    logger.info(f"[Artwork] Cache MISS para {track_id[:8]}, buscando online...")
+                    # search_artwork_online encadena hasta 8 peticiones HTTP
+                    # SINCRONAS (iTunes busqueda + descarga, Deezer x2, Last.fm x2)
+                    # con timeouts de 5-8 s. Llamarla directa desde este handler
+                    # async congelaba el event loop del unico worker hasta ~45 s.
+                    online = await run_in_threadpool(search_artwork_online, artist, title)
+                    if online and online.get('data'):
+                        save_artwork_to_cache(
+                            track_id, online['data'], online['mime_type'])
+                        # Devolver los bytes que ya tenemos en memoria (no re-leer
+                        # el fichero recién guardado → no puede fallar por race).
+                        return Response(
+                            content=online['data'],
+                            media_type=online['mime_type'])
     except Exception as e:
         logger.warning(f"[Artwork] Fallback online error: {e}")
 

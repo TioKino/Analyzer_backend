@@ -2842,12 +2842,59 @@ async def analyze_track(
             pass
         raise HTTPException(400, "Archivo demasiado pequeño o corrupto")
 
-    # Si force=true, eliminar registro antiguo para reanalisis completo
+    # ── SEC-01: el nombre de fichero NO es identidad ──────────────────────
+    #
+    # La tabla `tracks` de Render es COMPARTIDA por todos los usuarios, y este
+    # bloque casaba por `filename` a secas. Con nombres universales en
+    # bibliotecas DJ —`01.mp3`, `track01.mp3`, `Untitled.mp3`, `01 - Intro.mp3`—
+    # eso significaba:
+    #
+    #   A tiene en la BD colectiva '01 - Intro.mp3' -> DJ ALPHA / 128 BPM
+    #   B sube OTRO audio llamado '01 - Intro.mp3'  -> recibia los datos de A
+    #   B reanaliza con force=true                   -> BORRABA el track de A
+    #
+    # Corrupcion silenciosa de datos ajenos, y ademas contradecia de raiz la
+    # promesa "agrupamos por sonido": el camino mas corto del codigo agrupaba
+    # por nombre. La huella se calculaba DOCE LINEAS mas abajo, o sea que la
+    # identidad real estaba disponible y no se usaba.
+    #
+    # Ahora se calcula ANTES y manda ella. El fichero ya esta en tmp_path (el
+    # upload streaming termino arriba), asi que no cuesta una lectura extra
+    # respecto al flujo anterior — solo se adelanta.
+    try:
+        fingerprint = calculate_fingerprint(tmp_path)
+    except (OSError, IOError) as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        logger.error(f"[Analyze] No se pudo leer el fichero subido: {e}")
+        raise HTTPException(400, "No se pudo leer el archivo subido")
+
     if force:
-        db.delete_track_by_filename(file.filename)
+        # Borrar SOLO la fila cuyo audio coincide, nunca "la que se llame
+        # igual". Si nadie tiene este audio no hay nada que borrar; antes se
+        # ejecutaba `DELETE FROM tracks WHERE filename = ?` sin filtro de
+        # propietario y se llevaba por delante el track de otro usuario.
+        _mismo_audio = db.get_track_by_fingerprint(fingerprint)
+        if _mismo_audio and _mismo_audio.get('id'):
+            db.delete_track(_mismo_audio['id'])
     else:
         # Verificar si ya existe en BD por filename
         existing = db.get_track_by_filename(file.filename)
+        # ...pero solo vale si es EL MISMO AUDIO. Un nombre que coincide con
+        # huella distinta es otro track de otra persona: se ignora el cache-hit
+        # y se analiza de verdad. Las filas legacy sin huella tampoco valen: no
+        # se pueden verificar, y ante la duda es preferible reanalizar a servir
+        # el analisis de un desconocido.
+        if existing:
+            _fp_guardada = (db._row_to_dict(existing) or {}).get('fingerprint')
+            if _fp_guardada != fingerprint:
+                logger.info(
+                    f"[Cache] '{file.filename}' existe en la BD colectiva pero con "
+                    f"OTRO audio (huella distinta). Se ignora el cache y se analiza."
+                )
+                existing = None
         if existing:
             analysis_json = json.loads(existing[11]) if len(existing) > 11 and existing[11] else {}
 
@@ -2902,10 +2949,11 @@ async def analyze_track(
     try:
         import warnings
         warnings.filterwarnings('ignore')
-        
-        # Calcular fingerprint del archivo
-        fingerprint = calculate_fingerprint(tmp_path)
-        
+
+        # `fingerprint` ya se calculo arriba, antes del cache por filename
+        # (SEC-01). Antes se computaba aqui, DESPUES de que el atajo por nombre
+        # hubiera podido devolver el analisis de otro usuario.
+
         # NUEVO: Buscar por fingerprint si no se encontro por filename
         # Esto recupera datos de AudD guardados previamente
         if not force:
@@ -3192,9 +3240,14 @@ async def analyze_track(
                 result, track_data.get('chromaprint'), track_data.get('duration'),
             )
 
-        # Incrementar contador de popularidad
+        # Incrementar contador de popularidad. El device_id va AHORA (BUG-01):
+        # la cabecera ya se leia unas lineas mas arriba para la contabilidad de
+        # AudD, pero aqui no se pasaba, asi que `dj_count` no podia contar DJs
+        # distintos y devolvia 1 para siempre.
         try:
-            db.increment_popularity(fingerprint)
+            db.increment_popularity(
+                fingerprint, request.headers.get('X-Device-Id') or '',
+            )
         except Exception:
             pass
 
