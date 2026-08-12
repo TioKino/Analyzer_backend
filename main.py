@@ -217,7 +217,7 @@ def _get_analysis_semaphore() -> asyncio.Semaphore:
 # (prioridad 110, gana a todo) y que _apply_cluster_best lo propaga a TODO el
 # cluster acustico -> envenenamiento permanente para todos los usuarios.
 #
-# No se puede exigir firma de golpe: los clientes YA publicados (<=2.9.7) no
+# No se puede exigir firma de golpe: los clientes YA publicados (<=2.9.8) no
 # firman y romperiamos el auto-upload del motor local en produccion. Rollout en
 # dos fases, igual que se hizo con el anti-replay del sync:
 #
@@ -564,7 +564,7 @@ _DOCS_ON = (
 
 app = FastAPI(
     title="DJ Analyzer Pro API",
-    version="2.9.7",
+    version="2.9.8",
     default_response_class=SafeJSONResponse,
     docs_url="/docs" if _DOCS_ON else None,
     redoc_url="/redoc" if _DOCS_ON else None,
@@ -4710,7 +4710,7 @@ if SIMILAR_TRACKS_ENABLED:
 async def root():
     return {
         "name": "DJ Analyzer Pro API",
-        "version": "2.9.7",
+        "version": "2.9.8",
         "status": "running",
         "modules": {
             "artwork": ARTWORK_ENABLED,
@@ -4808,7 +4808,7 @@ async def health():
 
     return {
         "status": "ok",
-        "version": "2.9.7",
+        "version": "2.9.8",
         "uptime_seconds": uptime_seconds,
         "checks": {
             "database": db_status,
