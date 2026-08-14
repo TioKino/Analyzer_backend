@@ -1327,7 +1327,19 @@ async def retention(request: Request):
         tool = _get_db().get_tool_usage_metrics()
     except Exception:  # noqa: BLE001
         tool = {}
-    return {"cohorts": cohorts, "returns": returns, "tool": tool}
+    # `investment`: cuanta biblioteca ha metido cada usuario. En una
+    # herramienta el coste de cambio (rehacer 3.000 tracks en otra app) predice
+    # la disposicion a pagar MUCHO mejor que la frecuencia de apertura.
+    try:
+        investment = _get_db().get_library_investment()
+    except Exception:  # noqa: BLE001
+        investment = {}
+    return {
+        "cohorts": cohorts,
+        "returns": returns,
+        "tool": tool,
+        "investment": investment,
+    }
 
 
 # ── GET /admin/activity ────────────────────────────────────

@@ -1078,6 +1078,74 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def get_library_investment(self) -> dict:
+        """INVERSION DEL USUARIO = coste de cambio = mejor predictor de si
+        pagaria.
+
+        En una herramienta, la gente no vuelve por enganche: vuelve porque SU
+        TRABAJO esta dentro. Un DJ con 3.000 tracks analizados tiene un coste
+        de cambio altisimo (rehacerlo en otra app son horas) y es candidato
+        natural a pagar aunque abra una vez al mes. Diez que abrieron y se
+        fueron no valen nada. Esta metrica separa a unos de otros.
+
+        Suma los tracks de los eventos `import_completed` por device. El props
+        es JSON: desktop manda {'ok': N, ...} y movil {'total': N, ...}, asi
+        que se aceptan ambas claves.
+
+        Devuelve devices_with_imports, total_tracks, median/max por device y
+        `buckets` (cuantos superan 100 / 500 / 1000 tracks). Best-effort: {}
+        si la tabla no existe."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'import_completed' AND device_id IS NOT NULL"
+            )
+            per_device = {}
+            for row in c.fetchall():
+                n = 0
+                raw = row['props']
+                if raw:
+                    try:
+                        data = json.loads(raw)
+                        # desktop: 'ok' (los que entraron de verdad).
+                        # movil: 'total' (ficheros del import).
+                        n = int(data.get('ok') or data.get('total') or 0)
+                    except (ValueError, TypeError, AttributeError):
+                        n = 0
+                if n > 0:
+                    per_device[row['device_id']] = \
+                        per_device.get(row['device_id'], 0) + n
+
+            counts = sorted(per_device.values())
+            if not counts:
+                return {
+                    'devices_with_imports': 0,
+                    'total_tracks': 0,
+                    'median_tracks': 0,
+                    'max_tracks': 0,
+                    'buckets': {'gte_100': 0, 'gte_500': 0, 'gte_1000': 0},
+                }
+            mid = len(counts) // 2
+            median = (counts[mid] if len(counts) % 2
+                      else (counts[mid - 1] + counts[mid]) / 2.0)
+            return {
+                'devices_with_imports': len(counts),
+                'total_tracks': sum(counts),
+                'median_tracks': round(float(median), 1),
+                'max_tracks': counts[-1],
+                'buckets': {
+                    'gte_100': sum(1 for n in counts if n >= 100),
+                    'gte_500': sum(1 for n in counts if n >= 500),
+                    'gte_1000': sum(1 for n in counts if n >= 1000),
+                },
+            }
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def get_community_updates_for_library(self, fingerprints, since=None,
                                           exclude_device_id=None,
                                           max_examples=5):

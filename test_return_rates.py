@@ -217,3 +217,66 @@ def test_ventanas_largas_en_return_rates():
     assert out['d28']['returned'] == 0
     assert out['d60']['returned'] == 1
     assert out['d90']['returned'] == 1
+
+
+# ── Inversion del usuario (coste de cambio) ─────────────────────────────
+
+def _import_ev(db, device_id, props_json, days_ago=1):
+    conn = db._open_conn()
+    conn.execute(
+        'INSERT INTO events (timestamp, device_id, event_name, props) '
+        'VALUES (?,?,?,?)',
+        (_ts(days_ago), device_id, 'import_completed', props_json))
+    conn.commit()
+    conn.close()
+
+
+def test_investment_vacio():
+    db = _db()
+    out = db.get_library_investment()
+    assert out['devices_with_imports'] == 0
+    assert out['buckets']['gte_1000'] == 0
+
+
+def test_investment_acepta_ok_desktop_y_total_movil():
+    db = _db()
+    _import_ev(db, 'desktop1', '{"ok": 300, "errors": 2}')
+    _import_ev(db, 'mobile1', '{"total": 40, "cached": 10}')
+    out = db.get_library_investment()
+    assert out['devices_with_imports'] == 2
+    assert out['total_tracks'] == 340
+
+
+def test_investment_suma_varios_imports_del_mismo_device():
+    """Un DJ importa por lotes; la inversion es la SUMA."""
+    db = _db()
+    _import_ev(db, 'a', '{"ok": 500}')
+    _import_ev(db, 'a', '{"ok": 700}')
+    out = db.get_library_investment()
+    assert out['devices_with_imports'] == 1
+    assert out['total_tracks'] == 1200
+    assert out['buckets']['gte_1000'] == 1
+
+
+def test_investment_buckets():
+    db = _db()
+    _import_ev(db, 'poco', '{"ok": 20}')
+    _import_ev(db, 'medio', '{"ok": 150}')
+    _import_ev(db, 'mucho', '{"ok": 600}')
+    _import_ev(db, 'bestia', '{"ok": 4800}')
+    out = db.get_library_investment()
+    assert out['buckets']['gte_100'] == 3
+    assert out['buckets']['gte_500'] == 2
+    assert out['buckets']['gte_1000'] == 1
+    assert out['max_tracks'] == 4800
+
+
+def test_investment_ignora_props_corruptos_o_a_cero():
+    db = _db()
+    _import_ev(db, 'a', 'no-es-json')
+    _import_ev(db, 'b', '{"ok": 0}')
+    _import_ev(db, 'c', None)
+    _import_ev(db, 'd', '{"ok": 10}')
+    out = db.get_library_investment()
+    assert out['devices_with_imports'] == 1, 'solo el device con tracks reales'
+    assert out['total_tracks'] == 10
