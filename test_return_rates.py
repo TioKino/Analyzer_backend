@@ -140,3 +140,80 @@ def test_endpoint_devuelve_ambas_metricas():
     body = r.json()
     assert 'cohorts' in body
     assert 'returns' in body
+
+
+# ── Metricas de HERRAMIENTA (uso a rafagas, no diario) ──────────────────
+
+def test_ever_returned_cuenta_vuelta_muy_tardia():
+    """EL PATRON REAL DEL OWNER: importa su musica, no vuelve en semanas, y
+    reaparece cuando tiene un rato (vacaciones). D7/D28 lo dan por perdido;
+    `ever_returned` ve que sigue vivo."""
+    db = _db()
+    _ev(db, 'devA', 'app_opened', 90)   # instalo hace 3 meses
+    _ev(db, 'devA', 'app_opened', 5)    # reaparecio hace 5 dias
+    out = db.get_tool_usage_metrics()
+    assert out['ever_returned']['cohort'] == 1
+    assert out['ever_returned']['returned'] == 1
+    # Y con criterio de app social habria contado como perdido:
+    assert db.get_return_rates()['d7']['returned'] == 0
+
+
+def test_ever_returned_no_cuenta_al_que_solo_abrio_una_vez():
+    db = _db()
+    _ev(db, 'devA', 'app_opened', 30)
+    out = db.get_tool_usage_metrics()
+    assert out['ever_returned']['returned'] == 0
+
+
+def test_ever_returned_ignora_instalaciones_de_ayer():
+    """Quien instalo ayer aun no ha tenido ocasion de volver."""
+    db = _db()
+    _ev(db, 'nuevo', 'app_opened', 0)
+    out = db.get_tool_usage_metrics()
+    assert out['ever_returned']['cohort'] == 0
+
+
+def test_active_last_30d():
+    db = _db()
+    _ev(db, 'vivo', 'app_opened', 10)
+    _ev(db, 'zombi', 'app_opened', 200)
+    out = db.get_tool_usage_metrics()
+    assert out['active_last_30d'] == 1
+
+
+def test_deep_users_cuenta_quien_importo():
+    """Un usuario que importo 3.000 tracks y vuelve cada dos meses vale mas
+    que diez que abrieron y se fueron."""
+    db = _db()
+    _ev(db, 'a', 'app_opened', 20)
+    _ev(db, 'a', 'import_completed', 20)
+    _ev(db, 'b', 'app_opened', 20)  # abrio pero nunca importo
+    out = db.get_tool_usage_metrics()
+    assert out['deep_users'] == 1
+
+
+def test_mediana_entre_visitas():
+    """Si sale ~30, el producto es MENSUAL y las metricas diarias sobran."""
+    db = _db()
+    _ev(db, 'a', 'app_opened', 60)
+    _ev(db, 'a', 'app_opened', 50)   # hueco de 10
+    _ev(db, 'a', 'app_opened', 40)   # hueco de 10
+    out = db.get_tool_usage_metrics()
+    assert out['median_days_between_visits'] == 10.0
+
+
+def test_mediana_none_si_nadie_repite():
+    db = _db()
+    _ev(db, 'a', 'app_opened', 10)
+    out = db.get_tool_usage_metrics()
+    assert out['median_days_between_visits'] is None
+
+
+def test_ventanas_largas_en_return_rates():
+    db = _db()
+    _ev(db, 'a', 'app_opened', 100)
+    _ev(db, 'a', 'app_opened', 50)  # dia 50: fuera de D28, dentro de D60/D90
+    out = db.get_return_rates()
+    assert out['d28']['returned'] == 0
+    assert out['d60']['returned'] == 1
+    assert out['d90']['returned'] == 1

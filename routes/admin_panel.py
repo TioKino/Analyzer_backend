@@ -1319,7 +1319,15 @@ async def retention(request: Request):
         returns = _get_db().get_return_rates()
     except Exception:  # noqa: BLE001
         returns = {}
-    return {"cohorts": cohorts, "returns": returns}
+    # `tool`: metricas de HERRAMIENTA, no de app social. DJ Analyzer se usa a
+    # rafagas (importas la biblioteca y no vuelves hasta que compras temas o
+    # preparas un bolo); la app sigue instalada. D1/D7 pintan como fracaso ese
+    # patron, que es el NORMAL aqui. Ver get_tool_usage_metrics.
+    try:
+        tool = _get_db().get_tool_usage_metrics()
+    except Exception:  # noqa: BLE001
+        tool = {}
+    return {"cohorts": cohorts, "returns": returns, "tool": tool}
 
 
 # ── GET /admin/activity ────────────────────────────────────

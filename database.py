@@ -920,7 +920,14 @@ class AnalysisDB:
         try:
             c = conn.cursor()
             out = {}
-            for label, n in (('d1', 1), ('d7', 7), ('d28', 28)):
+            # Ventanas LARGAS ademas de las cortas: DJ Analyzer es una
+            # herramienta de PREPARACION, no una app de uso diario. El usuario
+            # importa su biblioteca en rafagas (compra temas, prepara un bolo,
+            # vacaciones) y entre medias la tiene instalada sin abrirla. Medir
+            # solo a 1/7/28 dias con criterio de app social pinta como fracaso
+            # lo que es el patron NORMAL de una herramienta profesional.
+            for label, n in (('d1', 1), ('d7', 7), ('d28', 28),
+                             ('d60', 60), ('d90', 90)):
                 c.execute(
                     """
                     WITH firsts AS (
@@ -954,6 +961,117 @@ class AnalysisDB:
                     'returned': returned,
                     'rate': rate,
                 }
+            return out
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
+    def get_tool_usage_metrics(self) -> dict:
+        """METRICAS DE HERRAMIENTA (no de app social).
+
+        DJ Analyzer se usa a RAFAGAS: importas tu biblioteca, y hasta que no
+        compras temas / preparas un bolo / tienes un rato libre no vuelves. La
+        app sigue instalada. Medir eso con D1/D7 (criterio de app de uso
+        diario) pinta como fracaso el patron NORMAL de una herramienta
+        profesional — el mismo que tendria Photoshop.
+
+        Devuelve:
+          - `ever_returned`: de los que instalaron hace >=`grace` dias, cuantos
+            volvieron ALGUNA VEZ despues del dia 0. Sin ventana. Es la pregunta
+            honesta: "¿se quedo o desinstalo y adios?".
+          - `active_last_30d`: devices con actividad en los ultimos 30 dias.
+            Aunque abran una vez al mes, son usuarios VIVOS.
+          - `deep_users`: devices que llegaron a IMPORTAR musica (el momento en
+            que la herramienta empieza a servir para algo). Un usuario que
+            importo 3.000 tracks y vuelve cada dos meses vale mas que diez que
+            abrieron y se fueron.
+          - `median_days_between_visits`: cada cuanto vuelve la gente que
+            vuelve. Si sale ~30, el producto es mensual y las metricas diarias
+            sobran.
+
+        Best-effort: {} si la tabla no existe."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            out = {}
+            # Margen para no contar como "no volvio" a quien instalo ayer.
+            grace = 3
+
+            c.execute(
+                """
+                WITH firsts AS (
+                    SELECT device_id, MIN(day) AS d0
+                    FROM events
+                    WHERE event_name = 'app_opened' AND device_id IS NOT NULL
+                    GROUP BY device_id
+                )
+                SELECT
+                    COUNT(*) AS cohort,
+                    COALESCE(SUM(
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM events e
+                            WHERE e.device_id = f.device_id
+                              AND e.event_name IN ('app_opened', 'session_start')
+                              AND e.day > f.d0
+                        ) THEN 1 ELSE 0 END
+                    ), 0) AS returned
+                FROM firsts f
+                WHERE f.d0 <= date('now', ?)
+                """,
+                (f'-{grace} days',),
+            )
+            row = c.fetchone()
+            cohort = int(row['cohort'] or 0) if row else 0
+            returned = int(row['returned'] or 0) if row else 0
+            out['ever_returned'] = {
+                'cohort': cohort,
+                'returned': returned,
+                'rate': round(100.0 * returned / cohort, 1) if cohort else 0.0,
+            }
+
+            c.execute(
+                "SELECT COUNT(DISTINCT device_id) AS n FROM events "
+                "WHERE device_id IS NOT NULL AND day >= date('now','-30 days')"
+            )
+            row = c.fetchone()
+            out['active_last_30d'] = int(row['n'] or 0) if row else 0
+
+            c.execute(
+                "SELECT COUNT(DISTINCT device_id) AS n FROM events "
+                "WHERE device_id IS NOT NULL AND event_name = 'import_completed'"
+            )
+            row = c.fetchone()
+            out['deep_users'] = int(row['n'] or 0) if row else 0
+
+            # Mediana del hueco entre dias activos consecutivos (solo de quien
+            # tiene 2+ dias activos: los de un solo dia no tienen "hueco").
+            c.execute(
+                """
+                WITH days AS (
+                    SELECT DISTINCT device_id, day
+                    FROM events
+                    WHERE device_id IS NOT NULL
+                      AND event_name IN ('app_opened', 'session_start')
+                ),
+                gaps AS (
+                    SELECT julianday(day) - julianday(
+                        LAG(day) OVER (PARTITION BY device_id ORDER BY day)
+                    ) AS gap
+                    FROM days
+                )
+                SELECT gap FROM gaps WHERE gap IS NOT NULL ORDER BY gap
+                """
+            )
+            gaps = [r['gap'] for r in c.fetchall() if r['gap'] is not None]
+            if gaps:
+                mid = len(gaps) // 2
+                median = (gaps[mid] if len(gaps) % 2
+                          else (gaps[mid - 1] + gaps[mid]) / 2.0)
+                out['median_days_between_visits'] = round(float(median), 1)
+            else:
+                out['median_days_between_visits'] = None
+
             return out
         except sqlite3.OperationalError:
             return {}
