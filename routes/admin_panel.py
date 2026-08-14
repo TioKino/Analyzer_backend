@@ -1309,7 +1309,17 @@ async def retention(request: Request):
         cohorts = _get_db().get_retention_cohorts()
     except Exception:  # noqa: BLE001 - best-effort, tabla vieja / sin datos
         cohorts = {}
-    return {"cohorts": cohorts}
+    # `returns`: retencion ROLLING ("volvio ALGUNA vez en los N primeros dias")
+    # frente a `cohorts`, que es el criterio App Store ("volvio EXACTAMENTE el
+    # dia N"). El estricto sirve para comparar con benchmarks, pero subestima
+    # con muestras pequeñas: quien volvio los dias 3, 5 y 9 cuenta como perdido
+    # en D7. Se devuelven LOS DOS para no decidir sobre un artefacto de la
+    # definicion. Clave nueva -> los clientes viejos la ignoran.
+    try:
+        returns = _get_db().get_return_rates()
+    except Exception:  # noqa: BLE001
+        returns = {}
+    return {"cohorts": cohorts, "returns": returns}
 
 
 # ── GET /admin/activity ────────────────────────────────────

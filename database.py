@@ -897,6 +897,69 @@ class AnalysisDB:
             conn.close()
         return list(keys)
 
+    def get_return_rates(self) -> dict:
+        """RETENCION "ROLLING": de los que instalaron, cuantos VOLVIERON ALGUNA
+        VEZ dentro de los N primeros dias.
+
+        Complementa (no sustituye) a get_retention_cohorts, que usa el criterio
+        App Store: "abrio EXACTAMENTE el dia N". Ese criterio es correcto para
+        comparar con benchmarks de la industria, pero SUBESTIMA brutalmente con
+        muestras pequeñas: un DJ que volvio los dias 3, 5 y 9 cuenta como
+        PERDIDO en D7. Con 41 devices en cohorte, la diferencia entre "nadie
+        vuelve" y "vuelven pero no justo el septimo dia" cambia una decision de
+        producto (activar o posponer el paywall).
+
+        Aqui se cuenta actividad en CUALQUIER dia posterior a D0 y hasta D0+N:
+          - install_day (D0) = primer `app_opened` del device.
+          - "volvio" = tiene `app_opened` O `session_start` en (D0, D0+N].
+          - Solo cohorts con edad suficiente (>= N dias), igual que el otro.
+
+        Devuelve {'d1':{...}, 'd7':{...}, 'd28':{...}} con cohort/returned/rate.
+        Best-effort: {} si la tabla no existe."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            out = {}
+            for label, n in (('d1', 1), ('d7', 7), ('d28', 28)):
+                c.execute(
+                    """
+                    WITH firsts AS (
+                        SELECT device_id, MIN(day) AS d0
+                        FROM events
+                        WHERE event_name = 'app_opened' AND device_id IS NOT NULL
+                        GROUP BY device_id
+                    )
+                    SELECT
+                        COUNT(*) AS cohort,
+                        COALESCE(SUM(
+                            CASE WHEN EXISTS (
+                                SELECT 1 FROM events e
+                                WHERE e.device_id = f.device_id
+                                  AND e.event_name IN ('app_opened', 'session_start')
+                                  AND e.day > f.d0
+                                  AND e.day <= date(f.d0, ?)
+                            ) THEN 1 ELSE 0 END
+                        ), 0) AS returned
+                    FROM firsts f
+                    WHERE f.d0 <= date('now', ?)
+                    """,
+                    (f'+{n} days', f'-{n} days'),
+                )
+                row = c.fetchone()
+                cohort = int(row['cohort'] or 0) if row else 0
+                returned = int(row['returned'] or 0) if row else 0
+                rate = round(100.0 * returned / cohort, 1) if cohort else 0.0
+                out[label] = {
+                    'cohort': cohort,
+                    'returned': returned,
+                    'rate': rate,
+                }
+            return out
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def get_community_updates_for_library(self, fingerprints, since=None,
                                           exclude_device_id=None,
                                           max_examples=5):
