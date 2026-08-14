@@ -807,6 +807,142 @@ class AnalysisDB:
             conn.close()
         return list(keys)
 
+    def get_community_updates_for_library(self, fingerprints, since=None,
+                                          exclude_device_id=None,
+                                          max_examples=5):
+        """MEMORIA COLECTIVA — que gano MI biblioteca desde `since`.
+
+        Dada la lista de fingerprints del usuario, cuenta cuantos de SUS tracks
+        recibieron aportaciones de OTROS DJs (cues, beat-grid, correcciones,
+        notas, ratings) despues de `since`. Es el gancho de retencion: da un
+        motivo real para volver a abrir la app ("12 temas tuyos mejoraron"), y
+        es el diferenciador frente a Rekordbox (alli el trabajo de otro DJ no
+        te llega nunca).
+
+        `exclude_device_id`: NO contar lo que aporto el propio usuario — si no,
+        el aviso diria "tu biblioteca mejoro" por sus propios cues, que es
+        mentira y quema la confianza en el mensaje.
+
+        Claves de lectura: cada fingerprint se busca bajo (a) su clave de
+        CLUSTER acustico (donde se re-key-ean correcciones/beat-grid/notas/
+        ratings) y (b) todos los fingerprints del cluster (los cues NO se
+        re-key-ean en escritura porque comparten tabla con el sync personal).
+        Asi el conteo ve el mismo audio en otro codec/tag, igual que el resto
+        de lecturas community.
+
+        Devuelve {'tracks_updated', 'by_type', 'examples'}; best-effort ({} si
+        falta alguna tabla). `since` ISO-8601; None = sin filtro temporal."""
+        fps = [f for f in (fingerprints or []) if f]
+        if not fps:
+            return {'tracks_updated': 0, 'by_type': {}, 'examples': []}
+
+        # (1) clave de cluster por fingerprint (fallback: el propio fp).
+        canon = self.canonical_community_keys(fps)
+
+        # (2) lookup_key -> fingerprint MIO al que pertenece. Incluye el propio
+        # fp, su clave de cluster y todos los hermanos del cluster.
+        owner = {}
+        for f in fps:
+            owner.setdefault(f, f)
+            owner.setdefault(canon.get(f, f), f)
+
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            aids = {v for k, v in canon.items() if v != k}
+            if aids:
+                ph = ','.join('?' * len(aids))
+                c.execute(
+                    f'SELECT fingerprint, id, acoustic_id FROM tracks '
+                    f'WHERE acoustic_id IN ({ph})',
+                    list(aids),
+                )
+                # aid -> mi fp (el primero que lo reclame; un cluster solo puede
+                # corresponder a un track mio a efectos de conteo).
+                aid_owner = {}
+                for f in fps:
+                    a = canon.get(f)
+                    if a and a != f:
+                        aid_owner.setdefault(a, f)
+                for row in c.fetchall():
+                    mine = aid_owner.get(row['acoustic_id'])
+                    if not mine:
+                        continue
+                    if row['fingerprint']:
+                        owner.setdefault(row['fingerprint'], mine)
+                    if row['id']:
+                        owner.setdefault(row['id'], mine)
+
+            keys = list(owner.keys())
+            if not keys:
+                return {'tracks_updated': 0, 'by_type': {}, 'examples': []}
+            ph = ','.join('?' * len(keys))
+
+            # (3) una consulta por tabla. Cada una aporta (fingerprint, tipo).
+            #     `since` y `exclude_device_id` se aplican como filtros extra.
+            sources = [
+                ('cues', 'community_cues', 'fingerprint', 'created_at', 'device_id'),
+                ('beat_grid', 'beat_grid_corrections', 'fingerprint', 'created_at', 'device_id'),
+                ('notes', 'community_notes', 'fingerprint', 'created_at', 'device_id'),
+                ('ratings', 'track_ratings', 'fingerprint', 'rated_at', 'device_id'),
+                ('corrections', 'corrections', 'fingerprint', 'corrected_at', None),
+            ]
+            by_type = {}
+            touched = set()
+            for label, table, fp_col, ts_col, dev_col in sources:
+                sql = (f'SELECT DISTINCT {fp_col} AS fp FROM {table} '
+                       f'WHERE {fp_col} IN ({ph})')
+                params = list(keys)
+                if since:
+                    sql += f' AND {ts_col} > ?'
+                    params.append(since)
+                if exclude_device_id and dev_col:
+                    sql += f' AND ({dev_col} IS NULL OR {dev_col} != ?)'
+                    params.append(exclude_device_id)
+                try:
+                    c.execute(sql, params)
+                except sqlite3.OperationalError:
+                    continue  # tabla/columna ausente en BDs viejas: se salta
+                hits = {owner[r['fp']] for r in c.fetchall() if r['fp'] in owner}
+                if hits:
+                    by_type[label] = len(hits)
+                    touched |= hits
+
+            # (4) ejemplos legibles (artist - title) para el mensaje de la UI.
+            examples = []
+            if touched:
+                sample = list(touched)[:max_examples]
+                ph2 = ','.join('?' * len(sample))
+                try:
+                    c.execute(
+                        f'SELECT fingerprint, id, artist, title FROM tracks '
+                        f'WHERE fingerprint IN ({ph2}) OR id IN ({ph2})',
+                        sample + sample,
+                    )
+                    seen = set()
+                    for row in c.fetchall():
+                        key = row['fingerprint'] or row['id']
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        examples.append({
+                            'fingerprint': key,
+                            'artist': row['artist'] or '',
+                            'title': row['title'] or '',
+                        })
+                except sqlite3.OperationalError:
+                    pass
+
+            return {
+                'tracks_updated': len(touched),
+                'by_type': by_type,
+                'examples': examples,
+            }
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def cluster_identities(self, acoustic_id):
         """(artist, title) de las copias del cluster que tienen AMBOS campos no
         vacios, mas reciente primero. Sirve para HEREDAR una identidad limpia de

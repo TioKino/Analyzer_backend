@@ -16,7 +16,7 @@ se BORRAN -> sin duplicacion stale.
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -456,4 +456,35 @@ async def get_my_ratings_batch(req: MyRatingsBatchRequest):
         return db.get_my_ratings_batch(req.fingerprints, req.device_id)
     except Exception as e:
         logger.error(f"[Community] Error my-ratings batch: {e}")
+        return {}
+
+
+class LibraryUpdatesRequest(BaseModel):
+    fingerprints: List[str]
+    since: Optional[str] = None       # ISO-8601; None = sin filtro temporal
+    device_id: Optional[str] = None   # el propio: se EXCLUYE del conteo
+
+
+@community_router.post("/community/library-updates")
+async def get_library_updates(req: LibraryUpdatesRequest):
+    """MEMORIA COLECTIVA — que gano MI biblioteca desde `since`.
+
+    Gancho de retencion (FASE 4 del RETENTION_PLAN): el cliente manda los
+    fingerprints de su biblioteca y recibe cuantos de SUS tracks recibieron
+    aportaciones de OTROS DJs (cues, beat-grid, correcciones, notas, ratings)
+    desde la ultima vez. Es el motivo para volver a abrir la app y el
+    diferenciador frente a Rekordbox.
+
+    El propio `device_id` se excluye: contar las aportaciones del usuario como
+    "mejoras de la comunidad" seria mentira y quemaria el mensaje.
+
+    Devuelve {tracks_updated, by_type, examples}. Best-effort: {} si falla."""
+    try:
+        return db.get_community_updates_for_library(
+            req.fingerprints,
+            since=req.since,
+            exclude_device_id=req.device_id,
+        )
+    except Exception as e:
+        logger.error(f"[Community] Error library-updates: {e}")
         return {}
