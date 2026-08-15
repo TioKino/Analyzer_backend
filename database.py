@@ -525,7 +525,16 @@ class AnalysisDB:
         # (a) contabilidad REAL del gasto AudD por via (antes solo /analyze se
         # logueaba → el panel infravaloraba el gasto de Escuchar) y (b) cap por
         # dispositivo/dia en /recognize. Filas legacy: source NULL = 'analyze'.
-        for _col in ('source TEXT', 'device_id TEXT'):
+        # Migracion: `reason` = POR QUE acabo asi una llamada/sesion de AudD.
+        # Sin esto solo sabiamos success 0/1, que mete en el mismo saco dos
+        # fallos que exigen decisiones opuestas: "AudD proceso el audio y no
+        # conoce el track" (limite de SU base de datos; el usuario no puede
+        # hacer nada) vs "AudD no pudo ni generar la huella" (audio mal captado;
+        # acercar el micro SI ayuda). /recognize ya distinguia los dos para el
+        # mensaje al usuario, pero el dato se tiraba y el panel no podia decir
+        # si el 57% de fallos de Escuchar era culpa del catalogo o del micro.
+        # Valores: 'matched' | 'no_match' | 'audio_unusable'. Filas legacy NULL.
+        for _col in ('source TEXT', 'device_id TEXT', 'reason TEXT'):
             try:
                 conn.execute(f'ALTER TABLE audd_call_log ADD COLUMN {_col}')
             except sqlite3.OperationalError:
@@ -2496,23 +2505,29 @@ class AnalysisDB:
                       artist: Optional[str] = None,
                       title: Optional[str] = None,
                       source: str = 'analyze',
-                      device_id: Optional[str] = None) -> None:
+                      device_id: Optional[str] = None,
+                      reason: Optional[str] = None) -> None:
         """Registra una llamada AudD (incluso fallidas) para honrar cooldown/cap
         y para CONTABILIDAD real del gasto por via. `source`:
           - 'analyze'   → auto-trigger de /analyze (cuenta para AUDD_DAILY_CAP).
           - 'recognize' → Escuchar (/recognize); cuenta para el cap por device.
           - 'identify'  → /identify manual (solo visibilidad).
-        Antes solo se logueaba 'analyze' → el panel infravaloraba el gasto."""
+        Antes solo se logueaba 'analyze' → el panel infravaloraba el gasto.
+
+        `reason` explica el DESENLACE cuando se conoce ('matched' / 'no_match' /
+        'audio_unusable'); ver el comentario del ALTER en _init_db. Opcional:
+        las vias que no lo distinguen lo dejan a None."""
         if not fingerprint:
             return
         conn = self._open_conn()
         try:
             conn.execute(
                 'INSERT INTO audd_call_log '
-                '(fingerprint, called_at, success, artist, title, source, device_id) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                '(fingerprint, called_at, success, artist, title, source, '
+                'device_id, reason) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                 (fingerprint, time.time(), 1 if success else 0, artist, title,
-                 source, device_id),
+                 source, device_id, reason),
             )
             conn.commit()
         finally:
@@ -2637,6 +2652,40 @@ class AnalysisDB:
                     'fail': total - ok,
                 }
             return out
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
+    def get_recognize_reasons(self, *, days: int = 30) -> dict:
+        """Desenlace de las SESIONES de Escuchar (una pulsacion = una sesion) en
+        los ultimos `days`, agrupado por `reason`.
+
+        Se mira el marcador source='recognize_session', no las llamadas: lo que
+        importa es cuantas VECES el usuario pulso Escuchar y como le fue, no
+        cuantas llamadas costo cada una.
+
+        Separa los dos fallos que el success 0/1 mezclaba:
+          - 'no_match'       → AudD proceso el audio y no conoce el track. Es el
+                               limite de SU catalogo (musica underground/promo);
+                               ni el usuario ni nosotros podemos hacer nada.
+          - 'audio_unusable' → AudD no pudo generar huella. Micro/ruido: el
+                               usuario SI puede mejorarlo.
+        La proporcion entre ambos decide si vale la pena tocar la captura de
+        audio o si el techo es de AudD. Filas previas al ALTER salen como
+        'unknown' (no se puede inferir a posteriori). Best-effort: {} sin tabla."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            cutoff = time.time() - int(days) * 86400
+            c.execute(
+                "SELECT COALESCE(reason,'unknown') AS r, COUNT(*) AS n "
+                "FROM audd_call_log "
+                "WHERE called_at >= ? AND source = 'recognize_session' "
+                "GROUP BY r",
+                (cutoff,),
+            )
+            return {row['r']: int(row['n'] or 0) for row in c.fetchall()}
         except sqlite3.OperationalError:
             return {}
         finally:

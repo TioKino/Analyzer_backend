@@ -4000,6 +4000,22 @@ def _audd_clip_if_large(audio_path: str, threshold_mb: float = 4.0) -> Optional[
     return None
 
 
+def _recognize_reason(track_data, audio_processed: bool) -> str:
+    """Desenlace de un intento/sesion de Escuchar, para `audd_call_log.reason`.
+
+    Los tres casos son los que /recognize ya distinguia para el mensaje al
+    usuario; aqui se persisten para poder medirlos:
+      - 'matched'        → hubo match.
+      - 'no_match'       → AudD proceso el audio y NO conoce el track. Techo de
+                           su catalogo: reintentar es tirar cuota.
+      - 'audio_unusable' → AudD no pudo generar huella (ruido/silencio/corto).
+                           Acercar el micro SI puede ayudar.
+    """
+    if track_data:
+        return 'matched'
+    return 'no_match' if audio_processed else 'audio_unusable'
+
+
 def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30):
     """
     Envía audio a AudD. Devuelve (track_data, processed_ok):
@@ -4148,6 +4164,7 @@ async def recognize_audio(
                 fingerprint='recognize', success=bool(td),
                 artist=(td or {}).get('artist'), title=(td or {}).get('title'),
                 source='recognize', device_id=device_id,
+                reason=_recognize_reason(td, processed_ok),
             )
         except Exception as e:
             logger.warning(f"[Recognize] log_audd_call fallo: {e}")
@@ -4231,12 +4248,19 @@ async def recognize_audio(
         # (un fallo tambien cuenta como uso), pero NO cuando salto el cap arriba
         # (ahi devolvimos antes sin llegar aqui). Independiente del log por
         # llamada (source='recognize') que mide el coste real.
+        # El desenlace se calcula UNA vez y se usa para las dos cosas: sellarlo
+        # en el marcador de sesion (de ahi sale el desglose del panel) y elegir
+        # el mensaje que ve el usuario. Antes solo existia lo segundo y el dato
+        # se perdia, asi que no habia forma de saber si los fallos de Escuchar
+        # eran por el catalogo de AudD o por audio mal captado.
+        session_reason = _recognize_reason(track_data, audio_processed)
         try:
             db.log_audd_call(
                 fingerprint='recognize_session', success=bool(track_data),
                 artist=(track_data or {}).get('artist'),
                 title=(track_data or {}).get('title'),
                 source='recognize_session', device_id=device_id,
+                reason=session_reason,
             )
         except Exception as _e:
             logger.warning(f"[Recognize] log sesion fallo: {_e}")
@@ -4249,19 +4273,19 @@ async def recognize_audio(
             #     parar. Mensaje: "no encontrado" (no es culpa del micro).
             #   - audio_ok=False: AudD no pudo generar huella (ruido/silencio/
             #     audio muy corto). Reintentar/acercar el micro SI puede ayudar.
-            if audio_processed:
+            if session_reason == 'no_match':
                 logger.info("[Recognize] ✗ audio válido pero sin match (track no en AudD)")
                 return {
                     "status": "not_found",
                     "audio_ok": True,
-                    "reason": "no_match",
+                    "reason": session_reason,
                     "message": "No encontramos esta canción en la base de datos.",
                 }
             logger.info("[Recognize] ✗ audio no procesable (ruido/silencio)")
             return {
                 "status": "not_found",
                 "audio_ok": False,
-                "reason": "audio_unusable",
+                "reason": session_reason,
                 "message": "No se captó bien el audio. Acerca el micro y evita el ruido.",
             }
 

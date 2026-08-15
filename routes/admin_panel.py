@@ -1057,6 +1057,15 @@ async def telemetry(request: Request):
     except Exception:  # noqa: BLE001 - best-effort
         audd_by_source_stats_30d = {}
 
+    # POR QUE fallan las sesiones de Escuchar. El success 0/1 metia en el mismo
+    # saco "AudD no conoce el track" (techo de su catalogo, nada que hacer) y
+    # "no se pudo fingerprintear el audio" (micro/ruido, accionable). Sin este
+    # desglose no habia forma de decidir si tocar la captura de audio.
+    try:
+        recognize_reasons_30d = _get_db().get_recognize_reasons(days=30)
+    except Exception:  # noqa: BLE001 - best-effort
+        recognize_reasons_30d = {}
+
     # 2) Cobertura preview + artwork sobre el total de tracks sync.
     #
     # Mismo denominador que el bloque `fingerprints` de mas abajo, por
@@ -1171,6 +1180,10 @@ async def telemetry(request: Request):
             "by_source_stats_30d": audd_by_source_stats_30d,
             # Uso de Escuchar como feature (sesiones, no llamadas) en 30d.
             "recognize_sessions_30d": recognize_sessions_30d,
+            # Desenlace de esas sesiones: matched / no_match / audio_unusable.
+            # 'unknown' = sesiones anteriores al ALTER que anadio la columna;
+            # no se puede inferir a posteriori, se vacia solo con el tiempo.
+            "recognize_reasons_30d": recognize_reasons_30d,
         },
         "coverage": {
             "total_tracks": total_tracks,
