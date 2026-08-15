@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -258,6 +259,54 @@ def _preview_exists(fingerprint: str) -> bool:
         return False
     path = os.path.join(_PREVIEWS_DIR, f"{fingerprint}.mp3")
     return os.path.isfile(path)
+
+
+def _get_sync_auth_adoption(days: int = 30) -> dict:
+    """Lee sync_auth_stats (sync.db) y resume el estado de la auth de sync.
+
+    Devuelve:
+      {"total": N,
+       "by_secret_slot": {"0": n, "1": n, ...},   # -1 = sin firma (dev mode)
+       "device_token": {"with": n, "without": n, "pct": 0.0}}
+
+    Best-effort: {} si la tabla aun no existe (backend sin desplegar el fix).
+    """
+    conn = _get_sync_conn()
+    try:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=int(days))
+        ).strftime('%Y-%m-%d')
+        rows = conn.execute(
+            "SELECT secret_slot, has_token, SUM(n) AS n FROM sync_auth_stats "
+            "WHERE day >= ? GROUP BY secret_slot, has_token",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+
+    by_slot: dict = {}
+    with_token = 0
+    without_token = 0
+    for r in rows:
+        n = int(r["n"] or 0)
+        slot = str(r["secret_slot"])
+        by_slot[slot] = by_slot.get(slot, 0) + n
+        if int(r["has_token"] or 0):
+            with_token += n
+        else:
+            without_token += n
+    total = with_token + without_token
+    return {
+        "total": total,
+        "by_secret_slot": by_slot,
+        "device_token": {
+            "with": with_token,
+            "without": without_token,
+            "pct": round(with_token / total * 100, 1) if total else 0.0,
+        },
+    }
 
 
 def _dedupe_analysis_tracks(analysis_rows):
@@ -1066,6 +1115,20 @@ async def telemetry(request: Request):
     except Exception:  # noqa: BLE001 - best-effort
         recognize_reasons_30d = {}
 
+    # Estado de la auth de sync (30d). Responde a DOS decisiones que hoy solo
+    # se pueden tomar a ojo:
+    #   - `by_secret_slot`: cuantas peticiones valida cada secreto de la lista
+    #     rotada de SYNC_AUTH_SECRET. Slot 0 = el vigente; 1+ = los que se
+    #     mantienen por compatibilidad. Cuando un slot viejo llegue a 0 se puede
+    #     retirar de la env var sin dejar tirado a nadie.
+    #   - `device_token`: cuantas peticiones llegan ya con X-Device-Token. Es
+    #     el requisito para poder EXIGIRLO (fase 3): mientras haya trafico sin
+    #     token, endurecer deja usuarios fuera de sus propios datos.
+    try:
+        sync_auth_30d = _get_sync_auth_adoption(days=30)
+    except Exception:  # noqa: BLE001 - best-effort
+        sync_auth_30d = {}
+
     # 2) Cobertura preview + artwork sobre el total de tracks sync.
     #
     # Mismo denominador que el bloque `fingerprints` de mas abajo, por
@@ -1185,6 +1248,10 @@ async def telemetry(request: Request):
             # no se puede inferir a posteriori, se vacia solo con el tiempo.
             "recognize_reasons_30d": recognize_reasons_30d,
         },
+        # Estado de la auth de /sync: que secreto valida (para poder retirar el
+        # viejo con datos) y cuanto trafico manda ya X-Device-Token (requisito
+        # para exigirlo). Ver _get_sync_auth_adoption.
+        "sync_auth_30d": sync_auth_30d,
         "coverage": {
             "total_tracks": total_tracks,
             "with_preview": with_preview,

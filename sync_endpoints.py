@@ -77,7 +77,11 @@ async def _verify_sync_auth(request: Request):
     # firma si coincide con CUALQUIERA. Asi los clientes viejos (firman con el
     # viejo) siguen sincronizando hasta que actualizan; luego quitas el viejo de
     # la env var. Un solo valor (sin coma) se comporta igual que antes.
-    secrets = [s.strip() for s in SYNC_AUTH_SECRET.split(',') if s.strip()]
+    # OJO con el nombre: llamar `secrets` a esta lista SOMBREABA el modulo
+    # `secrets` de la stdlib dentro de la funcion. Nadie lo usaba aqui todavia,
+    # pero el modulo si se usa en este fichero (_issue_device_token), asi que
+    # era una mina esperando a que alguien anadiera una linea.
+    auth_secrets = [s.strip() for s in SYNC_AUTH_SECRET.split(',') if s.strip()]
 
     # ANTI-REPLAY (rollout por fases, backward-compatible):
     # - Cliente NUEVO manda `X-Timestamp` (unix ms) y firma "<ts>.<body>". Aqui
@@ -89,6 +93,10 @@ async def _verify_sync_auth(request: Request):
     # desajustado del dispositivo; bajarla cuando se confirme que no da 401s.
     ts = request.headers.get("X-Timestamp", "")
     valid = False
+    # Slot del secreto que valida: 0 = el primero de la lista (el vigente),
+    # 1+ = los que se mantienen por rotacion. Se registra para poder retirar
+    # un secreto viejo SOLO cuando nadie lo use ya (hoy eso se decidia a ojo).
+    matched_slot = -1
     if ts:
         try:
             ts_ms = int(ts)
@@ -98,20 +106,56 @@ async def _verify_sync_auth(request: Request):
         if ts_ms <= 0 or abs(now_ms - ts_ms) > SYNC_REPLAY_WINDOW_SEC * 1000:
             raise HTTPException(status_code=401, detail="Stale or invalid timestamp")
         signed = ts.encode() + b"." + body
-        for secret in secrets:
+        for slot, secret in enumerate(auth_secrets):
             expected = _hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
             if _hmac.compare_digest(signature, expected):
                 valid = True
+                matched_slot = slot
                 break
     else:
-        for secret in secrets:
+        for slot, secret in enumerate(auth_secrets):
             expected = _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
             if _hmac.compare_digest(signature, expected):
                 valid = True
+                matched_slot = slot
                 break
 
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # ── Auth POR DISPOSITIVO (fase 1 de 3) ──────────────────────────────
+    # El HMAC de arriba solo demuestra "tengo el secreto de la app", y ese
+    # secreto lo tiene cualquiera que abra el binario con `strings`. NO
+    # demuestra ser el dueño del device_id, que es lo unico que separa la
+    # biblioteca de un usuario de la de otro.
+    #
+    # FASE 1 (esto): si el cliente manda X-Device-Token, se EXIGE que sea el
+    # suyo. Si no lo manda, se acepta igual que hasta ahora. Los dispositivos
+    # ya en campo siguen funcionando sin tocar nada, y los clientes nuevos
+    # empiezan a acreditarse.
+    # FASE 3 (mas adelante, NO aqui): exigirlo siempre. Solo se puede hacer
+    # cuando sync_auth_stats demuestre que practicamente todo el parque manda
+    # token — endurecer antes deja gente fuera de SUS PROPIOS datos.
+    #
+    # Mientras tanto el agujero sigue abierto para quien omita la cabecera.
+    # Esta fase NO lo cierra: despliega el mecanismo y mide, que es el unico
+    # camino seguro hasta poder cerrarlo.
+    token = request.headers.get("X-Device-Token", "")
+    device_id = _device_id_from_request(request, body)
+    if token and device_id:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT device_token FROM user_devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        stored = row[0] if row and row[0] else None
+        # Si el dispositivo aun no tiene token emitido NO se rechaza: es un
+        # cliente ya actualizado hablando de un device_id que todavia no lo ha
+        # reclamado. Rechazarlo romperia sync justo durante la migracion.
+        if stored and not _hmac.compare_digest(token, stored):
+            raise HTTPException(status_code=401, detail="Invalid device token")
+
+    _record_sync_auth(matched_slot, bool(token))
 
 
 sync_router = APIRouter(
@@ -205,7 +249,40 @@ def _init_tables(conn: sqlite3.Connection):
             ON detected_tracks_sync(device_id);
         CREATE INDEX IF NOT EXISTS idx_dts_date
             ON detected_tracks_sync(detected_at);
+
+        -- Adopcion de la auth por dispositivo + que secreto valida cada
+        -- peticion. Agregado por dia, sin device_id ni nada identificable.
+        -- Existe para poder tomar DOS decisiones con datos en vez de a ojo:
+        --   1) retirar el secreto viejo de la lista rotada de SYNC_AUTH_SECRET
+        --      sin dejar tirado a ningun cliente que aun firme con el;
+        --   2) saber cuando TODOS los clientes mandan ya X-Device-Token, que es
+        --      el requisito para EXIGIRLO (fase 3) sin bloquear a nadie.
+        CREATE TABLE IF NOT EXISTS sync_auth_stats (
+            day         TEXT NOT NULL,
+            secret_slot INTEGER NOT NULL,
+            has_token   INTEGER NOT NULL,
+            n           INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (day, secret_slot, has_token)
+        );
     """)
+
+    # Migration: token POR DISPOSITIVO.
+    #
+    # Por que hace falta: SYNC_AUTH_SECRET viaja compilado en el binario de
+    # cada cliente (--dart-define), asi que cualquiera puede extraerlo con
+    # `strings` del .app/.exe/.apk. No es un secreto "comprometido": es que un
+    # secreto compartido dentro de una app distribuida NO PUEDE serlo. Y hoy
+    # ese HMAC es la UNICA puerta: _require_user_id solo comprueba que el
+    # device_id este registrado, no que quien llama SEA ese dispositivo. Con el
+    # secreto (extraible) y un device_id conocido se puede leer y sobrescribir
+    # la biblioteca de cualquier usuario.
+    #
+    # El token es aleatorio, se emite UNA sola vez por dispositivo y no viaja
+    # en ningun binario, asi que un device_id filtrado deja de bastar.
+    try:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN device_token TEXT")
+    except sqlite3.OperationalError:
+        pass  # Already exists
 
     # Migration: add payload column to device_seen if missing
     try:
@@ -299,6 +376,80 @@ def _get_all_devices_for_user(conn: sqlite3.Connection, user_id: str) -> list[di
     ]
 
 
+def _issue_device_token(conn: sqlite3.Connection, device_id: str) -> Optional[str]:
+    """Emite el token de un dispositivo si aun no tiene, y lo devuelve.
+
+    Devuelve None si YA tenia uno. Esto es deliberado y es la parte importante:
+    el token se entrega UNA sola vez. Si /sync/register lo devolviera siempre,
+    cualquiera con el secreto global (que es cualquiera: viaja en el binario)
+    podria pedir el token de un device_id conocido y quedarse con la cuenta —
+    justo lo que este mecanismo existe para impedir.
+
+    Consecuencia asumida durante la migracion: los dispositivos ya registrados
+    no tienen token, asi que el PRIMERO que llame a register se lo lleva. En la
+    practica sera su cliente legitimo al actualizar, y mientras el token no sea
+    obligatorio (fase 3) reclamarlo no da mas acceso del que el secreto global
+    ya da hoy. Cuando un dispositivo pierde sus prefs pierde tambien su
+    device_id (los dos viven en SharedPreferences), asi que vuelve como
+    dispositivo nuevo y recibe token nuevo: no hay estado irrecuperable.
+    """
+    row = conn.execute(
+        "SELECT device_token FROM user_devices WHERE device_id = ?",
+        (device_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row[0]:
+        return None  # ya emitido: no se revela nunca mas
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        "UPDATE user_devices SET device_token = ? WHERE device_id = ?",
+        (token, device_id),
+    )
+    conn.commit()
+    return token
+
+
+def _record_sync_auth(secret_slot: int, has_token: bool) -> None:
+    """Cuenta (por dia) que secreto valido y si venia token. Best-effort: nunca
+    puede tumbar una peticion de sync."""
+    try:
+        conn = _get_conn()
+        day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        conn.execute(
+            "INSERT INTO sync_auth_stats (day, secret_slot, has_token, n) "
+            "VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(day, secret_slot, has_token) DO UPDATE SET n = n + 1",
+            (day, int(secret_slot), 1 if has_token else 0),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _device_id_from_request(request: Request, body: bytes) -> Optional[str]:
+    """device_id de la peticion, venga por path (/pull/{device_id}) o por body.
+
+    Se resuelve aqui, en la dependency, y no en cada endpoint: asi la
+    verificacion del token vive en UN sitio y no hay que tocar las ocho firmas
+    que hoy llaman a _require_user_id (ninguna recibe el Request).
+    """
+    did = request.path_params.get('device_id')
+    if did:
+        return str(did)
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        v = data.get('device_id')
+        if v:
+            return str(v)
+    return None
+
+
 def _require_user_id(conn: sqlite3.Connection, device_id: str) -> str:
     """Obtiene user_id o lanza 403 si el dispositivo no está registrado."""
     user_id = _get_user_id_for_device(conn, device_id)
@@ -381,13 +532,21 @@ async def sync_register(req: RegisterRequest):
     existing = _get_user_id_for_device(conn, req.device_id)
     if existing:
         devices = _get_all_devices_for_user(conn, existing)
-        return {
+        # Migracion de los dispositivos que se registraron antes de que
+        # existieran los tokens: se les emite aqui, la primera vez que su
+        # cliente actualizado vuelva a llamar. Si ya tenian, _issue_device_token
+        # devuelve None y NO se revela — ver su docstring.
+        issued = _issue_device_token(conn, req.device_id)
+        resp = {
             "user_id": existing,
             "device_id": req.device_id,
             "already_registered": True,
             "linked_devices": devices,
             "max_devices": MAX_DEVICES_PER_USER,
         }
+        if issued:
+            resp["device_token"] = issued
+        return resp
 
     # Crear usuario nuevo
     user_id = str(uuid.uuid4())
@@ -409,13 +568,19 @@ async def sync_register(req: RegisterRequest):
     logger.info(f"New user registered: {user_id} (device: {req.device_id})")
 
     devices = _get_all_devices_for_user(conn, user_id)
-    return {
+    resp = {
         "user_id": user_id,
         "device_id": req.device_id,
         "already_registered": False,
         "linked_devices": devices,
         "max_devices": MAX_DEVICES_PER_USER,
     }
+    # Dispositivo nuevo: token recien emitido. Es la UNICA vez que se entrega
+    # (ver _issue_device_token); el cliente tiene que persistirlo.
+    issued = _issue_device_token(conn, req.device_id)
+    if issued:
+        resp["device_token"] = issued
+    return resp
 
 
 def _assign_orphan_data(conn: sqlite3.Connection, device_id: str, user_id: str):
@@ -519,6 +684,18 @@ async def sync_link_join(req: LinkJoinRequest, request: Request):
             "max_devices": MAX_DEVICES_PER_USER,
         }
 
+    # El token del dispositivo se preserva a traves del DELETE/INSERT de abajo.
+    # Vincular es una operacion de CUENTA (a que usuario pertenece el device),
+    # mientras que el token acredita la IDENTIDAD del device: cambiar de usuario
+    # no lo convierte en otro aparato. Sin esto, unir dos dispositivos con el
+    # codigo le borraria el token al que se une, y en fase 3 (token obligatorio)
+    # eso seria dejarlo fuera de sus propios datos.
+    _tok_row = conn.execute(
+        "SELECT device_token FROM user_devices WHERE device_id = ?",
+        (req.device_id,),
+    ).fetchone()
+    preserved_token = _tok_row[0] if _tok_row else None
+
     if existing_user:
         # Re-vincular de un usuario a otro
         conn.execute("DELETE FROM user_devices WHERE device_id = ?", (req.device_id,))
@@ -535,8 +712,10 @@ async def sync_link_join(req: LinkJoinRequest, request: Request):
         # Si hicimos DELETE antes, restaurar para no corromper estado.
         if existing_user:
             conn.execute(
-                "INSERT INTO user_devices (device_id, user_id, device_type, device_name, linked_at) VALUES (?, ?, ?, ?, ?)",
-                (req.device_id, existing_user, req.device_type, req.device_name, now),
+                "INSERT INTO user_devices (device_id, user_id, device_type, device_name, "
+                "linked_at, device_token) VALUES (?, ?, ?, ?, ?, ?)",
+                (req.device_id, existing_user, req.device_type, req.device_name, now,
+                 preserved_token),
             )
             conn.commit()
         raise HTTPException(
@@ -550,8 +729,10 @@ async def sync_link_join(req: LinkJoinRequest, request: Request):
         )
 
     conn.execute(
-        "INSERT INTO user_devices (device_id, user_id, device_type, device_name, linked_at) VALUES (?, ?, ?, ?, ?)",
-        (req.device_id, target_user_id, req.device_type, req.device_name, now),
+        "INSERT INTO user_devices (device_id, user_id, device_type, device_name, "
+        "linked_at, device_token) VALUES (?, ?, ?, ?, ?, ?)",
+        (req.device_id, target_user_id, req.device_type, req.device_name, now,
+         preserved_token),
     )
 
     # Migrar datos huérfanos
