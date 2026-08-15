@@ -2780,12 +2780,18 @@ class AnalysisDB:
     def get_funnel_counts(self, *, days: int = 30) -> dict:
         """Devuelve, para los ultimos `days` dias, cuantos DISPOSITIVOS UNICOS
         dispararon cada evento del embudo. Distinct por device_id → mide
-        personas, no repeticiones. La UI calcula el drop-off entre pasos."""
+        personas, no repeticiones. La UI calcula el drop-off entre pasos.
+
+        Los eventos ANONIMOS (los de la web, que se mandan sin device_id a
+        proposito) cuentan uno por fila: `COUNT(DISTINCT device_id)` ignora los
+        NULL en SQL, asi que sin el COALESCE salian 0 por muchos que hubiera.
+        Para un evento sin identidad "dispositivos unicos" no esta definido."""
         conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute(
-                "SELECT event_name, COUNT(DISTINCT device_id) AS devices, "
+                "SELECT event_name, "
+                "       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS devices, "
                 "       COUNT(*) AS total "
                 "FROM events "
                 "WHERE timestamp >= datetime('now', ?) "

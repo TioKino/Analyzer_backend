@@ -1395,8 +1395,15 @@ async def telemetry(request: Request):
 # ── GET /admin/funnel ──────────────────────────────────────
 # Embudo de onboarding/retencion: cuantos DISPOSITIVOS UNICOS llegaron a cada
 # paso en los ultimos 30d, para ver DONDE se cae el usuario. Lee la tabla
-# `events` (poblada por /client-event). Privacy-first: solo cuenta device_id
-# distintos, nunca devuelve props ni ids.
+# `events` (poblada por /client-event). Privacy-first: nunca devuelve props ni ids.
+#
+# El conteo dedupe por device_id, pero OJO con los eventos ANONIMOS: los de la
+# web (`web_visit`, `web_download_click`) se mandan a proposito SIN device_id,
+# y `COUNT(DISTINCT device_id)` IGNORA los NULL en SQL -> salian 0 SIEMPRE, por
+# muchas visitas que hubiera. Se agrupa por `COALESCE(device_id, 'anon:'||id)`:
+# los identificados siguen dedupeando por aparato y cada evento anonimo cuenta
+# como uno. Para un evento sin identidad "dispositivos unicos" no esta definido;
+# lo unico medible es cuantas veces paso, que es justo lo que la web quiere.
 
 # Orden canonico del embudo de adquisicion. Los eventos que existan se pintan;
 # los que falten salen a 0 (aun no instrumentados / nadie llego).
@@ -1441,7 +1448,8 @@ async def funnel(request: Request, platform: str = None):
         adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
         try:
             rows = adb.execute(
-                "SELECT event_name, COUNT(DISTINCT device_id) AS devices "
+                "SELECT event_name, "
+                "       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS devices "
                 "FROM events WHERE timestamp >= datetime('now','-30 days')"
                 + plat_sql +
                 " GROUP BY event_name",
