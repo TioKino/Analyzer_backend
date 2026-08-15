@@ -1584,6 +1584,16 @@ def generate_preview_snippet(
             '-ss', str(round(start, 2)),
             '-i', file_path,
             '-t', '6',
+            # Solo la primera pista de AUDIO. Sin esto, como la salida es .mp3
+            # (contenedor que admite caratula incrustada), ffmpeg selecciona
+            # automaticamente tambien "la mejor pista de video" = el APIC del
+            # ID3, intenta decodificarlo para re-incrustarlo y, si esa imagen
+            # esta corrupta o truncada, ABORTA LA CONVERSION ENTERA:
+            #   Error while decoding stream #0:1: Invalid data found ...
+            #   Error marking filters as finished | Conversion failed!
+            # El audio estaba perfecto; se perdia la preview por la caratula.
+            '-map', '0:a:0',
+            '-vn',
             '-ac', '1',           # Mono
             '-ab', '64k',         # 64kbps
             '-ar', '22050',       # Sample rate bajo (suficiente para preview)
@@ -3964,7 +3974,13 @@ def _audd_clip_if_large(audio_path: str, threshold_mb: float = 4.0) -> Optional[
     clip_path = f"{audio_path}.audd20.mp3"
     for seek in (['-ss', '30'], []):
         try:
-            cmd = ['ffmpeg', '-y'] + seek + ['-i', audio_path, '-ac', '1',
+            # '-map 0:a:0 -vn': misma trampa que en generate_preview_snippet —
+            # la salida es .mp3, asi que ffmpeg arrastraria la caratula del ID3
+            # y una imagen corrupta tumbaria el recorte entero. Aqui el fallo
+            # era mudo (returncode != 0 → se envia el original a AudD, que
+            # responde 413) en vez de un error visible.
+            cmd = ['ffmpeg', '-y'] + seek + ['-i', audio_path,
+                   '-map', '0:a:0', '-vn', '-ac', '1',
                    '-ar', '22050', '-b:a', '128k', '-t', '20', clip_path]
             r = _sp.run(cmd, capture_output=True, timeout=30)
             if r.returncode == 0 and os.path.exists(clip_path) \
