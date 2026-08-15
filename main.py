@@ -564,7 +564,7 @@ _DOCS_ON = (
 
 app = FastAPI(
     title="DJ Analyzer Pro API",
-    version="2.9.8",
+    version="2.9.9",
     default_response_class=SafeJSONResponse,
     docs_url="/docs" if _DOCS_ON else None,
     redoc_url="/redoc" if _DOCS_ON else None,
@@ -4754,7 +4754,7 @@ if SIMILAR_TRACKS_ENABLED:
 async def root():
     return {
         "name": "DJ Analyzer Pro API",
-        "version": "2.9.8",
+        "version": "2.9.9",
         "status": "running",
         "modules": {
             "artwork": ARTWORK_ENABLED,
@@ -4852,7 +4852,7 @@ async def health():
 
     return {
         "status": "ok",
-        "version": "2.9.8",
+        "version": "2.9.9",
         "uptime_seconds": uptime_seconds,
         "checks": {
             "database": db_status,
