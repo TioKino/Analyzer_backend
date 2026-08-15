@@ -162,9 +162,15 @@ def _compute_telemetry_from_sync(conn) -> dict:
     # como los tracks reales de las filas incrementales nunca se contaban, los
     # usuarios en version actual quedaban INVISIBLES en estas metricas: solo
     # aportaban clientes legacy. Ademas ninguna rama deduplicaba entre devices.
+    # Cursor SIN fetchall(): se itera fila a fila. fetchall() materializaba en
+    # una lista TODAS las cargas utiles de analisis a la vez —cada una con su
+    # waveform, curva de energia, secciones y cue points en JSON—, que es el
+    # pico de memoria que revienta el contenedor de Render (2GB, un worker).
+    # sqlite3 devuelve un cursor iterable que trae las filas por lotes, asi que
+    # el pico pasa a ser una fila.
     rows = conn.execute(
         "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
-    ).fetchall()
+    )
     tracks_by_id, _no_id = _dedupe_analysis_tracks(rows)
     for t in tracks_by_id.values():
         fp_total += 1
@@ -648,9 +654,11 @@ async def all_tracks(request: Request):
     await _verify_admin_secret(request)
     conn = _get_sync_conn()
     try:
+        # Cursor sin fetchall(): materializar todas las cargas utiles de
+        # analisis a la vez es el pico de memoria que tumba el worker en Render.
         analysis_rows = conn.execute(
             "SELECT last_device_id, device_type, payload FROM sync_items WHERE data_type = 'analysis'"
-        ).fetchall()
+        )
 
         base_url = os.environ.get("BASE_URL", "").rstrip("/")
         result = []
@@ -715,9 +723,10 @@ async def all_previews(request: Request):
     await _verify_admin_secret(request)
     conn = _get_sync_conn()
     try:
+        # Cursor sin fetchall(): ver la nota en _compute_telemetry_from_sync.
         analysis_rows = conn.execute(
             "SELECT last_device_id, payload FROM sync_items WHERE data_type = 'analysis'"
-        ).fetchall()
+        )
 
         base_url = os.environ.get("BASE_URL", "").rstrip("/")
         result = []
@@ -778,9 +787,10 @@ async def global_stats(request: Request):
         # iteraban sus CAMPOS como si fueran tracks => el contador se disparaba a
         # cientos de miles. _count_unique_tracks maneja ambos formatos y dedup-ea
         # por track.id (chromaprint MD5, identico cross-device). Ver su docstring.
+        # Cursor sin fetchall(): ver la nota en _compute_telemetry_from_sync.
         analysis_rows = conn.execute(
             "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
-        ).fetchall()
+        )
         seen_ids, preview_fps, no_id_tracks = _count_unique_tracks(analysis_rows)
         total_tracks = len(seen_ids) + no_id_tracks
         total_previews = len(preview_fps)
@@ -1186,9 +1196,10 @@ async def telemetry(request: Request):
         # asi que en Render contaba siempre 0 aunque hubiera artwork en disco.
         artwork_dir = _ARTWORK_CACHE_DIR
         artwork_dir_exists = os.path.isdir(artwork_dir)
+        # Cursor sin fetchall(): ver la nota en _compute_telemetry_from_sync.
         arows = conn.execute(
             "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
-        ).fetchall()
+        )
         cov_tracks, cov_no_id = _dedupe_analysis_tracks(arows)
         total_tracks = len(cov_tracks) + cov_no_id
         for t in cov_tracks.values():
