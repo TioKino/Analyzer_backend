@@ -305,3 +305,74 @@ class TestFormatoIncremental:
         assert out['fingerprints']['total_tracks'] == 1
         assert out['fingerprints']['with_fingerprint'] == 0
         assert out['total_users'] == 1
+
+
+class TestNoRetenerPayloadsEnteros:
+    """Regresion del 502 en /admin/telemetry.
+
+    _dedupe_analysis_tracks nacio guardando el payload COMPLETO de cada track
+    en un dict. Como telemetry() la llama dos veces, el endpoint pasaba de leer
+    fila a fila (memoria constante) a mantener decenas de miles de analisis
+    enteros en RAM — con waveform de ~12K frames, curva de energia, secciones y
+    cue points cada uno. En Render, con un solo worker, eso mata el proceso:
+    /health sigue respondiendo y /admin/telemetry devuelve 502.
+
+    La proyeccion no es una optimizacion opcional: es lo que mantiene el
+    endpoint dentro de la memoria del contenedor.
+    """
+
+    def _track_gordo(self, tid):
+        return {
+            'id': tid,
+            'fingerprint': f'fp_{tid}',
+            'bpmSource': 'rekordbox',
+            # Lo que NO debe retenerse:
+            'waveform': [0.5] * 2000,
+            'energyCurve': [0.1] * 1000,
+            'structure_sections': [{'start': i, 'kind': 'x'} for i in range(50)],
+            'cuePoints': [{'pos': float(i)} for i in range(16)],
+        }
+
+    def test_los_campos_pesados_no_se_guardan(self, empty_sync):
+        from routes.admin_panel import _dedupe_analysis_tracks
+        _insert_incremental(empty_sync,
+            device_id='dja_a', device_type='macos', track_id='t1',
+            track=self._track_gordo('t1'),
+        )
+        rows = empty_sync.execute(
+            "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
+        ).fetchall()
+        tracks, _ = _dedupe_analysis_tracks(rows)
+
+        guardado = tracks['t1']
+        for pesado in ('waveform', 'energyCurve', 'structure_sections', 'cuePoints'):
+            assert pesado not in guardado, f'{pesado} retenido en memoria'
+
+    def test_pero_conserva_lo_que_el_panel_mide(self, empty_sync):
+        _insert_incremental(empty_sync,
+            device_id='dja_a', device_type='macos', track_id='t1',
+            track=dict(self._track_gordo('t1'),
+                       artworkUrl='https://x/y.jpg', keySource='traktor'),
+        )
+        out = _compute_telemetry_from_sync(empty_sync)
+        assert out['fingerprints']['total_tracks'] == 1
+        assert out['fingerprints']['with_fingerprint'] == 1
+        assert out['sources']['bpm'] == {'rekordbox': 1}
+        assert out['sources']['key'] == {'traktor': 1}
+        assert out['artwork_coverage']['with_artwork'] == 1
+
+    def test_gana_el_mas_completo_por_campos_utiles_no_por_tamano(self, empty_sync):
+        """Un payload enorme de waveform sin bpm_source NO debe ganarle a uno
+        pequeno que si lo trae — el criterio es la proyeccion, no el peso."""
+        _insert_incremental(empty_sync,
+            device_id='dja_phone', device_type='ios', track_id='t1',
+            track={'id': 't1', 'waveform': [0.5] * 5000},
+        )
+        _insert_incremental(empty_sync,
+            device_id='dja_pc', device_type='macos', track_id='t1',
+            track={'id': 't1', 'fingerprint': 'fp1', 'bpmSource': 'rekordbox'},
+        )
+        out = _compute_telemetry_from_sync(empty_sync)
+        assert out['fingerprints']['total_tracks'] == 1
+        assert out['fingerprints']['with_fingerprint'] == 1
+        assert out['sources']['bpm'] == {'rekordbox': 1}

@@ -309,6 +309,43 @@ def _get_sync_auth_adoption(days: int = 30) -> dict:
     }
 
 
+# Unicos campos que el panel necesita de un track. Todo lo demas del payload
+# —waveform (~12K frames), curva de energia, secciones de estructura, cue
+# points— se descarta nada mas parsearlo.
+#
+# NO es una optimizacion opcional: la primera version de _dedupe_analysis_tracks
+# retenia el payload COMPLETO de cada track en un dict, y como telemetry() la
+# llama dos veces, el endpoint pasaba de leer fila a fila (memoria constante) a
+# mantener decenas de miles de analisis enteros en RAM a la vez. En Render, con
+# un solo worker, eso mataba el proceso: /health seguia respondiendo y
+# /admin/telemetry devolvia 502.
+#
+# Se guardan las dos grafias (snake_case del backend y camelCase del cliente
+# Flutter) porque _get() las busca indistintamente.
+_TELEMETRY_TRACK_FIELDS = frozenset((
+    'id', 'fingerprint',
+    'bpm_source', 'bpmSource',
+    'key_source', 'keySource',
+    'genre_source', 'genreSource',
+    'track_type_source', 'trackTypeSource',
+    'artwork_url', 'artworkUrl',
+    'artwork_embedded', 'hasArtworkEmbedded',
+    'artwork_source', 'artworkSource',
+))
+
+
+def _slim_track(track: dict) -> dict:
+    """Proyecta un track a los campos que el panel usa. Ver comentario arriba."""
+    if not track:
+        return {}
+    return {k: v for k, v in track.items() if k in _TELEMETRY_TRACK_FIELDS}
+
+
+def _slim_score(slim: dict) -> int:
+    """Cuantos campos utiles trae la proyeccion (para 'gana el mas completo')."""
+    return sum(1 for v in slim.values() if v not in (None, '', 0))
+
+
 def _dedupe_analysis_tracks(analysis_rows):
     """Normaliza filas de sync_items(data_type='analysis') a tracks UNICOS.
 
@@ -347,9 +384,13 @@ def _dedupe_analysis_tracks(analysis_rows):
     no_id_tracks = 0
 
     def _remember(ident, track):
+        slim = _slim_track(track)
         prev = tracks_by_id.get(ident)
-        if prev is None or len(track) > len(prev):
-            tracks_by_id[ident] = track
+        # "Gana el mas completo" se mide sobre la PROYECCION (campos con valor),
+        # no sobre el payload crudo: un movil puede mandar un payload enorme de
+        # waveform y aun asi no traer bpm_source.
+        if prev is None or _slim_score(slim) > _slim_score(prev):
+            tracks_by_id[ident] = slim
 
     for arow in analysis_rows:
         try:
