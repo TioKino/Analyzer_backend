@@ -3974,11 +3974,15 @@ def _audd_clip_if_large(audio_path: str, threshold_mb: float = 4.0) -> Optional[
     clip_path = f"{audio_path}.audd20.mp3"
     for seek in (['-ss', '30'], []):
         try:
-            # '-map 0:a:0 -vn': misma trampa que en generate_preview_snippet —
-            # la salida es .mp3, asi que ffmpeg arrastraria la caratula del ID3
-            # y una imagen corrupta tumbaria el recorte entero. Aqui el fallo
-            # era mudo (returncode != 0 → se envia el original a AudD, que
-            # responde 413) en vez de un error visible.
+            # '-map 0:a:0 -vn': PREVENTIVO, no un fallo observado. Hoy el unico
+            # llamador es _send_to_audd desde /recognize, que pasa el WAV ya
+            # preprocesado — un WAV no lleva caratula, asi que la trampa de
+            # generate_preview_snippet no llega a dispararse aqui. Se blinda
+            # igual porque la salida SI es .mp3: el dia que a esta funcion le
+            # entre el fichero original (o cualquier formato con APIC) ffmpeg
+            # arrastraria la imagen y una caratula corrupta tumbaria el recorte
+            # — y aqui el fallo seria MUDO (returncode != 0 → se envia el
+            # fichero entero a AudD, que responde 413), no un error en el log.
             cmd = ['ffmpeg', '-y'] + seek + ['-i', audio_path,
                    '-map', '0:a:0', '-vn', '-ac', '1',
                    '-ar', '22050', '-b:a', '128k', '-t', '20', clip_path]

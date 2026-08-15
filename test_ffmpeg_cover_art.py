@@ -13,10 +13,12 @@ audio" Y "la mejor pista de video", decodifica la imagen para re-incrustarla
 y, si esa imagen esta corrupta o truncada, tumba la conversion COMPLETA. El
 audio estaba intacto: se perdia la preview por una caratula rota.
 
-Afectaba a los dos sitios que producen .mp3:
-  - generate_preview_snippet  → el snippet de 6s (error visible en el log)
-  - _audd_clip_if_large       → el recorte de 20s para AudD (fallo MUDO: se
-    enviaba el fichero entero y AudD respondia 413)
+Fallo OBSERVADO en generate_preview_snippet (el snippet de 6s). El otro sitio
+que produce .mp3, _audd_clip_if_large (recorte de 20s para AudD), se blinda de
+forma PREVENTIVA: hoy su unico llamador le pasa el WAV ya preprocesado de
+/recognize y un WAV no lleva caratula, asi que la trampa no se dispara — pero
+la salida si es .mp3, y alli el fallo seria mudo (se enviaria el fichero entero
+a AudD, que responde 413) en vez de un error en el log.
 
 Los comandos que escriben .wav no estaban afectados: el muxer WAV no admite
 video, asi que ffmpeg nunca selecciona la caratula.
