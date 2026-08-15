@@ -149,48 +149,63 @@ def _compute_telemetry_from_sync(conn) -> dict:
             if drow["device_type"]:
                 device_types[ddid] = drow["device_type"]
 
-    # Metricas de tracks/sources/fingerprints/artwork: solo de payloads 'analysis'.
+    # Metricas de tracks/sources/fingerprints/artwork: solo de payloads
+    # 'analysis', y SIEMPRE sobre el conjunto deduplicado.
+    #
+    # Antes esto leia solo `payload` (sin item_key), asi que no podia
+    # distinguir el formato incremental del blob legacy: para una fila
+    # incremental (un track suelto) _parse_analysis_payload devolvia el track
+    # entero y `.values()` iteraba sus CAMPOS como si cada uno fuera un track.
+    # Resultado en produccion: 304.232 "tracks" contados de los que 274.125
+    # salian con todas las fuentes en 'unknown' — eran campos, no tracks. Y
+    # como los tracks reales de las filas incrementales nunca se contaban, los
+    # usuarios en version actual quedaban INVISIBLES en estas metricas: solo
+    # aportaban clientes legacy. Ademas ninguna rama deduplicaba entre devices.
     rows = conn.execute(
-        "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
+        "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
     ).fetchall()
-    for row in rows:
-        tracks = _parse_analysis_payload(row["payload"])
-        for t in tracks.values():
-            if not isinstance(t, dict):
-                continue
-            fp_total += 1
+    tracks_by_id, _no_id = _dedupe_analysis_tracks(rows)
+    for t in tracks_by_id.values():
+        fp_total += 1
 
-            fp = _get(t, 'fingerprint')
-            if fp:
-                fp_with += 1
-                fp_seen[str(fp)] = fp_seen.get(str(fp), 0) + 1
+        fp = _get(t, 'fingerprint')
+        if fp:
+            fp_with += 1
+            fp_seen[str(fp)] = fp_seen.get(str(fp), 0) + 1
 
-            _bump(sources['bpm'], None, _get(t, 'bpm_source', 'bpmSource'))
-            _bump(sources['key'], None, _get(t, 'key_source', 'keySource'))
-            _bump(sources['genre'], None, _get(t, 'genre_source', 'genreSource'))
-            _bump(sources['track_type'], None,
-                  _get(t, 'track_type_source', 'trackTypeSource'))
+        _bump(sources['bpm'], None, _get(t, 'bpm_source', 'bpmSource'))
+        _bump(sources['key'], None, _get(t, 'key_source', 'keySource'))
+        _bump(sources['genre'], None, _get(t, 'genre_source', 'genreSource'))
+        _bump(sources['track_type'], None,
+              _get(t, 'track_type_source', 'trackTypeSource'))
 
-            # Artwork: cuenta tracks con cualquier fuente de artwork.
-            # Tolerante a shapes camelCase (cliente) y snake_case (backend).
-            art_url = _get(t, 'artwork_url', 'artworkUrl')
-            art_embed = bool(
-                t.get('artwork_embedded') or t.get('hasArtworkEmbedded')
-            )
-            art_source = _get(t, 'artwork_source', 'artworkSource')
-            if art_url or art_embed:
-                artwork_total += 1
-                if art_embed:
-                    artwork_embedded_count += 1
-                elif art_url:
-                    artwork_url_only_count += 1
-                # Determinar fuente: si declara art_source la usamos, sino
-                # inferimos 'id3' para embedded y 'unknown' para URL suelta.
-                src = art_source or ('id3' if art_embed else 'unknown')
-                artwork_sources[str(src)] = artwork_sources.get(str(src), 0) + 1
+        # Artwork: cuenta tracks con cualquier fuente de artwork.
+        # Tolerante a shapes camelCase (cliente) y snake_case (backend).
+        art_url = _get(t, 'artwork_url', 'artworkUrl')
+        art_embed = bool(
+            t.get('artwork_embedded') or t.get('hasArtworkEmbedded')
+        )
+        art_source = _get(t, 'artwork_source', 'artworkSource')
+        if art_url or art_embed:
+            artwork_total += 1
+            if art_embed:
+                artwork_embedded_count += 1
+            elif art_url:
+                artwork_url_only_count += 1
+            # Determinar fuente: si declara art_source la usamos, sino
+            # inferimos 'id3' para embedded y 'unknown' para URL suelta.
+            src = art_source or ('id3' if art_embed else 'unknown')
+            artwork_sources[str(src)] = artwork_sources.get(str(src), 0) + 1
 
     # Colisiones: cuantos fingerprints aparecen >1 vez y cuantas filas extra
     # aportan en total.
+    #
+    # OJO al leerlo: ahora se cuenta sobre tracks YA deduplicados por
+    # identidad, asi que una "colision" son tracks con IDENTIDAD DISTINTA que
+    # comparten fingerprint — es decir, el mismo audio guardado con otro
+    # nombre/tamano de fichero (copias reales que la memoria colectiva puede
+    # unificar). Antes se contaba por fila, asi que el mismo track sincronizado
+    # desde PC + movil ya salia como "colision" y el numero no significaba nada.
     collision_groups = sum(1 for n in fp_seen.values() if n > 1)
     collision_extras = sum((n - 1) for n in fp_seen.values() if n > 1)
 
@@ -245,8 +260,12 @@ def _preview_exists(fingerprint: str) -> bool:
     return os.path.isfile(path)
 
 
-def _count_unique_tracks(analysis_rows, check_previews: bool = True):
-    """Cuenta tracks UNICOS a partir de filas sync_items (data_type='analysis').
+def _dedupe_analysis_tracks(analysis_rows):
+    """Normaliza filas de sync_items(data_type='analysis') a tracks UNICOS.
+
+    Fuente de verdad UNICA para todo el panel: cualquier metrica que cuente
+    "tracks de los usuarios" tiene que salir de aqui, para que el numerador y
+    el denominador hablen del mismo conjunto.
 
     Maneja los DOS formatos que coexisten en produccion:
 
@@ -254,28 +273,34 @@ def _count_unique_tracks(analysis_rows, check_previews: bool = True):
          payload = el track suelto (un dict de campos: id, bpm, key, ...).
          NO viene envuelto en {"tracks": {...}}. La identidad del track es
          directamente el item_key. OJO: pasar este payload por
-         _parse_analysis_payload + .items() iteraria los CAMPOS del track
+         _parse_analysis_payload + .values() iteraria los CAMPOS del track
          como si cada uno fuera un track => inflaba el contador a cientos de
          miles. Por eso se trata por separado mirando el item_key.
 
       2. Blob legacy (clientes < v2.9.3): item_key='all_analysis',
          payload = {"tracks": {trackId: {...}}}. Aqui si se itera el dict.
 
-    Identidad canonica = track.id (chromaprint MD5, idempotente al
-    filename/tags/re-codec e identico cross-device para el mismo archivo),
-    con fallback a fingerprint y al item_key / key del dict. Esto deduplica
-    el mismo track sincronizado desde varios devices (PC+Mac+movil) y entre
-    el blob legacy y las filas incrementales.
+    Identidad canonica = track.id (idempotente al filename/tags/re-codec e
+    identico cross-device para el mismo archivo), con fallback a fingerprint
+    y al item_key / key del dict. Deduplica el mismo track sincronizado desde
+    varios devices (PC+Mac+movil) y entre el blob legacy y las filas
+    incrementales. La precedencia id -> fingerprint es la MISMA en las dos
+    ramas a proposito: antes la rama incremental miraba fingerprint primero,
+    asi que un track que llegaba por los dos formatos se contaba DOS veces.
 
-    Devuelve (seen_ids:set, preview_fps:set, no_id_tracks:int).
+    Cuando el mismo track llega desde varios devices con payloads de distinta
+    riqueza (el movil manda menos campos que el PC), nos quedamos con el mas
+    completo para no perder bpm_source / artwork por el orden de lectura.
+
+    Devuelve (tracks_by_id: dict[ident -> dict], no_id_tracks: int).
     """
-    seen_ids: set = set()
-    preview_fps: set = set()
+    tracks_by_id: dict = {}
     no_id_tracks = 0
 
-    def _maybe_preview(fp):
-        if check_previews and fp and fp not in preview_fps and _preview_exists(fp):
-            preview_fps.add(fp)
+    def _remember(ident, track):
+        prev = tracks_by_id.get(ident)
+        if prev is None or len(track) > len(prev):
+            tracks_by_id[ident] = track
 
     for arow in analysis_rows:
         try:
@@ -286,33 +311,59 @@ def _count_unique_tracks(analysis_rows, check_previews: bool = True):
 
         if ikey and ikey != "all_analysis":
             # Incremental: una fila = un track. item_key ES el trackId.
-            fp = None
+            payload = {}
             try:
-                pl = json.loads(raw)
-                if isinstance(pl, dict):
-                    fp = pl.get("fingerprint") or pl.get("id")
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    payload = parsed
             except (json.JSONDecodeError, TypeError):
                 pass
-            seen_ids.add(str(fp or ikey))
-            _maybe_preview(fp)
+            ident = payload.get("id") or payload.get("fingerprint") or ikey
+            _remember(str(ident), payload)
             continue
 
         # Blob legacy all_analysis: iterar el dict de tracks.
         tracks = _parse_analysis_payload(raw)
         for tkey, t in tracks.items():
-            ident = None
-            fp = None
-            if isinstance(t, dict):
-                ident = t.get("id") or t.get("fingerprint")
-                fp = t.get("fingerprint", "")
-            ident = ident or tkey
+            td = t if isinstance(t, dict) else {}
+            ident = td.get("id") or td.get("fingerprint") or tkey
             if ident:
-                seen_ids.add(str(ident))
+                _remember(str(ident), td)
             else:
                 no_id_tracks += 1
-            _maybe_preview(fp)
 
-    return seen_ids, preview_fps, no_id_tracks
+    return tracks_by_id, no_id_tracks
+
+
+def _track_preview_key(track):
+    """Clave con la que se guarda la preview de un track en disco.
+
+    Espeja `TrackMeta.previewId` del cliente: fingerprint y, para tracks
+    pre-v2.8.0 que nunca lo tuvieron, el id.
+    """
+    return track.get("fingerprint") or track.get("id") or ""
+
+
+def _count_unique_tracks(analysis_rows, check_previews: bool = True):
+    """Cuenta tracks UNICOS a partir de filas sync_items (data_type='analysis').
+
+    Wrapper fino sobre _dedupe_analysis_tracks; ver alli el detalle de los dos
+    formatos y de la identidad canonica.
+
+    Devuelve (seen_ids:set, preview_fps:set, no_id_tracks:int).
+    """
+    tracks_by_id, no_id_tracks = _dedupe_analysis_tracks(analysis_rows)
+
+    preview_fps: set = set()
+    if check_previews:
+        # Sobre el conjunto YA deduplicado: antes se hacia un stat de disco por
+        # FILA (cientos de miles en produccion) para acabar en el mismo set.
+        for track in tracks_by_id.values():
+            fp = _track_preview_key(track)
+            if fp and fp not in preview_fps and _preview_exists(fp):
+                preview_fps.add(fp)
+
+    return set(tracks_by_id.keys()), preview_fps, no_id_tracks
 
 
 # ── GET /admin/users ────────────────────────────────────────
@@ -1007,9 +1058,14 @@ async def telemetry(request: Request):
         audd_by_source_stats_30d = {}
 
     # 2) Cobertura preview + artwork sobre el total de tracks sync.
+    #
+    # Mismo denominador que el bloque `fingerprints` de mas abajo, por
+    # construccion: los dos salen de _dedupe_analysis_tracks. Antes este bucle
+    # contaba por fila y sin distinguir formato incremental de blob legacy, asi
+    # que el denominador estaba inflado ~10x y preview_rate/artwork_rate daban
+    # cifras de un solo digito que no describian nada real.
     conn = _get_sync_conn()
     try:
-        total_tracks = 0
         with_preview = 0
         with_artwork = 0
         # _ARTWORK_CACHE_DIR viene de config (persistente /data/ en Render).
@@ -1018,23 +1074,20 @@ async def telemetry(request: Request):
         artwork_dir = _ARTWORK_CACHE_DIR
         artwork_dir_exists = os.path.isdir(artwork_dir)
         arows = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'analysis'"
+            "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
         ).fetchall()
-        for arow in arows:
-            tracks_map = _parse_analysis_payload(arow["payload"])
-            for t in tracks_map.values():
-                if not isinstance(t, dict):
-                    continue
-                total_tracks += 1
-                fp = t.get("fingerprint", "")
-                if _preview_exists(fp):
-                    with_preview += 1
-                # Artwork file convencion: <fp>.jpg / <fp>.png
-                if fp and artwork_dir_exists:
-                    for ext in (".jpg", ".jpeg", ".png", ".webp"):
-                        if os.path.exists(os.path.join(artwork_dir, f"{fp}{ext}")):
-                            with_artwork += 1
-                            break
+        cov_tracks, cov_no_id = _dedupe_analysis_tracks(arows)
+        total_tracks = len(cov_tracks) + cov_no_id
+        for t in cov_tracks.values():
+            fp = _track_preview_key(t)
+            if _preview_exists(fp):
+                with_preview += 1
+            # Artwork file convencion: <fp>.jpg / <fp>.png
+            if fp and artwork_dir_exists:
+                for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                    if os.path.exists(os.path.join(artwork_dir, f"{fp}{ext}")):
+                        with_artwork += 1
+                        break
     finally:
         conn.close()
     preview_rate = (with_preview / total_tracks) if total_tracks else 0.0
