@@ -2843,7 +2843,7 @@ async def analyze_track(
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-                raise HTTPException(400, "Archivo demasiado grande. Máximo: 100 MB")
+                raise HTTPException(400, f"Archivo demasiado grande. Máximo: {MAX_UPLOAD_MB} MB")
             tmp.write(chunk)
     if total_bytes < min_size:
         try:
@@ -3530,7 +3530,7 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
                     break
                 total_bytes += len(chunk)
                 if total_bytes > MAX_UPLOAD_BYTES:
-                    raise HTTPException(400, "Archivo demasiado grande. Máximo: 100 MB")
+                    raise HTTPException(400, f"Archivo demasiado grande. Máximo: {MAX_UPLOAD_MB} MB")
                 tmp.write(chunk)
 
         logger.info(f"Identificando track: {file.filename}")
@@ -4187,7 +4187,7 @@ async def recognize_audio(
                     break
                 total_bytes += len(chunk)
                 if total_bytes > MAX_UPLOAD_BYTES:
-                    raise HTTPException(400, "Audio demasiado grande. Máximo: 100 MB")
+                    raise HTTPException(400, f"Audio demasiado grande. Máximo: {MAX_UPLOAD_MB} MB")
                 tmp.write(chunk)
 
         logger.info(f"[Recognize] Audio recibido: {file.filename} ({total_bytes} bytes)")
