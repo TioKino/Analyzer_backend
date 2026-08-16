@@ -43,6 +43,36 @@ class TestLogEvent:
         assert counts['import_completed']['devices'] == 1
         assert counts['import_completed']['total'] == 3
 
+    def test_eventos_anonimos_de_la_web_se_cuentan(self, db):
+        """REGRESION: la web manda sus eventos SIN device_id a proposito
+        (privacy-first, esta escrito en el tracking de index.html). El embudo
+        contaba `COUNT(DISTINCT device_id)`, y SQL IGNORA los NULL en un
+        COUNT(DISTINCT) -> `web_visit` reportaba 0 por muchas visitas que
+        hubiera, y el embudo de adquisicion era ciego sin que nada fallara.
+
+        Se persiguio como si fuera un problema de deploy y luego de CORS; las
+        dos cosas estaban bien. El fallo estaba en el contador.
+        """
+        for _ in range(3):
+            db.log_event(device_id=None, event_name='web_visit', platform='web')
+        counts = db.get_funnel_counts(days=30)
+        assert counts['web_visit']['devices'] == 3, (
+            'los eventos anonimos deben contar uno por fila: sin identidad, '
+            '"dispositivos unicos" no esta definido'
+        )
+        assert counts['web_visit']['total'] == 3
+
+    def test_anonimos_e_identificados_conviven(self, db):
+        """El COALESCE no debe romper el dedupe de los eventos que SI tienen
+        identidad: 1 device repetido sigue contando 1, y los anonimos suman."""
+        db.log_event(device_id='d1', event_name='app_opened')
+        db.log_event(device_id='d1', event_name='app_opened')
+        db.log_event(device_id=None, event_name='app_opened')
+        db.log_event(device_id=None, event_name='app_opened')
+        counts = db.get_funnel_counts(days=30)
+        assert counts['app_opened']['devices'] == 3   # d1 + los dos anonimos
+        assert counts['app_opened']['total'] == 4
+
     def test_props_json_persisted(self, db):
         db.log_event(
             device_id='d1',
