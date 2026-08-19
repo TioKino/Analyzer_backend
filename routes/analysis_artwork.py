@@ -50,18 +50,22 @@ _is_analysis_current = None
 ARTWORK_CACHE_DIR = None
 search_artwork_online = None
 save_artwork_to_cache = None
+# Solo en el motor local: consulta a Render el analisis de un fingerprint.
+# None en Render (no se consulta a si mismo).
+fetch_render_cache = None
 
 
 def init(database, is_analysis_current, artwork_cache_dir,
-         search_online=None, save_to_cache=None):
+         search_online=None, save_to_cache=None, render_cache_lookup=None):
     """Inyecta deps desde main.py. Llamar ANTES de include_router(router)."""
     global db, _is_analysis_current, ARTWORK_CACHE_DIR
-    global search_artwork_online, save_artwork_to_cache
+    global search_artwork_online, save_artwork_to_cache, fetch_render_cache
     db = database
     _is_analysis_current = is_analysis_current
     ARTWORK_CACHE_DIR = artwork_cache_dir
     search_artwork_online = search_online
     save_artwork_to_cache = save_to_cache
+    fetch_render_cache = render_cache_lookup
 
 
 # ── Router ───────────────────────────────────────────────────
@@ -148,8 +152,20 @@ async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintReque
         existing = db.get_track_by_fingerprint(fp)
         if existing and _is_analysis_current(existing):
             analyzed.append(fp)
-        else:
-            not_analyzed.append(fp)
+            continue
+        # Motor local: su BD es local a ESTA maquina, asi que tras un formateo
+        # (o en un Mac nuevo) esta vacia y el pre-check del cliente fallaba
+        # SIEMPRE -> subida + analisis completo de toda la biblioteca aunque
+        # Render ya tuviera cada track. Preguntamos a Render antes de decir
+        # "no analizado": es un SELECT, y el cliente se ahorra subir el fichero.
+        if fetch_render_cache is not None:
+            try:
+                if fetch_render_cache(fp):
+                    analyzed.append(fp)
+                    continue
+            except Exception as e:  # nunca romper el pre-check por esto
+                logger.debug("[Dedup] fallback Render fallo para %s: %s", fp[:8], e)
+        not_analyzed.append(fp)
 
     return {
         "analyzed": analyzed,
@@ -171,6 +187,17 @@ async def get_analysis_by_fingerprint(fingerprint: str):
         raise HTTPException(400, "fingerprint inválido")
     existing = db.get_track_by_fingerprint(safe_fp)
     if not existing:
+        # Motor local sin el track en su BD: si Render lo tiene, se lo damos al
+        # cliente tal cual. Sin esto el pre-check de dedup decia "ya analizado"
+        # (gracias al mismo fallback en /check-analyzed-by-fingerprint) y aqui
+        # respondia 404, asi que el cliente acababa subiendo el fichero igual.
+        if fetch_render_cache is not None:
+            try:
+                remote = fetch_render_cache(safe_fp)
+            except Exception:
+                remote = None
+            if remote:
+                return remote
         raise HTTPException(404, "fingerprint no encontrado")
     raw = existing.get('analysis_json')
     result = None

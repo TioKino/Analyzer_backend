@@ -883,6 +883,10 @@ init_lookup(
     ARTWORK_CACHE_DIR,
     search_online=search_artwork_online,
     save_to_cache=(save_artwork_to_cache if ARTWORK_ENABLED else None),
+    # Solo el motor local pregunta a Render: en Render seria consultarse a si
+    # mismo. Hace que el pre-check de dedup del cliente funcione en una maquina
+    # recien formateada, donde la BD local esta vacia pero Render lo tiene todo.
+    render_cache_lookup=(_fetch_render_cache if IS_LOCAL_ENGINE else None),
 )
 app.include_router(lookup_router)
 
