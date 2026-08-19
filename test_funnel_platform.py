@@ -103,3 +103,63 @@ def test_mobile_only(seeded_db):
 def test_specific_platform(seeded_db):
     body = _funnel(TestClient(app), 'macos')
     assert body['steps'][0]['devices'] == 1   # solo mac
+
+
+# ── Pasos POR PLATAFORMA (2026-08-19) ──────────────────────────────────
+#
+# El embudo aplicaba los MISMOS cinco pasos a desktop y movil, con
+# `import_completed` como paso clave. En movil eso mide contra un objetivo que
+# no es el suyo: el DJ tiene la musica en el PC y al movil le llega por SYNC
+# (el propio cliente lo dice en mobile_onboarding.dart: "CTA PRINCIPAL en movil
+# = Escuchar; importar = secundario"). El sintoma que lo delataba: en movil
+# `first_track_viewed` (15) superaba a `import_completed` (12) — usuarios que
+# llegan a su biblioteca SIN importar. Un paso que supera al anterior no es una
+# fuga, es una secuencia mal planteada.
+from routes.admin_panel import _funnel_steps_for  # noqa: E402
+
+
+class TestFunnelStepsPorPlataforma:
+    def test_desktop_conserva_los_pasos_de_import(self):
+        names = [n for n, _ in _funnel_steps_for('desktop')]
+        assert 'import_started' in names
+        assert 'import_completed' in names
+
+    def test_movil_no_mide_import_como_paso(self):
+        names = [n for n, _ in _funnel_steps_for('mobile')]
+        assert 'import_started' not in names
+        assert 'import_completed' not in names
+        assert names == ['app_opened', 'onboarding_completed',
+                         'first_track_viewed']
+
+    def test_ios_y_android_sueltos_cuentan_como_movil(self):
+        for p in ('ios', 'android', 'IOS', 'Android'):
+            names = [n for n, _ in _funnel_steps_for(p)]
+            assert 'import_completed' not in names, p
+
+    def test_sin_plataforma_y_desktop_sueltos_usan_el_completo(self):
+        for p in (None, 'macos', 'windows', 'linux'):
+            names = [n for n, _ in _funnel_steps_for(p)]
+            assert 'import_completed' in names, p
+
+    def test_plataforma_desconocida_no_pierde_pasos(self):
+        # Defensivo: un valor raro no debe silenciar pasos del embudo.
+        names = [n for n, _ in _funnel_steps_for('web')]
+        assert 'import_completed' in names
+
+
+class TestFunnelStepsEnLaRespuesta:
+    def test_movil_devuelve_tres_pasos_y_nota(self, seeded_db):
+        body = _funnel(TestClient(app), 'mobile')
+        assert [s['event'] for s in body['steps']] == [
+            'app_opened', 'onboarding_completed', 'first_track_viewed']
+        assert body['steps_note']
+
+    def test_desktop_devuelve_cinco_pasos_sin_nota(self, seeded_db):
+        body = _funnel(TestClient(app), 'desktop')
+        assert len(body['steps']) == 5
+        assert body['steps_note'] is None
+
+    def test_raw_sigue_trayendo_todos_los_eventos(self, seeded_db):
+        # Quitar import_* de `steps` NO puede dejar de medirlos: siguen en raw.
+        body = _funnel(TestClient(app), 'mobile')
+        assert 'raw' in body and isinstance(body['raw'], dict)
