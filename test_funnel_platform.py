@@ -128,8 +128,20 @@ class TestFunnelStepsPorPlataforma:
         names = [n for n, _ in _funnel_steps_for('mobile')]
         assert 'import_started' not in names
         assert 'import_completed' not in names
+
+    def test_movil_mide_vinculacion_y_sync(self):
+        """Fase B: el camino real del movil es vincular + recibir biblioteca.
+        Los emite el cliente desde 2.9.10; hasta entonces salen a 0."""
+        names = [n for n, _ in _funnel_steps_for('mobile')]
         assert names == ['app_opened', 'onboarding_completed',
+                         'device_linked', 'library_synced',
                          'first_track_viewed']
+
+    def test_desktop_no_mide_vinculacion(self):
+        # En desktop la biblioteca es local: vincular no es un paso del embudo.
+        names = [n for n, _ in _funnel_steps_for('desktop')]
+        assert 'device_linked' not in names
+        assert 'library_synced' not in names
 
     def test_ios_y_android_sueltos_cuentan_como_movil(self):
         for p in ('ios', 'android', 'IOS', 'Android'):
@@ -148,11 +160,24 @@ class TestFunnelStepsPorPlataforma:
 
 
 class TestFunnelStepsEnLaRespuesta:
-    def test_movil_devuelve_tres_pasos_y_nota(self, seeded_db):
+    def test_movil_devuelve_sus_pasos_y_nota(self, seeded_db):
         body = _funnel(TestClient(app), 'mobile')
-        assert [s['event'] for s in body['steps']] == [
-            'app_opened', 'onboarding_completed', 'first_track_viewed']
+        events = [s['event'] for s in body['steps']]
+        assert 'import_completed' not in events
+        assert events == ['app_opened', 'onboarding_completed',
+                          'device_linked', 'library_synced',
+                          'first_track_viewed']
         assert body['steps_note']
+
+    def test_pasos_sin_instrumentar_salen_a_cero_no_desaparecen(self, seeded_db):
+        """La BD sembrada solo tiene app_opened. Los pasos que aun no emite
+        ningun cliente deben salir con devices=0, NO omitirse: si se omitieran,
+        el embudo parecería completo cuando en realidad falta instrumentar."""
+        body = _funnel(TestClient(app), 'mobile')
+        by_event = {s['event']: s['devices'] for s in body['steps']}
+        assert by_event['device_linked'] == 0
+        assert by_event['library_synced'] == 0
+        assert by_event['app_opened'] == 1
 
     def test_desktop_devuelve_cinco_pasos_sin_nota(self, seeded_db):
         body = _funnel(TestClient(app), 'desktop')

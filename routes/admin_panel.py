@@ -1434,9 +1434,16 @@ _FUNNEL_DEFAULT = [
     ("first_track_viewed", "Vio su 1er track"),
 ]
 
+# `device_linked` y `library_synced` los emite el cliente desde 2.9.10 (fase B).
+# Hasta que haya releases con esos eventos en la calle saldran a 0, que es el
+# comportamiento normal de un paso no instrumentado — NO es una fuga. Ojo al
+# leerlo las primeras semanas: convivira gente en 2.9.9 (que nunca los emite)
+# con gente ya actualizada.
 _FUNNEL_MOBILE = [
     ("app_opened", "Abrio la app"),
     ("onboarding_completed", "Completo onboarding"),
+    ("device_linked", "Vinculo el dispositivo"),
+    ("library_synced", "Recibio su biblioteca"),
     ("first_track_viewed", "Vio su 1er track"),
 ]
 
