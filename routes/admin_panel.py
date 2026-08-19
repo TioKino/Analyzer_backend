@@ -1407,13 +1407,61 @@ async def telemetry(request: Request):
 
 # Orden canonico del embudo de adquisicion. Los eventos que existan se pintan;
 # los que falten salen a 0 (aun no instrumentados / nadie llego).
-_FUNNEL_STEPS = [
+#
+# EL EMBUDO NO ES EL MISMO EN LAS DOS PLATAFORMAS (corregido 2026-08-19).
+# Hasta hoy los cinco pasos se aplicaban por igual a desktop y movil, y el paso
+# clave era `import_completed`. Eso medía el movil contra un objetivo que NO es
+# el suyo: el DJ tiene la musica en el PC/Mac y al movil le llega por SYNC. El
+# propio cliente ya lo tiene decidido (mobile_onboarding.dart: "CTA PRINCIPAL en
+# movil = Escuchar; importar musica = secundario"), pero el embudo no lo
+# reflejaba y pintaba como fuga lo que era gente haciendo lo correcto.
+#
+# El dato que lo delataba estaba a la vista y se leyo mal durante dos snapshots:
+# en movil `first_track_viewed` (15) es MAYOR que `import_completed` (12) — hay
+# usuarios que llegan a su biblioteca SIN importar nada en el telefono. En
+# desktop es al reves (43 -> 30). Un embudo donde un paso supera al anterior no
+# es una fuga: es que la secuencia esta mal planteada.
+#
+# PENDIENTE (fase B, necesita cliente): no existe evento para el camino real del
+# movil —vincular dispositivo y recibir la biblioteca por sync—, asi que aqui
+# solo se puede QUITAR el paso que no aplica, no añadir el que falta. Cuando el
+# cliente emita `device_linked` / `library_synced`, meterlos en _FUNNEL_MOBILE.
+_FUNNEL_DEFAULT = [
     ("app_opened", "Abrio la app"),
     ("onboarding_completed", "Completo onboarding"),
     ("import_started", "Empezo a importar"),
     ("import_completed", "Importo musica"),
     ("first_track_viewed", "Vio su 1er track"),
 ]
+
+# `device_linked` y `library_synced` los emite el cliente desde 2.9.10 (fase B).
+# Hasta que haya releases con esos eventos en la calle saldran a 0, que es el
+# comportamiento normal de un paso no instrumentado — NO es una fuga. Ojo al
+# leerlo las primeras semanas: convivira gente en 2.9.9 (que nunca los emite)
+# con gente ya actualizada.
+_FUNNEL_MOBILE = [
+    ("app_opened", "Abrio la app"),
+    ("onboarding_completed", "Completo onboarding"),
+    ("device_linked", "Vinculo el dispositivo"),
+    ("library_synced", "Recibio su biblioteca"),
+    ("first_track_viewed", "Vio su 1er track"),
+]
+
+# Compat: algun sitio externo podria seguir importando el nombre viejo.
+_FUNNEL_STEPS = _FUNNEL_DEFAULT
+
+
+def _funnel_steps_for(platform):
+    """Pasos del embudo aplicables a `platform`. Solo el movil difiere: alli
+    importar es secundario (la musica llega por sync), asi que medirlo como
+    paso obligatorio da una fuga que no existe. `?platform=ios` y
+    `?platform=android` cuentan como movil, igual que el grupo."""
+    if not platform:
+        return _FUNNEL_DEFAULT
+    p = platform.lower()
+    if p == "mobile" or p in _PLATFORM_GROUPS.get("mobile", ()):
+        return _FUNNEL_MOBILE
+    return _FUNNEL_DEFAULT
 
 
 # Grupos de plataforma: la mayoria de DJs tienen la musica en PC/discos, no en
@@ -1462,10 +1510,12 @@ async def funnel(request: Request, platform: str = None):
             adb.close()
 
     # Construir el embudo ordenado con drop-off relativo al primer paso.
-    top = counts.get(_FUNNEL_STEPS[0][0], 0) or 0
+    # Los pasos dependen de la plataforma: ver _funnel_steps_for.
+    funnel_steps = _funnel_steps_for(platform)
+    top = counts.get(funnel_steps[0][0], 0) or 0
     steps = []
     prev = None
-    for name, label in _FUNNEL_STEPS:
+    for name, label in funnel_steps:
         devices = counts.get(name, 0)
         pct_of_top = round(100.0 * devices / top, 1) if top else 0.0
         drop_from_prev = (
@@ -1485,6 +1535,13 @@ async def funnel(request: Request, platform: str = None):
         "window_days": 30,
         "platform": platform or "all",  # que subconjunto se esta mirando
         "steps": steps,
+        # Que import_* no salga en `steps` del movil NO significa que no se mida:
+        # sigue en `raw`, que lleva TODOS los eventos. Lo que cambia es que deja
+        # de contarse como paso obligatorio del camino.
+        "steps_note": (
+            "movil sin import_*: alli la musica llega por sync, no se importa"
+            if _funnel_steps_for(platform) is _FUNNEL_MOBILE else None
+        ),
         "raw": counts,  # todos los eventos (incluye los no-embudo: session_start, etc.)
     }
 
