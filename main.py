@@ -1066,6 +1066,81 @@ def get_camelot(key: str) -> str:
 CAMELOT_TO_KEY = {v: k for k, v in KEY_TO_CAMELOT.items()}
 
 
+# Alias de notacion tonal -> clave canonica de KEY_TO_CAMELOT.
+#
+# KEY_TO_CAMELOT solo habla en SOSTENIDOS ('A#m', 'C#'), pero Rekordbox,
+# Traktor y Mixed In Key escriben la tonalidad en BEMOLES ('Bbm', 'Db', 'Ab').
+# Sin esta tabla, un TKEY escrito por Rekordbox no mapeaba, el codigo lo daba
+# por "key no reconocida" y CAIA AL ANALISIS PROPIO EN SILENCIO: el usuario
+# veia una tonalidad distinta a la de Rekordbox sin ninguna pista de por que.
+_KEY_ENHARMONICS = {
+    'DB': 'C#', 'EB': 'D#', 'GB': 'F#', 'AB': 'G#', 'BB': 'A#',
+    'DBM': 'C#M', 'EBM': 'D#M', 'GBM': 'F#M', 'ABM': 'G#M', 'BBM': 'A#M',
+    # Enarmonicos "raros" que algunas herramientas emiten igualmente.
+    'E#': 'F', 'B#': 'C', 'FB': 'E', 'CB': 'B',
+    'E#M': 'FM', 'B#M': 'CM', 'FBM': 'EM', 'CBM': 'BM',
+}
+
+# KEY_TO_CAMELOT con las claves en mayusculas, para buscar sin importar el caso.
+_KEY_TO_CAMELOT_UPPER = {k.upper(): (k, v) for k, v in KEY_TO_CAMELOT.items()}
+
+_CAMELOT_RE = re.compile(r'^(\d{1,2})\s*([AB])$')
+
+
+def normalize_musical_key(raw):
+    """Normaliza una tonalidad escrita por CUALQUIER herramienta DJ.
+
+    Acepta la nota en sostenidos o bemoles ('A#m' / 'Bbm'), con el modo escrito
+    de las mil formas que hay en circulacion ('m', 'min', 'minor', 'maj', '-',
+    unicode sharp/flat) y tambien el codigo Camelot directo ('8A', '08a').
+
+    Devuelve `(key, camelot)` canonicos -- `key` siempre es una clave de
+    KEY_TO_CAMELOT, para que la invariante `camelot == KEY_TO_CAMELOT[key]` se
+    cumpla siempre -- o `None` si el valor no es una tonalidad reconocible.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s or s in ('?', 'Unknown', 'None', '-'):
+        return None
+
+    # Unicode musical -> ASCII.
+    s = s.replace('\u266f', '#').replace('\u266d', 'b').replace('\u2669', '')
+    s = s.upper().replace('\u00a0', ' ')
+
+    # Camelot directo ('8A', '08 A', '8a').
+    m = _CAMELOT_RE.match(s.replace(' ', ''))
+    if m:
+        code = '{}{}'.format(int(m.group(1)), m.group(2))
+        key = CAMELOT_TO_KEY.get(code)
+        return (key, code) if key else None
+
+    # Open Key de Traktor ('8d' = mayor, '8m' = menor) -> Camelot.
+    m = re.match(r'^(\d{1,2})\s*([DM])$', s.replace(' ', ''))
+    if m:
+        num = int(m.group(1))
+        if 1 <= num <= 12:
+            # Open Key n -> Camelot ((n+6) mod 12)+1 (1d=8B=Do, 1m=8A=Lam);
+            # d=mayor(B), m=menor(A).
+            code = '{}{}'.format(((num + 6) % 12) + 1, 'B' if m.group(2) == 'D' else 'A')
+            key = CAMELOT_TO_KEY.get(code)
+            return (key, code) if key else None
+
+    # Modo escrito con palabra: MINOR/MIN/MOLL -> 'M' final; MAJOR/MAJ/DUR -> nada.
+    s = re.sub(r'[\s_\-]*(MINOR|MIN|MOLL)$', 'M', s)
+    s = re.sub(r'[\s_\-]*(MAJOR|MAJ|DUR)$', '', s)
+    s = s.replace(' ', '')
+
+    # Bemoles -> sostenidos (la 'B' final de un bemol ya no puede confundirse
+    # con la nota B porque el modo ya se normalizo a sufijo 'M' o nada).
+    s = _KEY_ENHARMONICS.get(s, s)
+
+    hit = _KEY_TO_CAMELOT_UPPER.get(s)
+    if hit:
+        return hit
+    return None
+
+
 def camelot_to_key(camelot: str) -> str:
     """Convierte notacion Camelot (1A-12B) a nota cruda (C, Cm, F#, etc.).
 
@@ -1854,22 +1929,15 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         logger.info(f"   Key: {key} ({camelot}) [modo ambiguo: margen={mode_margin:.3f}]")
     
     # Usar Key de ID3 solo si existe y es vlido
-    id3_key = id3_data.get('key')
-    if id3_key and id3_key.strip() and id3_key.strip() not in ['?', '', 'Unknown', 'None']:
-        id3_key = id3_key.strip()
+    # normalize_musical_key traga bemoles (Rekordbox/Mixed In Key escriben
+    # 'Bbm', no 'A#m'), modos en palabra ('F min') y Camelot/Open Key directo.
+    # Antes solo se probaba KEY_TO_CAMELOT tal cual, asi que la tonalidad que
+    # el usuario habia currado en Rekordbox se descartaba EN SILENCIO y ganaba
+    # nuestro DSP: de ahi que la key no coincidiera con la de Rekordbox.
+    id3_norm = normalize_musical_key(id3_data.get('key'))
+    if id3_norm:
+        key, camelot = id3_norm
         key_source = "id3"
-        # Intentar mapear a Camelot
-        id3_camelot = KEY_TO_CAMELOT.get(id3_key, None)
-        if id3_camelot:
-            key = id3_key
-            camelot = id3_camelot
-        # Si es formato Camelot directo (ej: "8A", "11B")
-        elif len(id3_key) >= 2 and id3_key[-1].upper() in ['A', 'B'] and id3_key[:-1].isdigit():
-            camelot = id3_key.upper()
-            key = id3_key
-        else:
-            # ID3 key no reconocida, mantener anlisis
-            key_source = "analysis"
     
     # Energy - Escala DJ 1-10 con curva power para mejor distribucion
     rms = librosa.feature.rms(y=y)[0]
@@ -2397,18 +2465,11 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
     key = result['key']
     camelot = result['camelot']
     key_source = result['key_source']
-    id3_key = id3_data.get('key')
-    if id3_key and id3_key.strip() and id3_key.strip() not in ['?', '', 'Unknown', 'None']:
-        id3_key = id3_key.strip()
-        id3_camelot = KEY_TO_CAMELOT.get(id3_key, None)
-        if id3_camelot:
-            key = id3_key
-            camelot = id3_camelot
-            key_source = "id3"
-        elif len(id3_key) >= 2 and id3_key[-1].upper() in ['A', 'B'] and id3_key[:-1].isdigit():
-            camelot = id3_key.upper()
-            key = id3_key
-            key_source = "id3"
+    # Mismo normalizador que la ruta no-chunked (ver comentario alli).
+    id3_norm = normalize_musical_key(id3_data.get('key'))
+    if id3_norm:
+        key, camelot = id3_norm
+        key_source = "id3"
     
     # ==================== GNERO ====================
     genre = "Electronic"
