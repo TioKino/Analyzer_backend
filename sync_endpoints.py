@@ -975,7 +975,10 @@ async def sync_pull(
     Multi-tenant: solo devuelve items del MISMO usuario + colectivos.
     Filtra por user_id (no por device_id como antes).
 
-    full=true → IGNORA device_seen y reenvía TODO lo del usuario. Necesario
+    full=true → IGNORA device_seen Y la exclusión por `last_device_id`, y
+    reenvía TODO lo del usuario, incluido lo que subió este mismo dispositivo
+    (sin eso, un PC que se formatea recibe 0: es él quien había subido casi
+    todo). Necesario
     cuando un cliente se quedó a medias aplicando un pull anterior (p.ej. la
     app se congeló/cerró tras recibir la respuesta pero antes de persistir):
     el servidor ya había marcado esos items como "vistos", así que un pull
@@ -1000,14 +1003,31 @@ async def sync_pull(
 
     # Orden por rowid garantiza paginación estable (rowid no cambia para
     # rows existentes en SQLite; nuevas inserciones van al final).
+    # El filtro `last_device_id != ?` evita el eco: en un pull normal no tiene
+    # sentido devolverle a un dispositivo lo que acaba de subir el.
+    #
+    # Con full=true hay que QUITARLO, y esa es justo la razon de ser de este
+    # endpoint. `full=true` lo pide un dispositivo que perdio sus datos en
+    # local y quiere recuperarlos de la nube. Si ademas excluimos lo que subio
+    # el mismo, al PC —que es la fuente de la verdad y por tanto quien subio
+    # casi todo— se le devuelve CERO: el unico caso para el que existe
+    # "Restaurar desde la nube" era el unico que no funcionaba. Reportado con
+    # un Mac formateado que pidio full=true sobre 5.000 tracks y recibio 0,
+    # mientras el movil seguia enseñandolos porque los tenia de un pull viejo.
+    #
+    # Sin riesgo de eco: al aplicar un pull el cliente NO marca dirty (escribe
+    # a disco y recarga por replaceFromDisk/loadFromDisk), asi que recibir lo
+    # propio no genera un push de vuelta.
     sql = (
         "SELECT si.key, si.data_type, si.item_key, si.payload, si.deleted, "
         "       si.updated_at, si.device_type, si.hash "
         "FROM sync_items si "
-        "WHERE si.last_device_id != ? "
-        "  AND (si.user_id = ? OR si.user_id = '__collective__')"
+        "WHERE (si.user_id = ? OR si.user_id = '__collective__')"
     )
-    params: list = [device_id, user_id]
+    params: list = [user_id]
+    if not full:
+        sql += " AND si.last_device_id != ?"
+        params.append(device_id)
     if type_list:
         placeholders = ",".join("?" for _ in type_list)
         sql += f" AND si.data_type IN ({placeholders})"
