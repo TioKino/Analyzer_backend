@@ -12,7 +12,10 @@ Uso:
     )
 """
 
-from fastapi import HTTPException
+# `Request` lo usa get_client_ip() como anotacion, que Python evalua al definir
+# la funcion: si falta, el modulo no importa y se cae TODA la suite. Vivia en el
+# bloque del decorador de validacion y se fue con el al borrarlo (2026-08-20).
+from fastapi import HTTPException, Request
 from typing import Optional, Tuple
 import re
 import os
