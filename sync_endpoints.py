@@ -142,18 +142,49 @@ async def _verify_sync_auth(request: Request):
     # camino seguro hasta poder cerrarlo.
     token = request.headers.get("X-Device-Token", "")
     device_id = _device_id_from_request(request, body)
-    if token and device_id:
+    if device_id:
         conn = _get_conn()
         row = conn.execute(
-            "SELECT device_token FROM user_devices WHERE device_id = ?",
+            "SELECT device_token, token_seen_at FROM user_devices "
+            "WHERE device_id = ?",
             (device_id,),
         ).fetchone()
         stored = row[0] if row and row[0] else None
-        # Si el dispositivo aun no tiene token emitido NO se rechaza: es un
-        # cliente ya actualizado hablando de un device_id que todavia no lo ha
-        # reclamado. Rechazarlo romperia sync justo durante la migracion.
-        if stored and not _hmac.compare_digest(token, stored):
-            raise HTTPException(status_code=401, detail="Invalid device token")
+        enforced = bool(row and row[1])
+
+        if token:
+            # Si el dispositivo aun no tiene token emitido NO se rechaza: es un
+            # cliente ya actualizado hablando de un device_id que todavia no lo
+            # ha reclamado. Rechazarlo romperia sync justo en la migracion.
+            if stored and not _hmac.compare_digest(token, stored):
+                raise HTTPException(
+                    status_code=401, detail="Invalid device token")
+            # Token correcto: a partir de AHORA se le exige. Se sella una sola
+            # vez (WHERE token_seen_at IS NULL) para no escribir en cada
+            # peticion de sync.
+            if stored and not enforced:
+                try:
+                    conn.execute(
+                        "UPDATE user_devices SET token_seen_at = ? "
+                        "WHERE device_id = ? AND token_seen_at IS NULL",
+                        (_now_iso(), device_id),
+                    )
+                    conn.commit()
+                except sqlite3.Error:
+                    pass  # sellar es best-effort, nunca tumba un sync
+        elif enforced:
+            # FASE 2.5 — este dispositivo YA demostro saber mandar su token y
+            # ahora llega sin el. O es un downgrade del cliente (raro) o es
+            # alguien suplantando el device_id con el secreto global, que es
+            # justo el agujero que esto cierra.
+            #
+            # Se cierra POR DISPOSITIVO, no con un dia D: cada usuario queda
+            # protegido en cuanto actualiza, sin esperar a que se actualice
+            # nadie mas. Esperar al 100 % del parque —el criterio de la fase 3
+            # original— es esperar a un numero que no llega nunca, y mientras
+            # tanto el agujero sigue abierto para todos.
+            raise HTTPException(
+                status_code=401, detail="Device token required")
 
     _record_sync_auth(matched_slot, bool(token))
 
@@ -281,6 +312,23 @@ def _init_tables(conn: sqlite3.Connection):
     # en ningun binario, asi que un device_id filtrado deja de bastar.
     try:
         conn.execute("ALTER TABLE user_devices ADD COLUMN device_token TEXT")
+    except sqlite3.OperationalError:
+        pass  # Already exists
+
+    # FASE 2.5 — marca de que este dispositivo YA DEMOSTRO saber mandar su
+    # token. Se sella la primera vez que llega una peticion con el token
+    # correcto, y a partir de ahi se le EXIGE (ver _verify_sync_auth).
+    #
+    # Hace falta una columna aparte y no vale `device_token IS NOT NULL`: el
+    # plan original decia "si ya tiene token emitido, exigelo", pero eso es
+    # FALSO como premisa. `_issue_device_token` se llama en TODO /sync/register
+    # sin mirar la version del cliente, asi que un cliente <= 2.9.8 recibe el
+    # token en la respuesta, lo IGNORA (su codigo no conoce el campo) y deja el
+    # device_token guardado en el servidor. Exigirlo por "emitido" habria
+    # echado de su propia biblioteca a todo ese parque — el 71 % de las
+    # peticiones de sync todavia llegan sin token.
+    try:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN token_seen_at TEXT")
     except sqlite3.OperationalError:
         pass  # Already exists
 
@@ -690,11 +738,17 @@ async def sync_link_join(req: LinkJoinRequest, request: Request):
     # no lo convierte en otro aparato. Sin esto, unir dos dispositivos con el
     # codigo le borraria el token al que se une, y en fase 3 (token obligatorio)
     # eso seria dejarlo fuera de sus propios datos.
+    # FASE 2.5: se preserva TAMBIEN `token_seen_at`. Si solo se arrastrara el
+    # token, un dispositivo YA PROTEGIDO que se vincule a otra cuenta volveria a
+    # aceptar peticiones sin token — o sea, vincular reabriria el agujero justo
+    # en el aparato que ya estaba cerrado, y en silencio.
     _tok_row = conn.execute(
-        "SELECT device_token FROM user_devices WHERE device_id = ?",
+        "SELECT device_token, token_seen_at FROM user_devices "
+        "WHERE device_id = ?",
         (req.device_id,),
     ).fetchone()
     preserved_token = _tok_row[0] if _tok_row else None
+    preserved_seen = _tok_row[1] if _tok_row else None
 
     if existing_user:
         # Re-vincular de un usuario a otro
@@ -713,9 +767,10 @@ async def sync_link_join(req: LinkJoinRequest, request: Request):
         if existing_user:
             conn.execute(
                 "INSERT INTO user_devices (device_id, user_id, device_type, device_name, "
-                "linked_at, device_token) VALUES (?, ?, ?, ?, ?, ?)",
+                "linked_at, device_token, token_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (req.device_id, existing_user, req.device_type, req.device_name, now,
-                 preserved_token),
+                 preserved_token, preserved_seen),
             )
             conn.commit()
         raise HTTPException(
@@ -730,9 +785,9 @@ async def sync_link_join(req: LinkJoinRequest, request: Request):
 
     conn.execute(
         "INSERT INTO user_devices (device_id, user_id, device_type, device_name, "
-        "linked_at, device_token) VALUES (?, ?, ?, ?, ?, ?)",
+        "linked_at, device_token, token_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (req.device_id, target_user_id, req.device_type, req.device_name, now,
-         preserved_token),
+         preserved_token, preserved_seen),
     )
 
     # Migrar datos huérfanos

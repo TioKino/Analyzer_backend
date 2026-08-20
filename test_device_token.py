@@ -237,3 +237,168 @@ class TestVinculacionEntreDispositivos:
             "SELECT device_token FROM user_devices WHERE device_id = 'dja_movil'"
         ).fetchone()
         assert row['device_token'] == token
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FASE 2.5 — el token se EXIGE por dispositivo, sin dia D
+# ══════════════════════════════════════════════════════════════════════
+#
+# La fase 1 solo validaba el token SI venia, asi que quien omitia la cabecera
+# seguia entrando: el agujero quedaba abierto para todos.
+#
+# El plan escrito decia "si ese device_id ya tiene token EMITIDO, exigelo". Esa
+# premisa es FALSA y aplicarla habria provocado una caida: `_issue_device_token`
+# se llama en TODO /sync/register sin mirar la version del cliente, asi que un
+# cliente <= 2.9.8 recibe el token, lo IGNORA (su codigo no conoce el campo) y
+# deja `device_token` guardado en el servidor. Exigirlo por "emitido" habria
+# echado de su propia biblioteca a todo ese parque.
+#
+# Lo que SI demuestra que un aparato sabe mandar el token es haberlo mandado.
+# De ahi `token_seen_at`: se sella al primer token correcto y a partir de ahi se
+# exige. Cada usuario queda protegido al actualizar, sin esperar a nadie.
+import asyncio  # noqa: E402
+
+
+class _FakeRequest:
+    """Request minimo: _verify_sync_auth solo usa headers y body()."""
+
+    def __init__(self, headers, body=b'{}'):
+        self.headers = headers
+        self._body = body
+
+    async def body(self):
+        return self._body
+
+
+def _verify(headers, body=b'{}'):
+    return asyncio.get_event_loop().run_until_complete(
+        se._verify_sync_auth(_FakeRequest(headers, body))
+    )
+
+
+@pytest.fixture
+def sin_secreto(monkeypatch):
+    """Dev mode local: SYNC_AUTH_SECRET vacio -> _verify_sync_auth sale antes
+    de mirar el token. Para probar la parte del token hace falta secreto."""
+    monkeypatch.setattr(se, 'SYNC_AUTH_SECRET', '')
+    monkeypatch.delenv('RENDER', raising=False)
+    monkeypatch.delenv('RAILWAY_ENVIRONMENT', raising=False)
+
+
+class TestFase25Enforcement:
+    """Comportamiento del sellado + exigencia. Se prueba sobre la BD, que es
+    donde vive la decision, sin montar el HMAC completo."""
+
+    def test_la_columna_nace_null(self, conn):
+        _register(conn, 'dja_x')
+        row = conn.execute(
+            "SELECT token_seen_at FROM user_devices WHERE device_id='dja_x'"
+        ).fetchone()
+        assert row['token_seen_at'] is None
+
+    def test_migracion_idempotente(self, conn):
+        se._init_tables(conn)
+        se._init_tables(conn)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(user_devices)")]
+        assert cols.count('token_seen_at') == 1
+
+    def test_token_emitido_NO_basta_para_exigir(self, conn):
+        """EL CASO QUE HABRIA TUMBADO PRODUCCION. Un cliente viejo recibe token
+        en /sync/register y lo ignora: la fila tiene device_token pero el
+        aparato no sabe mandarlo. NO puede quedar marcado como protegido."""
+        _register(conn, 'dja_viejo')
+        emitido = se._issue_device_token(conn, 'dja_viejo')
+        assert emitido, 'register emite token a cualquiera, tambien a clientes viejos'
+        row = conn.execute(
+            "SELECT device_token, token_seen_at FROM user_devices "
+            "WHERE device_id='dja_viejo'"
+        ).fetchone()
+        assert row['device_token'] is not None   # emitido
+        assert row['token_seen_at'] is None      # pero NO exigible
+
+    def test_sellado_marca_el_dispositivo(self, conn):
+        _register(conn, 'dja_nuevo')
+        se._issue_device_token(conn, 'dja_nuevo')
+        conn.execute(
+            "UPDATE user_devices SET token_seen_at = ? "
+            "WHERE device_id = ? AND token_seen_at IS NULL",
+            (se._now_iso(), 'dja_nuevo'),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT token_seen_at FROM user_devices WHERE device_id='dja_nuevo'"
+        ).fetchone()
+        assert row['token_seen_at'] is not None
+
+    def test_el_sellado_no_se_reescribe(self, conn):
+        """El UPDATE lleva `AND token_seen_at IS NULL` para no escribir en cada
+        peticion de sync: sellar es una vez en la vida del dispositivo."""
+        _register(conn, 'dja_s')
+        se._issue_device_token(conn, 'dja_s')
+        primero = '2020-01-01T00:00:00+00:00'
+        conn.execute(
+            "UPDATE user_devices SET token_seen_at = ? "
+            "WHERE device_id = ? AND token_seen_at IS NULL",
+            (primero, 'dja_s'),
+        )
+        conn.execute(
+            "UPDATE user_devices SET token_seen_at = ? "
+            "WHERE device_id = ? AND token_seen_at IS NULL",
+            (se._now_iso(), 'dja_s'),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT token_seen_at FROM user_devices WHERE device_id='dja_s'"
+        ).fetchone()
+        assert row['token_seen_at'] == primero
+
+    def test_vincular_no_desprotege_al_dispositivo(self, conn):
+        """/sync/link/join hace DELETE+INSERT sobre user_devices y solo
+        arrastraba `device_token`. Si pierde `token_seen_at`, un dispositivo YA
+        PROTEGIDO vuelve a aceptar peticiones sin token: vincular reabriria el
+        agujero justo en el aparato que ya estaba cerrado, y en silencio.
+
+        El test LLAMA al endpoint de verdad: comprobarlo con un UPDATE a mano
+        pasaria sin ejercitar el DELETE+INSERT, que es donde esta el fallo."""
+        _register(conn, 'dja_p', user_id='u_a')
+        tok = se._issue_device_token(conn, 'dja_p')
+        sellado = se._now_iso()
+        conn.execute(
+            "UPDATE user_devices SET token_seen_at = ? WHERE device_id = ?",
+            (sellado, 'dja_p'),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, created_at) VALUES ('u_b', ?)",
+            (se._now_iso(),))
+        conn.commit()
+
+        from datetime import datetime, timedelta, timezone
+        exp = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        conn.execute(
+            "INSERT INTO link_codes (code, user_id, created_at, expires_at) "
+            "VALUES ('ZZZ999', 'u_b', ?, ?)", (se._now_iso(), exp))
+        conn.commit()
+
+        class _Req:
+            device_id = 'dja_p'
+            code = 'ZZZ999'
+            device_type = 'macos'
+            device_name = 'Mac'
+
+        class _Client:
+            host = '127.0.0.1'
+
+        class _HttpReq:
+            client = _Client()
+            headers: dict = {}
+
+        asyncio.run(se.sync_link_join(_Req(), _HttpReq()))
+
+        row = conn.execute(
+            "SELECT user_id, device_token, token_seen_at FROM user_devices "
+            "WHERE device_id='dja_p'"
+        ).fetchone()
+        assert row['user_id'] == 'u_b', 'no cambio de usuario'
+        assert row['device_token'] == tok, 'la vinculacion le borro el token'
+        assert row['token_seen_at'] == sellado, \
+            'la vinculacion DESPROTEGIO el dispositivo'
