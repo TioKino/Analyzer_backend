@@ -403,6 +403,15 @@ def extract_id3_metadata(file_path: str) -> Dict:
                         pass
                 if 'TKEY' in tags:
                     metadata['key'] = str(tags['TKEY'])
+                else:
+                    # Mixed In Key y varias herramientas escriben la tonalidad
+                    # en un TXXX libre en vez de en TKEY (que esta limitado a 3
+                    # caracteres en ID3v2.3 y no admite 'Bbm').
+                    for txxx_desc in ('INITIALKEY', 'INITIAL KEY', 'KEY'):
+                        frame = tags.getall('TXXX:' + txxx_desc)
+                        if frame:
+                            metadata['key'] = str(frame[0])
+                            break
                 if 'TSRC' in tags:
                     metadata['isrc'] = str(tags['TSRC'])
                     
@@ -431,6 +440,15 @@ def extract_id3_metadata(file_path: str) -> Dict:
                     metadata['genre'] = audio['genre'][0]
                 if 'bpm' in audio:
                     metadata['bpm'] = float(audio['bpm'][0])
+                # La tonalidad de un FLAC no se leia: Rekordbox/Traktor la
+                # escriben como INITIALKEY (o KEY) en el bloque Vorbis, asi que
+                # todo FLAC etiquetado perdia su key y se re-analizaba a ciegas.
+                for key_tag in ('initialkey', 'key'):
+                    if key_tag in audio and audio[key_tag]:
+                        metadata['key'] = audio[key_tag][0]
+                        break
+                if 'isrc' in audio and audio['isrc']:
+                    metadata['isrc'] = audio['isrc'][0]
             except Exception as e:
                 # Best-effort: un FLAC corrupto/truncado (mutagen FLACError y
                 # otros MutagenError no son IOError) no debe tumbar el analisis.
@@ -451,6 +469,17 @@ def extract_id3_metadata(file_path: str) -> Dict:
                     metadata['genre'] = audio['\xa9gen'][0]
                 if 'tmpo' in audio:
                     metadata['bpm'] = float(audio['tmpo'][0])
+                # Misma historia que en FLAC: el atomo freeform de iTunes es
+                # donde Rekordbox/Mixed In Key dejan la tonalidad en M4A.
+                for key_atom in ('----:com.apple.iTunes:initialkey',
+                                 '----:com.apple.iTunes:KEY',
+                                 '----:com.apple.iTunes:Initial Key'):
+                    if key_atom in audio and audio[key_atom]:
+                        raw_key = audio[key_atom][0]
+                        if isinstance(raw_key, bytes):
+                            raw_key = raw_key.decode('utf-8', 'ignore')
+                        metadata['key'] = raw_key
+                        break
             except Exception as e:
                 # Best-effort: un M4A/MP4 truncado del cliente (descarga de nube
                 # incompleta) lanza MP4MetadataError / MP4StreamInfoError

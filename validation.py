@@ -5,7 +5,6 @@ Validación de entrada para todos los endpoints.
 
 Uso:
     from validation import (
-        validate_audio_file,
         validate_bpm_range,
         validate_energy_range,
         sanitize_string,
@@ -13,7 +12,10 @@ Uso:
     )
 """
 
-from fastapi import HTTPException, UploadFile
+# `Request` lo usa get_client_ip() como anotacion, que Python evalua al definir
+# la funcion: si falta, el modulo no importa y se cae TODA la suite. Vivia en el
+# bloque del decorador de validacion y se fue con el al borrarlo (2026-08-20).
+from fastapi import HTTPException, Request
 from typing import Optional, Tuple
 import re
 import os
@@ -94,70 +96,6 @@ class ValidationError(HTTPException):
 # ============================================================================
 # VALIDACIÓN DE ARCHIVOS
 # ============================================================================
-
-async def validate_audio_file(
-    file: UploadFile,
-    max_size_mb: int = MAX_FILE_SIZE_MB,
-    check_content: bool = True
-) -> Tuple[bytes, str]:
-    """
-    Valida un archivo de audio subido.
-    
-    Args:
-        file: Archivo subido
-        max_size_mb: Tamaño máximo en MB
-        check_content: Si debe verificar los magic bytes
-    
-    Returns:
-        Tuple[bytes, str]: (contenido, extensión)
-    
-    Raises:
-        ValidationError: Si el archivo no es válido
-    """
-    if not file or not file.filename:
-        raise ValidationError("No se proporcionó archivo", "file")
-    
-    # Validar nombre de archivo
-    filename = sanitize_filename(file.filename)
-    if not filename:
-        raise ValidationError("Nombre de archivo inválido", "filename")
-    
-    # Validar extensión
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise ValidationError(
-            f"Formato no soportado. Permitidos: {', '.join(ALLOWED_EXTENSIONS)}",
-            "extension"
-        )
-    
-    # Leer contenido
-    content = await file.read()
-    await file.seek(0)  # Reset para posible re-lectura
-    
-    # Validar tamaño
-    max_bytes = max_size_mb * 1024 * 1024
-    if len(content) > max_bytes:
-        raise ValidationError(
-            f"Archivo demasiado grande. Máximo: {max_size_mb} MB",
-            "size"
-        )
-    
-    if len(content) < 1000:  # Mínimo 1KB
-        raise ValidationError(
-            "Archivo demasiado pequeño o corrupto",
-            "size"
-        )
-    
-    # Verificar magic bytes (opcional)
-    if check_content:
-        if not _is_valid_audio_content(content, ext):
-            raise ValidationError(
-                "El contenido no parece ser un archivo de audio válido",
-                "content"
-            )
-    
-    return content, ext
-
 
 def _is_valid_audio_content(content: bytes, ext: str) -> bool:
     """Verifica magic bytes del archivo"""
@@ -583,23 +521,21 @@ def check_rate_limit(client_ip: str) -> None:
 
 
 # ============================================================================
-# DECORADORES DE VALIDACIÓN
+# NOTA — aqui vivian validate_audio_file() y el decorador validate_audio_upload
 # ============================================================================
-
-from functools import wraps
-from fastapi import Request
-
-def validate_audio_upload(max_size_mb: int = MAX_FILE_SIZE_MB):
-    """Decorador para validar uploads de audio"""
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, file: UploadFile = None, **kwargs):
-            if file:
-                await validate_audio_file(file, max_size_mb)
-            return await func(*args, file=file, **kwargs)
-        return wrapper
-    return decorator
-
+#
+# Borrados 2026-08-20. Ningun endpoint los llamaba (el decorador no tenia ni un
+# uso, y la funcion solo la usaba el decorador), pero eran una trampa esperando
+# a que alguien los cableara: `validate_audio_file` hacia
+# `content = await file.read()` ANTES de comprobar el tamaño, o sea que
+# bufferizaba el fichero entero en RAM para luego rechazarlo por grande — en
+# los 512 MB de Render eso es un OOM servido en bandeja.
+#
+# Los tres endpoints de subida reales —/analyze, /identify y /recognize— hacen
+# streaming a disco en bloques de 1 MB con corte temprano por tamaño. Si hace
+# falta validar una subida nueva, cópialos a ellos, no resucites esto.
+#
+# Los magic bytes siguen vivos en _is_valid_audio_content, que sí se usa.
 
 # ============================================================================
 # FUNCIONES DE UTILIDAD
