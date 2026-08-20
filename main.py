@@ -96,7 +96,6 @@ from config import (
 
 #  Importar mdulo de validacin
 from validation import (
-    validate_audio_file,
     validate_bpm_range,
     validate_energy_range,
     validate_limit,
