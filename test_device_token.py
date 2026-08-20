@@ -402,3 +402,74 @@ class TestFase25Enforcement:
         assert row['device_token'] == tok, 'la vinculacion le borro el token'
         assert row['token_seen_at'] == sellado, \
             'la vinculacion DESPROTEGIO el dispositivo'
+
+
+class TestCensoDeDispositivosProtegidos:
+    """`enforced_devices` en /admin/telemetry.
+
+    La primera version tragaba el OperationalError y devolvia 0/0, que es
+    INDISTINGUIBLE de "aun no hay ninguno protegido". Paso en produccion nada
+    mas desplegar: el ALTER de token_seen_at solo corre cuando una peticion de
+    /sync/* crea la conexion singleton del proceso, y con ~20 syncs al dia
+    puede tardar. El panel decia "0 de 0" como si fuera un dato real.
+    """
+
+    def _adopcion(self, path, monkeypatch):
+        from routes import admin_panel as ap
+        monkeypatch.setattr(ap, '_SYNC_DB_PATH', path)
+        return ap._get_sync_auth_adoption(days=30)
+
+    def test_sin_la_columna_dice_pending_migration_no_cero(
+            self, conn, monkeypatch, tmp_path):
+        """BD con el schema viejo: no puede reportar 0/0."""
+        viejo = str(tmp_path / 'viejo.db')
+        c = sqlite3.connect(viejo)
+        c.executescript(
+            "CREATE TABLE user_devices (device_id TEXT PRIMARY KEY, "
+            "  user_id TEXT, device_token TEXT);"
+            "CREATE TABLE sync_auth_stats (day TEXT, secret_slot INT, "
+            "  has_token INT, n INT);"
+        )
+        c.execute("INSERT INTO user_devices VALUES ('d1','u1','tok')")
+        c.commit()
+        c.close()
+        out = self._adopcion(viejo, monkeypatch)
+        assert out['enforced_devices'] == {'pending_migration': True}
+
+    def test_con_la_columna_cuenta_de_verdad(self, conn, monkeypatch, tmp_path):
+        nuevo = str(tmp_path / 'nuevo.db')
+        c = sqlite3.connect(nuevo)
+        c.executescript(
+            "CREATE TABLE user_devices (device_id TEXT PRIMARY KEY, "
+            "  user_id TEXT, device_token TEXT, token_seen_at TEXT);"
+            "CREATE TABLE sync_auth_stats (day TEXT, secret_slot INT, "
+            "  has_token INT, n INT);"
+        )
+        c.execute("INSERT INTO user_devices VALUES ('d1','u1','t','2026-08-20')")
+        c.execute("INSERT INTO user_devices VALUES ('d2','u1','t',NULL)")
+        c.execute("INSERT INTO user_devices VALUES ('d3','u1',NULL,NULL)")
+        c.commit()
+        c.close()
+        out = self._adopcion(nuevo, monkeypatch)
+        ed = out['enforced_devices']
+        assert ed['total'] == 3, 'cuenta TODOS los dispositivos'
+        assert ed['protected'] == 1, 'solo el sellado esta protegido'
+        assert 'pending_migration' not in ed
+
+    def test_cero_protegidos_con_columna_NO_es_pending(
+            self, conn, monkeypatch, tmp_path):
+        """El caso que se confundia: columna presente y nadie sellado todavia.
+        Eso SI es un 0 legitimo y debe distinguirse del schema viejo."""
+        nuevo = str(tmp_path / 'cero.db')
+        c = sqlite3.connect(nuevo)
+        c.executescript(
+            "CREATE TABLE user_devices (device_id TEXT PRIMARY KEY, "
+            "  user_id TEXT, device_token TEXT, token_seen_at TEXT);"
+            "CREATE TABLE sync_auth_stats (day TEXT, secret_slot INT, "
+            "  has_token INT, n INT);"
+        )
+        c.execute("INSERT INTO user_devices VALUES ('d1','u1','t',NULL)")
+        c.commit()
+        c.close()
+        ed = self._adopcion(nuevo, monkeypatch)['enforced_devices']
+        assert ed == {'protected': 0, 'total': 1, 'pct': 0.0}

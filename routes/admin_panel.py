@@ -298,19 +298,34 @@ def _get_sync_auth_adoption(days: int = 30) -> dict:
     # emite token a cualquiera que llame a /sync/register, incluidos los
     # clientes viejos que no saben guardarlo. Solo `token_seen_at` demuestra que
     # ese aparato SABE mandarlo, que es lo unico que permite exigirselo.
+    #
+    # OJO CON EL SILENCIO: la primera version tragaba el OperationalError y
+    # devolvia 0/0, que es INDISTINGUIBLE de "aun no hay ninguno protegido".
+    # Y paso de verdad nada mas desplegar: el ALTER de `token_seen_at` vive en
+    # `sync_endpoints._init_tables`, que solo corre cuando una peticion de
+    # /sync/* crea la conexion singleton del proceso. Con ~20 syncs al dia, tras
+    # un deploy puede pasar un buen rato sin que ninguna entre, y mientras tanto
+    # el panel decia "0 dispositivos protegidos de 0" como si fuera un dato.
+    # El tell era `total: 0`: con cientos de dispositivos, COUNT(*) no puede dar
+    # cero. Ahora se distingue explicitamente y no hay que deducirlo.
     enforced = total_devices = 0
+    pending_migration = False
     try:
-        r = conn.execute(
-            "SELECT COUNT(*) AS total, "
-            "       SUM(CASE WHEN token_seen_at IS NOT NULL THEN 1 ELSE 0 END) "
-            "         AS enforced "
-            "FROM user_devices"
-        ).fetchone()
-        if r:
-            total_devices = int(r["total"] or 0)
-            enforced = int(r["enforced"] or 0)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(user_devices)")}
+        if "token_seen_at" not in cols:
+            pending_migration = True
+        else:
+            r = conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "       SUM(CASE WHEN token_seen_at IS NOT NULL THEN 1 ELSE 0 "
+                "           END) AS enforced "
+                "FROM user_devices"
+            ).fetchone()
+            if r:
+                total_devices = int(r["total"] or 0)
+                enforced = int(r["enforced"] or 0)
     except sqlite3.OperationalError:
-        pass  # backend sin la columna aun (deploy a medias)
+        pending_migration = True
     finally:
         conn.close()
 
@@ -336,12 +351,17 @@ def _get_sync_auth_adoption(days: int = 30) -> dict:
         },
         # Censo de DISPOSITIVOS con el token ya exigido (fase 2.5). Sube solo,
         # segun cada usuario actualiza; no hay que hacer nada para moverlo.
-        "enforced_devices": {
-            "protected": enforced,
-            "total": total_devices,
-            "pct": (round(enforced / total_devices * 100, 1)
-                    if total_devices else 0.0),
-        },
+        # `pending_migration: True` = la columna aun no existe en sync.db (el
+        # ALTER corre al primer /sync/* tras el deploy). NO es "cero
+        # protegidos": es "todavia no se puede saber".
+        "enforced_devices": (
+            {"pending_migration": True} if pending_migration else {
+                "protected": enforced,
+                "total": total_devices,
+                "pct": (round(enforced / total_devices * 100, 1)
+                        if total_devices else 0.0),
+            }
+        ),
     }
 
 
