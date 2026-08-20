@@ -288,7 +288,29 @@ def _get_sync_auth_adoption(days: int = 30) -> dict:
             (cutoff,),
         ).fetchall()
     except sqlite3.OperationalError:
+        conn.close()
         return {}
+
+    # FASE 2.5: cuantos dispositivos estan YA protegidos (token exigido). Es la
+    # metrica del despliegue, y NO es lo mismo que `device_token.pct`: ese es un
+    # porcentaje de PETICIONES de los ultimos 30 dias, este es un censo de
+    # DISPOSITIVOS. Tampoco vale contar `device_token IS NOT NULL`: el servidor
+    # emite token a cualquiera que llame a /sync/register, incluidos los
+    # clientes viejos que no saben guardarlo. Solo `token_seen_at` demuestra que
+    # ese aparato SABE mandarlo, que es lo unico que permite exigirselo.
+    enforced = total_devices = 0
+    try:
+        r = conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "       SUM(CASE WHEN token_seen_at IS NOT NULL THEN 1 ELSE 0 END) "
+            "         AS enforced "
+            "FROM user_devices"
+        ).fetchone()
+        if r:
+            total_devices = int(r["total"] or 0)
+            enforced = int(r["enforced"] or 0)
+    except sqlite3.OperationalError:
+        pass  # backend sin la columna aun (deploy a medias)
     finally:
         conn.close()
 
@@ -311,6 +333,14 @@ def _get_sync_auth_adoption(days: int = 30) -> dict:
             "with": with_token,
             "without": without_token,
             "pct": round(with_token / total * 100, 1) if total else 0.0,
+        },
+        # Censo de DISPOSITIVOS con el token ya exigido (fase 2.5). Sube solo,
+        # segun cada usuario actualiza; no hay que hacer nada para moverlo.
+        "enforced_devices": {
+            "protected": enforced,
+            "total": total_devices,
+            "pct": (round(enforced / total_devices * 100, 1)
+                    if total_devices else 0.0),
         },
     }
 
