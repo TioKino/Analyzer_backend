@@ -26,7 +26,7 @@ import string
 from fastapi import APIRouter, Request, HTTPException, Depends
 from starlette.requests import ClientDisconnect
 from pydantic import BaseModel
-from typing import Any, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone, timedelta
 import json, hashlib, sqlite3, os
 
@@ -1361,6 +1361,102 @@ async def sync_status():
         "total_users":    total_users,
         "total_registered_devices": total_registered_devices,
         "version":        "6.0",
+    }
+
+
+# ── PUBLISH ───────────────────────────────────────────────────
+
+
+class PublishLibraryRequest(BaseModel):
+    device_id: str
+    device_type: str = "unknown"
+    track_ids: List[str]
+    apply: bool = False
+
+
+@sync_router.post("/publish")
+async def sync_publish(req: PublishLibraryRequest):
+    """El escritorio declara su biblioteca COMPLETA; lo que no esté, se borra.
+
+    Por qué hace falta un endpoint aparte del push: el push manda CAMBIOS
+    ("añade esto", "borra aquello"), así que la nube solo se entera de un
+    borrado si alguien se lo dice track a track. Cuando el usuario llega a su
+    estado limpio por otro camino —formateo, reinstalación, disco nuevo— no hay
+    nada que decir: el servidor conserva los miles de tracks viejos y los sigue
+    sirviendo a los demás dispositivos. Este endpoint es la frase que faltaba:
+    "mi biblioteca es exactamente esta".
+
+    Dos fases a propósito. Con `apply=false` solo CUENTA lo que se perdería y
+    no toca nada, para que el cliente pueda enseñar "esto marcará N tracks como
+    borrados" ANTES de que el usuario decida. Es la operación más destructiva
+    de la app: no puede ejecutarse sin que se vea antes el daño.
+
+    Solo escritorio. Misma regla que el resto de borrados propagados: el móvil
+    es el aparato que se reinstala y se queda sin espacio, y no puede imponerle
+    su estado al resto.
+
+    NO toca `all_analysis` (el blob de clientes < v2.9.3): ese item es la
+    biblioteca entera en una sola fila, y darlo por borrado dejaría a un cliente
+    legacy sin nada. Se ignora en la comparación.
+    """
+    if req.device_type not in ("windows", "macos", "linux"):
+        raise HTTPException(
+            status_code=403,
+            detail="Publish requires a desktop device (windows/macos/linux)",
+        )
+
+    conn = _get_conn()
+    user_id = _require_user_id(conn, req.device_id)
+
+    declarados = set(req.track_ids)
+
+    # Candidatos: los análisis vivos de ESTE usuario. Los colectivos no entran
+    # (no son suyos) y `all_analysis` tampoco (ver docstring).
+    sobrantes = []
+    for item_key, in conn.execute(
+        "SELECT item_key FROM sync_items "
+        " WHERE user_id = ? AND data_type = 'analysis' AND deleted = 0",
+        (user_id,),
+    ):
+        if item_key == "all_analysis":
+            continue
+        if item_key not in declarados:
+            sobrantes.append(item_key)
+
+    if not req.apply:
+        return {
+            "would_delete": len(sobrantes),
+            "declared": len(declarados),
+            "sample": sobrantes[:20],
+            "applied": False,
+        }
+
+    now = _now_iso()
+    payload_json = json.dumps({})
+    borrados = 0
+    for item_key in sobrantes:
+        key = f"{user_id}|analysis|{item_key}"
+        # Se marca borrado y se sella con el device que publica, para que el
+        # filtro anti-eco del pull se lo entregue a TODOS los demás.
+        conn.execute(
+            "UPDATE sync_items "
+            "   SET deleted = 1, payload = ?, updated_at = ?, "
+            "       last_device_id = ?, device_type = ?, hash = ? "
+            " WHERE key = ?",
+            (payload_json, now, req.device_id, req.device_type,
+             _payload_hash({}), key),
+        )
+        # Sin esto, el dispositivo que publica se guarda su propio borrado como
+        # "ya visto" con el hash viejo y podría reenviárselo a sí mismo.
+        conn.execute("DELETE FROM device_seen WHERE item_key = ?", (key,))
+        borrados += 1
+
+    conn.commit()
+    return {
+        "would_delete": borrados,
+        "declared": len(declarados),
+        "applied": True,
+        "timestamp": now,
     }
 
 
