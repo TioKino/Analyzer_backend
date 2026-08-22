@@ -646,6 +646,53 @@ def _assign_orphan_data(conn: sqlite3.Connection, device_id: str, user_id: str):
         pass  # Table may not exist yet
 
 
+def _migrate_abandoned_account(conn: sqlite3.Connection, old_user: str, new_user: str):
+    """Si el device era el ULTIMO de su cuenta vieja, se lleva sus datos.
+
+    `_assign_orphan_data` solo rescata items SIN `user_id`. Pero un dispositivo
+    que sincroniza antes de vincularse no tiene datos huerfanos: tiene datos de
+    la cuenta que el servidor le creo solo. Al vincularlo, esos items se
+    quedaban bajo la cuenta vieja, invisibles para siempre — no los ve el otro
+    dispositivo, no los cuenta `/sync/publish`, y no hay forma de borrarlos.
+    Reportado por el owner: analizo 4 tracks en el movil antes de vincular y no
+    hubo manera ni de verlos desde el Mac ni de quitarlos.
+
+    **Solo si la cuenta vieja se queda SIN dispositivos.** Si le quedan otros,
+    esos items son parte de SU biblioteca y llevarselos seria quitarselos a un
+    usuario que sigue usandolos. Cuando no queda ninguno, en cambio, los datos
+    son inalcanzables para todo el mundo: migrarlos no se los quita a nadie.
+
+    Se llama DESPUES del INSERT del device en la cuenta nueva, para que la rama
+    de MAX_DEVICES (que revierte y lanza 409) no deje datos movidos a medias.
+    Los items colectivos llevan `user_id='__collective__'`, asi que el WHERE por
+    la cuenta vieja no los toca.
+    """
+    quedan = conn.execute(
+        "SELECT COUNT(*) FROM user_devices WHERE user_id = ?", (old_user,)
+    ).fetchone()[0]
+    if quedan > 0:
+        return
+
+    movidos = conn.execute(
+        "UPDATE sync_items SET user_id = ? WHERE user_id = ?",
+        (new_user, old_user),
+    ).rowcount
+    try:
+        conn.execute(
+            "UPDATE detected_tracks_sync SET user_id = ? WHERE user_id = ?",
+            (new_user, old_user),
+        )
+    except sqlite3.OperationalError:
+        pass  # la tabla puede no existir en BDs viejas
+    try:
+        conn.execute("DELETE FROM users WHERE user_id = ?", (old_user,))
+    except sqlite3.OperationalError:
+        pass
+    logger.info(
+        f"Cuenta {old_user} sin dispositivos: {movidos} items migrados a {new_user}"
+    )
+
+
 class LinkGenerateRequest(BaseModel):
     device_id: str
 
@@ -792,6 +839,8 @@ async def sync_link_join(req: LinkJoinRequest, request: Request):
 
     # Migrar datos huérfanos
     _assign_orphan_data(conn, req.device_id, target_user_id)
+    if existing_user and existing_user != target_user_id:
+        _migrate_abandoned_account(conn, existing_user, target_user_id)
 
     # No consumir el código: se mantiene válido hasta que expire (10 min)
     # para permitir vincular múltiples dispositivos con el mismo código.
