@@ -1064,12 +1064,22 @@ async def sync_pull(
     # un Mac formateado que pidio full=true sobre 5.000 tracks y recibio 0,
     # mientras el movil seguia enseñandolos porque los tenia de un pull viejo.
     #
-    # Sin riesgo de eco: al aplicar un pull el cliente NO marca dirty (escribe
-    # a disco y recarga por replaceFromDisk/loadFromDisk), asi que recibir lo
-    # propio no genera un push de vuelta.
+    # Sin riesgo de eco en el PUSH: al aplicar un pull el cliente NO marca dirty
+    # (escribe a disco y recarga por replaceFromDisk/loadFromDisk), asi que
+    # recibir lo propio no genera un push de vuelta.
+    #
+    # Si hay riesgo de eco al APLICARLO, y costo una carpeta: devolver lo que
+    # subio este mismo dispositivo significa devolverle una FOTO VIEJA DE SI
+    # MISMO. Los bloques de organizacion (all_folders, all_collections…) se
+    # aplican por sustitucion completa, asi que un aparato que subio "0
+    # carpetas", creo una despues y luego pidio full=true, se pisaba su propia
+    # carpeta con el vacio de antes. Por eso ahora se devuelve `last_device_id`:
+    # el cliente necesita poder reconocer su propio eco y no aplicarlo encima de
+    # datos que ya tiene. El filtro NO se puede hacer aqui — sin lo propio, el
+    # PC formateado vuelve a recibir cero, que es el bug de arriba.
     sql = (
         "SELECT si.key, si.data_type, si.item_key, si.payload, si.deleted, "
-        "       si.updated_at, si.device_type, si.hash "
+        "       si.updated_at, si.device_type, si.hash, si.last_device_id "
         "FROM sync_items si "
         "WHERE (si.user_id = ? OR si.user_id = '__collective__')"
     )
@@ -1098,7 +1108,8 @@ async def sync_pull(
     all_items: list = []  # list of (change_dict, (key, hash, payload_json))
 
     for row in rows:
-        key, data_type, item_key, payload_json, deleted, updated_at, device_type, item_hash = row
+        (key, data_type, item_key, payload_json, deleted, updated_at,
+         device_type, item_hash, last_device_id) = row
 
         # Verificar si el dispositivo ya conoce este hash (salvo full=true)
         if not full and seen_map.get(key) == item_hash:
@@ -1112,6 +1123,9 @@ async def sync_pull(
                 "deleted":     bool(deleted),
                 "updated_at":  updated_at,
                 "device_type": device_type,
+                # Quien lo subio. El cliente lo usa para no aplicarse su propio
+                # eco encima de datos mas nuevos (ver la nota del SELECT).
+                "last_device_id": last_device_id,
             },
             (key, item_hash, payload_json),
         ))
