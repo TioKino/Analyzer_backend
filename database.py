@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 import re
 import statistics
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 
 def _scrub_volatile_tokens(text: str) -> str:
@@ -615,6 +615,30 @@ class AnalysisDB:
             conn.execute("ALTER TABLE tracks ADD COLUMN analysis_version TEXT")
         except sqlite3.OperationalError:
             pass
+
+        # Plataforma del cliente que pidio el analisis. Es OTRO EJE que
+        # engine_source: ese dice que motor lo calculo (render | local_engine),
+        # y movil y la build del Mac App Store van los DOS a Render, asi que no
+        # los separa.
+        #
+        # Hace falta para la unica pregunta que decide donde invertir en
+        # cobertura de huella: del ~64% de tracks SIN chromaprint, cuanto es
+        # movil (donde el backfill no existe) y cuanto es MAS (donde el sandbox
+        # impide que fpcalc abra ficheros). Piden arreglos opuestos y hoy van
+        # en el mismo numero.
+        #
+        # El cliente ya mandaba `X-Platform` en cada peticion desde hace
+        # versiones; nadie la leia. Esto solo la sella.
+        #
+        # NULL = pre-instrumentacion. Mientras `unknown` domine el reparto, el
+        # porcentaje NO es representativo — mismo aviso que `device_linked`, que
+        # dio un «2 de 141» que no media nada.
+        try:
+            conn.execute("ALTER TABLE tracks ADD COLUMN platform TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_tracks_platform ON tracks(platform)')
 
         conn.commit()
         conn.close()
@@ -1399,8 +1423,8 @@ class AnalysisDB:
                 (id, filename, artist, title, duration, bpm, key, camelot,
                  energy_dj, genre, track_type, analysis_json, analyzed_at,
                  fingerprint, chromaprint, acoustic_id, engine_source,
-                 analysis_version, isrc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 analysis_version, isrc, platform)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 track_data['id'],
                 track_data['filename'],
@@ -1421,6 +1445,7 @@ class AnalysisDB:
                 track_data.get('engine_source'),
                 track_data.get('analysis_version'),
                 track_data.get('isrc'),
+                track_data.get('platform'),
             ))
 
             conn.commit()
@@ -3222,10 +3247,34 @@ class AnalysisDB:
                 "   GROUP BY acoustic_id HAVING COUNT(*) > 1)"
             )
             r2 = c.fetchone()
+
+            # El reparto por plataforma de lo que NO tiene huella. Es LA
+            # pregunta que decide donde invertir, y hasta ahora los dos casos
+            # iban en el mismo numero pidiendo arreglos opuestos:
+            #
+            #   ios / android -> el backfill no existe en movil
+            #   macos-mas     -> existe pero el sandbox no deja a fpcalc abrir
+            #                    ficheros, asi que no puede funcionar nunca
+            #
+            # Se cuenta con `platform` sellado en /analyze desde 2026-08-26.
+            # Todo lo anterior sale como `unknown`, y mientras `unknown` domine
+            # el reparto NO es representativo: es exactamente el error del
+            # «2 de 141» de device_linked, que media un paso sin instrumentar.
+            c.execute(
+                "SELECT COALESCE(platform, 'unknown') AS p, COUNT(*) AS n"
+                "  FROM tracks"
+                " WHERE chromaprint IS NULL OR chromaprint = ''"
+                " GROUP BY p ORDER BY n DESC"
+            )
+            sin_huella_por_plataforma = {
+                str(row['p']): int(row['n'] or 0) for row in c.fetchall()
+            }
+
             return {
                 'total_tracks': total,
                 'with_chromaprint': con_huella,
                 'without_chromaprint': total - con_huella,
+                'without_chromaprint_by_platform': sin_huella_por_plataforma,
                 'with_cluster': con_cluster,
                 'chromaprint_pct': (round(100.0 * con_huella / total, 1)
                                     if total else None),
@@ -3245,6 +3294,91 @@ class AnalysisDB:
             }
         except sqlite3.OperationalError:
             # BD antigua sin las columnas chromaprint/acoustic_id.
+            return {}
+        finally:
+            conn.close()
+
+    def acoustic_gap_breakdown(self) -> Dict[str, Any]:
+        """De los tracks SIN huella acustica: ¿son legado, o siguen entrando?
+
+        Es LA pregunta, y no la contestaba nada. El reparto por plataforma
+        (`without_chromaprint_by_platform`) dice de donde viene lo NUEVO, pero
+        se sella desde 2026-08-26 y no puede explicar el agujero historico.
+
+        Y el agujero historico casi seguro NO es «movil no puede»: `/analyze`
+        llama a `_attach_acoustic` INCONDICIONALMENTE sobre el fichero subido,
+        asi que todo track analizado por Render sale con huella venga de donde
+        venga, movil incluido. Y `/cache-analysis` tambien, porque el motor
+        local manda el chromaprint que calculo el. Las tres vias por las que un
+        track se queda sin huella son otras:
+
+          1. Se analizo ANTES de que `_attach_acoustic` existiera.
+          2. Dio cache-hit en el pre-check por huella y nunca subio el audio.
+          3. Venia del motor local ANTES de que este mandara el chromaprint.
+
+        Las tres son legado, y las tres las cierra el backfill del cliente.
+
+        `newest_without` es el numero que decide: si es de hace meses, el
+        agujero esta cerrado y solo hace falta que el backfill llegue a mas
+        sitios. Si es de hoy, hay algo activo produciendo tracks sin huella y
+        ampliar el backfill seria achicar agua sin tapar la via.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            sin = "chromaprint IS NULL OR chromaprint = ''"
+
+            c.execute(f"SELECT COUNT(*) AS n FROM tracks WHERE {sin}")
+            total = int(c.fetchone()['n'] or 0)
+
+            c.execute(
+                "SELECT COALESCE(engine_source, 'unknown') AS e, COUNT(*) AS n"
+                f"  FROM tracks WHERE {sin} GROUP BY e ORDER BY n DESC"
+            )
+            por_motor = {str(r['e']): int(r['n'] or 0) for r in c.fetchall()}
+
+            # OJO con la comparacion de fechas. `analyzed_at` se guarda con
+            # `datetime.now().isoformat()` -> 'YYYY-MM-DDTHH:MM:SS.ffffff',
+            # mientras que `datetime('now')` de SQLite da 'YYYY-MM-DD HH:MM:SS'.
+            # Comparadas como texto, la 'T' (0x54) es MAYOR que el espacio
+            # (0x20), asi que cualquier registro del mismo dia ordena despues y
+            # el corte se va un dia. Se compara solo la parte de FECHA, que
+            # ademas es lo que el bucket promete.
+            c.execute(
+                "SELECT"
+                "  SUM(CASE WHEN analyzed_at IS NULL THEN 1 ELSE 0 END) AS sin_fecha,"
+                "  SUM(CASE WHEN substr(analyzed_at,1,10) >= date('now','-7 days')"
+                "           THEN 1 ELSE 0 END) AS d7,"
+                "  SUM(CASE WHEN substr(analyzed_at,1,10) >= date('now','-30 days')"
+                "           THEN 1 ELSE 0 END) AS d30"
+                f"  FROM tracks WHERE {sin}"
+            )
+            r = c.fetchone()
+            sin_fecha = int(r['sin_fecha'] or 0)
+            d7 = int(r['d7'] or 0)
+            d30 = int(r['d30'] or 0)
+
+            c.execute(
+                "SELECT MAX(analyzed_at) AS m FROM tracks"
+                f" WHERE ({sin}) AND analyzed_at IS NOT NULL"
+            )
+            newest = c.fetchone()['m']
+
+            return {
+                'without_chromaprint': total,
+                'by_engine': por_motor,
+                'by_age': {
+                    'last_7d': d7,
+                    # Acumulados, no excluyentes: 'last_30d' INCLUYE los 7.
+                    'last_30d': d30,
+                    'older': max(total - d30 - sin_fecha, 0),
+                    'no_date': sin_fecha,
+                },
+                # El dato que decide si esto es legado o una via abierta.
+                'newest_without': newest,
+            }
+        except sqlite3.OperationalError:
+            # BD antigua sin chromaprint/engine_source.
             return {}
         finally:
             conn.close()

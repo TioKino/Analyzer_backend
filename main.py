@@ -157,6 +157,7 @@ from validation import (
     validate_track_id,
     check_rate_limit,
     get_client_ip,
+    client_platform,
     ValidationError,
 )
 
@@ -3386,6 +3387,15 @@ async def analyze_track(
         track_data['fingerprint'] = fingerprint
         track_data['engine_source'] = 'local_engine' if IS_LOCAL_ENGINE else 'render'
         track_data['analysis_version'] = ANALYSIS_VERSION
+        # Plataforma del cliente. Otro eje que engine_source: movil y la build
+        # del Mac App Store van los DOS a Render, asi que ese campo no los
+        # separa — y son justo los dos sitios donde la huella acustica no se
+        # puede generar (en movil no existe el backfill; en MAS el sandbox
+        # impide que fpcalc abra ficheros). Sin esto no hay forma de saber cual
+        # de los dos pesa mas en el 64% sin huella.
+        #
+        # La cabecera la manda el cliente desde hace versiones y nadie la leia.
+        track_data['platform'] = client_platform(request)
         # Huella acustica + cluster para la memoria colectiva por sonido.
         _attach_acoustic(track_data, tmp_path)
         db.save_track(track_data)

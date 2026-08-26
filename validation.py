@@ -582,3 +582,28 @@ def get_client_ip(request: Request) -> str:
         client_host,
         TRUSTED_PROXY_HOPS,
     )
+
+
+# Plataformas que el cliente declara en `X-Platform`. Lista CERRADA a
+# proposito: la cabecera la manda el cliente y va derecha a una columna que
+# luego se agrupa, asi que un valor libre seria a la vez basura en el panel y
+# una via de inyeccion de cardinalidad.
+#
+# `macos-mas` y `macos-dmg` son la misma plataforma con una diferencia que
+# decide el producto: la build del Mac App Store NO puede generar huella
+# acustica (el sandbox impide que el subproceso fpcalc abra ficheros) y la del
+# DMG si. Juntarlas en `macos` borraria justo la particion que se quiere medir.
+ALLOWED_PLATFORMS = frozenset({
+    'android', 'ios', 'windows', 'macos', 'macos-mas', 'macos-dmg', 'linux',
+})
+
+
+def client_platform(request: Request) -> Optional[str]:
+    """La plataforma declarada en `X-Platform`, o None si no viene o no vale.
+
+    None significa «no lo se», que es distinto de cualquier valor concreto.
+    Escribir aqui un `'unknown'` inventado convertiria un hueco en un dato —
+    el mismo fallo que la ficha de Info del cliente tenia con `bpm_source`.
+    """
+    raw = (request.headers.get('X-Platform') or '').strip().lower()
+    return raw if raw in ALLOWED_PLATFORMS else None

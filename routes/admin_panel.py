@@ -967,6 +967,16 @@ def _acoustic_coverage() -> dict:
         return {}
 
 
+def _acoustic_gap() -> dict:
+    """Reparto de los tracks SIN huella: legado o via abierta. Best-effort,
+    igual que el resto de metricas de observacion."""
+    try:
+        return _get_db().acoustic_gap_breakdown()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Admin] acoustic_gap_breakdown no disponible: {e}")
+        return {}
+
+
 def _vote_registration_stats() -> dict:
     """Reparto registrado/no-registrado de las identidades que votan en
     /community/* (SEC-12 fase 1). Best-effort: el panel nunca debe caerse por
@@ -1367,6 +1377,12 @@ async def telemetry(request: Request):
         # atascado o sin arrancar. Mirar `tracks_in_multi_clusters`, no
         # `with_chromaprint`: una huella sola no comparte nada con nadie.
         "acoustic": _acoustic_coverage(),
+        # De los que NO tienen huella: ¿legado, o sigue entrando gente sin
+        # ella? `newest_without` es el que decide. Si es de hace meses, el
+        # agujero esta cerrado y solo falta que el backfill llegue a mas
+        # sitios; si es de hoy, hay una via abierta y ampliar el backfill seria
+        # achicar agua sin taparla.
+        "acoustic_gap": _acoustic_gap(),
         # SEC-12 fase 1 — el dato que decide si se puede exigir registro para
         # votar en /community/*. `unregistered` es EXACTAMENTE la gente que se
         # quedaria fuera al activar la fase 2. `unknown` son votos anteriores a
