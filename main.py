@@ -44,6 +44,56 @@ from typing import Any, Dict, List, Optional
 # logger.info/warning/error en el codigo de inicializacion no fallen
 # con NameError. Antes habia prints aqui; B-L1 los migro a logger.
 import logging
+import sys as _sys
+
+# ============================================================================
+# LOS logger.info NO SE VEIAN EN RENDER. NINGUNO. (2026-08-26)
+# ============================================================================
+# Habia `logger.setLevel(logging.INFO)` y ni un solo HANDLER: ni aqui, ni un
+# `basicConfig`, ni nada. Y uvicorn configura solo sus propios loggers
+# (`uvicorn`, `uvicorn.error`, `uvicorn.access`), no el root.
+#
+# Cuando un record no encuentra handler en toda la cadena, Python cae en
+# `logging.lastResort`, que es un `_StderrHandler` **a nivel WARNING**. O sea:
+#
+#     logger.warning(...)  -> se ve            (por eso salia "Sin ID3 valido")
+#     logger.info(...)     -> SE TIRA EN SILENCIO
+#
+# Son **163 llamadas a logger.info** en este backend, incluidas las que dicen
+# si AudD se disparo y por que, si un cluster adopto metadata, o que decidio el
+# sync. Todas invisibles en produccion desde siempre.
+#
+# Cuesta encontrarlo porque en LOCAL funciona: `local_engine.py` si llama a
+# `logging.basicConfig(...)`. Depuras en local, ves los logs, y das por hecho
+# que en Render tambien estan. No estan.
+#
+# Se configura el ROOT y no solo `dj_analyzer` a proposito: los modulos usan
+# `logging.getLogger(__name__)` —`audd_helper`, `sync_endpoints`,
+# `acoustic_fingerprint`…— que NO cuelgan de `dj_analyzer`. Ponerle un handler
+# solo a este logger habria arreglado main.py y dejado el resto mudo, que es
+# justo el error que parece razonable al leerlo por encima.
+# ============================================================================
+#
+# Se configura a mano y NO con `logging.basicConfig(...)`: basicConfig es un
+# no-op si el root YA tiene handlers, y eso depende de quien haya importado
+# que antes (pytest se los pone, por ejemplo). Depender de esa sutileza para
+# algo que solo se nota en produccion es como llegamos aqui.
+_LOG_LEVEL = getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper(),
+                     logging.INFO)
+_root_logger = logging.getLogger()
+_root_logger.setLevel(_LOG_LEVEL)
+if not any(isinstance(_h, logging.StreamHandler) for _h in _root_logger.handlers):
+    _handler = logging.StreamHandler(_sys.stdout)
+    _handler.setFormatter(logging.Formatter('%(levelname)s [%(name)s] %(message)s'))
+    _root_logger.addHandler(_handler)
+
+# Las librerias de terceros a WARNING. Sin esto, subir el root a INFO llena el
+# log de Render con el ruido de urllib3/PIL/numba y entierra justo lo que
+# acabamos de rescatar — cambiar no ver nada por no encontrar nada.
+for _ruidoso in ('urllib3', 'httpx', 'httpcore', 'PIL', 'numba', 'matplotlib',
+                 'asyncio', 'multipart', 'python_multipart', 'charset_normalizer'):
+    logging.getLogger(_ruidoso).setLevel(logging.WARNING)
+
 logger = logging.getLogger('dj_analyzer')
 logger.setLevel(logging.INFO)
 
