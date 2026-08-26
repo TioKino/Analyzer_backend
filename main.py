@@ -1039,6 +1039,18 @@ class AnalysisResult(BaseModel):
     # "no identificado". Default False => parsear analysis_json legacy sin el
     # campo no rompe (mismo criterio que los 18 campos extendidos de arriba).
     audd_daily_cap_reached: bool = False
+    # Por que AudD NO corrio para este track, cuando el usuario lo forzo desde
+    # "Limpiar con AudD". El cap es solo UNO de los motivos, y no el mas comun:
+    # `should_trigger_audd` corta ANTES por duracion, y `force` no salta ese
+    # corte a proposito (AudD cobra por llamada y un mix de una hora no se
+    # identifica ni gastandola). Ese skip se loguea en DEBUG, o sea que era
+    # invisible en Render, y el cliente lo contaba como "no se pudo identificar
+    # (o se agoto la cuota)" — dos causas distintas en una frase, y ninguna
+    # cierta para un megamix de 68 minutos.
+    #
+    # Valores tal cual los devuelve `should_trigger_audd`: "duracion>720.0s",
+    # "daily cap (100/100)", "cooldown (2.1d/7d)"... None = AudD si corrio.
+    audd_skipped_reason: Optional[str] = None
 
 class CorrectionRequest(BaseModel):
     track_id: str
@@ -3199,11 +3211,34 @@ async def analyze_track(
         # should_trigger_audd() en audd_helper.py y CLAUDE.md > "AudD: tiers".
         if force_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
             try:
-                from audd_helper import is_garbage_metadata
-                if (is_garbage_metadata(result.artist, result.title)
-                        and db is not None
-                        and db.count_audd_calls_today() >= AUDD_DAILY_CAP):
-                    result.audd_daily_cap_reached = True
+                from audd_helper import is_garbage_metadata, should_trigger_audd
+                # El guard de metadata-basura se queda: si el track SI acabo
+                # identificado, AudD hizo su trabajo y no hay nada que excusar.
+                # Sin el, un track recien identificado por la llamada que agoto
+                # el cap se reportaria como "no corrio", que es falso.
+                if is_garbage_metadata(result.artist, result.title) and db is not None:
+                    _corrio, _motivo = should_trigger_audd(
+                        result.artist,
+                        result.title,
+                        result.duration or 0,
+                        fingerprint,
+                        db,
+                        min_duration=AUDD_MIN_DURATION,
+                        max_duration=AUDD_MAX_DURATION,
+                        daily_cap=AUDD_DAILY_CAP,
+                        cooldown_days=AUDD_COOLDOWN_DAYS,
+                        force=True,
+                    )
+                    if not _corrio:
+                        result.audd_skipped_reason = _motivo
+                        # Se mantiene el booleano de antes: hay clientes en la
+                        # calle que solo saben leer este campo.
+                        if _motivo.startswith('daily cap'):
+                            result.audd_daily_cap_reached = True
+                        logger.info(
+                            "[AudD-force] no corrio para %s: %s",
+                            (file.filename or '?')[:60], _motivo,
+                        )
             except Exception:
                 pass
 
