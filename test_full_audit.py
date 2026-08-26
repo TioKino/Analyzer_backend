@@ -535,14 +535,17 @@ class TestR008_DateTimeCrashProtection:
         else:
             pytest.skip("Frontend files not accessible")
 
-    def test_cue_pair_uses_tryparse(self):
-        path = os.path.join(os.path.dirname(__file__), "..", "Analyzer", "lib", "models", "cue_pair.dart")
-        if os.path.exists(path):
-            with open(path) as f:
-                content = f.read()
-            assert "DateTime.tryParse" in content
-        else:
-            pytest.skip("Frontend files not accessible")
+    # `test_cue_pair_uses_tryparse` vivia aqui. Se borro con la feature entera
+    # el 2026-08-26 (CuePair: modelo, CRUD, sync y provider, sin una sola UI que
+    # creara o enseñara un par).
+    #
+    # Se anota porque el sintoma fue silencioso y de los que enganian: el test
+    # no fallo, pasó a SKIP con «Frontend files not accessible» — que es falso,
+    # el fichero no es inaccesible, es que ya no existe. Un test que se salta
+    # para siempre con un motivo equivocado no lo mira nadie nunca mas.
+    #
+    # Si borras un modelo del repo de la app, busca aqui tambien: estas
+    # comprobaciones cruzan de repo y ningun grep en Analyzer/ las encuentra.
 
     def test_track_cue_uses_tryparse(self):
         path = os.path.join(os.path.dirname(__file__), "..", "Analyzer", "lib", "models", "track_cue.dart")
