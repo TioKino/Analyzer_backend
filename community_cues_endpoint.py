@@ -9,6 +9,33 @@
 #   2. Al exportar o sincronizar, envia sus cues al backend (POST /community-cues)
 #   3. Backend agrega cues de todos los DJs por fingerprint
 #   4. Cuando otro DJ analiza el mismo track, recibe zonas comunitarias (GET)
+#
+# ---------------------------------------------------------------------------
+# LA CLAVE: por que existe `legacy_key` / `?also=`
+# ---------------------------------------------------------------------------
+# Durante anios el cliente subio y leyo estos cues con su `track.id`, que es
+# MD5("nombre|tamanio") y NO es la huella. Aqui `tracks.id = tracks.fingerprint`
+# (MD5 del CONTENIDO), asi que ese `track.id` no existe en ninguna tabla:
+# `fingerprints_in_cluster()` no encontraba fila, no podia resolver el cluster
+# acustico y devolvia la clave pelada. Resultado: cada usuario escribia en su
+# propio compartimento y los cues comunitarios no cruzaron entre DJs ni una vez
+# (para cruzar harian falta dos ficheros de identico nombre Y tamanio; en
+# produccion, `collision_groups: 0` entre 317 dispositivos).
+#
+# El cliente ya manda la huella. Estos dos parametros son el puente para que el
+# cambio no se note, y son OPCIONALES: un cliente viejo se comporta igual que
+# antes.
+#
+#   GET  ?also=<clave vieja>   suma esa clave al conjunto que se consulta, asi
+#                              lo que subiste antes se sigue viendo aunque no
+#                              hayas vuelto a tocar el track.
+#   POST legacy_key            despues de guardar bajo la huella, borra las
+#                              filas de ESE MISMO device bajo la clave vieja.
+#                              Sin esto, mover un cue deja la posicion antigua
+#                              colgada y la zona sale por duplicado.
+#
+# Los dos estan acotados al `device_id` que llama o a una lectura de solo
+# lectura: no hay forma de tocar datos de otro usuario con ellos.
 # ============================================================================
 
 import sqlite3
@@ -37,6 +64,10 @@ class CueUpload(BaseModel):
     fingerprint: str
     device_id: str  # identificador anonimo del dispositivo
     cues: List[CueSubmission]
+    # Clave con la que ESTE cliente subia antes este track (su `track.id`,
+    # MD5(nombre|tamanio)). Ver el bloque LA CLAVE, abajo. Solo se usa para
+    # limpiar las filas viejas DE ESTE MISMO device; nunca para escribir.
+    legacy_key: Optional[str] = None
 
 
 class CommunityZoneResponse(BaseModel):
@@ -261,6 +292,29 @@ def register_community_endpoints(app, db):
                     now,
                 ))
 
+            # Migracion silenciosa: las filas que este MISMO device dejo bajo
+            # su clave vieja ya estan representadas por las que acabamos de
+            # insertar, asi que sobran. Y no solo sobran: si el DJ movio un
+            # cue, la posicion antigua sigue ahi y la zona sale DOS VECES, en
+            # dos sitios distintos de la onda.
+            #
+            # Acotado a (clave vieja, este device_id): no puede tocar datos de
+            # nadie mas ni la clave nueva. Y solo si de verdad es OTRA clave —
+            # un cliente sin huella manda las dos iguales y ahi borrar seria
+            # borrarse lo que se acaba de escribir.
+            if upload.legacy_key and upload.legacy_key != upload.fingerprint:
+                c.execute(
+                    'DELETE FROM community_cues '
+                    'WHERE fingerprint = ? AND device_id = ?',
+                    (upload.legacy_key, upload.device_id),
+                )
+                if c.rowcount:
+                    logger.info(
+                        "community_cues: migradas %s filas de %s -> %s (device %s)",
+                        c.rowcount, upload.legacy_key[:8],
+                        upload.fingerprint[:8], upload.device_id[:12],
+                    )
+
             conn.commit()
 
             # Devolver zonas actualizadas agregando TODO el cluster acustico
@@ -298,10 +352,14 @@ def register_community_endpoints(app, db):
 
     @app.get("/community-cues/{fingerprint}", response_model=CommunityResponse)
     @app.get("/community/cues/{fingerprint}", response_model=CommunityResponse)  # alias barra
-    async def get_community_cues(fingerprint: str):
+    async def get_community_cues(fingerprint: str, also: Optional[str] = None):
         """
         Obtiene las zonas comunitarias agregadas para un track.
         Solo devuelve zonas con >= 2 DJs de acuerdo.
+
+        `also` es la clave con la que el cliente subia ANTES este track (ver el
+        bloque LA CLAVE de la cabecera). Se suma al conjunto consultado para
+        que lo ya subido no desaparezca durante la transicion. Es solo lectura.
         """
         conn = db.conn
         c = conn.cursor()
@@ -310,6 +368,8 @@ def register_community_endpoints(app, db):
         # del mismo audio (cluster acustico), no solo las de este fingerprint.
         # Asi los cues que otro DJ marco en el flac aparecen al abrir el mp3.
         cluster = db.fingerprints_in_cluster(fingerprint)
+        if also and also not in cluster:
+            cluster = cluster + [also]
         ph = ','.join('?' * len(cluster))
         c.execute(
             f'SELECT {_CUES_COLUMNS} FROM community_cues WHERE fingerprint IN ({ph})',
