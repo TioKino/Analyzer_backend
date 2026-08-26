@@ -12,6 +12,7 @@ Estructura:
 - api_config.py / config.py - Configuracin
 """
 
+from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sync_endpoints import sync_router
@@ -182,6 +183,26 @@ IS_LOCAL_ENGINE = os.environ.get('LOCAL_ENGINE', 'false').lower() == 'true'
 # (BPM, key, energy, etc.) para invalidar la cache y forzar re-análisis.
 # Convención: NULL en BD == "1" (registros pre-versionado no se reanalizan).
 ANALYSIS_VERSION = "1"
+
+
+# Version de la API, en UN solo sitio. Estaba escrita a mano en TRES —el
+# constructor de FastAPI, `/` y `/health`— asi que subir una version y olvidar
+# otra dejaba dos numeros distintos conviviendo sin que nada avisara. Es la
+# misma forma que tenia `X-Client-Version` en el cliente, clavado en '2.3.0'
+# durante seis versiones.
+API_VERSION = "2.9.9"
+
+# Commit y rama desplegados. Render los expone como variables de entorno; fuera
+# de Render no existen y se devuelven como None.
+#
+# Motivo: `/health` daba `version` y `uptime_seconds` y nada mas, asi que para
+# saber si un deploy concreto habia entrado habia que DEDUCIRLO por el uptime
+# —«lleva 40 segundos levantado, debe de ser el mio»— que falla en cuanto Render
+# reinicia el worker por su cuenta.
+#
+# None y no `'unknown'`: una cadena inventada convertiria un hueco en un dato.
+DEPLOY_COMMIT = (os.environ.get('RENDER_GIT_COMMIT') or '')[:12] or None
+DEPLOY_BRANCH = os.environ.get('RENDER_GIT_BRANCH') or None
 
 
 def _is_analysis_current(track: dict) -> bool:
@@ -614,7 +635,7 @@ _DOCS_ON = (
 
 app = FastAPI(
     title="DJ Analyzer Pro API",
-    version="2.9.9",
+    version=API_VERSION,
     default_response_class=SafeJSONResponse,
     docs_url="/docs" if _DOCS_ON else None,
     redoc_url="/redoc" if _DOCS_ON else None,
@@ -4913,7 +4934,7 @@ if SIMILAR_TRACKS_ENABLED:
 async def root():
     return {
         "name": "DJ Analyzer Pro API",
-        "version": "2.9.9",
+        "version": API_VERSION,
         "status": "running",
         "modules": {
             "artwork": ARTWORK_ENABLED,
@@ -5011,8 +5032,18 @@ async def health():
 
     return {
         "status": "ok",
-        "version": "2.9.9",
+        "version": API_VERSION,
+        # Que commit esta corriendo AHORA. Sin esto, saber si un deploy entro
+        # exigia deducirlo por el uptime («lleva 40 segundos, debe de ser el
+        # mio»), que falla en cuanto Render reinicia el worker por su cuenta.
+        # None fuera de Render: es «no lo se», no un valor inventado.
+        "commit": DEPLOY_COMMIT,
+        "branch": DEPLOY_BRANCH,
         "uptime_seconds": uptime_seconds,
+        # El instante del arranque, en absoluto. `uptime_seconds` solo dice
+        # cuanto lleva; para cruzarlo con la hora de un merge hace falta esto.
+        "started_at": datetime.fromtimestamp(_startup_time, timezone.utc)
+                              .isoformat(),
         "checks": {
             "database": db_status,
             "ffmpeg": ffmpeg_status,
