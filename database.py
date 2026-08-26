@@ -616,6 +616,30 @@ class AnalysisDB:
         except sqlite3.OperationalError:
             pass
 
+        # Plataforma del cliente que pidio el analisis. Es OTRO EJE que
+        # engine_source: ese dice que motor lo calculo (render | local_engine),
+        # y movil y la build del Mac App Store van los DOS a Render, asi que no
+        # los separa.
+        #
+        # Hace falta para la unica pregunta que decide donde invertir en
+        # cobertura de huella: del ~64% de tracks SIN chromaprint, cuanto es
+        # movil (donde el backfill no existe) y cuanto es MAS (donde el sandbox
+        # impide que fpcalc abra ficheros). Piden arreglos opuestos y hoy van
+        # en el mismo numero.
+        #
+        # El cliente ya mandaba `X-Platform` en cada peticion desde hace
+        # versiones; nadie la leia. Esto solo la sella.
+        #
+        # NULL = pre-instrumentacion. Mientras `unknown` domine el reparto, el
+        # porcentaje NO es representativo — mismo aviso que `device_linked`, que
+        # dio un «2 de 141» que no media nada.
+        try:
+            conn.execute("ALTER TABLE tracks ADD COLUMN platform TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_tracks_platform ON tracks(platform)')
+
         conn.commit()
         conn.close()
 
@@ -1399,8 +1423,8 @@ class AnalysisDB:
                 (id, filename, artist, title, duration, bpm, key, camelot,
                  energy_dj, genre, track_type, analysis_json, analyzed_at,
                  fingerprint, chromaprint, acoustic_id, engine_source,
-                 analysis_version, isrc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 analysis_version, isrc, platform)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 track_data['id'],
                 track_data['filename'],
@@ -1421,6 +1445,7 @@ class AnalysisDB:
                 track_data.get('engine_source'),
                 track_data.get('analysis_version'),
                 track_data.get('isrc'),
+                track_data.get('platform'),
             ))
 
             conn.commit()
@@ -3222,10 +3247,34 @@ class AnalysisDB:
                 "   GROUP BY acoustic_id HAVING COUNT(*) > 1)"
             )
             r2 = c.fetchone()
+
+            # El reparto por plataforma de lo que NO tiene huella. Es LA
+            # pregunta que decide donde invertir, y hasta ahora los dos casos
+            # iban en el mismo numero pidiendo arreglos opuestos:
+            #
+            #   ios / android -> el backfill no existe en movil
+            #   macos-mas     -> existe pero el sandbox no deja a fpcalc abrir
+            #                    ficheros, asi que no puede funcionar nunca
+            #
+            # Se cuenta con `platform` sellado en /analyze desde 2026-08-26.
+            # Todo lo anterior sale como `unknown`, y mientras `unknown` domine
+            # el reparto NO es representativo: es exactamente el error del
+            # «2 de 141» de device_linked, que media un paso sin instrumentar.
+            c.execute(
+                "SELECT COALESCE(platform, 'unknown') AS p, COUNT(*) AS n"
+                "  FROM tracks"
+                " WHERE chromaprint IS NULL OR chromaprint = ''"
+                " GROUP BY p ORDER BY n DESC"
+            )
+            sin_huella_por_plataforma = {
+                str(row['p']): int(row['n'] or 0) for row in c.fetchall()
+            }
+
             return {
                 'total_tracks': total,
                 'with_chromaprint': con_huella,
                 'without_chromaprint': total - con_huella,
+                'without_chromaprint_by_platform': sin_huella_por_plataforma,
                 'with_cluster': con_cluster,
                 'chromaprint_pct': (round(100.0 * con_huella / total, 1)
                                     if total else None),
