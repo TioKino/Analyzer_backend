@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 import re
 import statistics
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 
 def _scrub_volatile_tokens(text: str) -> str:
@@ -3294,6 +3294,91 @@ class AnalysisDB:
             }
         except sqlite3.OperationalError:
             # BD antigua sin las columnas chromaprint/acoustic_id.
+            return {}
+        finally:
+            conn.close()
+
+    def acoustic_gap_breakdown(self) -> Dict[str, Any]:
+        """De los tracks SIN huella acustica: ¿son legado, o siguen entrando?
+
+        Es LA pregunta, y no la contestaba nada. El reparto por plataforma
+        (`without_chromaprint_by_platform`) dice de donde viene lo NUEVO, pero
+        se sella desde 2026-08-26 y no puede explicar el agujero historico.
+
+        Y el agujero historico casi seguro NO es «movil no puede»: `/analyze`
+        llama a `_attach_acoustic` INCONDICIONALMENTE sobre el fichero subido,
+        asi que todo track analizado por Render sale con huella venga de donde
+        venga, movil incluido. Y `/cache-analysis` tambien, porque el motor
+        local manda el chromaprint que calculo el. Las tres vias por las que un
+        track se queda sin huella son otras:
+
+          1. Se analizo ANTES de que `_attach_acoustic` existiera.
+          2. Dio cache-hit en el pre-check por huella y nunca subio el audio.
+          3. Venia del motor local ANTES de que este mandara el chromaprint.
+
+        Las tres son legado, y las tres las cierra el backfill del cliente.
+
+        `newest_without` es el numero que decide: si es de hace meses, el
+        agujero esta cerrado y solo hace falta que el backfill llegue a mas
+        sitios. Si es de hoy, hay algo activo produciendo tracks sin huella y
+        ampliar el backfill seria achicar agua sin tapar la via.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            sin = "chromaprint IS NULL OR chromaprint = ''"
+
+            c.execute(f"SELECT COUNT(*) AS n FROM tracks WHERE {sin}")
+            total = int(c.fetchone()['n'] or 0)
+
+            c.execute(
+                "SELECT COALESCE(engine_source, 'unknown') AS e, COUNT(*) AS n"
+                f"  FROM tracks WHERE {sin} GROUP BY e ORDER BY n DESC"
+            )
+            por_motor = {str(r['e']): int(r['n'] or 0) for r in c.fetchall()}
+
+            # OJO con la comparacion de fechas. `analyzed_at` se guarda con
+            # `datetime.now().isoformat()` -> 'YYYY-MM-DDTHH:MM:SS.ffffff',
+            # mientras que `datetime('now')` de SQLite da 'YYYY-MM-DD HH:MM:SS'.
+            # Comparadas como texto, la 'T' (0x54) es MAYOR que el espacio
+            # (0x20), asi que cualquier registro del mismo dia ordena despues y
+            # el corte se va un dia. Se compara solo la parte de FECHA, que
+            # ademas es lo que el bucket promete.
+            c.execute(
+                "SELECT"
+                "  SUM(CASE WHEN analyzed_at IS NULL THEN 1 ELSE 0 END) AS sin_fecha,"
+                "  SUM(CASE WHEN substr(analyzed_at,1,10) >= date('now','-7 days')"
+                "           THEN 1 ELSE 0 END) AS d7,"
+                "  SUM(CASE WHEN substr(analyzed_at,1,10) >= date('now','-30 days')"
+                "           THEN 1 ELSE 0 END) AS d30"
+                f"  FROM tracks WHERE {sin}"
+            )
+            r = c.fetchone()
+            sin_fecha = int(r['sin_fecha'] or 0)
+            d7 = int(r['d7'] or 0)
+            d30 = int(r['d30'] or 0)
+
+            c.execute(
+                "SELECT MAX(analyzed_at) AS m FROM tracks"
+                f" WHERE ({sin}) AND analyzed_at IS NOT NULL"
+            )
+            newest = c.fetchone()['m']
+
+            return {
+                'without_chromaprint': total,
+                'by_engine': por_motor,
+                'by_age': {
+                    'last_7d': d7,
+                    # Acumulados, no excluyentes: 'last_30d' INCLUYE los 7.
+                    'last_30d': d30,
+                    'older': max(total - d30 - sin_fecha, 0),
+                    'no_date': sin_fecha,
+                },
+                # El dato que decide si esto es legado o una via abierta.
+                'newest_without': newest,
+            }
+        except sqlite3.OperationalError:
+            # BD antigua sin chromaprint/engine_source.
             return {}
         finally:
             conn.close()
