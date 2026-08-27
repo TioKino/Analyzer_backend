@@ -1914,13 +1914,43 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         id3_data = extract_id3_metadata(file_path)
     
     # BPM
-    tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+    #
+    # `trim=True` (el defecto) recorta los beats debiles del principio y el
+    # final, y cuando NINGUNO pasa el umbral librosa hace
+    # `beats[valid.min():valid.max()]` sobre un array VACIO y revienta con
+    # «zero-size array to reduction operation minimum». Es un fallo suyo, no
+    # nuestro: pasa con audio sin percusion, casi silencio o muy corto.
+    #
+    # Tumbaba el analisis ENTERO —BPM, key, energia, genero, waveform,
+    # preview— por no poder recortar unos beats de los bordes. Dos usuarios lo
+    # comieron el 2026-08-19 y el track no se analizo nunca. Reintentar sin
+    # recorte da el mismo tempo y se salta la funcion que peta.
+    try:
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+    except ValueError as e:
+        logger.warning(
+            f"[BPM] beat_track fallo ({e}); reintento sin trim. "
+            "Audio sin percusion o demasiado corto."
+        )
+        try:
+            tempo, beats = librosa.beat.beat_track(y=y, sr=sr, trim=False)
+        except Exception as e2:  # noqa: BLE001
+            # Ni asi. El BPM se queda sin medir —y se DICE, con bpm=0 y
+            # bpm_source vacio, en vez de inventar un 120— pero el resto del
+            # analisis sigue: la key, la energia y el genero no dependen de
+            # los beats.
+            logger.warning(f"[BPM] sin beats: {type(e2).__name__}: {e2}")
+            tempo, beats = 0.0, np.array([], dtype=int)
     # librosa >=0.10 puede devolver tempo como np.ndarray (ej. array([120.5]))
     # en lugar de un escalar. Normalizar antes de convertir a float.
     if hasattr(tempo, '__iter__'):
         tempo = tempo[0] if len(tempo) > 0 else 0.0
     bpm = float(tempo)
-    bpm_source = "analysis"
+    # Si no se pudo medir, NO se firma como «analysis»: eso afirmaria que el
+    # backend lo midio. Se deja la fuente vacia, que es lo que la ficha del
+    # cliente sabe leer como «no se sabe» (`bpmSourceKnown`). Un 0 con fuente
+    # «analysis» es un valor por defecto pintado como un hecho.
+    bpm_source = "analysis" if bpm > 0 else ""
     
     # Usar BPM de ID3 si existe y es razonable
     if id3_data.get('bpm') and 60 < id3_data['bpm'] < 200:
