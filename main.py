@@ -190,7 +190,7 @@ ANALYSIS_VERSION = "1"
 # otra dejaba dos numeros distintos conviviendo sin que nada avisara. Es la
 # misma forma que tenia `X-Client-Version` en el cliente, clavado en '2.3.0'
 # durante seis versiones.
-API_VERSION = "2.9.9"
+API_VERSION = "2.9.10"
 
 # Commit y rama desplegados. Render los expone como variables de entorno; fuera
 # de Render no existen y se devuelven como None.
