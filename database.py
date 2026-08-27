@@ -637,6 +637,24 @@ class AnalysisDB:
             conn.execute("ALTER TABLE tracks ADD COLUMN platform TEXT")
         except sqlite3.OperationalError:
             pass
+
+        # Quien emitio cada correccion. `save_correction` recibia `device_id`
+        # desde siempre y NO lo guardaba en ningun sitio: la columna no
+        # existia. Sin ella, el consenso contaba `DISTINCT track_id ||
+        # corrected_at`, o sea POR MARCA DE TIEMPO — el mismo aparato votando
+        # tres veces fabricaba un `consensus_3` (prioridad 80, gana al motor
+        # local), sin necesidad de inventarse ni un ID.
+        #
+        # NULL en todo lo anterior a esto, y esas filas se siguen contando de
+        # una en una (ver `get_consensus`): perderlas seria tirar consenso
+        # legitimo ya acumulado.
+        try:
+            conn.execute("ALTER TABLE corrections ADD COLUMN device_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_corr_device '
+            'ON corrections(fingerprint, field, device_id)')
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_tracks_platform ON tracks(platform)')
 
@@ -1459,22 +1477,26 @@ class AnalysisDB:
         try:
             c = conn.cursor()
 
+            # Un dispositivo, un voto POR CAMPO. Re-votar sustituye el TUYO.
+            #
+            # Lo que habia aqui borraba «la correccion mas reciente de este
+            # track+campo» sin mirar de quien era, asi que el segundo votante
+            # borraba el voto del primero. No era dedup por dispositivo: era
+            # ultimo-que-escribe-gana disfrazado. Con dos DJs corrigiendo el
+            # mismo tema, el consenso no subia de 1 jamas.
             if device_id and fingerprint:
                 c.execute('''
                     DELETE FROM corrections
-                    WHERE fingerprint = ? AND field = ? AND track_id = ?
-                    AND corrected_at IN (
-                        SELECT corrected_at FROM corrections
-                        WHERE fingerprint = ? AND field = ? AND track_id = ?
-                        ORDER BY corrected_at DESC LIMIT 1
-                    )
-                ''', (fingerprint, field, track_id, fingerprint, field, track_id))
+                    WHERE fingerprint = ? AND field = ? AND device_id = ?
+                ''', (fingerprint, field, device_id))
 
             c.execute('''
                 INSERT INTO corrections
-                (track_id, field, old_value, new_value, corrected_at, fingerprint)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (track_id, field, old_value, new_value, datetime.now().isoformat(), fingerprint))
+                (track_id, field, old_value, new_value, corrected_at,
+                 fingerprint, device_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (track_id, field, old_value, new_value,
+                  datetime.now().isoformat(), fingerprint, device_id))
 
             conn.commit()
         finally:
@@ -1493,8 +1515,22 @@ class AnalysisDB:
         try:
             c = conn.cursor()
 
+            # Un voto por DISPOSITIVO, no por marca de tiempo.
+            #
+            # `DISTINCT track_id || corrected_at` contaba cada correccion como
+            # un voto, asi que el mismo aparato pulsando tres veces fabricaba
+            # un `consensus_3` — que en `ANALYSIS_SOURCE_PRIORITY` vale 80 y
+            # gana al motor local (50) y al id3 (30).
+            #
+            # `COALESCE(device_id, 'anon:' || id)`: las filas anteriores a la
+            # columna tienen `device_id` NULL, y `COUNT(DISTINCT device_id)`
+            # IGNORA los NULL en SQL — sin el COALESCE, todo el consenso
+            # historico caeria a 0 de golpe. Cada fila vieja sigue valiendo
+            # uno, que es exactamente lo que valia antes. Es la misma trampa
+            # que ya mordio en el embudo con los eventos anonimos de la web.
             c.execute('''
-                SELECT new_value, COUNT(DISTINCT track_id || corrected_at) as vote_count
+                SELECT new_value,
+                       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS vote_count
                 FROM corrections
                 WHERE fingerprint = ? AND field = ?
                 GROUP BY new_value
@@ -1529,7 +1565,12 @@ class AnalysisDB:
             c = conn.cursor()
 
             c.execute('''
-                SELECT field, new_value, COUNT(DISTINCT track_id || corrected_at) as vote_count
+                -- Mismo criterio que `get_consensus`: un voto por
+                -- DISPOSITIVO. Tenerlo distinto en los dos sitios haria
+                -- que el mismo track diera consensos diferentes segun
+                -- por donde se preguntara.
+                SELECT field, new_value,
+                       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS vote_count
                 FROM corrections
                 WHERE fingerprint = ?
                 GROUP BY field, new_value
