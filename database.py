@@ -587,6 +587,28 @@ class AnalysisDB:
                 day TEXT GENERATED ALWAYS AS (substr(timestamp,1,10)) VIRTUAL
             )
         ''')
+        # Primer dia que se vio cada dispositivo. Tabla APARTE de `events` y
+        # que NO se purga NUNCA, y ese es todo el motivo de que exista.
+        #
+        # `events` se purga a los 90 dias. Mientras el D0 se derivaba de
+        # `MIN(day) FROM events`, la purga no borraba solo datos viejos:
+        # REESCRIBIA el D0 de todo usuario con mas de 90 dias, que pasaba a
+        # figurar como instalado hace poco. Y como esos son justo los usuarios
+        # que siguen activos, entraban en la cohorte como altas nuevas y
+        # contaban como retenidos casi con seguridad. O sea que la purga
+        # INFLABA la retencion, y cuanto mas viejo era el parque, mas.
+        #
+        # Es una fila de ~50 bytes por dispositivo. Con 317 dispositivos son
+        # 16 KB: no hay nada que purgar aqui.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS device_first_seen (
+                device_id TEXT PRIMARY KEY,
+                first_day TEXT NOT NULL,
+                first_platform TEXT,
+                first_app_version TEXT
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_dfs_day ON device_first_seen(first_day)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_name ON events(event_name)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id)')
@@ -982,9 +1004,26 @@ class AnalysisDB:
                 c.execute(
                     """
                     WITH firsts AS (
-                        SELECT device_id, MIN(day) AS d0
+                        -- D0 desde `device_first_seen`, NO desde `events`.
+                        -- `events` se purga a los 90 dias, y derivar el D0 de
+                        -- ahi reescribia la fecha de alta de todo usuario
+                        -- veterano: pasaba a figurar como recien instalado, y
+                        -- como sigue activo contaba como retenido. La purga
+                        -- INFLABA la retencion. Esta tabla no se purga.
+                        SELECT device_id, first_day AS d0
+                        FROM device_first_seen
+                        WHERE device_id IS NOT NULL
+                        UNION
+                        -- Respaldo para dispositivos que tienen eventos pero
+                        -- todavia no fila en `device_first_seen`: datos
+                        -- anteriores a que la tabla existiera. Es el D0 malo
+                        -- (lo que la purga haya dejado), pero perderlos del
+                        -- todo seria peor. Se vacia solo segun `log_event` va
+                        -- sellando.
+                        SELECT device_id, MIN(day)
                         FROM events
                         WHERE event_name = 'app_opened' AND device_id IS NOT NULL
+                          AND device_id NOT IN (SELECT device_id FROM device_first_seen)
                         GROUP BY device_id
                     )
                     SELECT
@@ -1052,9 +1091,17 @@ class AnalysisDB:
             c.execute(
                 """
                 WITH firsts AS (
-                    SELECT device_id, MIN(day) AS d0
+                    -- Ver la nota de get_return_rates: el D0 sale de
+                    -- `device_first_seen`, que no se purga.
+                    SELECT device_id, first_day AS d0
+                    FROM device_first_seen
+                    WHERE device_id IS NOT NULL
+                    UNION
+                    -- Ver la nota de get_return_rates.
+                    SELECT device_id, MIN(day)
                     FROM events
                     WHERE event_name = 'app_opened' AND device_id IS NOT NULL
+                      AND device_id NOT IN (SELECT device_id FROM device_first_seen)
                     GROUP BY device_id
                 )
                 SELECT
@@ -2854,8 +2901,51 @@ class AnalysisDB:
                     (app_version or None) and app_version[:20],
                 ),
             )
+            # Sellar el D0 real. `INSERT OR IGNORE` -> solo la primera vez;
+            # a partir de ahi la fila no se toca por mucho que el device siga
+            # mandando eventos. Best-effort dentro del best-effort: si esta
+            # tabla falla, el evento se guarda igual.
+            try:
+                c.execute(
+                    'INSERT OR IGNORE INTO device_first_seen '
+                    '(device_id, first_day, first_platform, first_app_version) '
+                    "VALUES (?, date('now'), ?, ?)",
+                    (device_id, platform, app_version),
+                )
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
             return c.lastrowid or 0
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def backfill_first_seen(self) -> int:
+        """Siembra `device_first_seen` con lo que quede en `events`.
+
+        Solo sirve UNA vez, al desplegar: recupera el D0 de los dispositivos
+        cuyos eventos todavia no ha borrado la purga. **Lo anterior a 90 dias
+        esta perdido y no se puede recuperar** — no hay de donde sacarlo.
+
+        Consecuencia practica, y hay que decirla al leer los primeros
+        resultados: durante los ~90 dias siguientes al deploy conviven
+        dispositivos con D0 de verdad y dispositivos cuyo D0 es "el dia que
+        empezamos a mirar". Las cohortes viejas siguen sin ser fiables; las
+        nuevas si. A partir de ahi, todas.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'INSERT OR IGNORE INTO device_first_seen '
+                '(device_id, first_day) '
+                "SELECT device_id, MIN(day) FROM events "
+                "WHERE event_name = 'app_opened' AND device_id IS NOT NULL "
+                'GROUP BY device_id'
+            )
+            conn.commit()
+            return c.rowcount or 0
         except sqlite3.OperationalError:
             return 0
         finally:
@@ -2937,9 +3027,26 @@ class AnalysisDB:
                 c.execute(
                     """
                     WITH firsts AS (
-                        SELECT device_id, MIN(day) AS d0
+                        -- D0 desde `device_first_seen`, NO desde `events`.
+                        -- `events` se purga a los 90 dias, y derivar el D0 de
+                        -- ahi reescribia la fecha de alta de todo usuario
+                        -- veterano: pasaba a figurar como recien instalado, y
+                        -- como sigue activo contaba como retenido. La purga
+                        -- INFLABA la retencion. Esta tabla no se purga.
+                        SELECT device_id, first_day AS d0
+                        FROM device_first_seen
+                        WHERE device_id IS NOT NULL
+                        UNION
+                        -- Respaldo para dispositivos que tienen eventos pero
+                        -- todavia no fila en `device_first_seen`: datos
+                        -- anteriores a que la tabla existiera. Es el D0 malo
+                        -- (lo que la purga haya dejado), pero perderlos del
+                        -- todo seria peor. Se vacia solo segun `log_event` va
+                        -- sellando.
+                        SELECT device_id, MIN(day)
                         FROM events
                         WHERE event_name = 'app_opened' AND device_id IS NOT NULL
+                          AND device_id NOT IN (SELECT device_id FROM device_first_seen)
                         GROUP BY device_id
                     )
                     SELECT

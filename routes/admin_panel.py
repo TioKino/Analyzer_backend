@@ -1597,8 +1597,23 @@ def _funnel_steps_for(platform):
 # Grupos de plataforma: la mayoria de DJs tienen la musica en PC/discos, no en
 # el movil -> el embudo de 'desktop' es el que mide valor real. `?platform=`
 # acepta un grupo (desktop/mobile) o una plataforma concreta (macos/windows/...).
+#
+# `macos-mas` y `macos-dmg` van dentro de "desktop" aunque HOY el cliente
+# todavia mande `macos` a secas en los eventos. Y no es por si acaso: son DOS
+# vocabularios distintos para la misma palabra, en la misma BD.
+#
+#   tracks.platform  <- cabecera `X-Platform` <- PlatformUtils.platformHeader
+#                       -> distingue macos-mas de macos-dmg
+#   events.platform  <- cuerpo de /client-event <- EventReporter._platformName
+#                       -> dice `macos` para los dos
+#
+# El dia que el emisor de eventos se alinee con el de tracks —que es lo que
+# toca, porque MAS y DMG son justo los dos sitios donde la huella acustica se
+# comporta distinto— los usuarios del Mac App Store se caerian FUERA del grupo
+# desktop sin un solo error: el embudo de escritorio perderia una plataforma
+# entera y pareceria una fuga de producto. Dejarlo preparado cuesta dos lineas.
 _PLATFORM_GROUPS = {
-    "desktop": ("macos", "windows", "linux"),
+    "desktop": ("macos", "macos-mas", "macos-dmg", "windows", "linux"),
     "mobile": ("ios", "android"),
 }
 
@@ -1622,10 +1637,85 @@ async def funnel(request: Request, platform: str = None):
     )
     plat_sql, plat_params = _platform_filter(platform)
     counts = {}
+    window = {}
+    cohort_size = 0
     if os.path.exists(analysis_db_path):
         adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
         try:
+            # ── EL EMBUDO DE VERDAD: UNA cohorte, seguida por los pasos ──
+            #
+            # Antes esto contaba, por cada paso, los dispositivos que lo
+            # dispararon en los ultimos 30 dias. Eso NO es un embudo: son
+            # poblaciones distintas puestas en fila.
+            #
+            # El caso que lo rompe es el normal, no uno raro. `app_opened`
+            # salta en cada arranque, asi que el primer paso son TODOS los
+            # activos del mes. `onboarding_completed` solo salta la primera
+            # vez en la vida del dispositivo (la pantalla se marca vista en
+            # prefs), asi que el segundo paso son SOLO los que se instalaron
+            # este mes. Lo mismo con `import_*`: la biblioteca se importa una
+            # vez y ya. O sea que la "caida" entre el paso 1 y el 2 era, en su
+            # mayor parte, gente que ya habia pasado por ahi hace meses.
+            #
+            # Cuanto mas veterano el parque, peor pintaba el embudo — justo al
+            # reves de la realidad. Y como el numero se movia solo, cada
+            # lectura invitaba a "arreglar el onboarding" sobre un abandono
+            # que no existia.
+            #
+            # Ahora: se fija la cohorte (dispositivos cuyo D0 cae en la
+            # ventana) y se miran SUS eventos, sin limite de fecha para el
+            # evento. Un usuario que se instalo el dia 28 y completo el import
+            # el 32 cuenta como convertido, que es lo correcto: el embudo mide
+            # si llega, no si corre.
+            #
+            # Los eventos ANONIMOS (los de la web, sin device_id) no pueden
+            # estar en una cohorte — no hay a quien seguir. Siguen enteros en
+            # `raw`.
+            # El D0 sale de `device_first_seen`, con respaldo en `events` para
+            # los dispositivos que aun no tienen fila ahi (datos anteriores a
+            # que la tabla existiera). Misma regla que en retencion: ver
+            # `get_return_rates`.
+            FIRSTS = (
+                "WITH firsts AS ("
+                " SELECT device_id, first_day AS d0 FROM device_first_seen"
+                " WHERE device_id IS NOT NULL"
+                " UNION"
+                " SELECT device_id, MIN(substr(timestamp,1,10)) FROM events"
+                " WHERE event_name = 'app_opened' AND device_id IS NOT NULL"
+                "   AND device_id NOT IN (SELECT device_id FROM device_first_seen)"
+                " GROUP BY device_id"
+                ") "
+            )
             rows = adb.execute(
+                FIRSTS +
+                "SELECT e.event_name, COUNT(DISTINCT e.device_id) AS devices "
+                "FROM events e "
+                "JOIN firsts f ON f.device_id = e.device_id "
+                "WHERE f.d0 >= date('now','-30 days')"
+                + plat_sql.replace(" AND LOWER(platform)", " AND LOWER(e.platform)") +
+                " GROUP BY e.event_name",
+                plat_params,
+            ).fetchall()
+            counts = {r[0]: int(r[1] or 0) for r in rows}
+
+            # La cohorte se cuenta con el MISMO filtro de plataforma que los
+            # pasos. Sin eso, `?platform=mobile` dividiria los pasos de movil
+            # entre la cohorte de todo el parque y daria porcentajes ridiculos.
+            cohort_size = int(adb.execute(
+                FIRSTS +
+                "SELECT COUNT(DISTINCT f.device_id) FROM firsts f "
+                "WHERE f.d0 >= date('now','-30 days')" +
+                ("" if not plat_sql else
+                 " AND EXISTS (SELECT 1 FROM events e2 WHERE e2.device_id = f.device_id"
+                 + plat_sql.replace(" AND LOWER(platform)", " AND LOWER(e2.platform)")
+                 + ")"),
+                plat_params,
+            ).fetchone()[0] or 0)
+
+            # La cuenta VIEJA, conservada aparte y con nombre honesto. Sigue
+            # sirviendo para "cuanta gente hizo X este mes", que es una
+            # pregunta legitima — pero no es un embudo y no se lee como tal.
+            wrows = adb.execute(
                 "SELECT event_name, "
                 "       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS devices "
                 "FROM events WHERE timestamp >= datetime('now','-30 days')"
@@ -1633,16 +1723,21 @@ async def funnel(request: Request, platform: str = None):
                 " GROUP BY event_name",
                 plat_params,
             ).fetchall()
-            counts = {r[0]: int(r[1] or 0) for r in rows}
+            window = {r[0]: int(r[1] or 0) for r in wrows}
         except sqlite3.OperationalError:
-            counts = {}  # tabla events aun no existe (BD vieja)
+            # `events` o `device_first_seen` aun no existen (BD vieja).
+            counts = {}
         finally:
             adb.close()
 
     # Construir el embudo ordenado con drop-off relativo al primer paso.
     # Los pasos dependen de la plataforma: ver _funnel_steps_for.
     funnel_steps = _funnel_steps_for(platform)
-    top = counts.get(funnel_steps[0][0], 0) or 0
+    # El denominador es la COHORTE, no el primer paso. Si un dispositivo se dio
+    # de alta y nunca llego a mandar `app_opened` (evento perdido por red), con
+    # el primer paso de denominador desaparecia del embudo entero en vez de
+    # contar como el abandono que es.
+    top = cohort_size or (counts.get(funnel_steps[0][0], 0) or 0)
     steps = []
     prev = None
     for name, label in funnel_steps:
@@ -1664,6 +1759,11 @@ async def funnel(request: Request, platform: str = None):
     return {
         "window_days": 30,
         "platform": platform or "all",  # que subconjunto se esta mirando
+        # Que mide `steps`, dicho en la propia respuesta para que nadie tenga
+        # que acordarse: una COHORTE (altas de los ultimos 30 dias) seguida por
+        # los pasos, sin limite de fecha para el evento.
+        "basis": "cohort",
+        "cohort_size": cohort_size,
         "steps": steps,
         # Que import_* no salga en `steps` del movil NO significa que no se mida:
         # sigue en `raw`, que lleva TODOS los eventos. Lo que cambia es que deja
@@ -1672,7 +1772,12 @@ async def funnel(request: Request, platform: str = None):
             "movil sin import_*: alli la musica llega por sync, no se importa"
             if _funnel_steps_for(platform) is _FUNNEL_MOBILE else None
         ),
-        "raw": counts,  # todos los eventos (incluye los no-embudo: session_start, etc.)
+        # Actividad del mes por evento: cuanta gente hizo X en los ultimos 30
+        # dias, sin cohorte. Es la cuenta que `steps` usaba antes. Pregunta
+        # legitima, pero NO es un embudo: los pasos son poblaciones distintas
+        # y restarlos da abandonos inventados.
+        "window_devices": window,
+        "raw": counts,  # eventos de la cohorte (incluye los no-embudo)
     }
 
 
@@ -1707,19 +1812,104 @@ async def retention(request: Request):
         tool = _get_db().get_tool_usage_metrics()
     except Exception:  # noqa: BLE001
         tool = {}
-    # `investment`: cuanta biblioteca ha metido cada usuario. En una
-    # herramienta el coste de cambio (rehacer 3.000 tracks en otra app) predice
-    # la disposicion a pagar MUCHO mejor que la frecuencia de apertura.
+    # `investment`: cuanta biblioteca tiene cada usuario. En una herramienta el
+    # coste de cambio (rehacer 3.000 tracks en otra app) predice la disposicion
+    # a pagar MUCHO mejor que la frecuencia de apertura. Es EL numero del
+    # paywall, asi que hay que sacarlo de donde esta la verdad.
+    #
+    # La verdad son las bibliotecas de `sync.db`, no los eventos. La version
+    # anterior sumaba los `import_completed` de cada device, y eso fallaba por
+    # los dos lados a la vez:
+    #
+    #   - Por abajo: `events` se purga a los 90 dias. Quien importo sus 5.000
+    #     tracks hace cuatro meses contaba CERO. O sea que los usuarios con mas
+    #     coste de cambio —los que llevan mas tiempo, los que pagarian— eran
+    #     justo los invisibles.
+    #   - Por arriba: reimportar la misma carpeta vuelve a disparar el evento y
+    #     los numeros se SUMABAN. Cuatro pasadas de 500 tracks daban 2.000.
+    #
+    # Con los dos sesgos jugando en direcciones opuestas, la mediana no se
+    # podia corregir a ojo. Y la mediana era el numero que decidia.
     try:
-        investment = _get_db().get_library_investment()
+        investment = _library_investment_real()
     except Exception:  # noqa: BLE001
         investment = {}
+    # La cuenta vieja se conserva bajo otro nombre: mide algo distinto y real
+    # (actividad de import del trimestre), solo que no es "cuanta biblioteca
+    # tiene la gente".
+    try:
+        imports_90d = _get_db().get_library_investment()
+    except Exception:  # noqa: BLE001
+        imports_90d = {}
     return {
         "cohorts": cohorts,
         "returns": returns,
         "tool": tool,
         "investment": investment,
+        "import_activity_90d": imports_90d,
     }
+
+
+def _library_investment_real() -> dict:
+    """Inversion por usuario contada sobre las bibliotecas de `sync.db`.
+
+    Es la misma fuente y el mismo dedup que usa `/admin/users` para el
+    `track_count` de cada device, asi que los dos numeros cuadran.
+
+    Cursor sin `fetchall()` y una sola pasada: estos endpoints recorren la
+    biblioteca entera y ya tumbaron produccion con un OOM una vez.
+    """
+    conn = _get_sync_conn()
+    try:
+        por_device: dict[str, list] = {}
+        rows = conn.execute(
+            "SELECT last_device_id, item_key, payload FROM sync_items "
+            "WHERE data_type = 'analysis'"
+        )
+        for r in rows:
+            dev = r["last_device_id"]
+            if not dev:
+                continue
+            por_device.setdefault(dev, []).append(r)
+
+        counts = []
+        for dev, filas in por_device.items():
+            ids, _prev, sin_id = _count_unique_tracks(filas)
+            n = len(ids) + sin_id
+            if n > 0:
+                counts.append(n)
+
+        counts.sort()
+        if not counts:
+            return {
+                'source': 'sync.db',
+                'devices_with_library': 0,
+                'total_tracks': 0,
+                'median_tracks': 0,
+                'max_tracks': 0,
+                'buckets': {'gte_100': 0, 'gte_500': 0, 'gte_1000': 0},
+            }
+        mid = len(counts) // 2
+        median = (counts[mid] if len(counts) % 2
+                  else (counts[mid - 1] + counts[mid]) / 2.0)
+        return {
+            # Se dice de donde sale: el denominador de `sync.db` (bibliotecas
+            # de usuarios) NO es el mismo universo que el de `analysis.db`
+            # (analisis del backend, con borrados y nunca sincronizados
+            # dentro). El panel los enseña juntos y eso ya despisto una vez.
+            'source': 'sync.db',
+            'devices_with_library': len(counts),
+            'total_tracks': sum(counts),
+            'median_tracks': round(float(median), 1),
+            'max_tracks': counts[-1],
+            'buckets': {
+                'gte_100': sum(1 for n in counts if n >= 100),
+                'gte_500': sum(1 for n in counts if n >= 500),
+                'gte_1000': sum(1 for n in counts if n >= 1000),
+            },
+        }
+    finally:
+        conn.close()
 
 
 # ── GET /admin/activity ────────────────────────────────────
