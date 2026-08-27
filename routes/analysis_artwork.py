@@ -123,6 +123,47 @@ async def check_analyzed(filenames: list[str]):
     }
 
 
+class AcousticClustersRequest(BaseModel):
+    fingerprints: List[str]
+
+
+@router.post("/acoustic-clusters")
+async def acoustic_clusters(request: AcousticClustersRequest):
+    """Cluster acustico de un lote de huellas — para detectar DUPLICADOS.
+
+    El caso que resuelve: el mismo tema en dos ficheros distintos (otro codec,
+    otro bitrate, otro tag, rippeado de otro sitio). El MD5 del contenido no
+    los junta porque son bytes distintos, y el nombre tampoco. El chromaprint
+    si: agrupa por SONIDO, con Hamming tolerante y acotado por duracion.
+
+    El cliente manda SUS huellas y agrupa la respuesta por `acoustic_id`: dos o
+    mas huellas suyas en el mismo cluster = el mismo tema repetido en su
+    biblioteca. No se devuelve nada de otros usuarios — el cluster es un id
+    opaco y el agrupado lo hace el cliente sobre lo suyo.
+
+    `clusters` NO incluye las huellas sin cluster. Eso es a proposito: «no
+    tiene huella acustica todavia» y «no tiene duplicados» son cosas distintas,
+    y devolver `null` para las primeras las haria indistinguibles de las
+    segundas. `without_cluster` las nombra aparte para que el cliente pueda
+    decir «de estos N no lo se» en vez de afirmar que estan limpios.
+
+    Maximo 500 por peticion, igual que /check-analyzed-by-fingerprint.
+    """
+    fps = [f for f in (request.fingerprints or []) if f]
+    if len(fps) > 500:
+        raise HTTPException(400, "Máximo 500 fingerprints por petición")
+
+    clusters = db.acoustic_ids_for(fps)
+    sin_cluster = [f for f in fps if f not in clusters]
+    return {
+        "clusters": clusters,
+        "without_cluster": sin_cluster,
+        "total": len(fps),
+        "with_cluster_count": len(clusters),
+        "without_cluster_count": len(sin_cluster),
+    }
+
+
 class CheckAnalyzedByFingerprintRequest(BaseModel):
     fingerprints: List[str]
 
