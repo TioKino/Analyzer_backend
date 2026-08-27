@@ -325,6 +325,45 @@ def _write_signature_ok(body: bytes, signature: str, timestamp: str) -> bool:
     return False
 
 
+def _record_write_auth(signed: bool, path: str) -> None:
+    """Cuenta (por dia y endpoint) cuantas escrituras colectivas llegan
+    firmadas y cuantas no.
+
+    Sin esto, la condicion para la fase 2 —«cuando los logs muestren que casi
+    nadie llega sin firmar»— exigia rebuscar en los logs de Render a mano, y
+    esos rotan. O sea que la decision de activar `REQUIRE_WRITE_AUTH` se
+    tomaba a ojo, y equivocarse devuelve 401 a todos los motores locales ya
+    publicados.
+
+    Mismo patron que `sync_auth_stats`, que existe exactamente por lo mismo en
+    el HMAC de sync. Best-effort: nunca puede tumbar una escritura.
+    """
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, timeout=5.0)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS write_auth_stats (
+                    day    TEXT NOT NULL,
+                    signed INTEGER NOT NULL,
+                    path   TEXT NOT NULL,
+                    n      INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (day, signed, path)
+                )
+            """)
+            conn.execute(
+                "INSERT INTO write_auth_stats (day, signed, path, n) "
+                "VALUES (?, ?, ?, 1) "
+                "ON CONFLICT(day, signed, path) DO UPDATE SET n = n + 1",
+                (datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                 1 if signed else 0, path[:120]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def verify_write_auth(request: Request) -> bool:
     """Dependency de los endpoints de escritura colectiva.
 
@@ -341,9 +380,13 @@ async def verify_write_auth(request: Request) -> bool:
             raise HTTPException(status_code=499, detail="Client disconnected")
         if not _write_signature_ok(body, signature, request.headers.get('X-Timestamp', '')):
             raise HTTPException(401, "Invalid signature")
+        _record_write_auth(True, request.url.path)
         return True
     if REQUIRE_WRITE_AUTH and _WRITE_AUTH_SECRET:
         raise HTTPException(401, "Missing X-Signature header")
+    # Se cuenta ADEMAS de loguear: el log dice que paso una vez, la tabla dice
+    # cuanto pasa. La fase 2 se decide con lo segundo.
+    _record_write_auth(False, request.url.path)
     logger.info(f"[WriteAuth] sin firma: {request.url.path} (fase 1, permitido)")
     return False
 

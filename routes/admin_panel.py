@@ -967,6 +967,66 @@ def _acoustic_coverage() -> dict:
         return {}
 
 
+def _write_auth_adoption(days: int = 30) -> dict:
+    """Adopcion de la firma HMAC en las escrituras colectivas.
+
+    Es el dato que decide la FASE 2 (`REQUIRE_WRITE_AUTH=1`). Hasta ahora la
+    condicion escrita era «cuando los logs muestren que casi nadie llega sin
+    firmar», o sea rebuscar en los logs de Render a mano — y esos rotan. La
+    decision se tomaba a ojo, y equivocarse devuelve 401 a todos los motores
+    locales ya publicados.
+
+    `unsigned_pct` es el numero: cuando este cerca de 0, se puede activar.
+    Mirar tambien `by_path`: si lo que queda sin firmar es un solo endpoint,
+    puede cerrarse ese antes que el resto.
+    """
+    try:
+        db_path = os.environ.get(
+            "DATABASE_PATH",
+            os.environ.get("ANALYSIS_DB_PATH", "analysis.db"),
+        )
+        if not os.path.exists(db_path):
+            return {}
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=int(days))
+            ).strftime('%Y-%m-%d')
+            filas = conn.execute(
+                "SELECT signed, path, SUM(n) AS n FROM write_auth_stats "
+                "WHERE day >= ? GROUP BY signed, path",
+                (cutoff,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        # La tabla se crea en la primera escritura colectiva tras el deploy.
+        return {}
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Admin] write_auth_adoption no disponible: {e}")
+        return {}
+
+    firmadas = sum(int(r[2] or 0) for r in filas if r[0])
+    sin_firmar = sum(int(r[2] or 0) for r in filas if not r[0])
+    total = firmadas + sin_firmar
+    por_path: dict = {}
+    for signed, path, n in filas:
+        d = por_path.setdefault(str(path), {"signed": 0, "unsigned": 0})
+        d["signed" if signed else "unsigned"] += int(n or 0)
+
+    return {
+        "days": days,
+        "signed": firmadas,
+        "unsigned": sin_firmar,
+        "total": total,
+        # None y no 0 cuando no hay trafico: 0 % se leeria como «ya no llega
+        # nadie sin firmar», que es justo la conclusion que activaria la fase 2
+        # por error.
+        "unsigned_pct": round(100.0 * sin_firmar / total, 1) if total else None,
+        "by_path": por_path,
+    }
+
+
 def _acoustic_gap() -> dict:
     """Reparto de los tracks SIN huella: legado o via abierta. Best-effort,
     igual que el resto de metricas de observacion."""
@@ -1383,6 +1443,10 @@ async def telemetry(request: Request):
         # sitios; si es de hoy, hay una via abierta y ampliar el backfill seria
         # achicar agua sin taparla.
         "acoustic_gap": _acoustic_gap(),
+        # Decide la FASE 2 del HMAC de escritura (`REQUIRE_WRITE_AUTH=1`).
+        # Activarlo con `unsigned` > 0 devuelve 401 a los motores locales
+        # ya publicados, que no firman.
+        "write_auth_30d": _write_auth_adoption(days=30),
         # SEC-12 fase 1 — el dato que decide si se puede exigir registro para
         # votar en /community/*. `unregistered` es EXACTAMENTE la gente que se
         # quedaria fuera al activar la fase 2. `unknown` son votos anteriores a
