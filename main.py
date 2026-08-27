@@ -934,6 +934,20 @@ async def report_client_event(payload: ClientEventPayload, request: Request):
 # Inicializar BD con path de config (no hardcoded)
 db = AnalysisDB(db_path=DATABASE_PATH)
 
+# Sembrar `device_first_seen` ANTES de purgar, no despues: la purga borra los
+# eventos de los que hay que leer el D0. Al reves, cada deploy tiraria justo lo
+# que veniamos a rescatar.
+#
+# Solo sirve la primera vez (INSERT OR IGNORE); a partir de ahi el D0 lo sella
+# `log_event` en caliente. Lo anterior a 90 dias ya estaba perdido antes de que
+# esta tabla existiera y no hay de donde sacarlo.
+try:
+    _sembrados = db.backfill_first_seen()
+    if _sembrados:
+        logger.info(f"[Events] D0 sembrado para {_sembrados} dispositivos")
+except Exception as _e:  # noqa: BLE001 - best-effort
+    logger.warning(f"[Events] backfill de first_seen fallo: {_e}")
+
 # Purga best-effort de eventos viejos (>90d) para que la tabla `events` del
 # embudo no crezca sin limite. No bloquea el arranque si falla.
 try:

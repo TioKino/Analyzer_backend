@@ -28,9 +28,19 @@ class TestPlatformFilter:
         assert sql == "" and params == []
 
     def test_desktop_group_expands(self):
+        # `macos-mas` y `macos-dmg` estan dentro aunque el emisor de eventos
+        # todavia mande `macos` a secas: `tracks.platform` y `events.platform`
+        # son dos vocabularios para la misma palabra, y el dia que se alineen
+        # los usuarios del Mac App Store se caerian fuera del grupo sin un solo
+        # error. Ver la nota de _PLATFORM_GROUPS.
         sql, params = _platform_filter('desktop')
-        assert 'IN (?,?,?)' in sql
-        assert params == ['macos', 'windows', 'linux']
+        assert 'IN (?,?,?,?,?)' in sql
+        assert params == ['macos', 'macos-mas', 'macos-dmg', 'windows', 'linux']
+
+    def test_el_mac_app_store_cuenta_como_desktop(self):
+        _, params = _platform_filter('desktop')
+        assert 'macos-mas' in params, 'MAS es escritorio, y es la build sin motor local'
+        assert 'macos-dmg' in params
 
     def test_mobile_group_expands(self):
         sql, params = _platform_filter('mobile')
@@ -43,7 +53,7 @@ class TestPlatformFilter:
 
     def test_case_insensitive_group(self):
         _, params = _platform_filter('DeskTop')
-        assert params == ['macos', 'windows', 'linux']
+        assert params == ['macos', 'macos-mas', 'macos-dmg', 'windows', 'linux']
 
 
 # ── Integracion: /admin/funnel?platform= con BD temporal ───────────────
@@ -57,11 +67,24 @@ def seeded_db(monkeypatch):
         "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, "
         "device_id TEXT, event_name TEXT, platform TEXT)"
     )
+    # El embudo es por COHORTE: se sigue a los dispositivos dados de alta en la
+    # ventana. Sin esta tabla el JOIN no encuentra a nadie y todos los pasos
+    # salen a 0 — que es justo lo que pasaba cuando este fixture se quedo con
+    # el esquema de antes.
+    conn.execute(
+        "CREATE TABLE device_first_seen (device_id TEXT PRIMARY KEY, "
+        "first_day TEXT NOT NULL, first_platform TEXT, first_app_version TEXT)"
+    )
     # 2 desktop (macos + windows), 1 mobile (ios). Todos app_opened, recientes.
     for dev, plat in (('d_mac', 'macos'), ('d_win', 'windows'), ('d_ios', 'ios')):
         conn.execute(
             "INSERT INTO events (timestamp, device_id, event_name, platform) "
             "VALUES (datetime('now'), ?, 'app_opened', ?)",
+            (dev, plat),
+        )
+        conn.execute(
+            "INSERT INTO device_first_seen (device_id, first_day, first_platform) "
+            "VALUES (?, date('now'), ?)",
             (dev, plat),
         )
     conn.commit()
