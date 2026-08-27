@@ -133,7 +133,8 @@ class TestFunnelStepsPorPlataforma:
         """Fase B: el camino real del movil es vincular + recibir biblioteca.
         Los emite el cliente desde 2.9.10; hasta entonces salen a 0."""
         names = [n for n, _ in _funnel_steps_for('mobile')]
-        assert names == ['app_opened', 'onboarding_completed',
+        assert names == ['app_opened', 'onboarding_shown',
+                         'onboarding_completed',
                          'device_linked', 'library_synced',
                          'first_track_viewed']
 
@@ -164,7 +165,8 @@ class TestFunnelStepsEnLaRespuesta:
         body = _funnel(TestClient(app), 'mobile')
         events = [s['event'] for s in body['steps']]
         assert 'import_completed' not in events
-        assert events == ['app_opened', 'onboarding_completed',
+        assert events == ['app_opened', 'onboarding_shown',
+                          'onboarding_completed',
                           'device_linked', 'library_synced',
                           'first_track_viewed']
         assert body['steps_note']
@@ -179,9 +181,14 @@ class TestFunnelStepsEnLaRespuesta:
         assert by_event['library_synced'] == 0
         assert by_event['app_opened'] == 1
 
-    def test_desktop_devuelve_cinco_pasos_sin_nota(self, seeded_db):
+    def test_desktop_devuelve_sus_pasos_sin_nota(self, seeded_db):
+        # Seis desde el 2026-08-27: `onboarding_shown` se metio DELANTE de
+        # `onboarding_completed` porque era el denominador que faltaba —
+        # `app_opened` se emite una vez por dispositivo para siempre, asi que
+        # medir la finalizacion contra el incluia a gente que nunca vio la
+        # pantalla. La nota sigue siendo solo de movil.
         body = _funnel(TestClient(app), 'desktop')
-        assert len(body['steps']) == 5
+        assert len(body['steps']) == 6
         assert body['steps_note'] is None
 
     def test_raw_sigue_trayendo_todos_los_eventos(self, seeded_db):
