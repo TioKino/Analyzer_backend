@@ -3339,6 +3339,56 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def acoustic_ids_for(self, fingerprints: List[str]) -> Dict[str, str]:
+        """Cluster acustico de cada huella, en LOTE.
+
+        Es lo que permite detectar duplicados por SONIDO en la biblioteca del
+        usuario: dos ficheros distintos —otro codec, otro bitrate, otro tag—
+        del mismo tema caen en el mismo `acoustic_id`. El MD5 del contenido no
+        los junta (son bytes distintos) y el nombre tampoco.
+
+        Solo devuelve las que TIENEN cluster. Las que no aparecen en el mapa es
+        que no tienen huella acustica todavia, que es distinto de «no tiene
+        duplicados» — el cliente no puede confundir las dos cosas si una
+        simplemente no viene.
+
+        Se mira `fingerprint` Y `id`: en los registros antiguos el id ES el MD5
+        (`tracks.id = tracks.fingerprint`), y buscar solo por una columna
+        dejaria fuera media biblioteca historica.
+        """
+        fps = [f for f in (fingerprints or []) if f]
+        if not fps:
+            return {}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            marcas = ','.join('?' * len(fps))
+            # Una sola query, no una por huella: con 500 elementos la diferencia
+            # entre un IN y un bucle es de dos ordenes de magnitud.
+            c.execute(
+                f'SELECT id, fingerprint, acoustic_id FROM tracks '
+                f'WHERE acoustic_id IS NOT NULL '
+                f'  AND (fingerprint IN ({marcas}) OR id IN ({marcas}))',
+                fps + fps,
+            )
+            fuera: Dict[str, str] = {}
+            pedidas = set(fps)
+            for r in c.fetchall():
+                ac = r['acoustic_id']
+                if not ac:
+                    continue
+                # La clave devuelta es la que PIDIO el cliente, no la de la BD:
+                # si pidio por id legacy y la fila tiene ademas `fingerprint`,
+                # devolver esa otra le daria una clave que no reconoce.
+                for clave in (r['fingerprint'], r['id']):
+                    if clave in pedidas:
+                        fuera[clave] = ac
+            return fuera
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def acoustic_gap_breakdown(self) -> Dict[str, Any]:
         """De los tracks SIN huella acustica: ¿son legado, o siguen entrando?
 
