@@ -3337,6 +3337,29 @@ class AnalysisDB:
             )
             por_motor = {str(r['e']): int(r['n'] or 0) for r in c.fetchall()}
 
+            # El MISMO reparto, pero solo sobre lo RECIENTE — y esta es la
+            # mitad que de verdad se usa.
+            #
+            # Medido el 2026-08-27: 62.919 de los 64.264 sin huella son
+            # anteriores a 30 dias. Con las dos poblaciones en un solo
+            # `by_engine`, el reparto de los ~1.300 recientes queda enterrado
+            # bajo el legado y no se puede diagnosticar POR QUE siguen
+            # entrando. Es el mismo fallo que tener «AudD no lo reconoce» y
+            # «lo tiramos nosotros» compartiendo contador: el numero es
+            # correcto y no sirve para decidir nada.
+            #
+            # Lo que separa: si los recientes son `local_engine`, es un motor
+            # viejo que no manda chromaprint y se arregla solo segun actualice
+            # la gente. Si son `render`, `_attach_acoustic` esta fallando sobre
+            # audio real y hay algo que mirar.
+            c.execute(
+                "SELECT COALESCE(engine_source, 'unknown') AS e, COUNT(*) AS n"
+                f"  FROM tracks WHERE ({sin})"
+                "   AND substr(analyzed_at,1,10) >= date('now','-30 days')"
+                " GROUP BY e ORDER BY n DESC"
+            )
+            por_motor_30d = {str(r['e']): int(r['n'] or 0) for r in c.fetchall()}
+
             # OJO con la comparacion de fechas. `analyzed_at` se guarda con
             # `datetime.now().isoformat()` -> 'YYYY-MM-DDTHH:MM:SS.ffffff',
             # mientras que `datetime('now')` de SQLite da 'YYYY-MM-DD HH:MM:SS'.
@@ -3367,6 +3390,9 @@ class AnalysisDB:
             return {
                 'without_chromaprint': total,
                 'by_engine': por_motor,
+                # El reparto que se usa para decidir: solo lo reciente. El de
+                # arriba lo domina el legado y no dice nada del ahora.
+                'by_engine_last_30d': por_motor_30d,
                 'by_age': {
                     'last_7d': d7,
                     # Acumulados, no excluyentes: 'last_30d' INCLUYE los 7.

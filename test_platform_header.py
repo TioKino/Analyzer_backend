@@ -294,3 +294,52 @@ def test_el_panel_expone_el_reparto():
     # panel entero (ya paso con un OOM en admin).
     assert 'def _acoustic_gap()' in src
     assert 'except Exception' in src
+
+
+def test_el_reparto_por_motor_separa_lo_RECIENTE_del_legado(tmp_path):
+    """Dos poblaciones distintas no pueden compartir contador.
+
+    Medido el 2026-08-27: 62.919 de los 64.264 tracks sin huella son
+    anteriores a 30 dias. Con un solo `by_engine`, el reparto de los ~1.300
+    recientes —los unicos que dicen si HOY sigue entrando gente sin huella—
+    queda enterrado bajo el legado. El numero sale correcto y no sirve para
+    decidir nada, que es exactamente lo que paso con `failedAudd`.
+    """
+    from datetime import datetime, timedelta
+    reciente = (datetime.now() - timedelta(days=2)).isoformat()
+    viejo = (datetime.now() - timedelta(days=200)).isoformat()
+
+    conn = _bd_gap([
+        # Legado: mucho, y todo de render.
+        ('1', None, 'render', viejo),
+        ('2', None, 'render', viejo),
+        ('3', None, 'render', viejo),
+        # Reciente: poco, y de motor local -> se arregla solo al actualizar.
+        ('4', None, 'local_engine', reciente),
+        ('5', 'AQAB', 'local_engine', reciente),   # con huella: fuera
+    ], tmp_path)
+    try:
+        sin = "chromaprint IS NULL OR chromaprint = ''"
+        todo = dict(conn.execute(
+            "SELECT COALESCE(engine_source,'unknown') AS e, COUNT(*) AS n"
+            f"  FROM tracks WHERE {sin} GROUP BY e").fetchall())
+        recientes = dict(conn.execute(
+            "SELECT COALESCE(engine_source,'unknown') AS e, COUNT(*) AS n"
+            f"  FROM tracks WHERE ({sin})"
+            "   AND substr(analyzed_at,1,10) >= date('now','-30 days')"
+            " GROUP BY e").fetchall())
+    finally:
+        conn.close()
+
+    # Mezclado, 'render' domina y la historia que cuenta es falsa.
+    assert todo == {'render': 3, 'local_engine': 1}
+    # Separado, se ve lo que de verdad esta pasando ahora.
+    assert recientes == {'local_engine': 1}
+
+
+def test_el_panel_expone_los_dos_repartos():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'database.py'), encoding='utf-8') as f:
+        src = f.read()
+    assert "'by_engine': por_motor," in src
+    assert "'by_engine_last_30d': por_motor_30d," in src
