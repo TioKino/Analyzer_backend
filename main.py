@@ -3202,6 +3202,22 @@ async def analyze_track(
                 
                 # Actualizar el filename en la BD para futuras busquedas
                 existing_by_fp['filename'] = file.filename
+                # Y de paso, curar la huella acustica si le falta.
+                #
+                # Este es el unico momento en que el audio de un track LEGADO
+                # vuelve a estar a mano: la fila se analizo antes de que
+                # `_attach_acoustic` existiera, pero el fichero esta aqui, en
+                # `tmp_path`, y se va a borrar en cuanto retornemos. Sin esto,
+                # una fila sin huella no se cura JAMAS por esta via — da
+                # cache-hit una y otra vez, cada vez que alguien sube ese mismo
+                # fichero, y se queda fuera de la memoria colectiva para
+                # siempre.
+                #
+                # No cuesta ni una subida ni una llamada a AudD: el fichero ya
+                # esta en disco. Y es best-effort, como en el camino normal: si
+                # fpcalc falla, se guarda igual.
+                if not existing_by_fp.get('chromaprint'):
+                    _attach_acoustic(existing_by_fp, tmp_path)
                 db.save_track(existing_by_fp)
                 
                 # Intentar construir respuesta desde analysis_json
@@ -3299,6 +3315,12 @@ async def analyze_track(
                             to_save['id'] = fingerprint
                             if 'analysis_json' not in to_save:
                                 to_save['analysis_json'] = json.dumps(render_cached)
+                            # Render manda su analisis, pero no el chromaprint
+                            # (es un blob que no viaja en la respuesta). El
+                            # audio sigue en `tmp_path`, asi que la huella se
+                            # saca aqui en vez de nacer sin ella.
+                            if not to_save.get('chromaprint'):
+                                _attach_acoustic(to_save, tmp_path)
                             db.save_track(to_save)
                     except Exception as e:
                         logger.warning(f"[Render fallback] save_track fallo: {e}")

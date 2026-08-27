@@ -1456,7 +1456,25 @@ class AnalysisDB:
                 track_data['genre'],
                 track_data['track_type'],
                 json.dumps(analysis_json_data),
-                datetime.now().isoformat(),
+                # La fecha del ANALISIS, no la de la ultima escritura.
+                #
+                # Esto es un INSERT OR REPLACE y no todos los callers vienen de
+                # analizar: el cache-hit por huella de /analyze re-guarda la
+                # fila que ya existe solo para refrescar el `filename`. Con
+                # `datetime.now()` a pelo, un track analizado en 2024 pasaba a
+                # figurar como analizado HOY cada vez que alguien volvia a
+                # subir ese fichero.
+                #
+                # No es cosmetico: `acoustic_gap_breakdown` reparte el hueco de
+                # huella por antiguedad, y `newest_without` es EL numero que
+                # decide si el hueco es legado (backfill) o una via abierta
+                # (taparla). Al bombear las fechas, las filas viejas sin huella
+                # aparecian en `last_7d` y las dos causas —que piden arreglos
+                # opuestos— quedaban indistinguibles.
+                #
+                # Un analisis nuevo no trae `analyzed_at` (no esta en
+                # AnalysisResult), asi que cae a `now` como siempre.
+                track_data.get('analyzed_at') or datetime.now().isoformat(),
                 track_data.get('fingerprint'),
                 track_data.get('chromaprint'),
                 track_data.get('acoustic_id'),
