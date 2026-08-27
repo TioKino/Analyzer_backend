@@ -63,7 +63,11 @@ class TestAdminFunnelEndpoint:
         assert isinstance(body['steps'], list)
         assert 'raw' in body
         # El embudo declara sus pasos canonicos aunque no haya datos.
-        assert len(body['steps']) == 5
+        # Seis desde el 2026-08-27: `onboarding_shown` entro DELANTE de
+        # `onboarding_completed`. Era el denominador que faltaba — `app_opened`
+        # se emite una vez por dispositivo para siempre, asi que medir la
+        # finalizacion contra el incluia a gente que nunca vio la pantalla.
+        assert len(body['steps']) == 6
         assert body['steps'][0]['event'] == 'app_opened'
 
 

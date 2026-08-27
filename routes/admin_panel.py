@@ -1494,6 +1494,9 @@ async def telemetry(request: Request):
 # cliente emita `device_linked` / `library_synced`, meterlos en _FUNNEL_MOBILE.
 _FUNNEL_DEFAULT = [
     ("app_opened", "Abrio la app"),
+    # Mismo motivo que en movil: sin este paso, la finalizacion se mide contra
+    # dispositivos que nunca llegaron a ver el onboarding.
+    ("onboarding_shown", "Vio el onboarding"),
     ("onboarding_completed", "Completo onboarding"),
     ("import_started", "Empezo a importar"),
     ("import_completed", "Importo musica"),
@@ -1507,6 +1510,19 @@ _FUNNEL_DEFAULT = [
 # con gente ya actualizada.
 _FUNNEL_MOBILE = [
     ("app_opened", "Abrio la app"),
+    # `onboarding_shown` es el DENOMINADOR de verdad del paso siguiente, y
+    # faltaba. Sin el, «Completo onboarding / Abrio la app» daba 46,5% en la
+    # lectura del 2026-08-27 y se leia como «la mitad abandona» — pero
+    # `app_opened` se emite una vez por dispositivo PARA SIEMPRE, asi que el
+    # denominador incluye a todo el que ya tenia la app instalada y por tanto
+    # NUNCA vio el onboarding (se muestra una sola vez, flag en prefs).
+    #
+    # Es el mismo fallo que el «2 de 141» de `device_linked`, dos pasos mas
+    # abajo en esta misma lista: medir un paso contra gente que no podia
+    # darlo. Con el paso intermedio, `app_opened -> onboarding_shown` dice
+    # cuantos son nuevos y `onboarding_shown -> onboarding_completed` es la
+    # finalizacion REAL.
+    ("onboarding_shown", "Vio el onboarding"),
     ("onboarding_completed", "Completo onboarding"),
     ("device_linked", "Vinculo el dispositivo"),
     ("library_synced", "Recibio su biblioteca"),
@@ -1597,10 +1613,44 @@ async def funnel(request: Request, platform: str = None):
         })
         prev = devices
 
+    # Los que VIERON el onboarding y no lo terminaron, repartidos por lo que
+    # hicieron. Son dos causas distintas y piden cosas opuestas:
+    #
+    #   skipped    -> le dio a saltar. Lo vio, decidio, y siguio. Arreglarlo es
+    #                 hacer el contenido mas util, o aceptar que hay gente que
+    #                 no quiere tutoriales.
+    #   abandoned  -> lo abrio y cerro la app a medias. Eso si es una fuga: se
+    #                 atasco, no entendio, o algo no funciono.
+    #
+    # Sin separarlas, «la mitad no completa» mezcla a quien tomo una decision
+    # con quien se perdio, que es el mismo error que tenia `failedAudd`.
+    #
+    # `abandoned` es derivado, no medido: shown - completed - skipped. Se acota
+    # a 0 porque los tres son conteos independientes de dispositivos unicos en
+    # la ventana y pueden descuadrar en los bordes (un aparato que vio el
+    # onboarding hace 31 dias y lo completo hace 29).
+    _ob_shown = counts.get("onboarding_shown", 0)
+    _ob_done = counts.get("onboarding_completed", 0)
+    _ob_skip = counts.get("onboarding_skipped", 0)
+    onboarding = {
+        "shown": _ob_shown,
+        "completed": _ob_done,
+        "skipped": _ob_skip,
+        "abandoned": max(_ob_shown - _ob_done - _ob_skip, 0),
+        # El porcentaje que importa: sobre los que LO VIERON, no sobre los que
+        # abrieron la app. `app_opened` se emite una vez por dispositivo para
+        # siempre, asi que incluye a quien ya tenia la app instalada y nunca
+        # llego a ver el onboarding.
+        "completion_pct": (
+            round(100.0 * _ob_done / _ob_shown, 1) if _ob_shown else None
+        ),
+    }
+
     return {
         "window_days": 30,
         "platform": platform or "all",  # que subconjunto se esta mirando
         "steps": steps,
+        "onboarding": onboarding,
         # Que import_* no salga en `steps` del movil NO significa que no se mida:
         # sigue en `raw`, que lleva TODOS los eventos. Lo que cambia es que deja
         # de contarse como paso obligatorio del camino.
