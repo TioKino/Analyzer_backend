@@ -323,3 +323,65 @@ def test_el_denominador_es_la_cohorte_no_el_primer_paso():
     tiene que contar como el abandono que es, no desaparecer del embudo."""
     src = _src('routes/admin_panel.py')
     assert 'top = cohort_size or (' in src
+
+
+# ============================================================================
+# LOS ANONIMOS: LA COHORTE LOS DEJA FUERA, Y HAY QUE SABERLO
+# ============================================================================
+
+def test_los_eventos_SIN_device_id_no_estan_en_la_cohorte(tmp_path):
+    """No es un fallo, es la definicion: una cohorte sigue a alguien, y un
+    evento anonimo no tiene a quien seguir.
+
+    Lo que SI fue un fallo: el script del embudo leia las visitas de la web
+    (que van sin device_id a proposito) de `raw`, y al pasar `raw` a ser la
+    cuenta por cohorte se fueron a CERO. La primera lectura tras el cambio dio
+    «79 visitas -> 0» y parecia que la web se habia caido.
+    """
+    conn = _bd(tmp_path)
+    try:
+        conn.execute(
+            'INSERT INTO device_first_seen (device_id, first_day) '
+            "VALUES ('d1', date('now'))"
+        )
+        conn.execute(
+            "INSERT INTO events (timestamp, device_id, event_name) "
+            "VALUES (datetime('now'), 'd1', 'app_opened')"
+        )
+        # La web: sin device_id, a proposito.
+        conn.execute(
+            "INSERT INTO events (timestamp, device_id, event_name) "
+            "VALUES (datetime('now'), NULL, 'web_visit')"
+        )
+        conn.commit()
+
+        assert _pasos(conn, 'web_visit') == 0, 'la cohorte no puede verlos'
+
+        # `window_devices` si los cuenta, uno por fila via el COALESCE.
+        ventana = conn.execute(
+            "SELECT COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) "
+            "FROM events WHERE event_name = 'web_visit' "
+            "  AND timestamp >= datetime('now','-30 days')"
+        ).fetchone()[0]
+        assert ventana == 1
+    finally:
+        conn.close()
+
+
+def test_el_script_lee_la_web_de_window_devices_no_de_raw():
+    ruta = os.path.join(os.path.dirname(_AQUI), 'Analyzer', 'scripts', 'embudo.sh')
+    if not os.path.exists(ruta):
+        return  # el repo del cliente no esta al lado; CI del backend no lo tiene
+    with open(ruta, encoding='utf-8') as f:
+        src = f.read()
+    assert "wv = wd.get('web_visit'" in src
+    assert "wv = ra.get('web_visit'" not in src, 'raw ya no trae anonimos'
+
+
+def test_el_codigo_avisa_de_que_raw_ya_no_trae_anonimos():
+    """El comentario decia que los anonimos «siguen enteros en raw», y dejo de
+    ser cierto en cuanto `raw` paso a ser la cuenta por cohorte."""
+    src = _src('routes/admin_panel.py')
+    assert 'window_devices' in src
+    i = src.index('Los eventos ANONIMOS')
+    assert 'window_devices' in src[i:i + 700]
