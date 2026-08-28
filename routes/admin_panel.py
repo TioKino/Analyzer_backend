@@ -1668,9 +1668,13 @@ async def funnel(request: Request, platform: str = None):
             # el 32 cuenta como convertido, que es lo correcto: el embudo mide
             # si llega, no si corre.
             #
-            # Los eventos ANONIMOS (los de la web, sin device_id) no pueden
-            # estar en una cohorte — no hay a quien seguir. Siguen enteros en
-            # `raw`.
+            # Los eventos ANONIMOS (los de la web, sin device_id) NO pueden
+            # estar en una cohorte: el JOIN exige identidad y no hay a quien
+            # seguir. O sea que `raw` ya no los trae — y quien los quiera
+            # (visitas de la web, clics de descarga) tiene que leer
+            # `window_devices`, que sigue contandolos uno por fila via el
+            # COALESCE. La primera lectura tras este cambio los dio a CERO y
+            # parecio que la web habia dejado de recibir visitas.
             # El D0 sale de `device_first_seen`, con respaldo en `events` para
             # los dispositivos que aun no tienen fila ahi (datos anteriores a
             # que la tabla existiera). Misma regla que en retencion: ver
