@@ -19,6 +19,7 @@ from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
+from validation import is_desktop_platform, is_mobile_platform
 
 logger = logging.getLogger(__name__)
 
@@ -825,8 +826,14 @@ async def global_stats(request: Request):
         """).fetchall()
 
         total_users = len(device_rows)
-        desktop_users = sum(1 for r in device_rows if (r["device_type"] or "").lower() in ("desktop", "macos", "windows", "linux"))
-        mobile_users = sum(1 for r in device_rows if (r["device_type"] or "").lower() in ("mobile", "ios", "android"))
+        # Familias desde `validation`, no listas a mano: con la lista literal
+        # que habia aqui, los Mac dejaron de contar como escritorio en cuanto
+        # `platformHeader` paso a `macos-dmg`/`macos-mas` — y tampoco caian en
+        # movil, asi que desaparecian del reparto sin que nada fallara.
+        desktop_users = sum(1 for r in device_rows
+                            if is_desktop_platform(r["device_type"]))
+        mobile_users = sum(1 for r in device_rows
+                           if is_mobile_platform(r["device_type"]))
 
         # Count tracks and previews across all devices, DEDUPLICADO por track.id.
         # Antes se hacia total_tracks += len(tracks) por cada fila de sync_items,

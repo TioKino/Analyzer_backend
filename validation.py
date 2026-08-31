@@ -597,6 +597,49 @@ ALLOWED_PLATFORMS = frozenset({
     'android', 'ios', 'windows', 'macos', 'macos-mas', 'macos-dmg', 'linux',
 })
 
+# ── Familias de plataforma ───────────────────────────────────────────────
+#
+# ESTA ES LA UNICA LISTA. Cualquier sitio que pregunte «esto es escritorio?»
+# tiene que venir aqui, y el motivo es un bug real:
+#
+# `PlatformUtils.platformHeader` devolvia `macos` a secas hasta que
+# `Analyzer#109` lo afino a `macos-dmg` / `macos-mas` para poder separar el
+# Mac App Store del DMG (son los dos sitios donde la huella acustica se
+# comporta distinto). Ese cambio rompio EN SILENCIO a todos los consumidores
+# que comparaban contra la lista vieja:
+#
+#   - `/sync/publish` exigia `device_type in ("windows","macos","linux")` y
+#     empezo a devolver 403 a TODOS los Mac. «Publicar esta biblioteca», la
+#     feature estrella de la 2.9.10, no funcionaba en ningun Mac.
+#   - `/admin/stats` dejo de contar los Mac como `desktop_users`, sin caer
+#     tampoco en `mobile_users`: desaparecian del reparto.
+#
+# Los valores `desktop` y `mobile` a pelo son de clientes ANTIGUOS que
+# mandaban la familia en vez de la plataforma. No los quites.
+DESKTOP_PLATFORMS = frozenset({
+    'desktop', 'windows', 'linux', 'macos', 'macos-mas', 'macos-dmg',
+})
+MOBILE_PLATFORMS = frozenset({'mobile', 'android', 'ios'})
+
+
+def is_desktop_platform(value: Optional[str]) -> bool:
+    """True si `value` es cualquier variante de escritorio."""
+    return (value or '').strip().lower() in DESKTOP_PLATFORMS
+
+
+def is_mobile_platform(value: Optional[str]) -> bool:
+    return (value or '').strip().lower() in MOBILE_PLATFORMS
+
+
+def platform_family(value: Optional[str]) -> Optional[str]:
+    """`'desktop'`, `'mobile'` o None. None es «no lo se», no una tercera
+    familia: un valor desconocido no debe caer en ningun cubo por defecto."""
+    if is_desktop_platform(value):
+        return 'desktop'
+    if is_mobile_platform(value):
+        return 'mobile'
+    return None
+
 
 def client_platform(request: Request) -> Optional[str]:
     """La plataforma declarada en `X-Platform`, o None si no viene o no vale.
