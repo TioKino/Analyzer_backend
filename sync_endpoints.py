@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from typing import Any, List, Optional
 from datetime import datetime, timezone, timedelta
 import json, hashlib, sqlite3, os
+from validation import is_desktop_platform
 
 from config import SYNC_AUTH_SECRET, ADMIN_TOKEN
 
@@ -1462,10 +1463,18 @@ async def sync_publish(req: PublishLibraryRequest):
     biblioteca entera en una sola fila, y darlo por borrado dejaría a un cliente
     legacy sin nada. Se ignora en la comparación.
     """
-    if req.device_type not in ("windows", "macos", "linux"):
+    # `is_desktop_platform`, NO una lista a mano. La lista literal que habia
+    # aqui —("windows","macos","linux")— empezo a devolver 403 a TODOS los Mac
+    # en cuanto `Analyzer#109` afino `platformHeader` a `macos-dmg`/`macos-mas`:
+    # el cliente mandaba el valor nuevo y el guard solo conocia el viejo.
+    # Publicar, la feature estrella de la 2.9.10, no funcionaba en ningun Mac.
+    if not is_desktop_platform(req.device_type):
         raise HTTPException(
             status_code=403,
-            detail="Publish requires a desktop device (windows/macos/linux)",
+            detail=(
+                "Publish requires a desktop device "
+                f"(got {req.device_type!r})"
+            ),
         )
 
     conn = _get_conn()
