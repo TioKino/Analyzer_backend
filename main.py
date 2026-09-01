@@ -15,7 +15,7 @@ Estructura:
 from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sync_endpoints import sync_router
+from sync_endpoints import sync_router, admin_sync_router
 from routes.admin_panel import admin_panel_router
 from routes.search import search_router, init as init_search
 from routes.community import community_router, init as init_community
@@ -686,6 +686,13 @@ app = FastAPI(
 )
 _startup_time = time.time()
 app.include_router(sync_router)
+# `admin_sync_router` (/sync/admin/*) llevaba desde siempre DEFINIDO y SIN
+# MONTAR: cinco endpoints escritos, documentados y con tests, y las cinco rutas
+# devolviendo 404 en produccion. Por eso no habia forma de contestar «por que el
+# movil dejo de sincronizar» — la herramienta existia y no estaba enchufada, que
+# es peor que no tenerla: se la busca, se la encuentra en el codigo y se
+# concluye que el problema es otro.
+app.include_router(admin_sync_router)
 app.include_router(admin_panel_router)
 
 # CORS: en DEBUG permitimos los origins tipicos de dev local (Flutter web,

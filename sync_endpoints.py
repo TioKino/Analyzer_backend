@@ -1762,8 +1762,14 @@ async def admin_list_users():
 
     result = []
     for user_id, created_at, label in users:
+        # `token_seen_at` viaja porque es LA senal que decide si un dispositivo
+        # va a comerse un 401 «Device token required» — y no habia forma de
+        # verla desde fuera. Dos consultas mas no: son columnas de la fila que
+        # ya se estaba leyendo.
         devices = conn.execute(
-            "SELECT device_id, device_type, device_name, linked_at FROM user_devices WHERE user_id = ?",
+            "SELECT device_id, device_type, device_name, linked_at, "
+            "       device_token IS NOT NULL, token_seen_at "
+            "FROM user_devices WHERE user_id = ?",
             (user_id,),
         ).fetchall()
 
@@ -1788,6 +1794,9 @@ async def admin_list_users():
                     "device_type": d[1],
                     "device_name": d[2],
                     "linked_at": d[3],
+                    "has_token": bool(d[4]),
+                    "token_seen_at": d[5],
+                    "token_enforced": bool(d[5]),
                 }
                 for d in devices
             ],
@@ -1937,6 +1946,125 @@ async def admin_network_overview():
             }
             for r in top_users
         ],
+    }
+
+
+@admin_sync_router.get("/device/{device_id}")
+async def admin_device_diagnosis(device_id: str):
+    """Por que ESTE aparato no esta sincronizando. Una llamada, una respuesta.
+
+    «El sync con el movil ha dejado de funcionar» no se podia contestar desde
+    ningun sitio. Las causas posibles piden acciones OPUESTAS y hasta ahora no
+    habia forma de distinguirlas sin entrar a la BD a mano:
+
+      | `verdict`            | Que pasa                                    |
+      |----------------------|---------------------------------------------|
+      | `not_registered`     | el device_id no existe -> todo da 403       |
+      | `token_enforced`     | mando token alguna vez; si ahora llega sin  |
+      |                      | el, 401 «Device token required» PARA SIEMPRE|
+      | `alone`              | esta solo en su cuenta: no hay nada que     |
+      |                      | sincronizar, se perdio la vinculacion       |
+      | `nothing_pending`    | esta al dia — el problema no es el servidor |
+      | `pending`            | tiene N items esperando y no viene a por    |
+      |                      | ellos: mirar el cliente                     |
+
+    Y el dato que de verdad zanja la discusion: `siblings`, con lo que subio
+    CADA aparato de la cuenta y cuando. Si el Mac tiene `last_push` de hace un
+    minuto y el movil `pending: 0`, el que no habla es el movil aunque el
+    usuario jure lo contrario. Es la misma leccion que ya costo un dia entero:
+    los dos lados de la MISMA tanda, uno al lado del otro.
+
+    Coste: consultas puntuales por device_id y un COUNT, nada de recorrer la
+    biblioteca. Nunca devuelve el `device_token`.
+    """
+    conn = _get_conn()
+
+    row = conn.execute(
+        "SELECT user_id, device_type, device_name, linked_at, "
+        "       device_token IS NOT NULL, token_seen_at "
+        "FROM user_devices WHERE device_id = ?",
+        (device_id,),
+    ).fetchone()
+
+    if row is None:
+        return {
+            "device_id": device_id,
+            "registered": False,
+            "verdict": "not_registered",
+            "note": (
+                "El device_id no existe en user_devices: /sync/push y /sync/pull "
+                "devuelven 403. El cliente tiene que llamar a /sync/register."
+            ),
+        }
+
+    user_id, device_type, device_name, linked_at, has_token, token_seen_at = row
+
+    # Lo que ESTE aparato ha subido.
+    pushed, last_push = conn.execute(
+        "SELECT COUNT(*), MAX(updated_at) FROM sync_items WHERE last_device_id = ?",
+        (device_id,),
+    ).fetchone()
+
+    # Lo que le espera: items de su usuario (o colectivos) que no ha visto, o
+    # que ha visto con OTRO hash. El mismo criterio que /sync/pull, contado.
+    pending = conn.execute(
+        """SELECT COUNT(*)
+           FROM sync_items si
+           LEFT JOIN device_seen ds
+                  ON ds.device_id = ? AND ds.item_key = si.key
+           WHERE si.last_device_id != ?
+             AND (si.user_id = ? OR si.user_id = '__collective__')
+             AND (ds.hash IS NULL OR ds.hash != si.hash)""",
+        (device_id, device_id, user_id),
+    ).fetchone()[0]
+
+    siblings = []
+    for d in conn.execute(
+        "SELECT device_id, device_type, device_name, linked_at, "
+        "       device_token IS NOT NULL, token_seen_at "
+        "FROM user_devices WHERE user_id = ? AND device_id != ?",
+        (user_id, device_id),
+    ).fetchall():
+        s_pushed, s_last = conn.execute(
+            "SELECT COUNT(*), MAX(updated_at) FROM sync_items "
+            "WHERE last_device_id = ?",
+            (d[0],),
+        ).fetchone()
+        siblings.append({
+            "device_id": d[0],
+            "device_type": d[1],
+            "device_name": d[2],
+            "linked_at": d[3],
+            "has_token": bool(d[4]),
+            "token_enforced": bool(d[5]),
+            "items_pushed": s_pushed,
+            "last_push": s_last,
+        })
+
+    if token_seen_at:
+        verdict = "token_enforced"
+    elif not siblings:
+        verdict = "alone"
+    elif pending > 0:
+        verdict = "pending"
+    else:
+        verdict = "nothing_pending"
+
+    return {
+        "device_id": device_id,
+        "registered": True,
+        "user_id": user_id,
+        "device_type": device_type,
+        "device_name": device_name,
+        "linked_at": linked_at,
+        "has_token": bool(has_token),
+        "token_seen_at": token_seen_at,
+        "token_enforced": bool(token_seen_at),
+        "items_pushed": pushed,
+        "last_push": last_push,
+        "pending_for_this_device": pending,
+        "siblings": siblings,
+        "verdict": verdict,
     }
 
 
