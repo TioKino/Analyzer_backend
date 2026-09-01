@@ -29,11 +29,23 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-_MAIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'main.py')
+_AQUI = os.path.dirname(os.path.abspath(__file__))
+_MAIN = os.path.join(_AQUI, 'main.py')
+# El reintento se movio a `audio_helpers.beat_track_seguro` el 2026-09-01: la
+# misma guarda hacia falta en los otros TRES sitios que llaman a `beat_track`,
+# y en ellos el fallo no se veia (en `/identify` se comia el re-analisis
+# entero; en el analizador por chunks devolvia 120 BPM inventados). Estos tests
+# siguen atando lo mismo, ahora donde vive.
+_HELPERS = os.path.join(_AQUI, 'audio_helpers.py')
 
 
 def _fuente():
     with open(_MAIN, encoding='utf-8') as f:
+        return f.read()
+
+
+def _helpers():
+    with open(_HELPERS, encoding='utf-8') as f:
         return f.read()
 
 
@@ -44,25 +56,34 @@ def _fuente():
 def test_hay_reintento_sin_trim():
     """`trim=False` se salta `__trim_beats`, que es la funcion que peta, y da
     el mismo tempo. Es el arreglo quirurgico: no pierde el BPM."""
-    src = _fuente()
+    src = _helpers()
     assert 'except ValueError as e:' in src
-    assert 'librosa.beat.beat_track(y=y, sr=sr, trim=False)' in src
+    assert "kwargs['trim'] = False" in src
 
 
 def test_el_reintento_va_DESPUES_del_intento_normal():
     # Llamar siempre con trim=False cambiaria el resultado de todos los tracks
     # que hoy funcionan: el recorte existe por algo.
-    src = _fuente()
-    i_normal = src.index('tempo, beats = librosa.beat.beat_track(y=y, sr=sr)\n')
-    i_sin_trim = src.index('trim=False)')
+    src = _helpers()
+    i_normal = src.index('return librosa.beat.beat_track(y=y, sr=sr, **kwargs)')
+    i_sin_trim = src.index("kwargs['trim'] = False")
     assert i_normal < i_sin_trim
+
+
+def test_el_reintento_no_se_reintenta_a_si_mismo():
+    """Si ya venia con `trim=False`, no hay nada que reintentar y el error
+    sube. Un bucle seria peor que el fallo."""
+    src = _helpers()
+    assert "if kwargs.get('trim') is False:" in src
+    i = src.index("if kwargs.get('trim') is False:")
+    assert 'raise' in src[i:i + 120]
 
 
 def test_si_ni_asi_el_analisis_CONTINUA():
     """La key, la energia y el genero no dependen de los beats. Rendirse con
     el BPM no puede costar los otros seis campos."""
     src = _fuente()
-    i = src.index('librosa.beat.beat_track(y=y, sr=sr, trim=False)')
+    i = src.index('tempo, beats = beat_track_seguro(y, sr)')
     bloque = src[i:i + 700]
     assert 'tempo, beats = 0.0, np.array([], dtype=int)' in bloque, (
         'sin fallback el segundo fallo vuelve a tumbar /analyze'
@@ -125,6 +146,5 @@ def test_un_BPM_sin_medir_NO_se_firma_como_analysis():
 def test_el_fallo_queda_en_el_log_con_su_motivo():
     """Un `except` mudo convierte un bug en «a veces el BPM sale 0». El motivo
     tiene que estar delante cuando alguien lo mire."""
-    src = _fuente()
-    assert '[BPM] beat_track fallo' in src
-    assert '[BPM] sin beats' in src
+    assert '[BPM] beat_track fallo' in _helpers()
+    assert '[BPM] sin beats' in _fuente()
