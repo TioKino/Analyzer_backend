@@ -167,18 +167,38 @@ def test_la_siembra_va_ANTES_que_la_purga():
     assert i < j, 'sembrar despues de purgar no rescata nada'
 
 
+def _cuerpo_de(src, firma):
+    """El metodo entero, desde su `def` hasta el siguiente.
+
+    Recortar por bytes (`src[i:i+3000]`) parecia suficiente y no lo era:
+    anadir un comentario largo al principio del metodo empujaba el codigo
+    fuera de la ventana y el test fallaba **sin que nada se hubiera roto**.
+    Un test que se cae al documentar mejor el codigo entrena a no documentar.
+    """
+    i = src.index(firma)
+    j = src.find('\n    def ', i + len(firma))
+    return src[i:] if j < 0 else src[i:j]
+
+
 def test_el_D0_se_sella_al_registrar_el_evento():
-    src = _src('database.py')
-    i = src.index('def log_event(')
-    fn = src[i:i + 3000]
+    fn = _cuerpo_de(_src('database.py'), 'def log_event(')
     assert 'INSERT OR IGNORE INTO device_first_seen' in fn
+
+
+def test_el_D0_NO_se_sella_para_los_eventos_ANONIMOS():
+    """Los de la web llegan con `device_id = NULL`, y en SQLite un
+    `TEXT PRIMARY KEY` admite NULL **y admite muchos**: el `OR IGNORE` no
+    ignoraba nada y cada visita metia una fila en la unica tabla que no se
+    purga. Ver `test_d0_no_sella_anonimos.py`."""
+    fn = _cuerpo_de(_src('database.py'), 'def log_event(')
+    i = fn.index('INSERT OR IGNORE INTO device_first_seen')
+    assert 'if device_id:' in fn[:i], 'el sellado no esta guardado'
 
 
 def test_la_tabla_del_D0_NO_se_purga():
     """Si alguien la mete en la purga, el fallo vuelve entero."""
     src = _src('database.py')
-    i = src.index('def purge_old_events(')
-    fn = src[i:i + 1200]
+    fn = _cuerpo_de(src, 'def purge_old_events(')
     assert 'device_first_seen' not in fn
 
 

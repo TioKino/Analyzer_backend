@@ -482,7 +482,24 @@ def _device_id_from_request(request: Request, body: bytes) -> Optional[str]:
     Se resuelve aqui, en la dependency, y no en cada endpoint: asi la
     verificacion del token vive en UN sitio y no hay que tocar las ocho firmas
     que hoy llaman a _require_user_id (ninguna recibe el Request).
+
+    **Los `/sync/admin/*` quedan fuera, y no es una excepcion de conveniencia.**
+    En `/sync/pull/{device_id}` el id de la ruta ES quien llama, y por eso se
+    le pide su token. En `/sync/admin/device/{device_id}` es justo al reves: el
+    id de la ruta es el aparato del que se PREGUNTA, y quien llama es el
+    administrador con su Bearer. Confundirlos hacia que diagnosticar un
+    dispositivo con el token endurecido devolviera 401 «Device token
+    required» — o sea que la herramienta no podia mirar exactamente el caso
+    para el que se hizo, que es el unico del que un cliente no sale solo.
+    Se vio en la primera pasada real: cuatro aparatos salieron en blanco.
+
+    El admin ya esta autenticado dos veces (HMAC de sync + `ADMIN_TOKEN`), asi
+    que saltar la tercera no abre nada: pedir el token del aparato ajeno seria
+    pedir una credencial que el administrador no tiene ni debe tener.
     """
+    if request.url.path.startswith('/sync/admin/'):
+        return None
+
     did = request.path_params.get('device_id')
     if did:
         return str(did)

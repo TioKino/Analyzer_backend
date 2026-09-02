@@ -245,3 +245,77 @@ def test_el_router_admin_de_sync_ESTA_MONTADO(client):
     declaradas = {r.path for r in sync_endpoints.admin_sync_router.routes}
     assert declaradas, 'el router no declara ninguna ruta'
     assert declaradas <= montadas, f'sin montar: {sorted(declaradas - montadas)}'
+
+
+# ============================================================================
+# EL DIAGNOSTICO NO PUEDE MORIR EN EL CASO QUE VIENE A MIRAR
+# ============================================================================
+
+def test_se_puede_diagnosticar_un_aparato_con_el_TOKEN_ENDURECIDO(client):
+    """El `device_id` de `/sync/admin/device/{id}` es del que se PREGUNTA, no
+    de quien llama.
+
+    `_device_id_from_request` lo sacaba del path igual que en
+    `/sync/pull/{device_id}` —donde sí es quien llama— así que el guard le
+    exigía SU token al administrador. Resultado: diagnosticar un aparato con
+    `token_seen_at` puesto devolvía 401 «Device token required». O sea que la
+    herramienta no podía mirar el único estado del que un cliente legítimo no
+    sale solo, que es exactamente para lo que se hizo.
+
+    Se vio en la primera pasada real contra producción: cuatro aparatos
+    salieron en blanco en el informe.
+    """
+    import hashlib
+    import hmac as _h
+
+    import sync_endpoints
+
+    mac, movil = _uid("mac"), _uid("movil")
+    _register(client, mac, "macos-dmg")
+    token = _register(client, movil, "ios")["device_token"]
+    _link(client, mac, movil)
+
+    secreto = "secreto-de-test-para-firmar"
+    sync_endpoints.SYNC_AUTH_SECRET = secreto
+    try:
+        firma = _h.new(secreto.encode(), b"", hashlib.sha256).hexdigest()
+        # El móvil manda su token una vez: a partir de aquí queda endurecido.
+        assert client.get(f"/sync/pull/{movil}", headers={
+            "X-Device-Token": token, "X-Signature": firma}).status_code == 200
+
+        # Y AHORA el diagnóstico, sin el token del móvil (el admin no lo tiene
+        # ni debe tenerlo). Antes: 401.
+        r = client.get(f"/sync/admin/device/{movil}", headers={
+            "Authorization": f"Bearer {_ADMIN}", "X-Signature": firma})
+        assert r.status_code == 200, r.text
+        assert r.json()["verdict"] == "token_enforced"
+    finally:
+        sync_endpoints.SYNC_AUTH_SECRET = ""
+
+
+def test_un_pull_normal_SIGUE_pidiendo_el_token(client):
+    """La exención es solo para `/sync/admin/*`. Si se colara en `/sync/pull`,
+    el agujero que cierra el token vuelve a estar abierto para todo el mundo."""
+    import hashlib
+    import hmac as _h
+
+    import sync_endpoints
+
+    mac, movil = _uid("mac"), _uid("movil")
+    _register(client, mac, "macos-dmg")
+    token = _register(client, movil, "ios")["device_token"]
+    _link(client, mac, movil)
+
+    secreto = "secreto-de-test-para-firmar"
+    sync_endpoints.SYNC_AUTH_SECRET = secreto
+    try:
+        firma = _h.new(secreto.encode(), b"", hashlib.sha256).hexdigest()
+        assert client.get(f"/sync/pull/{movil}", headers={
+            "X-Device-Token": token, "X-Signature": firma}).status_code == 200
+
+        # Mismo aparato, ya endurecido, ahora SIN token: tiene que seguir 401.
+        r = client.get(f"/sync/pull/{movil}", headers={"X-Signature": firma})
+        assert r.status_code == 401
+        assert "Device token required" in r.text
+    finally:
+        sync_endpoints.SYNC_AUTH_SECRET = ""

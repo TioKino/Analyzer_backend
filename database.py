@@ -2922,6 +2922,21 @@ class AnalysisDB:
             # `device_id IS NOT NULL`. Eso lo salvo, pero por casualidad: no
             # hay que fiar el numero que decide el paywall a que todos los
             # consumidores futuros se acuerden del filtro.
+            #
+            # Y por casualidad solo A MEDIAS. El mismo CTE tiene una segunda
+            # rama para los dispositivos cuyo D0 es anterior a que existiera la
+            # tabla:
+            #
+            #     WHERE ... AND device_id NOT IN (SELECT device_id
+            #                                     FROM device_first_seen)
+            #
+            # En SQL, `x NOT IN (<conjunto con un NULL>)` **nunca es cierto**:
+            # evalua a desconocido para TODA x. Con una sola fila NULL ahi
+            # dentro —o sea, desde la primera visita a la web— esa rama dejaba
+            # de devolver una sola fila. Estaba muerta y no lo dijo nadie.
+            # El dano real fue pequeño porque `backfill_first_seen` ya habia
+            # sembrado a casi todo el parque, pero el fallo no depende de eso.
+            # Hay test.
             if device_id:
                 try:
                     c.execute(

@@ -100,8 +100,17 @@ class TestExtraccionDelDeviceId:
     al Request; de ahi que tenga que sacar el device_id del path o del body."""
 
     class _Req:
-        def __init__(self, path_params=None):
+        # Lleva `url.path` porque la funcion mira la ruta: los `/sync/admin/*`
+        # quedan fuera del guard del token (ahi el device_id del path es el
+        # aparato del que se PREGUNTA, no quien llama). Un fake sin `url` se
+        # caia con AttributeError y parecia un fallo del codigo.
+        class _Url:
+            def __init__(self, path):
+                self.path = path
+
+        def __init__(self, path_params=None, path='/sync/push'):
             self.path_params = path_params or {}
+            self.url = self._Url(path)
 
     def test_lo_saca_del_path(self):
         r = self._Req({'device_id': 'dja_path'})
@@ -124,6 +133,28 @@ class TestExtraccionDelDeviceId:
 
     def test_body_json_que_no_es_dict(self):
         assert se._device_id_from_request(self._Req(), b'[1,2,3]') is None
+
+    def test_en_los_admin_el_device_id_del_PATH_no_es_quien_llama(self):
+        """En `/sync/pull/{device_id}` el id de la ruta ES quien llama. En
+        `/sync/admin/device/{device_id}` es el aparato del que se PREGUNTA, y
+        quien llama es el administrador con su Bearer.
+
+        Confundirlos hacia que diagnosticar un dispositivo con el token
+        endurecido devolviera 401 «Device token required»: la herramienta no
+        podia mirar el unico estado del que un cliente legitimo no sale solo.
+        Se vio en la primera pasada real — cuatro aparatos en blanco.
+        """
+        r = self._Req({'device_id': 'dja_ajeno'},
+                      path='/sync/admin/device/dja_ajeno')
+        assert se._device_id_from_request(r, b'') is None
+
+    def test_la_exencion_es_SOLO_para_los_admin(self):
+        # Si se colara en /sync/pull, el agujero que cierra el token vuelve a
+        # estar abierto para todo el mundo.
+        for ruta in ('/sync/pull/dja_x', '/sync/push', '/sync/publish',
+                     '/sync/pending/dja_x'):
+            r = self._Req({'device_id': 'dja_x'}, path=ruta)
+            assert se._device_id_from_request(r, b'') == 'dja_x', ruta
 
 
 class TestContadoresDeAdopcion:
