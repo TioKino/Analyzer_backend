@@ -141,3 +141,43 @@ def test_el_backfill_barre_las_filas_anonimas_viejas(db):
     finally:
         conn.close()
     assert fila is not None and fila[0] == '2026-01-01'
+
+
+# ============================================================================
+# EL DAÑO COLATERAL: `NOT IN` CON UN NULL DENTRO NUNCA ES CIERTO
+# ============================================================================
+
+def test_una_sola_fila_NULL_mataba_la_rama_de_respaldo_de_la_cohorte():
+    """El CTE del embudo tiene una segunda rama para los veteranos:
+
+        WHERE ... AND device_id NOT IN (SELECT device_id FROM device_first_seen)
+
+    En SQL, `x NOT IN (<conjunto con un NULL>)` **nunca es cierto**: evalua a
+    desconocido para TODA x. O sea que con UNA sola fila NULL ahi dentro —desde
+    la primera visita a la web— esa rama dejaba de devolver una sola fila.
+    Estaba muerta y no lo dijo nadie.
+
+    El daño real fue pequeño porque `backfill_first_seen` ya habia sembrado a
+    casi todo el parque, pero el fallo no depende de eso: depende de que no
+    haya NULLs.
+    """
+    conn = sqlite3.connect(':memory:')
+    conn.execute('CREATE TABLE dfs (device_id TEXT PRIMARY KEY, first_day TEXT)')
+    conn.execute('CREATE TABLE events (device_id TEXT, event_name TEXT)')
+    conn.execute("INSERT INTO events VALUES ('veterano', 'app_opened')")
+    conn.execute("INSERT INTO dfs VALUES ('otro', '2026-05-01')")
+
+    consulta = (
+        "SELECT device_id FROM events "
+        "WHERE event_name = 'app_opened' AND device_id IS NOT NULL "
+        "  AND device_id NOT IN (SELECT device_id FROM dfs) "
+        "GROUP BY device_id"
+    )
+
+    assert conn.execute(consulta).fetchall() == [('veterano',)]
+
+    conn.execute("INSERT INTO dfs VALUES (NULL, '2026-08-27')")
+    assert conn.execute(consulta).fetchall() == [], (
+        'si esto deja de ser cierto, SQLite cambio de semantica — pero '
+        'mientras lo sea, un NULL en esa tabla mata la rama entera'
+    )
