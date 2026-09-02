@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - solo si falta librosa
     normalize_bpm_to_canonical = None
 
 try:
-    from audio_helpers import silence_native_stderr
+    from audio_helpers import silence_native_stderr, beat_track_seguro
 except ImportError:
     # Fallback: no-op si por lo que sea audio_helpers no esta disponible
     # (ej. cli scripts independientes).
@@ -52,6 +52,11 @@ except ImportError:
     @contextlib.contextmanager
     def silence_native_stderr():
         yield
+
+    def beat_track_seguro(y, sr, **kwargs):
+        # Sin `audio_helpers` no hay guarda, pero tampoco se cambia el
+        # comportamiento: el `except` del llamador sigue siendo la red.
+        return librosa.beat.beat_track(y=y, sr=sr, **kwargs)
 
 
 def _normalize_bpm_octave(bpm) -> Optional[float]:
@@ -222,7 +227,12 @@ class ChunkedAudioAnalyzer:
     def analyze_chunk_bpm(self, y: np.ndarray, sr: int) -> Dict:
         """Analiza BPM de un chunk."""
         try:
-            tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+            # `beat_track_seguro`, no `librosa.beat.beat_track` a pelo. Aqui el
+            # fallo de `trim` caia en el `except` de abajo y devolvia **120 BPM
+            # de default**: un chunk sin percusion —una intro ambiental, un
+            # breakdown largo— metia un numero inventado en el BPM agregado del
+            # track, y no quedaba ni un error en ningun sitio.
+            tempo, beats = beat_track_seguro(y, sr)
             tempo = float(tempo) if not isinstance(tempo, np.ndarray) else float(tempo[0])
             
             # Calcular confianza basada en regularidad de beats

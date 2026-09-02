@@ -2905,15 +2905,34 @@ class AnalysisDB:
             # a partir de ahi la fila no se toca por mucho que el device siga
             # mandando eventos. Best-effort dentro del best-effort: si esta
             # tabla falla, el evento se guarda igual.
-            try:
-                c.execute(
-                    'INSERT OR IGNORE INTO device_first_seen '
-                    '(device_id, first_day, first_platform, first_app_version) '
-                    "VALUES (?, date('now'), ?, ?)",
-                    (device_id, platform, app_version),
-                )
-            except sqlite3.OperationalError:
-                pass
+            #
+            # SOLO si hay device_id. Los eventos ANONIMOS —los de la web:
+            # `web_visit`, `web_download_click`— llegan con `device_id = NULL`
+            # a proposito, y en SQLite un `TEXT PRIMARY KEY` **admite NULL y
+            # ademas admite muchos**: dos NULL no chocan en un indice UNIQUE,
+            # asi que el `OR IGNORE` no ignora nada y cada visita a la web
+            # metia una fila basura mas.
+            #
+            # Es la peor tabla donde acumular basura: `device_first_seen` es
+            # justo la que NO se purga (guarda el D0, y purgarla reescribiria
+            # la fecha de alta de los veteranos — el bug que inflaba la
+            # retencion). O sea que crecia sin techo y para siempre.
+            #
+            # La cohorte no llego a contarlos porque el CTE filtra
+            # `device_id IS NOT NULL`. Eso lo salvo, pero por casualidad: no
+            # hay que fiar el numero que decide el paywall a que todos los
+            # consumidores futuros se acuerden del filtro.
+            if device_id:
+                try:
+                    c.execute(
+                        'INSERT OR IGNORE INTO device_first_seen '
+                        '(device_id, first_day, first_platform, '
+                        ' first_app_version) '
+                        "VALUES (?, date('now'), ?, ?)",
+                        (device_id, platform, app_version),
+                    )
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
             return c.lastrowid or 0
         except sqlite3.OperationalError:
@@ -2937,6 +2956,16 @@ class AnalysisDB:
         conn = self._open_conn()
         try:
             c = conn.cursor()
+            # Barrer las filas anonimas que dejo el bug del NULL (ver
+            # `log_event`): una por cada visita a la web, en la unica tabla
+            # que no se purga nunca. No borra ningun D0 real — una fila con
+            # `device_id IS NULL` no identifica a nadie y no la lee nadie: el
+            # CTE de la cohorte ya las descarta.
+            try:
+                c.execute('DELETE FROM device_first_seen '
+                          'WHERE device_id IS NULL')
+            except sqlite3.OperationalError:
+                pass
             c.execute(
                 'INSERT OR IGNORE INTO device_first_seen '
                 '(device_id, first_day) '

@@ -15,7 +15,7 @@ Estructura:
 from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sync_endpoints import sync_router
+from sync_endpoints import sync_router, admin_sync_router
 from routes.admin_panel import admin_panel_router
 from routes.search import search_router, init as init_search
 from routes.community import community_router, init as init_community
@@ -122,7 +122,7 @@ if _os_log.getenv('QUIET_ASSET_LOGS', '1') not in ('0', 'false', 'False'):
     logging.getLogger('uvicorn.access').addFilter(_QuietAssetAccessFilter())
 
 from pydantic import BaseModel
-from audio_helpers import silence_native_stderr
+from audio_helpers import silence_native_stderr, beat_track_seguro
 from spectral_genre_classifier import classify_genre_advanced
 from config import (
     AUDD_API_TOKEN,
@@ -686,6 +686,13 @@ app = FastAPI(
 )
 _startup_time = time.time()
 app.include_router(sync_router)
+# `admin_sync_router` (/sync/admin/*) llevaba desde siempre DEFINIDO y SIN
+# MONTAR: cinco endpoints escritos, documentados y con tests, y las cinco rutas
+# devolviendo 404 en produccion. Por eso no habia forma de contestar «por que el
+# movil dejo de sincronizar» — la herramienta existia y no estaba enchufada, que
+# es peor que no tenerla: se la busca, se la encuentra en el codigo y se
+# concluye que el problema es otro.
+app.include_router(admin_sync_router)
 app.include_router(admin_panel_router)
 
 # CORS: en DEBUG permitimos los origins tipicos de dev local (Flutter web,
@@ -1982,22 +1989,19 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # preview— por no poder recortar unos beats de los bordes. Dos usuarios lo
     # comieron el 2026-08-19 y el track no se analizo nunca. Reintentar sin
     # recorte da el mismo tempo y se salta la funcion que peta.
+    #
+    # El reintento vive en `beat_track_seguro` (audio_helpers) porque la misma
+    # guarda hacia falta en los otros tres sitios que llaman a `beat_track`;
+    # repetida cuatro veces se habria quedado desalineada al primer cambio.
     try:
-        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
-    except ValueError as e:
-        logger.warning(
-            f"[BPM] beat_track fallo ({e}); reintento sin trim. "
-            "Audio sin percusion o demasiado corto."
-        )
-        try:
-            tempo, beats = librosa.beat.beat_track(y=y, sr=sr, trim=False)
-        except Exception as e2:  # noqa: BLE001
-            # Ni asi. El BPM se queda sin medir —y se DICE, con bpm=0 y
-            # bpm_source vacio, en vez de inventar un 120— pero el resto del
-            # analisis sigue: la key, la energia y el genero no dependen de
-            # los beats.
-            logger.warning(f"[BPM] sin beats: {type(e2).__name__}: {e2}")
-            tempo, beats = 0.0, np.array([], dtype=int)
+        tempo, beats = beat_track_seguro(y, sr)
+    except Exception as e2:  # noqa: BLE001
+        # Ni asi. El BPM se queda sin medir —y se DICE, con bpm=0 y
+        # bpm_source vacio, en vez de inventar un 120— pero el resto del
+        # analisis sigue: la key, la energia y el genero no dependen de los
+        # beats.
+        logger.warning(f"[BPM] sin beats: {type(e2).__name__}: {e2}")
+        tempo, beats = 0.0, np.array([], dtype=int)
     # librosa >=0.10 puede devolver tempo como np.ndarray (ej. array([120.5]))
     # en lugar de un escalar. Normalizar antes de convertir a float.
     if hasattr(tempo, '__iter__'):
@@ -3954,7 +3958,11 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             duration = librosa.get_duration(y=y_full, sr=sr_full)
             
             # BPM
-            tempo, beat_frames = librosa.beat.beat_track(y=y_full, sr=sr_full)
+            # `beat_track_seguro`, no `librosa.beat.beat_track` a pelo: aqui el
+            # fallo de `trim` lo recogia el `except Exception` de todo el
+            # re-analisis, o sea que se perdian BPM, key Y energia por no poder
+            # recortar unos beats de los bordes.
+            tempo, beat_frames = beat_track_seguro(y_full, sr_full)
             if hasattr(tempo, '__iter__'):
                 tempo = float(tempo[0])
             bpm = round(tempo, 1)

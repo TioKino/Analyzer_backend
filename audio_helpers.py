@@ -17,6 +17,43 @@ from fastapi.responses import JSONResponse
 logger = logging.getLogger(__name__)
 
 
+def beat_track_seguro(y, sr, **kwargs):
+    """`librosa.beat.beat_track` que no se cae con audio sin percusion.
+
+    `trim=True` (el defecto de librosa) recorta los beats debiles del principio
+    y del final. Cuando NINGUNO pasa el umbral, librosa hace
+    `beats[valid.min():valid.max()]` sobre un array VACIO y revienta con
+    «zero-size array to reduction operation minimum which has no identity».
+    Es un fallo suyo, no nuestro, y pasa con audio sin percusion, casi silencio
+    o muy corto — o sea con intros ambientales y con chunks de un track largo.
+
+    Reintentar sin recorte da el MISMO tempo y se salta la funcion que peta.
+
+    Esta guarda existia desde el 2026-08-19, pero solo en `analyze_audio`, y
+    `beat_track` se llama desde tres sitios mas. En los otros el fallo no se
+    veia porque cada uno lo tragaba a su manera, que es peor que un error:
+
+      · `/identify` -> el `except Exception` del re-analisis se comia BPM, key
+        y energia enteros por no poder recortar unos beats de los bordes.
+      · `ChunkedAudioAnalyzer.analyze_chunk_bpm` -> devolvia **120 BPM** de
+        default. Un chunk mudo contaminaba el BPM agregado del track largo con
+        un numero inventado, sin un solo error en ningun lado.
+
+    Por eso la regla vive aqui y no repetida en cada sitio.
+    """
+    try:
+        return librosa.beat.beat_track(y=y, sr=sr, **kwargs)
+    except ValueError as e:
+        if kwargs.get('trim') is False:
+            raise
+        logger.warning(
+            f"[BPM] beat_track fallo ({e}); reintento sin trim. "
+            "Audio sin percusion o demasiado corto."
+        )
+        kwargs['trim'] = False
+        return librosa.beat.beat_track(y=y, sr=sr, **kwargs)
+
+
 @contextlib.contextmanager
 def silence_native_stderr():
     """Silencia el FD 2 (stderr) durante la operacion envuelta.
