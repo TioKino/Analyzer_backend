@@ -3558,6 +3558,95 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def telemetry_losses(self, *, days: int = 30) -> Dict[str, Any]:
+        """Cuantos eventos del embudo NO llegaron, por causa.
+
+        **Todos los numeros del embudo son una cota inferior**, y hasta ahora
+        nadie sabia de cuanto: `EventReporter.log` es un POST fire-and-forget,
+        asi que lo que se dispara sin red se pierde sin dejar rastro. La nota
+        que habia escrita decia —con razon— que medir cuanto se pierde es mas
+        barato que construir la cola offline a ciegas. Esto es la medida.
+
+        Dos causas, y piden arreglos OPUESTOS:
+
+          `sin_red`    la peticion ni salio -> lo arregla una cola offline.
+          `rechazado`  llego y NO se guardo. `/client-event` devuelve
+                       `202 {"logged": false}` cuando el INSERT falla, y el
+                       cliente daba por bueno cualquier HTTP: durante el bug de
+                       los NULL en `device_first_seen` los eventos de la web se
+                       cayeron asi, invisibles desde los dos lados a la vez.
+                       Aqui no hay cola que valga: hay un bug en el servidor.
+
+        **MAX por dispositivo, no suma.** El cliente manda un total monotonico
+        desde la instalacion, adjunto a cada evento que si sale; sumar las filas
+        contaria el mismo evento perdido tantas veces como informes lo lleven.
+
+        `devices_reporting` es el denominador honesto: solo cuenta aparatos que
+        han mandado la clave, no todo el parque. Y **lo que esto NO ve** es el
+        aparato que pierde eventos y no vuelve a conectar jamas — ese suelo es
+        irreducible, porque el contador viaja con el siguiente evento que sale.
+
+        Itera el cursor y solo mira filas cuyo `props` contiene la clave: la
+        tabla `events` es la unica que crece con el trafico.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            por_device: Dict[str, Dict[str, int]] = {}
+            c.execute(
+                "SELECT device_id, props FROM events "
+                " WHERE props IS NOT NULL AND props LIKE '%\"_losses\"%'"
+                "   AND timestamp >= datetime('now', ?)",
+                (f'-{int(days)} days',),
+            )
+            for fila in c:
+                dev = fila['device_id'] or 'anon'
+                try:
+                    perdidas = (json.loads(fila['props']) or {}).get('_losses')
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(perdidas, dict):
+                    continue
+                acc = por_device.setdefault(dev, {})
+                for causa, n in perdidas.items():
+                    try:
+                        n = int(n)
+                    except (TypeError, ValueError):
+                        continue
+                    # MAX, no suma: el contador del cliente es acumulado.
+                    if n > acc.get(str(causa), 0):
+                        acc[str(causa)] = n
+
+            por_causa: Dict[str, int] = {}
+            for acc in por_device.values():
+                for causa, n in acc.items():
+                    por_causa[causa] = por_causa.get(causa, 0) + n
+
+            c.execute(
+                "SELECT COUNT(DISTINCT device_id) AS n FROM events "
+                " WHERE device_id IS NOT NULL"
+                "   AND timestamp >= datetime('now', ?)",
+                (f'-{int(days)} days',),
+            )
+            activos = int((c.fetchone() or {'n': 0})['n'] or 0)
+
+            return {
+                'window_days': int(days),
+                'by_cause': por_causa,
+                'devices_reporting': len(por_device),
+                'devices_total': activos,
+                'note': (
+                    'MAX por dispositivo (el contador del cliente es un total '
+                    'monotonico). NO ve al aparato que pierde eventos y no '
+                    'vuelve a conectar nunca: ese suelo es irreducible.'
+                ),
+            }
+        except sqlite3.OperationalError:
+            return {'window_days': int(days), 'by_cause': {},
+                    'devices_reporting': 0, 'devices_total': 0}
+        finally:
+            conn.close()
+
     def acoustic_gap_breakdown(self) -> Dict[str, Any]:
         """De los tracks SIN huella acustica: ¿son legado, o siguen entrando?
 
@@ -3582,6 +3671,13 @@ class AnalysisDB:
         agujero esta cerrado y solo hace falta que el backfill llegue a mas
         sitios. Si es de hoy, hay algo activo produciendo tracks sin huella y
         ampliar el backfill seria achicar agua sin tapar la via.
+
+        Y cuando la via esta abierta hay DOS ejes que hay que leer juntos, cada
+        uno separando una cosa distinta: `by_engine_last_30d` dice QUIEN lo
+        analizo y `by_outcome_last_30d` dice si ese analisis SALIO BIEN. Con
+        solo el primero, «el fallback de un fichero que librosa no puede leer»
+        —que sale sin huella a proposito— y «un analisis correcto que aun asi
+        salio sin huella» —que es un bug— son indistinguibles.
         """
         conn = self._open_conn()
         try:
@@ -3620,6 +3716,51 @@ class AnalysisDB:
             )
             por_motor_30d = {str(r['e']): int(r['n'] or 0) for r in c.fetchall()}
 
+            # El OTRO eje: de los recientes, ¿el analisis salio bien?
+            #
+            # `by_engine_last_30d` separa uno de los tres candidatos a la via
+            # abierta (`local_engine` = motor viejo que no manda chromaprint, se
+            # cura solo). Los otros dos NO los separa, y piden acciones
+            # OPUESTAS:
+            #
+            #   `failed_fallback`  el fallback de `/analyze` para cuando librosa
+            #                      no puede con el fichero. Escribe la fila con
+            #                      bpm=0, sin key y SIN llamar a
+            #                      `_attach_acoustic` — a proposito: un analisis
+            #                      fallido no debe sembrar clusters con una
+            #                      duracion basura. Sale sin huella POR DISEÑO;
+            #                      aqui no hay nada que arreglar.
+            #   `analyzed_ok`      el analisis SI salio y la fila salio igual sin
+            #                      chromaprint. `_attach_acoustic` corre
+            #                      incondicionalmente sobre el fichero subido,
+            #                      asi que si falta la huella es que `fpcalc`
+            #                      fallo sobre ese audio y el best-effort se
+            #                      trago la excepcion. AQUI SI HAY BUG.
+            #
+            # Sin esta linea las dos se distinguen yendo a los logs de Render a
+            # buscar `[Acoustic] enrich fallo`, que es justo el tipo de
+            # arqueologia que hace que nadie lo mire.
+            #
+            # Y OJO al leer `by_engine_last_30d` con esto al lado: el fallback
+            # NO sella `engine_source` (decision consciente, ver el comentario
+            # de `/analyze`), asi que cae en `unknown`. Un `unknown` RECIENTE no
+            # es «no sabemos de donde vino», es casi siempre esto.
+            #
+            # El predicado son las columnas que escribe ese fallback (bpm=0,
+            # key vacia) — las mismas que mira `_render_fallback` en el motor
+            # local para negarse a reusar la fila.
+            c.execute(
+                "SELECT COUNT(*) AS n,"
+                "  SUM(CASE WHEN (bpm IS NULL OR bpm <= 0)"
+                "            AND (key IS NULL OR key = '')"
+                "           THEN 1 ELSE 0 END) AS fallidos"
+                f"  FROM tracks WHERE ({sin})"
+                "   AND substr(analyzed_at,1,10) >= date('now','-30 days')"
+            )
+            r = c.fetchone()
+            recientes = int(r['n'] or 0)
+            fallidos = int(r['fallidos'] or 0)
+
             # OJO con la comparacion de fechas. `analyzed_at` se guarda con
             # `datetime.now().isoformat()` -> 'YYYY-MM-DDTHH:MM:SS.ffffff',
             # mientras que `datetime('now')` de SQLite da 'YYYY-MM-DD HH:MM:SS'.
@@ -3653,6 +3794,12 @@ class AnalysisDB:
                 # El reparto que se usa para decidir: solo lo reciente. El de
                 # arriba lo domina el legado y no dice nada del ahora.
                 'by_engine_last_30d': por_motor_30d,
+                # Y el eje que dice cual de los recientes es un BUG y cual sale
+                # sin huella por diseño. Ver el comentario de arriba.
+                'by_outcome_last_30d': {
+                    'failed_fallback': fallidos,
+                    'analyzed_ok': max(recientes - fallidos, 0),
+                },
                 'by_age': {
                     'last_7d': d7,
                     # Acumulados, no excluyentes: 'last_30d' INCLUYE los 7.

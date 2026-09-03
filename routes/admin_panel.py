@@ -1044,6 +1044,18 @@ def _acoustic_gap() -> dict:
         return {}
 
 
+def _telemetry_losses() -> dict:
+    """Cuantos eventos del embudo NO llegaron, por causa. Best-effort.
+
+    Es el denominador que faltaba: todos los numeros del embudo son una cota
+    inferior y hasta ahora nadie sabia de cuanto."""
+    try:
+        return _get_db().telemetry_losses(days=30)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Admin] telemetry_losses no disponible: {e}")
+        return {}
+
+
 def _vote_registration_stats() -> dict:
     """Reparto registrado/no-registrado de las identidades que votan en
     /community/* (SEC-12 fase 1). Best-effort: el panel nunca debe caerse por
@@ -1450,6 +1462,7 @@ async def telemetry(request: Request):
         # sitios; si es de hoy, hay una via abierta y ampliar el backfill seria
         # achicar agua sin taparla.
         "acoustic_gap": _acoustic_gap(),
+        "telemetry_losses": _telemetry_losses(),
         # Decide la FASE 2 del HMAC de escritura (`REQUIRE_WRITE_AUTH=1`).
         # Activarlo con `unsigned` > 0 devuelve 401 a los motores locales
         # ya publicados, que no firman.

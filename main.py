@@ -904,6 +904,11 @@ class ClientEventPayload(BaseModel):
     props: Optional[dict] = None
     platform: Optional[str] = None
     app_version: Optional[str] = None
+    # Cuantos eventos NO llegaron, por causa, desde que se instalo la app.
+    # Total MONOTONICO (no un delta): el cliente lo adjunta al siguiente evento
+    # que si sale, asi que da igual cuantos informes se caigan por el camino.
+    # Ver `EventReporter._perdidosPendientes` en el cliente.
+    losses: Optional[dict] = None
 
 
 @app.post("/client-event")
@@ -917,9 +922,24 @@ async def report_client_event(payload: ClientEventPayload, request: Request):
     platform = (payload.platform or '')[:20] or None
     app_version = (payload.app_version or '')[:20] or None
     props_json = None
-    if payload.props:
+    # Las perdidas viajan DENTRO de `props`, bajo una clave reservada, para no
+    # tocar el esquema de `events` ni la purga. Se sanean a enteros: es un
+    # contador que manda el cliente y va derecho a un agregado.
+    props_merged = dict(payload.props) if payload.props else {}
+    if payload.losses:
+        limpio = {}
+        for k, v in list(payload.losses.items())[:8]:
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                limpio[str(k)[:24]] = n
+        if limpio:
+            props_merged['_losses'] = limpio
+    if props_merged:
         try:
-            props_json = json.dumps(payload.props, ensure_ascii=False)[:2000]
+            props_json = json.dumps(props_merged, ensure_ascii=False)[:2000]
         except (TypeError, ValueError):
             props_json = None
 
