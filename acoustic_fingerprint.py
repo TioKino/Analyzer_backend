@@ -171,7 +171,7 @@ _MAX_ALIGN_SHIFT = 3
 _MIN_OVERLAP = 8
 
 
-def compute_raw_chromaprint(file_path, timeout=30):
+def compute_raw_chromaprint(file_path, timeout=30, etiqueta=None):
     """Extrae el fingerprint Chromaprint crudo con `fpcalc -raw -json`.
 
     Devuelve una lista de int (subfingerprints uint32) o None si fpcalc no esta
@@ -182,7 +182,21 @@ def compute_raw_chromaprint(file_path, timeout=30):
     bundle PyInstaller), 'fpcalc' en PATH, o binario estático auto-descargado a
     disco persistente (Render no ofrece libchromaprint-tools en apt — ver
     ensure_fpcalc). None si no hay forma de tenerlo.
+
+    `etiqueta`: COMO SE LLAMA ESTO EN LOS LOGS, y no es cosmetico.
+
+    En Render `file_path` es un temporal con nombre aleatorio
+    (`/tmp/tmpab12cd.mp3`), asi que loguearlo no identifica nada: te enteras de
+    que fpcalc fallo tres veces esta semana y no de sobre QUE. Y esa es justo
+    la pregunta que decide, porque las dos respuestas piden cosas opuestas —
+    fichero roto (no hay nada que arreglar) contra formato que fpcalc no traga
+    y el ffmpeg del bundle si (se transcodifica a WAV y se reintenta).
+
+    Quien llama sabe el nombre de verdad (`track_data['filename']`) y la
+    huella; aqui solo llega el temporal. Por eso se pasa desde fuera. Si no
+    viene, se cae al basename, que al menos da la extension.
     """
+    nombre = etiqueta or os.path.basename(file_path or '?')
     fpcalc_bin = ensure_fpcalc()
     if not fpcalc_bin:
         logger.warning("[Acoustic] fpcalc no disponible; sin huella acustica")
@@ -194,19 +208,34 @@ def compute_raw_chromaprint(file_path, timeout=30):
         )
         if out.returncode != 0:
             logger.warning(
-                f"[Acoustic] fpcalc exit {out.returncode}: {(out.stderr or '')[:200]}"
+                f"[Acoustic] fpcalc exit {out.returncode} en {nombre!r}: "
+                f"{(out.stderr or '').strip()[:200]}"
             )
             return None
         data = json.loads(out.stdout)
         fp = data.get('fingerprint')
         if isinstance(fp, list) and fp:
             return [int(x) & 0xFFFFFFFF for x in fp]
+        # Exit 0 y sin array: fpcalc dijo que todo bien y no trajo huella. Es
+        # otro caso distinto y no tenia mensaje ninguno — se contaba como
+        # «sin huella» sin dejar una sola linea en el log.
+        logger.warning(
+            f"[Acoustic] fpcalc exit 0 pero sin fingerprint en {nombre!r}"
+        )
         return None
     except FileNotFoundError:
         logger.warning("[Acoustic] fpcalc no instalado; sin huella acustica")
         return None
+    except subprocess.TimeoutExpired:
+        # Separado del `except Exception` de abajo a proposito: un timeout es
+        # «el fichero es largo o el disco va lento», y se arregla subiendo el
+        # timeout. Los demas fallos no. Antes compartian mensaje.
+        logger.warning(
+            f"[Acoustic] fpcalc timeout ({timeout}s) en {nombre!r}"
+        )
+        return None
     except Exception as e:  # noqa: BLE001 - best-effort, nunca romper /analyze
-        logger.warning(f"[Acoustic] fpcalc fallo: {e}")
+        logger.warning(f"[Acoustic] fpcalc fallo en {nombre!r}: {e}")
         return None
 
 
