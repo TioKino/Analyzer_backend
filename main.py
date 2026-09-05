@@ -1343,6 +1343,19 @@ def calculate_fingerprint(file_path):
     return h.hexdigest()
 
 
+def _etiqueta(track_data):
+    """Como se llama este track en los logs de huella.
+
+    El fichero que se le pasa a fpcalc es el temporal de la subida, con nombre
+    aleatorio. Lo que sirve para ir a buscarlo es el nombre original mas la
+    huella (que es la clave de la fila en `tracks`, asi que con ella se llega a
+    la BD). Ambos estan en `track_data`; ninguno esta en el path.
+    """
+    nombre = (track_data or {}).get('filename') or '?'
+    fp = ((track_data or {}).get('fingerprint') or '')[:12]
+    return f"{nombre} [{fp}]" if fp else str(nombre)
+
+
 def _attach_acoustic(track_data, audio_path):
     """Enriquece track_data con la HUELLA ACUSTICA + su cluster antes de
     guardar, para que la memoria colectiva agrupe por SONIDO (no por bytes).
@@ -1358,7 +1371,11 @@ def _attach_acoustic(track_data, audio_path):
     """
     try:
         from acoustic_fingerprint import compute_raw_chromaprint, encode_raw
-        raw = compute_raw_chromaprint(audio_path)
+        # El nombre REAL para el log. `audio_path` es el temporal de la subida
+        # (`/tmp/tmpab12cd.mp3`), que no identifica nada: sin esto te enteras de
+        # que fpcalc fallo N veces y no de sobre que ficheros, que es lo que
+        # decide si estan rotos o si es un formato que no traga.
+        raw = compute_raw_chromaprint(audio_path, etiqueta=_etiqueta(track_data))
         if not raw:
             return
         track_data['chromaprint'] = encode_raw(raw)
@@ -1412,7 +1429,7 @@ def _cluster_clean_identity(audio_path, duration):
     rompe el analisis (si fpcalc no esta, cae a AudD como antes)."""
     try:
         from acoustic_fingerprint import compute_raw_chromaprint
-        raw = compute_raw_chromaprint(audio_path)
+        raw = compute_raw_chromaprint(audio_path, etiqueta='(pre-check AudD)')
         if not raw:
             return None
         acoustic_id = db.find_acoustic_cluster(raw, duration)
