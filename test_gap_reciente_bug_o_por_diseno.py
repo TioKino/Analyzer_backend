@@ -49,9 +49,9 @@ def _hace(dias):
 
 
 def _track(db, tid, *, bpm=128.0, key='Am', chromaprint=None,
-           engine='render', dias=1):
+           engine='render', dias=1, marcador=None):
     """Una fila de `tracks` con lo que mira el reparto."""
-    db.save_track({
+    fila = {
         'id': tid,
         'filename': f'{tid}.mp3',
         'duration': 300.0,
@@ -65,16 +65,38 @@ def _track(db, tid, *, bpm=128.0, key='Am', chromaprint=None,
         'engine_source': engine,
         'analyzed_at': _hace(dias),
         'fingerprint': tid,
-    })
+    }
+    if marcador:
+        fila['analysis_status'] = marcador
+    db.save_track(fila)
 
 
 def _fallback_de_analyze(db, tid, *, dias=1):
     """Lo que escribe el fallback de `/analyze` cuando librosa no puede.
 
-    bpm=0, sin key, y **sin `engine_source`**: no lo sella a proposito, porque
-    no representa un analisis real. Ver el comentario en `/analyze`.
+    Lo que lo IDENTIFICA es `analysis_status='failed'` — un marcador que
+    escribe un solo sitio en todo el backend. bpm=0 y key vacia las escribe
+    tambien, pero no son suyas en exclusiva: ver `_identify_sin_bpm`.
+
+    Y no sella `engine_source` a proposito, porque no representa un analisis
+    real. Ver el comentario en `/analyze`.
     """
-    _track(db, tid, bpm=0, key=None, engine=None, dias=dias)
+    _track(db, tid, bpm=0, key=None, engine=None, dias=dias,
+           marcador='failed')
+
+
+def _identify_sin_bpm(db, tid, *, dias=1):
+    """Una fila de `/identify` cuyo re-analisis no dio BPM ni key.
+
+    `/identify` arranca con `bpm = None` / `key = None`, los rellena solo si su
+    re-analisis sale, y guarda igual — **llamando a `_attach_acoustic` antes**.
+    O sea que si la fila esta sin chromaprint, a esta SI le fallo `fpcalc`
+    sobre audio real.
+
+    Se parece al fallback de `/analyze` en las columnas y NO es lo mismo: aquel
+    ni siquiera intenta sacar la huella.
+    """
+    _track(db, tid, bpm=None, key=None, engine='render', dias=dias)
 
 
 # ============================================================================
@@ -139,13 +161,61 @@ def test_el_legado_no_entra_en_el_reparto_reciente(db):
 
 
 def test_bpm_cero_pero_CON_key_no_es_el_fallback(db):
-    """El predicado son las DOS columnas. Una fila con bpm=0 y key puesta no
-    la escribio ese fallback —que no pone key jamas— y llamarla «fallo por
-    diseño» seria esconder un caso que no se ha mirado."""
+    """Sin el marcador no es el fallback, se parezcan las columnas o no."""
     _track(db, 'raro', bpm=0, key='Am', chromaprint=None)
     r = db.acoustic_gap_breakdown()
     assert r['by_outcome_last_30d']['failed_fallback'] == 0
     assert r['by_outcome_last_30d']['analyzed_ok'] == 1
+
+
+def test_una_fila_de_identify_sin_bpm_NO_es_el_fallback(db):
+    """La regresion que se coló, y es la peor forma de fallar: ESCONDIENDO.
+
+    El predicado de este reparto era `bpm <= 0 AND key vacia`, o sea las
+    columnas que escribe el fallback de `/analyze`. Parecia equivalente al
+    marcador y no lo es: **`/identify` guarda filas con esas mismas columnas**
+    —arranca con `bpm = None` / `key = None` y solo las rellena si su
+    re-analisis sale— y ademas **llama a `_attach_acoustic`**.
+
+    Resultado: una identificacion de AudD a la que `fpcalc` le fallo sobre
+    audio real caia en `failed_fallback`, el cubo etiquetado «por diseño, no
+    hay nada que arreglar». El numero que existe para destapar el bug lo
+    tapaba.
+
+    Un error que INFLA el cubo de «no pasa nada» no se nota nunca: la pantalla
+    dice justo lo que quieres oir.
+    """
+    _identify_sin_bpm(db, 'ident1')
+    r = db.acoustic_gap_breakdown()
+    assert r['by_outcome_last_30d'] == {
+        'failed_fallback': 0,
+        'analyzed_ok': 1,
+    }
+
+
+def test_el_marcador_es_lo_que_manda_aunque_haya_bpm(db):
+    """Al reves: si la fila trae el marcador, es el fallback, punto. No se
+    re-deduce de las columnas."""
+    _track(db, 'marcada', bpm=0, key=None, engine=None, dias=1,
+           marcador='failed')
+    assert db.acoustic_gap_breakdown()['by_outcome_last_30d'] == {
+        'failed_fallback': 1,
+        'analyzed_ok': 0,
+    }
+
+
+def test_el_marcador_lo_escribe_UN_solo_sitio(db):
+    """Si mañana otro endpoint escribe `analysis_status='failed'`, este reparto
+    empieza a excusar filas que no son de ese fallback — y otra vez por el lado
+    que no se nota. Se cuenta en el fuente."""
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(aqui, 'main.py'), encoding='utf-8') as f:
+        src = f.read()
+    escrituras = src.count("['analysis_status'] = 'failed'")
+    assert escrituras == 1, (
+        f"{escrituras} sitios escriben el marcador; el reparto de "
+        f"`by_outcome_last_30d` asume que es solo el fallback de /analyze"
+    )
 
 
 # ============================================================================
