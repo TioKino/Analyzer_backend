@@ -3730,30 +3730,47 @@ class AnalysisDB:
             #                      fallido no debe sembrar clusters con una
             #                      duracion basura. Sale sin huella POR DISEÑO;
             #                      aqui no hay nada que arreglar.
-            #   `analyzed_ok`      el analisis SI salio y la fila salio igual sin
-            #                      chromaprint. `_attach_acoustic` corre
+            #   `analyzed_ok`      TODO lo demas: filas a las que `_attach_acoustic`
+            #                      SI se les paso por encima —el camino normal de
+            #                      `/analyze`, el cache-hit por huella, el
+            #                      fallback de Render y `/identify`— y aun asi
+            #                      salieron sin chromaprint. Corre
             #                      incondicionalmente sobre el fichero subido,
-            #                      asi que si falta la huella es que `fpcalc`
-            #                      fallo sobre ese audio y el best-effort se
-            #                      trago la excepcion. AQUI SI HAY BUG.
-            #
-            # Sin esta linea las dos se distinguen yendo a los logs de Render a
-            # buscar `[Acoustic] enrich fallo`, que es justo el tipo de
-            # arqueologia que hace que nadie lo mire.
+            #                      asi que si la huella falta es que `fpcalc` no
+            #                      pudo con ESE audio. AQUI SI HAY BUG.
             #
             # Y OJO al leer `by_engine_last_30d` con esto al lado: el fallback
             # NO sella `engine_source` (decision consciente, ver el comentario
             # de `/analyze`), asi que cae en `unknown`. Un `unknown` RECIENTE no
             # es «no sabemos de donde vino», es casi siempre esto.
             #
-            # El predicado son las columnas que escribe ese fallback (bpm=0,
-            # key vacia) — las mismas que mira `_render_fallback` en el motor
-            # local para negarse a reusar la fila.
+            # EL PREDICADO ES EL MARCADOR, NO bpm=0.
+            #
+            # Aqui habia `bpm <= 0 AND key vacia`, que son las columnas que
+            # escribe ese fallback. Parecia equivalente y NO lo es: `/identify`
+            # tambien guarda filas —arranca con `bpm = None`, `key = None` y
+            # solo las rellena si su re-analisis sale— y tambien llama a
+            # `_attach_acoustic`. O sea que una identificacion de AudD cuyo
+            # re-analisis no dio BPM caia en `failed_fallback`, que es el cubo
+            # etiquetado «por diseño, no hay nada que arreglar» — y ahi SI hay
+            # algo: a esa fila `fpcalc` le fallo sobre audio real.
+            #
+            # El marcador `analysis_status='failed'` lo escribe UN solo sitio
+            # (`main.py`, el fallback de /analyze) y viaja dentro de
+            # `analysis_json`, porque `save_track` serializa todo `track_data`.
+            # Se busca con `instr()` para no sacar los blobs a Python: el
+            # analysis_json lleva waveform y curva de energia, y este endpoint
+            # ya tumbo produccion una vez por leerlos en memoria.
+            #
+            # Se aceptan los dos espaciados por si algun dia cambia el
+            # `json.dumps` (hoy el de por defecto da `"clave": "valor"`).
+            marcador = (
+                "(instr(analysis_json, '\"analysis_status\": \"failed\"') > 0"
+                " OR instr(analysis_json, '\"analysis_status\":\"failed\"') > 0)"
+            )
             c.execute(
                 "SELECT COUNT(*) AS n,"
-                "  SUM(CASE WHEN (bpm IS NULL OR bpm <= 0)"
-                "            AND (key IS NULL OR key = '')"
-                "           THEN 1 ELSE 0 END) AS fallidos"
+                f"  SUM(CASE WHEN {marcador} THEN 1 ELSE 0 END) AS fallidos"
                 f"  FROM tracks WHERE ({sin})"
                 "   AND substr(analyzed_at,1,10) >= date('now','-30 days')"
             )
