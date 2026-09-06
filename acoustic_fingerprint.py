@@ -35,6 +35,7 @@ import shutil
 import struct
 import subprocess
 import tarfile
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +63,16 @@ _FPCALC_URL = os.environ.get(
 _FPCALC_CACHE_DIR = os.environ.get("FPCALC_CACHE_DIR", "/data/bin")
 _FPCALC_AUTODOWNLOAD = os.environ.get("FPCALC_AUTODOWNLOAD", "1") != "0"
 
-_fpcalc_path = None       # ruta resuelta (cache)
-_fpcalc_resolved = False  # ya intentamos resolver en este proceso
+_fpcalc_path = None       # ruta resuelta (cache). Solo se cachea el EXITO.
+_fpcalc_ultimo_intento = 0.0   # monotonic() del ultimo intento fallido
+_fpcalc_fallos = 0             # intentos fallidos seguidos (para el backoff)
+
+# Cuanto esperar antes de volver a intentar resolver fpcalc tras un fallo.
+# NO es cero —cada reintento puede acabar en una descarga de red— y NO es
+# infinito, que es lo que habia. 5 minutos: un `/analyze` cada pocos segundos
+# no machaca nada, y un fallo transitorio al arrancar se cura solo dentro de la
+# primera tanda de analisis en vez de durar hasta el proximo deploy.
+_FPCALC_REINTENTO_S = float(os.environ.get("FPCALC_RETRY_SECONDS", "300"))
 
 
 def _resolve_existing_fpcalc():
@@ -140,19 +149,93 @@ def _download_fpcalc():
 
 
 def ensure_fpcalc():
-    """Ruta al binario fpcalc, auto-descargándolo si hace falta. Memoizado por
-    proceso. Devuelve None si no hay forma de tenerlo (la huella se salta)."""
-    global _fpcalc_path, _fpcalc_resolved
-    if _fpcalc_resolved:
+    """Ruta al binario fpcalc, auto-descargándolo si hace falta. Devuelve None
+    si ahora mismo no hay forma de tenerlo (la huella se salta, best-effort).
+
+    SOLO SE CACHEA EL EXITO, y el motivo costo 682 tracks.
+
+    Esto memoizaba el FALLO: un flag `_fpcalc_resolved` se ponia a True pasara
+    lo que pasara, asi que si el primer intento del proceso no encontraba el
+    binario —descarga que expira, red de Render con hipo al arrancar, /data
+    todavia no montado— **todas las llamadas siguientes devolvian None sin
+    reintentar**, durante toda la vida del worker. Y como el Procfile levanta
+    UN worker, eso es: la huella acustica apagada para TODO el mundo hasta el
+    proximo deploy.
+
+    Encaja con lo medido el 2026-09-06: 682 tracks recientes con
+    `engine_source='render'` y sin chromaprint, entrando a rafagas, mientras el
+    log solo tenia tres `fpcalc exit 2` sueltos. No es que fpcalc fallara 682
+    veces: es que no se le llamo 682 veces.
+
+    Y era invisible por partida doble — el `logger.info` de exito solo se
+    emitia si habia path, o sea que el fallo no escribia NADA aqui, y la unica
+    linea (`fpcalc no disponible`, en compute_raw_chromaprint) ni lleva la
+    palabra «error» ni es severidad error.
+
+    Ahora: exito -> se cachea para siempre. Fallo -> se reintenta pasados
+    `_FPCALC_REINTENTO_S`, y se avisa con lo que significa.
+    """
+    global _fpcalc_path, _fpcalc_ultimo_intento, _fpcalc_fallos
+    if _fpcalc_path:
         return _fpcalc_path
+
+    ahora = time.monotonic()
+    if _fpcalc_fallos and (ahora - _fpcalc_ultimo_intento) < _FPCALC_REINTENTO_S:
+        return None
+
+    _fpcalc_ultimo_intento = ahora
     path = _resolve_existing_fpcalc()
     if path is None and _FPCALC_AUTODOWNLOAD:
         path = _download_fpcalc()
-    _fpcalc_path = path
-    _fpcalc_resolved = True
+
     if path:
-        logger.info(f"[Acoustic] fpcalc en uso: {path}")
-    return path
+        if _fpcalc_fallos:
+            logger.warning(
+                f"[Acoustic] fpcalc RECUPERADO tras {_fpcalc_fallos} intento(s) "
+                f"fallido(s): {path}. Los tracks analizados mientras tanto se "
+                f"guardaron SIN huella; los cura el cache-hit cuando alguien "
+                f"vuelva a subir ese fichero."
+            )
+        else:
+            logger.info(f"[Acoustic] fpcalc en uso: {path}")
+        _fpcalc_path = path
+        _fpcalc_fallos = 0
+        return path
+
+    _fpcalc_fallos += 1
+    # Se avisa en CADA fallo, no solo el primero: es un apagon de la memoria
+    # colectiva entera y tiene que doler en el log, no pasar de puntillas.
+    logger.error(
+        f"[Acoustic] fpcalc NO disponible (intento {_fpcalc_fallos}). "
+        f"MIENTRAS DURE, NINGUN track sale con huella acustica y la memoria "
+        f"colectiva no agrupa nada nuevo. Reintento en {_FPCALC_REINTENTO_S:.0f}s. "
+        f"Cache: {_FPCALC_CACHE_DIR}  autodescarga: {_FPCALC_AUTODOWNLOAD}"
+    )
+    return None
+
+
+def estado_fpcalc():
+    """Para el panel admin: ¿esta la huella acustica funcionando AHORA?
+
+    Sin esto la unica forma de saberlo era leer los logs — y el fallo no lleva
+    la palabra «error», asi que ni filtrando por ella aparecia. Un apagon de la
+    huella podia durar dias sin que nada lo dijera; de hecho duro.
+
+    NO fuerza la resolucion: informa de lo que hay. Que un endpoint admin
+    dispare una descarga seria un efecto secundario feo.
+    """
+    return {
+        'disponible': bool(_fpcalc_path),
+        'ruta': _fpcalc_path,
+        'fallos_seguidos': _fpcalc_fallos,
+        'cache_dir': _FPCALC_CACHE_DIR,
+        'autodescarga': _FPCALC_AUTODOWNLOAD,
+        'nota': (
+            'disponible=false significa que AHORA MISMO ningun track sale con '
+            'huella acustica. No es un aviso menor: es la memoria colectiva '
+            'apagada.'
+        ),
+    }
 
 # Umbral de distancia Hamming normalizada (0..1) bajo el cual dos fingerprints
 # se consideran el MISMO audio. El mismo audio re-encoded a otro codec mide

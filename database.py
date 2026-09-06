@@ -3730,6 +3730,12 @@ class AnalysisDB:
             #                      fallido no debe sembrar clusters con una
             #                      duracion basura. Sale sin huella POR DISEÑO;
             #                      aqui no hay nada que arreglar.
+            #   `never_tried`      `/recognize` guarda su deteccion en `tracks` y
+            #                      NO llama a `_attach_acoustic`, tambien a
+            #                      proposito: trabaja sobre un fragmento corto
+            #                      y la huella de un fragmento la descarta el
+            #                      clustering por duracion. Tampoco hay nada
+            #                      que arreglar.
             #   `analyzed_ok`      TODO lo demas: filas a las que `_attach_acoustic`
             #                      SI se les paso por encima —el camino normal de
             #                      `/analyze`, el cache-hit por huella, el
@@ -3764,19 +3770,34 @@ class AnalysisDB:
             #
             # Se aceptan los dos espaciados por si algun dia cambia el
             # `json.dumps` (hoy el de por defecto da `"clave": "valor"`).
-            marcador = (
-                "(instr(analysis_json, '\"analysis_status\": \"failed\"') > 0"
-                " OR instr(analysis_json, '\"analysis_status\":\"failed\"') > 0)"
-            )
+            def _marcador(valor):
+                return (
+                    f"(instr(analysis_json, '\"analysis_status\": \"{valor}\"') > 0"
+                    f" OR instr(analysis_json, '\"analysis_status\":\"{valor}\"') > 0)"
+                )
+
+            # Y el TERCER caso, que tampoco es un bug: `/recognize` guarda su
+            # deteccion en `tracks` y NO pasa por `_attach_acoustic` a
+            # proposito — trabaja sobre un fragmento corto, y la huella de un
+            # fragmento la descarta el clustering por duracion (±2,5 s).
+            #
+            # Sin descontarlas, esas filas se contaban como «paso por fpcalc y
+            # fallo». Con 407 llamadas en 30 dias son ~218 tracks de ruido
+            # justo encima del numero que decide. Sale marcado desde
+            # 2026-09-06: las filas ANTERIORES siguen en `analyzed_ok`, asi que
+            # ese cubo esta inflado hasta que roten los 30 dias.
             c.execute(
                 "SELECT COUNT(*) AS n,"
-                f"  SUM(CASE WHEN {marcador} THEN 1 ELSE 0 END) AS fallidos"
+                f"  SUM(CASE WHEN {_marcador('failed')} THEN 1 ELSE 0 END) AS fallidos,"
+                f"  SUM(CASE WHEN {_marcador('recognize_only')} THEN 1 ELSE 0 END)"
+                "     AS sin_intento"
                 f"  FROM tracks WHERE ({sin})"
                 "   AND substr(analyzed_at,1,10) >= date('now','-30 days')"
             )
             r = c.fetchone()
             recientes = int(r['n'] or 0)
             fallidos = int(r['fallidos'] or 0)
+            sin_intento = int(r['sin_intento'] or 0)
 
             # OJO con la comparacion de fechas. `analyzed_at` se guarda con
             # `datetime.now().isoformat()` -> 'YYYY-MM-DDTHH:MM:SS.ffffff',
@@ -3815,7 +3836,8 @@ class AnalysisDB:
                 # sin huella por diseño. Ver el comentario de arriba.
                 'by_outcome_last_30d': {
                     'failed_fallback': fallidos,
-                    'analyzed_ok': max(recientes - fallidos, 0),
+                    'never_tried': sin_intento,
+                    'analyzed_ok': max(recientes - fallidos - sin_intento, 0),
                 },
                 'by_age': {
                     'last_7d': d7,

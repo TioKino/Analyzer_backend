@@ -4716,6 +4716,18 @@ async def recognize_audio(
                     'bpm_source': 'pending',
                     'key_source': 'pending',
                     'isrc': isrc,
+                    # Esta fila NO pasa por `_attach_acoustic` — y esta bien
+                    # asi: /recognize trabaja sobre un fragmento corto, y la
+                    # huella de un fragmento la descarta el clustering por
+                    # duracion (±2,5 s), igual que pasaria con el snippet de
+                    # 6 s. Sacarla seria gastar CPU en sembrar basura.
+                    #
+                    # Pero sin decirlo, estas filas caian en `analyzed_ok` del
+                    # reparto de `acoustic_gap_breakdown`, o sea contadas como
+                    # «paso por fpcalc y fallo: hay bug». Con 407 llamadas en
+                    # 30 dias eso son ~218 tracks de ruido encima del numero
+                    # que decide. Se marca para poder descontarlas.
+                    'analysis_status': 'recognize_only',
                 }
                 existing = db.get_track_by_fingerprint(detect_id)
                 if not existing:
