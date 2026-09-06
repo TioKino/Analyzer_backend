@@ -1044,6 +1044,21 @@ def _acoustic_gap() -> dict:
         return {}
 
 
+def _estado_fpcalc() -> dict:
+    """¿Esta la huella acustica viva ahora mismo? Best-effort.
+
+    Un apagon de fpcalc no lo decia nada: el fallo no lleva la palabra «error»
+    ni es severidad error, asi que ni filtrando los logs por «error» aparecia.
+    Duro dias y se descubrio por el contador de tracks sin huella, no por el
+    sitio donde estaba escrito."""
+    try:
+        from acoustic_fingerprint import estado_fpcalc
+        return estado_fpcalc()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Admin] estado_fpcalc no disponible: {e}")
+        return {}
+
+
 def _telemetry_losses() -> dict:
     """Cuantos eventos del embudo NO llegaron, por causa. Best-effort.
 
@@ -1462,6 +1477,10 @@ async def telemetry(request: Request):
         # sitios; si es de hoy, hay una via abierta y ampliar el backfill seria
         # achicar agua sin taparla.
         "acoustic_gap": _acoustic_gap(),
+        # ¿Esta la huella funcionando AHORA? Es lo primero que hay que mirar
+        # cuando `analyzed_ok` sube: si fpcalc no esta, no es que falle sobre
+        # ficheros concretos, es que no se le llama.
+        "fpcalc": _estado_fpcalc(),
         "telemetry_losses": _telemetry_losses(),
         # Decide la FASE 2 del HMAC de escritura (`REQUIRE_WRITE_AUTH=1`).
         # Activarlo con `unsigned` > 0 devuelve 401 a los motores locales

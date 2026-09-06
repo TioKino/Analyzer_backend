@@ -109,6 +109,7 @@ def test_el_fallback_fallido_NO_cuenta_como_bug(db):
     r = db.acoustic_gap_breakdown()
     assert r['by_outcome_last_30d'] == {
         'failed_fallback': 2,
+        'never_tried': 0,
         'analyzed_ok': 0,
     }
 
@@ -120,6 +121,7 @@ def test_un_analisis_BUENO_sin_huella_SI_es_un_bug(db):
     r = db.acoustic_gap_breakdown()
     assert r['by_outcome_last_30d'] == {
         'failed_fallback': 0,
+        'never_tried': 0,
         'analyzed_ok': 1,
     }
 
@@ -144,6 +146,7 @@ def test_los_que_SI_tienen_huella_no_entran(db):
     r = db.acoustic_gap_breakdown()
     assert r['by_outcome_last_30d'] == {
         'failed_fallback': 1,
+        'never_tried': 0,
         'analyzed_ok': 0,
     }
 
@@ -189,6 +192,7 @@ def test_una_fila_de_identify_sin_bpm_NO_es_el_fallback(db):
     r = db.acoustic_gap_breakdown()
     assert r['by_outcome_last_30d'] == {
         'failed_fallback': 0,
+        'never_tried': 0,
         'analyzed_ok': 1,
     }
 
@@ -200,8 +204,44 @@ def test_el_marcador_es_lo_que_manda_aunque_haya_bpm(db):
            marcador='failed')
     assert db.acoustic_gap_breakdown()['by_outcome_last_30d'] == {
         'failed_fallback': 1,
+        'never_tried': 0,
         'analyzed_ok': 0,
     }
+
+
+def test_recognize_no_cuenta_como_bug_porque_ni_lo_intenta(db):
+    """El tercer caso, y son ~218 tracks encima del numero que decide.
+
+    `/recognize` guarda su deteccion en `tracks` y NO llama a
+    `_attach_acoustic`. Eso esta BIEN: trabaja sobre un fragmento corto, y la
+    huella de un fragmento la descarta el clustering por duracion (±2,5 s) —
+    el mismo motivo por el que no se saca del snippet de 6 s.
+
+    Pero sin marcarlo caian en `analyzed_ok`, o sea contadas como «paso por
+    fpcalc y fallo». Con 407 llamadas en 30 dias, eso es ruido del mismo orden
+    que la señal.
+    """
+    _track(db, 'det1', bpm=0, key=None, engine=None,
+           marcador='recognize_only')
+    r = db.acoustic_gap_breakdown()
+    assert r['by_outcome_last_30d'] == {
+        'failed_fallback': 0,
+        'never_tried': 1,
+        'analyzed_ok': 0,
+    }
+
+
+def test_los_tres_cubos_suman_la_poblacion(db):
+    """Si no suman, dos lecturas del mismo dato se contradicen."""
+    _fallback_de_analyze(db, 'roto')
+    _track(db, 'det1', bpm=0, key=None, engine=None, marcador='recognize_only')
+    _identify_sin_bpm(db, 'ident1')
+    _track(db, 'ok1', chromaprint=None)
+    r = db.acoustic_gap_breakdown()
+    assert sum(r['by_outcome_last_30d'].values()) == 4
+    assert sum(r['by_engine_last_30d'].values()) == 4
+    # Y el reparto: solo los dos que SI pasaron por fpcalc son bug.
+    assert r['by_outcome_last_30d']['analyzed_ok'] == 2
 
 
 def test_el_marcador_lo_escribe_UN_solo_sitio(db):
@@ -211,6 +251,12 @@ def test_el_marcador_lo_escribe_UN_solo_sitio(db):
     aqui = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(aqui, 'main.py'), encoding='utf-8') as f:
         src = f.read()
+    # Y el otro marcador que tambien excusa filas, por lo mismo.
+    reconoce = src.count("'analysis_status': 'recognize_only'")
+    assert reconoce == 1, (
+        f"{reconoce} sitios marcan `recognize_only`; ese cubo asume que es "
+        f"solo /recognize"
+    )
     escrituras = src.count("['analysis_status'] = 'failed'")
     assert escrituras == 1, (
         f"{escrituras} sitios escriben el marcador; el reparto de "
@@ -252,6 +298,7 @@ def test_una_bd_vacia_no_inventa_nada(db):
     r = db.acoustic_gap_breakdown()
     assert r['by_outcome_last_30d'] == {
         'failed_fallback': 0,
+        'never_tried': 0,
         'analyzed_ok': 0,
     }
 
