@@ -159,17 +159,65 @@ def test_el_estado_sale_por_el_panel(monkeypatch, reloj):
     _resolucion(monkeypatch, None)
     af.ensure_fpcalc()
     e = af.estado_fpcalc()
+    assert e['estado'] == 'caido'
     assert e['disponible'] is False
     assert e['fallos_seguidos'] == 1
     assert 'memoria colectiva' in e['nota']
 
 
+def test_NO_intentado_todavia_NO_es_caido(monkeypatch):
+    """El falso positivo de la primera lectura real (2026-09-06): la alarma
+    salio en rojo con `fallos_seguidos: 0`, o sea gritando «no hay binario»
+    cuando lo que pasaba es que nadie habia pedido fpcalc en ese worker.
+
+    Tras CADA deploy hay una ventana asi hasta el primer `/analyze`, o sea que
+    el aviso saltaba en falso todo el rato. Y una alarma que grita en falso es
+    peor que no tenerla: entrena a ignorarla, y la caida de verdad pasa
+    desapercibida.
+
+    «No» y «no lo se» no pueden compartir señal — la misma razon por la que en
+    Duplicados se separan `clusters` de `without_cluster`.
+    """
+    monkeypatch.setattr(af, '_resolve_existing_fpcalc', lambda: '/data/bin/fpcalc')
+    e = af.estado_fpcalc()
+    assert e['estado'] == 'sin_intentar'
+    assert e['fallos_seguidos'] == 0
+    # Y no se queda en un encogimiento de hombros: dice si el binario esta.
+    assert e['binario_en_disco'] is True
+
+
+def test_sin_intentar_y_SIN_binario_en_disco(monkeypatch):
+    """El matiz que hace util el tercer estado: aun no se ha pedido, pero
+    cuando se pida no va a estar. No es una caida todavia, y casi."""
+    monkeypatch.setattr(af, '_resolve_existing_fpcalc', lambda: None)
+    e = af.estado_fpcalc()
+    assert e['estado'] == 'sin_intentar'
+    assert e['binario_en_disco'] is False
+
+
+def test_resuelto_es_ok(monkeypatch, reloj):
+    _resolucion(monkeypatch, '/usr/bin/fpcalc')
+    af.ensure_fpcalc()
+    e = af.estado_fpcalc()
+    assert e['estado'] == 'ok'
+    assert e['disponible'] is True
+
+
 def test_el_estado_NO_dispara_una_descarga(monkeypatch, reloj):
-    """Un endpoint admin que se lee para mirar no puede tener efectos."""
-    caja = _resolucion(monkeypatch, None)
+    """Un endpoint admin que se lee para mirar no puede tener efectos.
+
+    `estado_fpcalc` SI llama a `_resolve_existing_fpcalc` (solo `stat`/`which`),
+    pero NUNCA a `_download_fpcalc`."""
+    descargas = {'n': 0}
+
+    def _no():
+        descargas['n'] += 1
+        return None
+    monkeypatch.setattr(af, '_resolve_existing_fpcalc', lambda: None)
+    monkeypatch.setattr(af, '_download_fpcalc', _no)
     for _ in range(5):
         af.estado_fpcalc()
-    assert caja['i'] == 0
+    assert descargas['n'] == 0
 
 
 def test_telemetry_lo_expone():

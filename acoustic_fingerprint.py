@@ -221,19 +221,55 @@ def estado_fpcalc():
     la palabra «error», asi que ni filtrando por ella aparecia. Un apagon de la
     huella podia durar dias sin que nada lo dijera; de hecho duro.
 
-    NO fuerza la resolucion: informa de lo que hay. Que un endpoint admin
-    dispare una descarga seria un efecto secundario feo.
+    TRES ESTADOS, NO UN BOOLEANO. La primera version devolvia
+    `disponible: bool(_fpcalc_path)` y el embudo pintaba la alarma roja en
+    cuanto era False. En la primera lectura real (2026-09-06) salio
+    «APAGADA» con `fallos_seguidos: 0` — o sea la alarma diciendo que no hay
+    binario cuando lo que pasaba es que **nadie habia pedido fpcalc todavia en
+    ese worker**. Tras cada deploy hay una ventana asi hasta el primer
+    `/analyze`, o sea que el aviso saltaba en falso constantemente.
+
+    «No» y «no lo se» compartiendo señal, otra vez — la misma razon por la que
+    en Duplicados se separan `clusters` de `without_cluster`. Y una alarma que
+    grita en falso es peor que no tenerla: entrena a ignorarla, y la proxima
+    caida de verdad pasa desapercibida.
+
+      `ok`            resuelto y en uso.
+      `caido`         se intento y fallo. AQUI SI: ningun track sale con huella.
+      `sin_intentar`  aun no se ha pedido en este worker. NO es un fallo.
+
+    En `sin_intentar` se mira ademas si el binario ESTA en disco, con
+    `_resolve_existing_fpcalc()`, que solo hace `stat`/`which` y **no
+    descarga**: que un endpoint admin dispare una descarga seria un efecto
+    secundario feo. Asi «no se ha pedido» deja de ser un encogimiento de
+    hombros y dice si, cuando se pida, va a estar.
     """
+    if _fpcalc_path:
+        estado, listo = 'ok', True
+    elif _fpcalc_fallos:
+        estado, listo = 'caido', False
+    else:
+        estado = 'sin_intentar'
+        try:
+            listo = bool(_resolve_existing_fpcalc())
+        except Exception:  # noqa: BLE001 - informar nunca puede romper
+            listo = None
+
     return {
-        'disponible': bool(_fpcalc_path),
+        'estado': estado,
+        # Se mantiene por compatibilidad, pero SOLO es True en `ok`. No lo uses
+        # para decidir: `False` no distingue «caido» de «aun no se ha pedido».
+        'disponible': estado == 'ok',
+        'binario_en_disco': listo,
         'ruta': _fpcalc_path,
         'fallos_seguidos': _fpcalc_fallos,
         'cache_dir': _FPCALC_CACHE_DIR,
         'autodescarga': _FPCALC_AUTODOWNLOAD,
         'nota': (
-            'disponible=false significa que AHORA MISMO ningun track sale con '
-            'huella acustica. No es un aviso menor: es la memoria colectiva '
-            'apagada.'
+            'estado=caido significa que AHORA MISMO ningun track sale con '
+            'huella acustica: la memoria colectiva apagada. estado='
+            'sin_intentar NO es un fallo — es un worker que aun no ha '
+            'analizado nada; mira `binario_en_disco`.'
         ),
     }
 
