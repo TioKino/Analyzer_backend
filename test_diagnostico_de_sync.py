@@ -23,6 +23,7 @@ lado de la otra. Por eso `siblings` trae lo que subió cada aparato y cuándo.
 import os
 import tempfile
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -134,7 +135,63 @@ def test_cuando_el_movil_ya_se_lo_bajo_el_veredicto_cambia(client):
 
     d = _admin(client, f"/sync/admin/device/{movil}")
     assert d["pending_for_this_device"] == 0
+    # `nothing_pending` de verdad: el Mac SI empujo, y hace un momento.
     assert d["verdict"] == "nothing_pending"
+    assert d["days_since_sibling_push"] == 0
+
+
+def test_sin_pendientes_porque_NADIE_le_manda_nada_NO_es_estar_al_dia(client):
+    """Las dos causas de `pending == 0` mandan a mirar aparatos OPUESTOS.
+
+    Se lo bajo todo      -> el receptor esta al dia; si el usuario no ve los
+                            cambios, lo que falla es APLICARLOS.
+    Nadie le mando nada  -> el receptor esta perfecto; quien calla es el
+                            EMISOR (sync en pausa tras un formateo, app sin
+                            abrir, crash).
+
+    Compartian el veredicto `nothing_pending`, y el script lo imprimia como
+    «AL DÍA — el servidor no le debe nada, mirar el cliente»: o sea mandando a
+    mirar el movil cuando el que no habla es el escritorio.
+
+    Salio en la primera pasada real (2026-09-06) sobre la cuenta del owner: Mac
+    sin empujar desde el 31 de agosto, Android con `esperandole: 0`, veredicto
+    «AL DÍA». Es el mismo fallo que esta herramienta existe para no cometer, un
+    piso mas abajo.
+    """
+    mac, movil = _uid("mac"), _uid("movil")
+    _register(client, mac, "macos-dmg")
+    _register(client, movil, "ios")
+    _link(client, mac, movil)
+    # El Mac NUNCA sube nada. El movil no tiene pendientes... porque no hay.
+    d = _admin(client, f"/sync/admin/device/{movil}")
+    assert d["pending_for_this_device"] == 0
+    assert d["verdict"] == "sender_quiet"
+    assert d["last_sibling_push"] is None
+
+
+def test_un_emisor_callado_DIAS_tampoco_es_estar_al_dia(client):
+    """El caso del owner: el Mac empujo, pero hace una semana."""
+    import sync_endpoints as se
+
+    mac, movil = _uid("mac"), _uid("movil")
+    _register(client, mac, "macos-dmg")
+    _register(client, movil, "ios")
+    _link(client, mac, movil)
+    _push(client, mac, ["a"])
+    assert client.get(f"/sync/pull/{movil}").status_code == 200
+
+    # Envejecer el empuje del Mac a mano.
+    conn = se._get_conn()
+    conn.execute(
+        "UPDATE sync_items SET updated_at = ? WHERE last_device_id = ?",
+        ((datetime.now(timezone.utc) - timedelta(days=9)).isoformat(), mac),
+    )
+    conn.commit()
+
+    d = _admin(client, f"/sync/admin/device/{movil}")
+    assert d["pending_for_this_device"] == 0
+    assert d["verdict"] == "sender_quiet"
+    assert d["days_since_sibling_push"] >= 9
 
 
 def test_un_item_MODIFICADO_vuelve_a_contar_como_pendiente(client):
