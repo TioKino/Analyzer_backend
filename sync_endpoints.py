@@ -28,6 +28,12 @@ from starlette.requests import ClientDisconnect
 from pydantic import BaseModel
 from typing import Any, List, Optional
 from datetime import datetime, timezone, timedelta
+
+# Dias sin que NINGUN compañero suba nada para dejar de llamarlo «al dia» y
+# empezar a llamarlo «el emisor esta callado». No es un juicio de si esta bien
+# o mal —esta app se usa a rafagas, ~6 sesiones al mes— sino el corte que separa
+# dos causas que piden mirar aparatos distintos. Ver el comentario del verdict.
+_DIAS_EMISOR_CALLADO = 3
 import json, hashlib, sqlite3, os
 from validation import is_desktop_platform
 
@@ -1981,9 +1987,18 @@ async def admin_device_diagnosis(device_id: str):
       |                      | el, 401 «Device token required» PARA SIEMPRE|
       | `alone`              | esta solo en su cuenta: no hay nada que     |
       |                      | sincronizar, se perdio la vinculacion       |
-      | `nothing_pending`    | esta al dia — el problema no es el servidor |
+      | `nothing_pending`    | se lo bajo TODO: el problema no es el       |
+      |                      | servidor ni el emisor, falla APLICARLO      |
+      | `sender_quiet`       | no le espera nada porque NADIE le manda     |
+      |                      | nada: el receptor esta bien, mirar el       |
+      |                      | EMISOR (sync en pausa tras un formateo,     |
+      |                      | app sin abrir, crash)                       |
       | `pending`            | tiene N items esperando y no viene a por    |
       |                      | ellos: mirar el cliente                     |
+
+    `nothing_pending` y `sender_quiet` eran EL MISMO veredicto y mandaban a
+    mirar el aparato equivocado la mitad de las veces. Ver el comentario donde
+    se calculan.
 
     Y el dato que de verdad zanja la discusion: `siblings`, con lo que subio
     CADA aparato de la cuenta y cuando. Si el Mac tiene `last_push` de hace un
@@ -2058,12 +2073,55 @@ async def admin_device_diagnosis(device_id: str):
             "last_push": s_last,
         })
 
+    # `pending == 0` tiene DOS causas y piden mirar sitios OPUESTOS:
+    #
+    #   el aparato se lo bajo todo   -> el receptor esta al dia; si el usuario
+    #                                   no ve los cambios, falla APLICARLOS.
+    #   nadie le mando nada          -> el receptor esta perfecto; quien calla
+    #                                   es el EMISOR (sync en pausa tras un
+    #                                   formateo, app sin abrir, crash).
+    #
+    # Se llamaban las dos `nothing_pending` y el diagnostico salia «AL DÍA — el
+    # servidor no le debe nada, mirar el cliente», o sea mandando a mirar el
+    # movil cuando el que no habla es el escritorio. Medido el 2026-09-06 en la
+    # cuenta del owner: Mac sin empujar desde el 31 de agosto y el Android con
+    # `esperandole: 0` — leido como «al dia» cuando era «nadie te manda nada».
+    #
+    # Es el mismo fallo que esta herramienta existe para no cometer, un piso mas
+    # abajo. El umbral no juzga si esta bien o mal: solo separa las dos causas.
+    empujes = [s["last_push"] for s in siblings if s["last_push"]]
+    ultimo_de_otros = max(empujes) if empujes else None
+    dias_callado = None
+    if ultimo_de_otros:
+        try:
+            # `_now_iso()` escribe con offset (`+00:00`) y por ahi hay filas
+            # con `Z`. Las dos se normalizan a UTC consciente: comparar una
+            # marca con tz contra `utcnow()`, que es ingenua, lanza TypeError
+            # — y como esto va dentro de un `except`, el fallo salia como
+            # `dias_callado = None`, o sea el veredicto cayendo a
+            # `nothing_pending` justo en el caso que vengo a separar. Silencioso
+            # y en la direccion de decir «todo bien».
+            marca = datetime.fromisoformat(
+                ultimo_de_otros.replace('Z', '+00:00'))
+            if marca.tzinfo is None:
+                marca = marca.replace(tzinfo=timezone.utc)
+            dias_callado = max(
+                (datetime.now(timezone.utc) - marca).days, 0)
+        except (TypeError, ValueError):
+            dias_callado = None
+
     if token_seen_at:
         verdict = "token_enforced"
     elif not siblings:
         verdict = "alone"
     elif pending > 0:
         verdict = "pending"
+    elif not empujes:
+        # Tiene compañeros y NINGUNO ha subido nada en su vida. No es que este
+        # al dia: es que no hay biblioteca que mandarle.
+        verdict = "sender_quiet"
+    elif dias_callado is not None and dias_callado >= _DIAS_EMISOR_CALLADO:
+        verdict = "sender_quiet"
     else:
         verdict = "nothing_pending"
 
@@ -2081,6 +2139,10 @@ async def admin_device_diagnosis(device_id: str):
         "last_push": last_push,
         "pending_for_this_device": pending,
         "siblings": siblings,
+        # Cuando fue la ultima vez que ALGUIEN de la cuenta subio algo, y
+        # cuantos dias hace. Sin esto, `pending: 0` no se puede interpretar.
+        "last_sibling_push": ultimo_de_otros,
+        "days_since_sibling_push": dias_callado,
         "verdict": verdict,
     }
 
