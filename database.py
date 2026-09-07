@@ -3558,6 +3558,58 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def chromaprint_status_for(self, fingerprints: List[str]) -> Dict[str, bool]:
+        """Dice, en LOTE, cuales de estas huellas estan ANALIZADAS y si ademas
+        tienen chromaprint. `{fp: True}` = analizada y con huella acustica;
+        `{fp: False}` = analizada y SIN ella. Las que no aparecen en el mapa no
+        estan en la tabla.
+
+        Las tres respuestas piden acciones OPUESTAS y por eso no comparten
+        cubo (misma regla que `acoustic_ids_for` con `without_cluster`):
+
+          True      no hay nada que hacer.
+          False     CURABLE: subir el audio a /backfill-audio y sale con huella
+                    sin reanalizar, sin AudD y sin tocar bpm/key.
+          ausente   NO analizada. Subirla NO es un backfill: es un analisis
+                    completo, con su CPU y su posible AudD detras. El cliente
+                    tiene que poder distinguirla o acabaria pagando un analisis
+                    creyendo que rellena una huella.
+
+        Se mira `fingerprint` Y `id` por lo mismo que `acoustic_ids_for`: en los
+        registros antiguos el id ES el MD5 y buscar por una sola columna dejaria
+        fuera media biblioteca historica.
+        """
+        fps = [f for f in (fingerprints or []) if f]
+        if not fps:
+            return {}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            marcas = ','.join('?' * len(fps))
+            c.execute(
+                f'SELECT id, fingerprint, chromaprint FROM tracks '
+                f'WHERE fingerprint IN ({marcas}) OR id IN ({marcas})',
+                fps + fps,
+            )
+            fuera: Dict[str, bool] = {}
+            pedidas = set(fps)
+            for r in c.fetchall():
+                tiene = bool(r['chromaprint'])
+                # La clave devuelta es la que PIDIO el cliente, igual que en
+                # acoustic_ids_for: devolverle la otra columna seria darle una
+                # clave que no reconoce.
+                for clave in (r['fingerprint'], r['id']):
+                    if clave in pedidas:
+                        # Con dos filas para la misma clave (id legacy + fila
+                        # nueva) gana la que SI tiene huella: decir "curable"
+                        # de algo ya curado manda a subir audio para nada.
+                        fuera[clave] = fuera.get(clave, False) or tiene
+            return fuera
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def telemetry_losses(self, *, days: int = 30) -> Dict[str, Any]:
         """Cuantos eventos del embudo NO llegaron, por causa.
 
