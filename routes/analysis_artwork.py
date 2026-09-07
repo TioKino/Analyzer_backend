@@ -164,6 +164,53 @@ async def acoustic_clusters(request: AcousticClustersRequest):
     }
 
 
+class AcousticPendingRequest(BaseModel):
+    fingerprints: List[str]
+
+
+@router.post("/acoustic/pending")
+async def acoustic_pending(request: AcousticPendingRequest):
+    """De este lote de huellas, cuales se pueden CURAR subiendo el audio.
+
+    Es el paso previo del backfill que si funciona en el Mac App Store y en
+    movil. El backfill de siempre (`/backfill-fingerprint`) necesita `fpcalc`
+    local: en MAS el sandbox no le deja abrir ficheros y en movil no hay
+    binario, asi que esas dos plataformas no pueden rehacer la huella de su
+    legado. Pero el audio si lo tienen — y `/backfill-audio` calcula la huella
+    en el servidor, sin reanalizar y sin AudD.
+
+    La respuesta parte en TRES, no en dos, porque piden acciones opuestas:
+
+      `curable`         analizada y SIN chromaprint -> subir el audio.
+      `with_chromaprint` ya esta en la memoria colectiva -> no subir nada.
+      `not_analyzed`    no esta en la tabla. Subirla NO es un backfill: es un
+                        analisis completo con su CPU y su posible AudD. Que el
+                        cliente no la confunda con `curable` es justo el punto:
+                        un solo cubo «no tiene huella» haria que el backfill se
+                        comiera la biblioteca entera de un movil recien
+                        instalado creyendo que rellena huecos.
+
+    Maximo 500 por peticion, igual que sus vecinas.
+    """
+    fps = [f for f in (request.fingerprints or []) if f]
+    if len(fps) > 500:
+        raise HTTPException(400, "Máximo 500 fingerprints por petición")
+
+    estado = db.chromaprint_status_for(fps)
+    curable = [f for f in fps if estado.get(f) is False]
+    con_huella = [f for f in fps if estado.get(f) is True]
+    sin_analizar = [f for f in fps if f not in estado]
+    return {
+        "curable": curable,
+        "with_chromaprint": con_huella,
+        "not_analyzed": sin_analizar,
+        "total": len(fps),
+        "curable_count": len(curable),
+        "with_chromaprint_count": len(con_huella),
+        "not_analyzed_count": len(sin_analizar),
+    }
+
+
 class CheckAnalyzedByFingerprintRequest(BaseModel):
     fingerprints: List[str]
 

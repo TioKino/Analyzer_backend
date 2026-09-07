@@ -3558,6 +3558,58 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def chromaprint_status_for(self, fingerprints: List[str]) -> Dict[str, bool]:
+        """Dice, en LOTE, cuales de estas huellas estan ANALIZADAS y si ademas
+        tienen chromaprint. `{fp: True}` = analizada y con huella acustica;
+        `{fp: False}` = analizada y SIN ella. Las que no aparecen en el mapa no
+        estan en la tabla.
+
+        Las tres respuestas piden acciones OPUESTAS y por eso no comparten
+        cubo (misma regla que `acoustic_ids_for` con `without_cluster`):
+
+          True      no hay nada que hacer.
+          False     CURABLE: subir el audio a /backfill-audio y sale con huella
+                    sin reanalizar, sin AudD y sin tocar bpm/key.
+          ausente   NO analizada. Subirla NO es un backfill: es un analisis
+                    completo, con su CPU y su posible AudD detras. El cliente
+                    tiene que poder distinguirla o acabaria pagando un analisis
+                    creyendo que rellena una huella.
+
+        Se mira `fingerprint` Y `id` por lo mismo que `acoustic_ids_for`: en los
+        registros antiguos el id ES el MD5 y buscar por una sola columna dejaria
+        fuera media biblioteca historica.
+        """
+        fps = [f for f in (fingerprints or []) if f]
+        if not fps:
+            return {}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            marcas = ','.join('?' * len(fps))
+            c.execute(
+                f'SELECT id, fingerprint, chromaprint FROM tracks '
+                f'WHERE fingerprint IN ({marcas}) OR id IN ({marcas})',
+                fps + fps,
+            )
+            fuera: Dict[str, bool] = {}
+            pedidas = set(fps)
+            for r in c.fetchall():
+                tiene = bool(r['chromaprint'])
+                # La clave devuelta es la que PIDIO el cliente, igual que en
+                # acoustic_ids_for: devolverle la otra columna seria darle una
+                # clave que no reconoce.
+                for clave in (r['fingerprint'], r['id']):
+                    if clave in pedidas:
+                        # Con dos filas para la misma clave (id legacy + fila
+                        # nueva) gana la que SI tiene huella: decir "curable"
+                        # de algo ya curado manda a subir audio para nada.
+                        fuera[clave] = fuera.get(clave, False) or tiene
+            return fuera
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def telemetry_losses(self, *, days: int = 30) -> Dict[str, Any]:
         """Cuantos eventos del embudo NO llegaron, por causa.
 
@@ -3826,6 +3878,52 @@ class AnalysisDB:
             )
             newest = c.fetchone()['m']
 
+            # El MISMO maximo, pero descontando las dos causas que salen sin
+            # huella POR DISEÑO. Y es otro numero, no un matiz.
+            #
+            # `newest_without` mira TODAS las filas sin chromaprint, asi que
+            # una sola pulsacion de Escuchar (`recognize_only`) o un fichero
+            # que librosa no puede leer (`failed`) lo pone en hoy. Con eso, «la
+            # via sigue abierta» y «alguien uso Escuchar esta tarde» dan
+            # exactamente la misma lectura — y piden acciones opuestas: la
+            # primera es un bug que hay que perseguir, la segunda no es nada.
+            #
+            # Es el mismo fallo que ya tenia el eje de motor antes de partirlo
+            # en `by_outcome`, un nivel mas abajo: alli se partio el CONTEO y
+            # se dejo la FECHA compartida.
+            #
+            # Y ahora mismo es la fecha lo que decide. El 2026-09-06 se arreglo
+            # que `ensure_fpcalc` memoizara el FALLO (la huella se apagaba
+            # entera para todo el mundo hasta el proximo deploy, ~682 tracks en
+            # una rafaga). Esos 682 estan DENTRO de la ventana de 30 dias y la
+            # dominan, asi que `by_outcome_last_30d.analyzed_ok` seguira alto
+            # un mes entero aunque no vuelva a entrar ni uno. La unica pregunta
+            # que queda —¿sigue entrando DESPUES del arreglo?— la contesta esta
+            # fecha, y solo si excluye lo que sale sin huella a proposito.
+            c.execute(
+                "SELECT MAX(analyzed_at) AS m FROM tracks"
+                f" WHERE ({sin}) AND analyzed_at IS NOT NULL"
+                f"   AND NOT {_marcador('failed')}"
+                f"   AND NOT {_marcador('recognize_only')}"
+            )
+            newest_ok = c.fetchone()['m']
+
+            # Y el reparto por resultado tambien a 7 dias, por lo mismo: con
+            # solo la ventana de 30, un arreglo desplegado hoy no se puede
+            # comprobar hasta dentro de un mes.
+            c.execute(
+                "SELECT COUNT(*) AS n,"
+                f"  SUM(CASE WHEN {_marcador('failed')} THEN 1 ELSE 0 END) AS fallidos,"
+                f"  SUM(CASE WHEN {_marcador('recognize_only')} THEN 1 ELSE 0 END)"
+                "     AS sin_intento"
+                f"  FROM tracks WHERE ({sin})"
+                "   AND substr(analyzed_at,1,10) >= date('now','-7 days')"
+            )
+            r = c.fetchone()
+            recientes7 = int(r['n'] or 0)
+            fallidos7 = int(r['fallidos'] or 0)
+            sin_intento7 = int(r['sin_intento'] or 0)
+
             return {
                 'without_chromaprint': total,
                 'by_engine': por_motor,
@@ -3846,8 +3944,22 @@ class AnalysisDB:
                     'older': max(total - d30 - sin_fecha, 0),
                     'no_date': sin_fecha,
                 },
+                'by_outcome_last_7d': {
+                    'failed_fallback': fallidos7,
+                    'never_tried': sin_intento7,
+                    'analyzed_ok': max(recientes7 - fallidos7 - sin_intento7, 0),
+                },
                 # El dato que decide si esto es legado o una via abierta.
+                #
+                # OJO: este mira TODAS las filas sin huella, las que salen asi
+                # por diseño incluidas. Se mantiene por continuidad de la serie
+                # de `funnel_data/`, pero para decidir usa el de abajo.
                 'newest_without': newest,
+                # El mismo maximo SIN las dos causas por diseño. Este es el que
+                # dice si la via sigue abierta: si es anterior al ultimo
+                # arreglo, esta cerrada por muy alto que siga el conteo de 30
+                # dias (que arrastra la rafaga vieja durante un mes).
+                'newest_analyzed_ok_without': newest_ok,
             }
         except sqlite3.OperationalError:
             # BD antigua sin chromaprint/engine_source.

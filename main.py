@@ -3222,6 +3222,29 @@ async def analyze_track(
                         existing_dict = db._row_to_dict(existing) or {}
                         existing_dict['analysis_json'] = json.dumps(analysis_json)
                         # Re-save no es trivial, pero al menos guardamos el path
+                # Curar la huella acustica si le falta, igual que hace el
+                # cache-hit por fingerprint doce lineas mas abajo.
+                #
+                # Sin esto la cura no llegaba al caso MAS comun. Este atajo
+                # exige nombre igual Y huella igual, o sea el MISMO fichero
+                # subido otra vez — que es lo que hace todo el mundo al
+                # reimportar su carpeta— y devuelve ANTES de que el camino por
+                # huella pueda mirar el chromaprint. La fila legada solo se
+                # curaba si el fichero habia cambiado de nombre por el camino.
+                #
+                # El audio esta aqui, en `tmp_path`, y se borra en la linea de
+                # abajo: es la ultima oportunidad. Best-effort y sin coste
+                # extra — ni subida (ya esta hecha) ni AudD ni reanalisis.
+                _fila = db._row_to_dict(existing) or {}
+                if not _fila.get('chromaprint'):
+                    _attach_acoustic(_fila, tmp_path)
+                    if _fila.get('chromaprint'):
+                        db.backfill_track_fingerprint(
+                            fingerprint,
+                            _fila['chromaprint'],
+                            _fila.get('acoustic_id'),
+                        )
+
                 # Limpiar el tmp_path creado durante el upload streaming: este
                 # cache-hit no necesita el archivo subido. (No reventamos si ya
                 # no existe — race improbable con otro handler.)
@@ -4997,6 +5020,139 @@ async def backfill_fingerprint_endpoint(request: BackfillFingerprintRequest):
             "genre_source": best.get('genre_source'),
         } if best else None,
     }
+
+
+@app.post("/backfill-audio")
+async def backfill_audio_endpoint(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    """Backfill de huella acustica SUBIENDO EL AUDIO — el que si funciona en el
+    Mac App Store y en movil.
+
+    `/backfill-fingerprint` es mas barato (el cliente calcula el chromaprint con
+    su `fpcalc` y manda 4 KB), pero necesita ese binario: en la build MAS el
+    sandbox no le deja abrir ficheros y en movil no existe. Esas dos
+    plataformas no podian rehacer la huella de su legado NUNCA, y son justo las
+    que mas legado sin huella tienen.
+
+    Aqui el trabajo lo hace el servidor. Es exactamente la cura que /analyze ya
+    hace en su cache-hit por huella, pero sin nada de lo demas:
+
+      - NO reanaliza (no toca bpm, key, energia, genero ni analysis_json).
+      - NO llama a AudD.
+      - NO genera preview.
+      - NO reescribe la fila: es un UPDATE de dos columnas
+        (`backfill_track_fingerprint`), asi que `analyzed_at` no se bombea.
+
+    El coste real es el ANCHO DE BANDA de subir el audio, y por eso el cliente
+    lo gatea (a peticion, con wifi y en tandas). El servidor no lo gatea: aqui
+    solo se paga CPU de fpcalc, que es lo mismo que ya paga cualquier /analyze.
+
+    Cuatro respuestas, y ninguna es un error HTTP — todas son informacion que el
+    cliente necesita para no repetir trabajo:
+
+      `curada`       tenia hueco y ahora esta en la memoria colectiva.
+      `ya_tenia`     otro aparato se adelanto. No volver a subirla.
+      `no_analizado` el audio no esta en la tabla. **No se analiza**: eso seria
+                     un analisis completo disfrazado de backfill.
+      `sin_huella`   fpcalc no pudo con este fichero (audio ilegible). Es
+                     permanente para ESTE fichero: el cliente lo marca hecho y
+                     no lo reintenta en cada tanda.
+    """
+    # Mismo rate limit que /analyze: acepta subidas de hasta MAX_UPLOAD_MB y sin
+    # limite seria el mismo vector de DoS.
+    check_rate_limit(get_client_ip(request))
+
+    if not file.filename:
+        raise HTTPException(400, "No se proporcionó archivo")
+    if os.path.basename(file.filename).startswith("._"):
+        raise HTTPException(400, "Fichero AppleDouble (._*), no es audio real")
+
+    max_size = MAX_UPLOAD_BYTES
+    total_bytes = 0
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=os.path.splitext(file.filename)[1],
+    ) as tmp:
+        tmp_path = tmp.name
+        while True:
+            chunk = await file.read(1024 * 1024)  # 1 MB
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > max_size:
+                tmp.close()
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    400, f"Archivo demasiado grande. Máximo: {MAX_UPLOAD_MB} MB")
+            tmp.write(chunk)
+
+    try:
+        if total_bytes < 1000:
+            raise HTTPException(400, "Archivo demasiado pequeño o corrupto")
+
+        try:
+            fingerprint = calculate_fingerprint(tmp_path)
+        except (OSError, IOError) as e:
+            logger.error(f"[BackfillAudio] No se pudo leer el fichero subido: {e}")
+            raise HTTPException(400, "No se pudo leer el archivo subido")
+
+        fila = db.get_track_by_fingerprint(fingerprint)
+        if not fila:
+            # Deliberado: NO se analiza. Este endpoint rellena huecos de la
+            # memoria colectiva, no da de alta tracks — analizar aqui gastaria
+            # CPU y posiblemente AudD por una peticion que el usuario creia
+            # gratis. El cliente ya sabe cuales son cuales por /acoustic/pending.
+            return {"ok": False, "status": "no_analizado", "fingerprint": fingerprint}
+
+        if fila.get('chromaprint'):
+            return {
+                "ok": True,
+                "status": "ya_tenia",
+                "fingerprint": fingerprint,
+                "acoustic_id": fila.get('acoustic_id'),
+            }
+
+        _attach_acoustic(fila, tmp_path)
+        if not fila.get('chromaprint'):
+            # `_attach_acoustic` es best-effort y se traga la excepcion: si no
+            # dejo huella, fpcalc no pudo con este fichero. Decirlo en vez de
+            # devolver un OK vacio es lo que permite al cliente marcarlo y no
+            # volver a subir los mismos megas en cada tanda.
+            return {"ok": False, "status": "sin_huella", "fingerprint": fingerprint}
+
+        # UPDATE de dos columnas, NO `save_track`: reescribir la fila entera
+        # arriesga `analyzed_at` (el numero que decide si el hueco de huella es
+        # legado o una via abierta) sin ganar nada.
+        db.backfill_track_fingerprint(
+            fingerprint, fila['chromaprint'], fila.get('acoustic_id'),
+        )
+        best = (db.best_cluster_analysis(fila.get('acoustic_id'))
+                if fila.get('acoustic_id') else None)
+        return {
+            "ok": True,
+            "status": "curada",
+            "fingerprint": fingerprint,
+            "acoustic_id": fila.get('acoustic_id'),
+            "best": {
+                "bpm": best.get('bpm'),
+                "bpm_source": best.get('bpm_source'),
+                "key": best.get('key'),
+                "camelot": best.get('camelot'),
+                "key_source": best.get('key_source'),
+                "genre": best.get('genre'),
+                "genre_source": best.get('genre_source'),
+            } if best else None,
+        }
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ==================== CACHE-LOOKUP / ARTWORK ====================
