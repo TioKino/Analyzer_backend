@@ -3878,6 +3878,52 @@ class AnalysisDB:
             )
             newest = c.fetchone()['m']
 
+            # El MISMO maximo, pero descontando las dos causas que salen sin
+            # huella POR DISEÑO. Y es otro numero, no un matiz.
+            #
+            # `newest_without` mira TODAS las filas sin chromaprint, asi que
+            # una sola pulsacion de Escuchar (`recognize_only`) o un fichero
+            # que librosa no puede leer (`failed`) lo pone en hoy. Con eso, «la
+            # via sigue abierta» y «alguien uso Escuchar esta tarde» dan
+            # exactamente la misma lectura — y piden acciones opuestas: la
+            # primera es un bug que hay que perseguir, la segunda no es nada.
+            #
+            # Es el mismo fallo que ya tenia el eje de motor antes de partirlo
+            # en `by_outcome`, un nivel mas abajo: alli se partio el CONTEO y
+            # se dejo la FECHA compartida.
+            #
+            # Y ahora mismo es la fecha lo que decide. El 2026-09-06 se arreglo
+            # que `ensure_fpcalc` memoizara el FALLO (la huella se apagaba
+            # entera para todo el mundo hasta el proximo deploy, ~682 tracks en
+            # una rafaga). Esos 682 estan DENTRO de la ventana de 30 dias y la
+            # dominan, asi que `by_outcome_last_30d.analyzed_ok` seguira alto
+            # un mes entero aunque no vuelva a entrar ni uno. La unica pregunta
+            # que queda —¿sigue entrando DESPUES del arreglo?— la contesta esta
+            # fecha, y solo si excluye lo que sale sin huella a proposito.
+            c.execute(
+                "SELECT MAX(analyzed_at) AS m FROM tracks"
+                f" WHERE ({sin}) AND analyzed_at IS NOT NULL"
+                f"   AND NOT {_marcador('failed')}"
+                f"   AND NOT {_marcador('recognize_only')}"
+            )
+            newest_ok = c.fetchone()['m']
+
+            # Y el reparto por resultado tambien a 7 dias, por lo mismo: con
+            # solo la ventana de 30, un arreglo desplegado hoy no se puede
+            # comprobar hasta dentro de un mes.
+            c.execute(
+                "SELECT COUNT(*) AS n,"
+                f"  SUM(CASE WHEN {_marcador('failed')} THEN 1 ELSE 0 END) AS fallidos,"
+                f"  SUM(CASE WHEN {_marcador('recognize_only')} THEN 1 ELSE 0 END)"
+                "     AS sin_intento"
+                f"  FROM tracks WHERE ({sin})"
+                "   AND substr(analyzed_at,1,10) >= date('now','-7 days')"
+            )
+            r = c.fetchone()
+            recientes7 = int(r['n'] or 0)
+            fallidos7 = int(r['fallidos'] or 0)
+            sin_intento7 = int(r['sin_intento'] or 0)
+
             return {
                 'without_chromaprint': total,
                 'by_engine': por_motor,
@@ -3898,8 +3944,22 @@ class AnalysisDB:
                     'older': max(total - d30 - sin_fecha, 0),
                     'no_date': sin_fecha,
                 },
+                'by_outcome_last_7d': {
+                    'failed_fallback': fallidos7,
+                    'never_tried': sin_intento7,
+                    'analyzed_ok': max(recientes7 - fallidos7 - sin_intento7, 0),
+                },
                 # El dato que decide si esto es legado o una via abierta.
+                #
+                # OJO: este mira TODAS las filas sin huella, las que salen asi
+                # por diseño incluidas. Se mantiene por continuidad de la serie
+                # de `funnel_data/`, pero para decidir usa el de abajo.
                 'newest_without': newest,
+                # El mismo maximo SIN las dos causas por diseño. Este es el que
+                # dice si la via sigue abierta: si es anterior al ultimo
+                # arreglo, esta cerrada por muy alto que siga el conteo de 30
+                # dias (que arrastra la rafaga vieja durante un mes).
+                'newest_analyzed_ok_without': newest_ok,
             }
         except sqlite3.OperationalError:
             # BD antigua sin chromaprint/engine_source.
