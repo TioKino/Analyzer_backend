@@ -35,6 +35,7 @@ import shutil
 import struct
 import subprocess
 import tarfile
+import tempfile
 import time
 
 logger = logging.getLogger(__name__)
@@ -290,6 +291,114 @@ _MAX_ALIGN_SHIFT = 3
 _MIN_OVERLAP = 8
 
 
+def _fpcalc_una_pasada(fpcalc_bin, file_path, timeout):
+    """Una invocación de fpcalc. Devuelve `(ints, motivo)`.
+
+    `ints` es la lista de subfingerprints, o None si no salió. `motivo` es una
+    cadena corta para el log, o None si fue bien. Se parte así para poder
+    llamarlo DOS veces —sobre el original y sobre el transcodificado— sin
+    duplicar el parseo ni el manejo de errores.
+    """
+    try:
+        out = subprocess.run(
+            [fpcalc_bin, '-raw', '-json', file_path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        return None, 'fpcalc no instalado'
+    except subprocess.TimeoutExpired:
+        return None, f'timeout ({timeout}s)'
+    except Exception as e:  # noqa: BLE001 - best-effort, nunca romper /analyze
+        return None, f'fallo: {e}'
+
+    if out.returncode != 0:
+        return None, (
+            f"exit {out.returncode}: {(out.stderr or '').strip()[:200]}"
+        )
+    try:
+        data = json.loads(out.stdout)
+    except Exception as e:  # noqa: BLE001
+        return None, f'json invalido: {e}'
+    fp = data.get('fingerprint')
+    if isinstance(fp, list) and fp:
+        return [int(x) & 0xFFFFFFFF for x in fp], None
+    # Exit 0 y sin array: fpcalc dijo que todo bien y no trajo huella. Es otro
+    # caso distinto y no tenia mensaje ninguno — se contaba como «sin huella»
+    # sin dejar una sola linea en el log.
+    return None, 'exit 0 pero sin fingerprint'
+
+
+def _merece_transcodificar(motivo):
+    """¿Vale la pena reintentar este fallo pasando el audio por ffmpeg?
+
+    **Se decide por el MENSAJE, no por el codigo de salida**, y eso costo una
+    recomendacion equivocada el 2026-09-08: se habia clasificado `exit 3` como
+    «no decodifica» y `exit 2` como «huella vacia», y los logs de produccion
+    traian `exit 2` con el mensaje de decodificacion. El codigo de salida de
+    fpcalc no separa las dos causas; el texto si.
+
+    Se reintenta cuando fpcalc no supo LEER el audio, porque ahi hay algo que
+    ganar: si el analisis de ese track salio bien —y `_attach_acoustic` solo
+    corre en ese caso—, librosa pudo con el fichero, asi que ffmpeg tambien
+    podra. Son MP3 viejos con la cabecera rota, tipicamente acapellas que
+    llevan veinte años rulando.
+
+    NO se reintenta:
+      - `Empty fingerprint`: decodifico bien y la huella salio vacia (audio
+        demasiado corto o silencio). Transcodificar no lo alarga.
+      - timeout: el fichero es largo o el disco va lento; meter un transcode
+        delante solo lo empeora.
+      - `fpcalc no instalado` / `no disponible`: no es el fichero, es el
+        binario. Eso lo cubre `ensure_fpcalc`.
+    """
+    if not motivo:
+        return False
+    m = motivo.lower()
+    if 'empty fingerprint' in m:
+        return False
+    if 'timeout' in m or 'no instalado' in m:
+        return False
+    return 'decoding' in m or 'invalid data' in m
+
+
+def _transcodificar_a_wav(file_path, timeout):
+    """Pasa el audio por ffmpeg a WAV mono 16 kHz. Devuelve la ruta temporal o
+    None. Quien llama se encarga de borrarla.
+
+    Mono y 16 kHz no es un capricho de tamaño: fpcalc remuestrea a mono 11 025
+    Hz por dentro de todas formas, asi que no se pierde nada que el fingerprint
+    fuera a usar, y un WAV de 5 minutos baja de ~50 MB a ~10. En Render, con UN
+    worker, esa diferencia importa.
+
+    `-nostdin` porque ffmpeg se come stdin si puede y aqui corre dentro de una
+    peticion; `-v error` para que su ruido no se confunda con el nuestro.
+    """
+    ffmpeg_bin = os.environ.get('FFMPEG_BIN', 'ffmpeg')
+    fd, destino = tempfile.mkstemp(suffix='.wav', prefix='fpcalc_')
+    os.close(fd)
+    try:
+        out = subprocess.run(
+            [ffmpeg_bin, '-nostdin', '-v', 'error', '-y',
+             '-i', file_path, '-ac', '1', '-ar', '16000', destino],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if out.returncode != 0 or os.path.getsize(destino) == 0:
+            logger.warning(
+                f"[Acoustic] ffmpeg no pudo transcodificar: "
+                f"{(out.stderr or '').strip()[:200]}"
+            )
+            os.unlink(destino)
+            return None
+        return destino
+    except Exception as e:  # noqa: BLE001 - best-effort
+        logger.warning(f"[Acoustic] ffmpeg fallo: {e}")
+        try:
+            os.unlink(destino)
+        except OSError:
+            pass
+        return None
+
+
 def compute_raw_chromaprint(file_path, timeout=30, etiqueta=None):
     """Extrae el fingerprint Chromaprint crudo con `fpcalc -raw -json`.
 
@@ -320,42 +429,45 @@ def compute_raw_chromaprint(file_path, timeout=30, etiqueta=None):
     if not fpcalc_bin:
         logger.warning("[Acoustic] fpcalc no disponible; sin huella acustica")
         return None
+
+    ints, motivo = _fpcalc_una_pasada(fpcalc_bin, file_path, timeout)
+    if ints:
+        return ints
+
+    if not _merece_transcodificar(motivo):
+        logger.warning(f"[Acoustic] fpcalc {motivo} en {nombre!r}")
+        return None
+
+    # SEGUNDA PASADA sobre el audio transcodificado.
+    #
+    # Medido en produccion el 2026-09-08: TODOS los fallos de huella vivos eran
+    # `Error decoding audio frame`, sobre acapellas viejas. Y `_attach_acoustic`
+    # solo corre cuando el analisis ha ido bien, asi que en esos ficheros
+    # librosa SI pudo leer el audio — el unico que no podia era el decoder que
+    # fpcalc lleva dentro. Eran huellas que se estaban tirando pudiendo sacarse.
+    logger.warning(
+        f"[Acoustic] fpcalc {motivo} en {nombre!r}; reintento via ffmpeg"
+    )
+    wav = _transcodificar_a_wav(file_path, timeout)
+    if not wav:
+        return None
     try:
-        out = subprocess.run(
-            [fpcalc_bin, '-raw', '-json', file_path],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if out.returncode != 0:
-            logger.warning(
-                f"[Acoustic] fpcalc exit {out.returncode} en {nombre!r}: "
-                f"{(out.stderr or '').strip()[:200]}"
-            )
-            return None
-        data = json.loads(out.stdout)
-        fp = data.get('fingerprint')
-        if isinstance(fp, list) and fp:
-            return [int(x) & 0xFFFFFFFF for x in fp]
-        # Exit 0 y sin array: fpcalc dijo que todo bien y no trajo huella. Es
-        # otro caso distinto y no tenia mensaje ninguno — se contaba como
-        # «sin huella» sin dejar una sola linea en el log.
+        ints2, motivo2 = _fpcalc_una_pasada(fpcalc_bin, wav, timeout)
+        if ints2:
+            # Linea propia y contable a proposito: sin ella no habria forma de
+            # saber cuantos tracks rescata esto, y «no se nota» es la razon por
+            # la que una funcion se queda años sin que nadie sepa si sirve.
+            logger.warning(f"[Acoustic] RESCATADO via ffmpeg: {nombre!r}")
+            return ints2
         logger.warning(
-            f"[Acoustic] fpcalc exit 0 pero sin fingerprint en {nombre!r}"
+            f"[Acoustic] ni con ffmpeg: {nombre!r} ({motivo2})"
         )
         return None
-    except FileNotFoundError:
-        logger.warning("[Acoustic] fpcalc no instalado; sin huella acustica")
-        return None
-    except subprocess.TimeoutExpired:
-        # Separado del `except Exception` de abajo a proposito: un timeout es
-        # «el fichero es largo o el disco va lento», y se arregla subiendo el
-        # timeout. Los demas fallos no. Antes compartian mensaje.
-        logger.warning(
-            f"[Acoustic] fpcalc timeout ({timeout}s) en {nombre!r}"
-        )
-        return None
-    except Exception as e:  # noqa: BLE001 - best-effort, nunca romper /analyze
-        logger.warning(f"[Acoustic] fpcalc fallo en {nombre!r}: {e}")
-        return None
+    finally:
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
 
 
 def encode_raw(ints):
