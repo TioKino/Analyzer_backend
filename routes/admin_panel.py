@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
@@ -260,12 +261,59 @@ def _parse_session_payload(payload_str: str) -> list:
     return []
 
 
+# Listado de previews cacheado unos segundos. NO es una optimizacion de
+# adorno: `_preview_exists` se llama UNA VEZ POR TRACK, y con ~76.000 tracks
+# unicos eso eran 76.000 accesos al disco persistente de Render DENTRO de una
+# sola peticion. Medido el 2026-09-08 contra produccion:
+#
+#     /health          0,18 s
+#     /admin/stats    30,19 s
+#     /admin/errors    0,71 s
+#
+# El servidor estaba perfectamente sano; solo ese endpoint tardaba 30 s. Y eso
+# tenia un efecto que no parecia relacionado: el dialogo del token de admin
+# valida contra `/admin/stats` con dos intentos de 20 s, asi que **el token
+# correcto era rechazado por timeout**. El gate fallaba por una razon que no
+# tiene nada que ver con lo que pregunta.
+#
+# El TTL es corto a proposito: esto alimenta paneles de administracion, donde
+# un preview que aparezca unos segundos tarde no cambia ninguna decision.
+_previews_cache: set = set()
+_previews_cache_ts: float = 0.0
+_PREVIEWS_CACHE_TTL_S = 30.0
+
+
+def _previews_en_disco():
+    """Fingerprints con preview en disco, leyendo el directorio UNA vez.
+
+    Devuelve None si el directorio no se puede listar — y entonces quien llama
+    cae al `os.path.isfile` de siempre. Devolver un set vacio ahi seria peor
+    que ser lento: diria «ningun track tiene preview», que es una respuesta
+    creible y falsa, justo el tipo de fallo silencioso que este repo persigue.
+    """
+    global _previews_cache, _previews_cache_ts
+    ahora = time.monotonic()
+    if _previews_cache_ts and (ahora - _previews_cache_ts) < _PREVIEWS_CACHE_TTL_S:
+        return _previews_cache
+    try:
+        nombres = os.listdir(_PREVIEWS_DIR)
+    except OSError as e:
+        logger.warning(f"[Admin] no pude listar previews ({e}); voy fichero a fichero")
+        return None
+    _previews_cache = {n[:-4] for n in nombres if n.endswith('.mp3')}
+    _previews_cache_ts = ahora
+    return _previews_cache
+
+
 def _preview_exists(fingerprint: str) -> bool:
     """Check if a preview MP3 exists for the given fingerprint."""
     if not fingerprint:
         return False
-    path = os.path.join(_PREVIEWS_DIR, f"{fingerprint}.mp3")
-    return os.path.isfile(path)
+    en_disco = _previews_en_disco()
+    if en_disco is None:
+        path = os.path.join(_PREVIEWS_DIR, f"{fingerprint}.mp3")
+        return os.path.isfile(path)
+    return fingerprint in en_disco
 
 
 def _get_sync_auth_adoption(days: int = 30) -> dict:
@@ -852,11 +900,14 @@ async def global_stats(request: Request):
         total_tracks = len(seen_ids) + no_id_tracks
         total_previews = len(preview_fps)
 
-        # Count sessions
+        # Count sessions. Cursor SIN fetchall(): mismo motivo que arriba y que
+        # en `_compute_telemetry_from_sync` — `fetchall()` se trae todos los
+        # payloads a memoria de golpe, y ese patron ya tumbo produccion con un
+        # OOM. Iterar el cursor cuesta lo mismo y no acumula.
         total_sessions = 0
         session_rows = conn.execute(
             "SELECT payload FROM sync_items WHERE data_type = 'session'"
-        ).fetchall()
+        )
         for srow in session_rows:
             sessions = _parse_session_payload(srow["payload"])
             total_sessions += len(sessions)
