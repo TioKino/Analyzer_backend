@@ -163,9 +163,20 @@ if fpcalc_path:
     print("[SPEC] AVISO: si fpcalc no es universal2, verifica con:")
     print(f"[SPEC]   lipo -info {fpcalc_path}")
 else:
-    print("[SPEC] ADVERTENCIA: fpcalc NO encontrado. La memoria colectiva NO "
-          "agrupara por sonido en local (cae al fingerprint MD5).")
-    print("[SPEC] Instala con `brew install chromaprint` o pon un binario en ./fpcalc")
+    # ABORTAR, no avisar — mismo motivo que en el spec de Windows y que en
+    # `build_desktop.ps1` desde el 2026-08-25: un motor sin fpcalc arranca
+    # perfecto, analiza perfecto y no genera huella JAMAS, sin un solo error
+    # visible. Aqui el binario suele estar (el repo SI trae el de macOS en
+    # assets/native/macos/fpcalc), asi que llegar a esta rama significa que algo
+    # se ha movido de sitio — y entonces hay que enterarse, no seguir.
+    raise SystemExit(
+        "\n[SPEC] ABORTADO: falta fpcalc.\n"
+        "[SPEC] Un motor sin fpcalc analiza bien y no genera huella acustica\n"
+        "[SPEC] NUNCA: esos tracks quedan fuera de la memoria colectiva y el\n"
+        "[SPEC] backfill automatico tampoco los cura (usa el mismo binario).\n"
+        "[SPEC] Deberia estar en ../Analyzer/assets/native/macos/fpcalc;\n"
+        "[SPEC] si no, `brew install chromaprint` o pon un binario en ./fpcalc."
+    )
 
 binaries += librosa_binaries
 binaries += scipy_binaries
