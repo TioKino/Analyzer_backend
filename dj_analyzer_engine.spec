@@ -130,10 +130,29 @@ if fpcalc_path:
     binaries.append((fpcalc_path, '.'))
     print(f"[SPEC] fpcalc encontrado: {fpcalc_path}")
 else:
-    print("[SPEC] ADVERTENCIA: fpcalc.exe NO encontrado. La memoria colectiva "
-          "NO agrupara por sonido en local (cae al fingerprint MD5).")
-    print("[SPEC] Descarga fpcalc de https://acoustid.org/chromaprint y ponlo "
-          "en ./fpcalc.exe o en el PATH.")
+    # ABORTAR, no avisar. Esto era un print de ADVERTENCIA y el build seguia:
+    # salia un motor que arranca perfecto, analiza perfecto (bpm, key, energia,
+    # genero) y NO GENERA HUELLA JAMAS. El usuario no ve un solo error y queda
+    # fuera de la memoria colectiva —la promesa central del producto— para
+    # siempre, porque el backfill automatico tira del MISMO binario que falta.
+    #
+    # Y desde fuera es casi indistinguible: el 2026-09-12 entraron 281 tracks
+    # por /cache-analysis con engine_source=local_engine y platform=windows sin
+    # chromaprint, y los datos no podian separar «motor viejo» (se cura solo al
+    # actualizar) de «motor sin binario» (no se cura nunca).
+    #
+    # `build_desktop.ps1` ya aborta por esto mismo desde el 2026-08-25 para el
+    # cliente Flutter. El motor se quedo sin la misma guarda, y el repo NO trae
+    # fpcalc.exe (assets/native/windows/ solo tiene el .gitkeep), asi que la
+    # unica proteccion era acordarse.
+    raise SystemExit(
+        "\n[SPEC] ABORTADO: falta fpcalc.exe.\n"
+        "[SPEC] Un motor sin fpcalc analiza bien y no genera huella acustica\n"
+        "[SPEC] NUNCA: esos tracks quedan fuera de la memoria colectiva y el\n"
+        "[SPEC] backfill automatico tampoco los cura (usa el mismo binario).\n"
+        "[SPEC] Descargalo de https://acoustid.org/chromaprint y ponlo en\n"
+        "[SPEC] ./fpcalc.exe, en ../Analyzer/assets/native/windows/ o en el PATH."
+    )
 
 binaries += librosa_binaries
 binaries += scipy_binaries

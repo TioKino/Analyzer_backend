@@ -5315,6 +5315,21 @@ async def announcement():
     }
 
 
+def _estado_fpcalc_health() -> dict:
+    """Estado de fpcalc para `/health`, sin romper nunca el endpoint.
+
+    `/health` tiene que responder aunque `acoustic_fingerprint` no se pueda
+    importar: un health que revienta no informa de nada. Por eso el import va
+    dentro y la excepcion se traga a un estado explicito en vez de propagarse.
+    """
+    try:
+        from acoustic_fingerprint import estado_fpcalc
+        return estado_fpcalc()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Health] estado_fpcalc no disponible: {e}")
+        return {"estado": "desconocido"}
+
+
 @app.get("/health")
 async def health():
     # Database check
@@ -5369,6 +5384,28 @@ async def health():
         "checks": {
             "database": db_status,
             "ffmpeg": ffmpeg_status,
+            # fpcalc: el binario del que depende la memoria colectiva ENTERA, y
+            # el unico cuyo fallo es COMPLETAMENTE SILENCIOSO. Sin ffmpeg no hay
+            # previews y se nota; sin fpcalc el analisis sale perfecto —bpm,
+            # key, energia, genero— y lo unico que falta es el chromaprint, o
+            # sea que ese track queda fuera de la agrupacion por sonido sin que
+            # el usuario vea nada raro nunca.
+            #
+            # Aqui pesa sobre todo por el MOTOR LOCAL: en Render el binario se
+            # auto-descarga y ademas sale en /admin/telemetry, pero un motor
+            # local sin `fpcalc.exe` bundleado solo lo decia con un
+            # `logger.warning` en un log de la maquina del usuario que no lee
+            # nadie. El 2026-09-12 se midieron 281 tracks entrando por
+            # /cache-analysis con `engine_source=local_engine`,
+            # `platform=windows` y sin chromaprint, y desde fuera no habia forma
+            # de distinguir «motor viejo que no manda huella» (se cura solo al
+            # actualizar) de «motor sin el binario» (no se cura jamas). Con esto
+            # se distingue con un curl al propio motor.
+            #
+            # Usa `estado_fpcalc()`, que da TRES estados y no un booleano
+            # (`ok` / `caido` / `sin_intentar`), y que NO dispara la descarga:
+            # un /health con efectos secundarios no seria un /health.
+            "fpcalc": _estado_fpcalc_health(),
             "disk_space_mb": disk_space_mb,
         },
     }
