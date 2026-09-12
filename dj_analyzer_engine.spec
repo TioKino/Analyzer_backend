@@ -115,10 +115,35 @@ else:
 # lo resuelve en runtime via FPCALC_BIN (busca en _internal/, igual que ffmpeg).
 # NOTA: a diferencia de ffmpeg, el repo NO trae fpcalc.exe (assets/native/
 # windows/ esta vacio). Descargalo de https://acoustid.org/chromaprint y ponlo
-# en esta carpeta (./fpcalc.exe) o en el PATH antes de compilar.
+# en assets/native/windows/ del cliente (que es donde lo coge tambien el
+# build de Flutter), en esta carpeta (./fpcalc.exe), o en el PATH.
+#
+# LAS RUTAS RELATIVAS AL CLIENTE VAN POR NOMBRE DE CARPETA, Y ESO FALLA EN
+# SILENCIO. El unico candidato que miraba al repo cliente era
+# `../Analyzer/assets/native/windows/fpcalc.exe`, que asume que el cliente se
+# llama `Analyzer` y esta AL LADO del backend. En la maquina donde se compilan
+# las releases de Windows no se cumple ninguna de las dos: el cliente es
+# `dj_analyzer` y el backend vive DENTRO de el (`dj_analyzer/audio_backend`).
+# Ahi ese candidato resuelve a una carpeta que no existe, y el build solo se
+# salvaba porque el binario estaba ademas en el PATH — una red de seguridad que
+# llevaba rota sin que nada lo dijera.
+#
+# Ahora se prueban los dos layouts, y ademas relativos AL .spec (no al cwd, que
+# depende de desde donde se lance PyInstaller).
 import shutil
+_AQUI = os.path.dirname(os.path.abspath(SPEC)) if 'SPEC' in globals() else os.getcwd()
 fpcalc_path = None
-for candidate in ['fpcalc.exe', 'fpcalc', '../Analyzer/assets/native/windows/fpcalc.exe']:
+for candidate in [
+    'fpcalc.exe',
+    'fpcalc',
+    os.path.join(_AQUI, 'fpcalc.exe'),
+    # backend DENTRO del cliente: dj_analyzer/audio_backend -> dj_analyzer/assets
+    os.path.join(_AQUI, '..', 'assets', 'native', 'windows', 'fpcalc.exe'),
+    # backend AL LADO del cliente, con el cliente llamado `Analyzer`
+    os.path.join(_AQUI, '..', 'Analyzer', 'assets', 'native', 'windows', 'fpcalc.exe'),
+    # ...o llamado `dj_analyzer`
+    os.path.join(_AQUI, '..', 'dj_analyzer', 'assets', 'native', 'windows', 'fpcalc.exe'),
+]:
     if os.path.exists(candidate):
         fpcalc_path = candidate
         break

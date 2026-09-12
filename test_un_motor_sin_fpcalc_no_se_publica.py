@@ -138,3 +138,47 @@ def test_health_no_revienta_si_no_se_puede_importar():
     estado = main._estado_fpcalc_health()
     assert isinstance(estado, dict)
     assert 'estado' in estado
+
+
+# ============================================================================
+# 3. LA RED DE SEGURIDAD APUNTA A ALGUN SITIO QUE EXISTE
+# ============================================================================
+
+def test_el_spec_de_windows_mira_los_dos_layouts_del_repo():
+    """La ruta al cliente iba por NOMBRE DE CARPETA, y fallaba en silencio.
+
+    El unico candidato que miraba al repo cliente era
+    `../Analyzer/assets/native/windows/fpcalc.exe`: asume que el cliente se
+    llama `Analyzer` y que esta AL LADO del backend. En la maquina donde se
+    compilan las releases de Windows no se cumple ninguna de las dos — el
+    cliente es `dj_analyzer` y el backend vive dentro (`audio_backend/`), asi
+    que ese candidato apuntaba a una carpeta inexistente.
+
+    El build se salvaba solo porque el binario estaba ADEMAS en el PATH. Una
+    red de seguridad rota que no se nota mientras la otra aguanta es como no
+    tenerla: el dia que el PATH cambie, sale un motor ciego.
+    """
+    src = _fuente('dj_analyzer_engine.spec')
+    i = src.find('fpcalc_path = None')
+    assert i > 0
+    bloque = src[i:i + 1500]
+    # El layout real de la maquina de releases: backend dentro del cliente.
+    assert "'..', 'assets', 'native', 'windows'" in bloque, (
+        'el spec no mira assets/ del cliente cuando el backend vive dentro'
+    )
+    # Y el nombre alternativo del repo, que es el que tiene de verdad.
+    assert 'dj_analyzer' in bloque, (
+        'el spec solo contempla que el cliente se llame `Analyzer`'
+    )
+
+
+def test_las_rutas_del_spec_son_relativas_AL_SPEC_no_al_cwd():
+    """PyInstaller se puede lanzar desde cualquier directorio. Una ruta
+    relativa al cwd encuentra el binario o no segun desde donde escribas el
+    comando, que es la peor forma de fallar: intermitente y sin mensaje."""
+    src = _fuente('dj_analyzer_engine.spec')
+    assert '_AQUI' in src, 'las rutas del spec siguen colgando del cwd'
+    i = src.find('_AQUI =')
+    assert 'SPEC' in src[i:i + 200], (
+        '_AQUI deberia salir de la ruta del propio .spec'
+    )

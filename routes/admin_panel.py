@@ -1718,6 +1718,83 @@ def _platform_filter(platform):
     return f" AND LOWER(platform) IN ({placeholders})", list(values)
 
 
+def _orden_de_version(v):
+    """Clave para ordenar versiones. `2.9.9` NO es mayor que `2.9.11`.
+
+    Ordenar estas cadenas como texto es un error silencioso y facil: '2.9.9'
+    sale POR ENCIMA de '2.9.11' porque compara caracter a caracter y '9' > '1'.
+    O sea que la tabla de adopcion enseñaria como version mas reciente una que
+    no lo es, justo en el momento en que se usa para decidir si un fix ha
+    llegado. Se parte en enteros.
+    """
+    partes = []
+    for trozo in str(v or '').replace('+', '.').split('.'):
+        try:
+            partes.append(int(trozo))
+        except ValueError:
+            partes.append(-1)  # sufijos raros al final, no delante
+    return partes
+
+
+def _reparto_por_version(adb, dias, plat_sql, plat_params):
+    """Que version corre CADA dispositivo activo, agregado.
+
+    Por que hace falta: hasta hoy no habia forma de saber si una release
+    llegaba a alguien. Lo unico parecido era el `download_count` de GitHub
+    Releases, que cuenta descargas (bots y reintentos incluidos) y no dice
+    cuanta gente EJECUTA esa version. El 2026-09-12 marcaba 6 descargas del
+    zip de Windows de la 2.9.11 en cinco dias, con ~275 escritorios activos, y
+    de ahi no se podia concluir nada firme.
+
+    Y la pregunta no es teorica: el snapshot 37 vio 281 tracks entrando sin
+    huella acustica desde un motor local de Windows, y las dos causas posibles
+    —motor viejo (se cura al actualizar) y motor sin fpcalc (no se cura
+    jamas)— se separan sabiendo en que version esta ese parque.
+
+    LA ULTIMA VERSION VISTA, NO LA PRIMERA. `device_first_seen.first_app_version`
+    contesta otra pregunta («con que version entro cada uno»), que sirve para
+    hablar de altas, no de adopcion. Mezclarlas daria una foto que envejece al
+    reves: cuanto mas actualiza la gente, mas viejo pareceria el parque.
+
+    NULL es un valor legitimo y NO se inventa una etiqueta para el: son
+    clientes anteriores a que se mandara `app_version`. Van aparte en
+    `sin_version` en vez de colarse como una version mas — el mismo criterio
+    que `client_platform`, que devuelve None y no un 'unknown' fabricado.
+    """
+    desde = (datetime.now(timezone.utc) - timedelta(days=dias)).strftime('%Y-%m-%d')
+    # La ultima fila de cada dispositivo. El truco de columnas desnudas junto a
+    # MAX() esta DEFINIDO en SQLite (devuelve la fila del maximo) y evita una
+    # window function, que exige 3.25+.
+    sql = (
+        "SELECT device_id, app_version, MAX(timestamp) FROM events "
+        "WHERE device_id IS NOT NULL AND timestamp >= ?" + plat_sql +
+        " GROUP BY device_id"
+    )
+    por_version = {}
+    sin_version = 0
+    total = 0
+    # Cursor iterado, no fetchall: estos endpoints recorren la tabla entera y
+    # un fetchall ya tumbo produccion con un OOM una vez.
+    for _dev, ver, _ts in adb.execute(sql, [desde] + list(plat_params)):
+        total += 1
+        if not ver:
+            sin_version += 1
+            continue
+        por_version[ver] = por_version.get(ver, 0) + 1
+    ordenadas = dict(
+        sorted(por_version.items(), key=lambda kv: _orden_de_version(kv[0]), reverse=True)
+    )
+    return {
+        "devices": total,
+        "por_version": ordenadas,
+        "sin_version": sin_version,
+        "nota": (
+            "ultima version vista por dispositivo en la ventana. `sin_version` "
+            "son clientes que no mandan app_version todavia, no una version."
+        ),
+    }
+
+
 @admin_panel_router.get("/funnel")
 async def funnel(request: Request, platform: str = None):
     await _verify_admin_secret(request)
@@ -1728,6 +1805,7 @@ async def funnel(request: Request, platform: str = None):
     plat_sql, plat_params = _platform_filter(platform)
     counts = {}
     window = {}
+    versions = {}
     cohort_size = 0
     if os.path.exists(analysis_db_path):
         adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
@@ -1818,6 +1896,25 @@ async def funnel(request: Request, platform: str = None):
                 plat_params,
             ).fetchall()
             window = {r[0]: int(r[1] or 0) for r in wrows}
+
+            # Adopcion por version. Va DENTRO del mismo try/finally para no
+            # abrir una segunda conexion a la misma BD por una agregacion mas,
+            # pero con SU PROPIO except, y ese detalle no es cosmetico.
+            #
+            # Sin el, este agregado se colgaba del `except sqlite3.OperationalError`
+            # de abajo, que pone `counts = {}`: o sea que si esta consulta
+            # fallaba —una `analysis.db` antigua sin la columna `app_version`, por
+            # ejemplo— NO se perdia la tabla de versiones, se perdia EL EMBUDO
+            # ENTERO, con todos los pasos a cero y sin un solo error visible. Se
+            # vio en CI el 2026-09-12 con cinco tests en rojo por esto.
+            #
+            # Un agregado que se añade no puede ampliar el radio de lo que se
+            # rompe. Si falla, se queda vacio el suyo y el resto sigue.
+            try:
+                versions = _reparto_por_version(adb, 30, plat_sql, plat_params)
+            except sqlite3.Error as e:  # noqa: BLE001
+                logger.debug(f"[Funnel] reparto por version no disponible: {e}")
+                versions = {}
         except sqlite3.OperationalError:
             # `events` o `device_first_seen` aun no existen (BD vieja).
             counts = {}
@@ -1871,6 +1968,10 @@ async def funnel(request: Request, platform: str = None):
         # legitima, pero NO es un embudo: los pasos son poblaciones distintas
         # y restarlos da abandonos inventados.
         "window_devices": window,
+        # Adopcion: en que version esta cada dispositivo activo. Contesta
+        # «¿llegan mis releases?», que hasta ahora no se podia contestar con
+        # nada del panel. Ver `_reparto_por_version`.
+        "versions": versions,
         "raw": counts,  # eventos de la cohorte (incluye los no-embudo)
     }
 
