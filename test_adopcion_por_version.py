@@ -147,3 +147,56 @@ def test_un_aparato_fuera_de_la_ventana_no_cuenta(db):
     r = _reparto_por_version(db, 30, '', [])
     assert r['devices'] == 1
     assert r['por_version'] == {'2.9.11': 1}
+
+
+# ============================================================================
+# 3. UN AGREGADO NUEVO NO PUEDE TUMBAR EL ENDPOINT DEL QUE CUELGA
+# ============================================================================
+
+def test_el_embudo_sobrevive_a_un_events_sin_app_version():
+    """El fallo que esto vino a arreglar, y que CI pilló el 2026-09-12.
+
+    El reparto por version se metio DENTRO del try/except que ya tenia
+    `/admin/funnel`, y ese except pone `counts = {}`. Resultado: si la consulta
+    de versiones fallaba —una `analysis.db` antigua sin la columna
+    `app_version`, exactamente lo que monta el fixture de
+    test_funnel_platform.py— no se perdia la tabla de versiones: **se perdia el
+    embudo entero**, con los cinco pasos a cero y sin un solo error visible.
+    Cinco tests en rojo lo destaparon.
+
+    La regla: un agregado que se añade a un endpoint no puede ampliar el radio
+    de lo que se rompe. Si falla, se queda vacio lo suyo y el resto responde.
+    """
+    con = sqlite3.connect(':memory:')
+    # Esquema VIEJO, sin app_version — el caso real que lo rompio.
+    con.execute(
+        'CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, '
+        'device_id TEXT, event_name TEXT, platform TEXT)'
+    )
+    con.execute(
+        "INSERT INTO events (timestamp, device_id, event_name, platform) "
+        "VALUES (datetime('now'), 'd1', 'app_opened', 'windows')"
+    )
+    # La funcion SI puede fallar contra un esquema viejo: eso es legitimo.
+    with pytest.raises(sqlite3.Error):
+        _reparto_por_version(con, 30, '', [])
+
+    # Lo que NO puede pasar es que ese fallo se lleve por delante el embudo.
+    # El endpoint tiene que capturarlo POR SEPARADO — se comprueba en el fuente
+    # porque montar el endpoint entero aqui traeria media app.
+    import os as _os
+    aqui = _os.path.dirname(_os.path.abspath(__file__))
+    with open(_os.path.join(aqui, 'routes', 'admin_panel.py'), encoding='utf-8') as f:
+        src = f.read()
+    # Ojo: `_reparto_por_version(adb` casa TAMBIEN con la linea del `def`, que
+    # va antes en el fichero. Hay que anclar en la LLAMADA.
+    i = src.find('versions = _reparto_por_version(adb')
+    assert i > 0, 'cambio la llamada al reparto por version'
+    alrededor = src[max(0, i - 400):i + 300]
+    assert 'try:' in alrededor, (
+        'la llamada no tiene su propio try: un fallo suyo volveria a poner '
+        'counts={} y el embudo saldria a cero'
+    )
+    assert 'versions = {}' in alrededor, (
+        'al fallar deberia quedarse vacio el reparto, no tumbar la respuesta'
+    )

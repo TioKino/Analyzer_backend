@@ -1898,8 +1898,23 @@ async def funnel(request: Request, platform: str = None):
             window = {r[0]: int(r[1] or 0) for r in wrows}
 
             # Adopcion por version. Va DENTRO del mismo try/finally para no
-            # abrir una segunda conexion a la misma BD por una agregacion mas.
-            versions = _reparto_por_version(adb, 30, plat_sql, plat_params)
+            # abrir una segunda conexion a la misma BD por una agregacion mas,
+            # pero con SU PROPIO except, y ese detalle no es cosmetico.
+            #
+            # Sin el, este agregado se colgaba del `except sqlite3.OperationalError`
+            # de abajo, que pone `counts = {}`: o sea que si esta consulta
+            # fallaba —una `analysis.db` antigua sin la columna `app_version`, por
+            # ejemplo— NO se perdia la tabla de versiones, se perdia EL EMBUDO
+            # ENTERO, con todos los pasos a cero y sin un solo error visible. Se
+            # vio en CI el 2026-09-12 con cinco tests en rojo por esto.
+            #
+            # Un agregado que se añade no puede ampliar el radio de lo que se
+            # rompe. Si falla, se queda vacio el suyo y el resto sigue.
+            try:
+                versions = _reparto_por_version(adb, 30, plat_sql, plat_params)
+            except sqlite3.Error as e:  # noqa: BLE001
+                logger.debug(f"[Funnel] reparto por version no disponible: {e}")
+                versions = {}
         except sqlite3.OperationalError:
             # `events` o `device_first_seen` aun no existen (BD vieja).
             counts = {}
