@@ -2045,6 +2045,21 @@ async def retention(request: Request):
     }
 
 
+def _percentil(ordenados, pct):
+    """Percentil `pct` de una lista YA ORDENADA, por el metodo del vecino mas
+    cercano (sin interpolar).
+
+    Sin interpolacion a proposito: son numeros de tracks de un dispositivo
+    real, y un p90 de "312,5 tracks" describe a un usuario que no existe. El
+    valor que se devuelve es siempre el de alguien.
+    """
+    if not ordenados:
+        return 0
+    k = max(0, min(len(ordenados) - 1,
+                   int(round(pct / 100.0 * len(ordenados) + 0.5)) - 1))
+    return ordenados[k]
+
+
 def _library_investment_real() -> dict:
     """Inversion por usuario contada sobre las bibliotecas de `sync.db`.
 
@@ -2082,7 +2097,11 @@ def _library_investment_real() -> dict:
                 'total_tracks': 0,
                 'median_tracks': 0,
                 'max_tracks': 0,
-                'buckets': {'gte_100': 0, 'gte_500': 0, 'gte_1000': 0},
+                'buckets': {
+                    'gte_10': 0, 'gte_25': 0, 'gte_50': 0,
+                    'gte_100': 0, 'gte_200': 0, 'gte_500': 0, 'gte_1000': 0,
+                },
+                'percentiles': {'p50': 0, 'p75': 0, 'p90': 0, 'p95': 0},
             }
         mid = len(counts) // 2
         median = (counts[mid] if len(counts) % 2
@@ -2097,10 +2116,26 @@ def _library_investment_real() -> dict:
             'total_tracks': sum(counts),
             'median_tracks': round(float(median), 1),
             'max_tracks': counts[-1],
+            # Los cortes finos (10/25/50/200) NO son adorno: son los unicos
+            # con los que se puede ELEGIR donde poner el limite del plan
+            # gratuito. Con solo 100/500/1000 y una mediana de 4, entre la
+            # mediana y el primer bucket hay un agujero donde vive casi todo
+            # el parque, y cualquier limite ahi dentro se elige a ojo.
+            # Cuestan cero: `counts` ya esta en memoria y ordenado.
             'buckets': {
+                'gte_10': sum(1 for n in counts if n >= 10),
+                'gte_25': sum(1 for n in counts if n >= 25),
+                'gte_50': sum(1 for n in counts if n >= 50),
                 'gte_100': sum(1 for n in counts if n >= 100),
+                'gte_200': sum(1 for n in counts if n >= 200),
                 'gte_500': sum(1 for n in counts if n >= 500),
                 'gte_1000': sum(1 for n in counts if n >= 1000),
+            },
+            'percentiles': {
+                'p50': _percentil(counts, 50),
+                'p75': _percentil(counts, 75),
+                'p90': _percentil(counts, 90),
+                'p95': _percentil(counts, 95),
             },
         }
     finally:
