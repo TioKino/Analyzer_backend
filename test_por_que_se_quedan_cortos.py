@@ -182,3 +182,95 @@ def test_investment_no_rescanea_si_le_pasan_el_conteo(monkeypatch):
     r = admin_panel._library_investment_real({'a': 5, 'b': 300})
     assert llamadas == [], 'no debe volver a escanear sync_items'
     assert r['devices_with_library'] == 2 and r['buckets']['gte_200'] == 1
+
+
+# ============================================================================
+# `ultima_senal` e `idos_por_alta`: distinguir «ya paso» de «esta pasando»
+# ============================================================================
+
+def test_la_ultima_senal_cubre_a_TODOS_los_cortos_no_solo_a_los_idos(analysis_db):
+    # Es el punto del histograma: quien se fue hace cinco dias NO esta en
+    # `no_volvio` (tiene evento dentro de los 30 dias), esta en
+    # `activo_sin_traer_mas`. Si el histograma solo mirase a los idos, los
+    # abandonos recientes seguirian invisibles.
+    _sembrar(
+        analysis_db,
+        eventos=[('reciente', 'app_opened', _dias(5) + 'T10:00', 'ios'),
+                 ('reciente', 'import_started', _dias(5) + 'T10:00', 'ios'),
+                 ('reciente', 'import_completed', _dias(5) + 'T10:02', 'ios'),
+                 ('ido', 'app_opened', _dias(70) + 'T10:00', 'ios')],
+        altas=[('reciente', _dias(60)), ('ido', _dias(80))])
+    r = admin_panel._por_que_se_quedan_cortos({'reciente': 2, 'ido': 3}, umbral=10)
+    assert sum(r['ultima_senal'].values()) == r['devices'] == 2
+    assert r['ultima_senal']['hasta_7d'] == 1      # el «vivo»
+    assert r['ultima_senal']['de_61_a_90d'] == 1   # el ido
+    # Y ese «vivo» esta en el cajon que dice que no hay nada roto:
+    assert r['por_causa']['activo_sin_traer_mas'] == 1
+
+
+def test_sin_eventos_cae_en_su_cajon_porque_no_se_puede_fechar(analysis_db):
+    # `events` se purga a los 90 dias: sin filas no hay forma de saber si se
+    # fue hace cuatro meses o si nunca reporto. Inventar una fecha seria peor
+    # que decir «no lo se».
+    _sembrar(analysis_db, altas=[('mudo', _dias(300))])
+    r = admin_panel._por_que_se_quedan_cortos({'mudo': 1}, umbral=10)
+    assert r['ultima_senal']['sin_eventos'] == 1
+    assert r['por_causa']['no_volvio'] == 1
+
+
+def test_los_idos_se_reparten_por_la_antiguedad_de_SU_alta(analysis_db):
+    # Una cohorte vieja muriendose es un cementerio heredado; una cohorte de
+    # este mes muriendose es una fuga abierta. Urgencias opuestas.
+    _sembrar(
+        analysis_db,
+        eventos=[('nueva', 'app_opened', _dias(35) + 'T10:00', 'ios'),
+                 ('media', 'app_opened', _dias(50) + 'T10:00', 'ios'),
+                 ('vieja', 'app_opened', _dias(80) + 'T10:00', 'ios')],
+        altas=[('nueva', _dias(20)), ('media', _dias(60)),
+               ('vieja', _dias(200))])
+    r = admin_panel._por_que_se_quedan_cortos(
+        {'nueva': 1, 'media': 2, 'vieja': 3}, umbral=10)
+    assert r['por_causa']['no_volvio'] == 3
+    assert r['idos_por_alta'] == {
+        'alta_ultimos_30d': 1,
+        'alta_31_a_90d': 1,
+        'alta_mas_de_90d': 1,
+        'sin_fecha_de_alta': 0,
+    }
+
+
+def test_idos_por_alta_suma_exactamente_los_que_no_volvieron(analysis_db):
+    _sembrar(
+        analysis_db,
+        eventos=[('a', 'app_opened', _dias(40) + 'T10:00', 'ios'),
+                 ('b', 'app_opened', _dias(45) + 'T10:00', 'ios'),
+                 ('vivo', 'app_opened', _dias(1) + 'T10:00', 'ios'),
+                 ('vivo', 'import_started', _dias(1) + 'T10:00', 'ios'),
+                 ('vivo', 'import_completed', _dias(1) + 'T10:03', 'ios')],
+        altas=[('a', _dias(50)), ('b', _dias(120)), ('vivo', _dias(50))])
+    r = admin_panel._por_que_se_quedan_cortos({'a': 1, 'b': 2, 'vivo': 3},
+                                              umbral=10)
+    assert sum(r['idos_por_alta'].values()) == r['por_causa']['no_volvio'] == 2
+
+
+def test_un_ido_sin_fila_de_alta_no_se_pierde_ni_se_inventa(analysis_db):
+    _sembrar(analysis_db,
+             eventos=[('huerfano', 'app_opened', _dias(60) + 'T10:00', 'ios')])
+    r = admin_panel._por_que_se_quedan_cortos({'huerfano': 2}, umbral=10)
+    assert r['idos_por_alta']['sin_fecha_de_alta'] == 1
+    assert sum(r['idos_por_alta'].values()) == r['por_causa']['no_volvio'] == 1
+
+
+def test_el_recien_llegado_sale_del_reparto_de_causas_pero_NO_del_histograma(analysis_db):
+    # El histograma describe a los 217 enteros; las causas descuentan al que
+    # todavia no se puede llamar estancado. Que los dos denominadores sean
+    # distintos es deliberado, y por eso los dos tienen que cuadrar con
+    # `devices` por su cuenta.
+    _sembrar(analysis_db,
+             eventos=[('nuevo', 'app_opened', _dias(1) + 'T10:00', 'ios')],
+             altas=[('nuevo', _dias(2))])
+    r = admin_panel._por_que_se_quedan_cortos({'nuevo': 1}, umbral=10)
+    assert r['por_causa']['recien_llegado'] == 1
+    assert sum(r['por_causa'].values()) == 1
+    assert r['ultima_senal']['hasta_7d'] == 1
+    assert sum(r['ultima_senal'].values()) == 1
