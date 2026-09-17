@@ -208,15 +208,25 @@ def test_la_tabla_del_D0_NO_se_purga():
 
 def test_la_inversion_se_cuenta_sobre_sync_db():
     """`events` se purga y los import se repiten. Las bibliotecas de `sync.db`
-    no: son el estado actual, que es lo que se queria medir."""
+    no: son el estado actual, que es lo que se queria medir.
+
+    El escaneo vive desde 2026-09-17 en `_tracks_por_device()`, sacado aparte
+    para que lo compartan el reparto y el diagnostico de los que se quedan
+    cortos. La garantia es la misma; lo que cambia es donde mirarla, asi que
+    aqui se comprueba TAMBIEN que las dos piezas siguen enganchadas.
+    """
     src = _src('routes/admin_panel.py')
+    escaneo = _cuerpo_de(src, 'def _tracks_por_device(')
+    assert '_get_sync_conn()' in escaneo
+    assert "data_type = 'analysis'" in escaneo
+    # El mismo dedup que /admin/users, para que los dos numeros cuadren.
+    assert '_count_unique_tracks(' in escaneo
+
     i = src.index('def _library_investment_real(')
     fn = src[i:i + 2500]
-    assert '_get_sync_conn()' in fn
-    assert "data_type = 'analysis'" in fn
-    # El mismo dedup que /admin/users, para que los dos numeros cuadren.
-    assert '_count_unique_tracks(' in fn
     assert "'source': 'sync.db'" in fn
+    # Y que el reparto siga saliendo de ESE escaneo y no de otro sitio.
+    assert '_tracks_por_device()' in fn
 
 
 def test_la_cuenta_vieja_no_desaparece_pero_cambia_de_nombre():
@@ -231,10 +241,25 @@ def test_no_carga_la_biblioteca_entera_en_memoria_de_golpe():
     """Los endpoints admin recorren la biblioteca entera y ya tumbaron
     produccion con un OOM. El cursor se itera, no se hace fetchall()."""
     src = _src('routes/admin_panel.py')
-    i = src.index('def _library_investment_real(')
-    fn = src[i:i + 2500]
-    j = fn.index("WHERE data_type = 'analysis'")
-    assert '.fetchall()' not in fn[j - 200:j + 200]
+    escaneo = _cuerpo_de(src, 'def _tracks_por_device(')
+    assert '.fetchall()' not in escaneo
+    # El diagnostico de los cortos recorre `events` entero por la misma razon.
+    cortos = _cuerpo_de(src, 'def _por_que_se_quedan_cortos(')
+    assert '.fetchall()' not in cortos
+
+
+def test_el_escaneo_de_sync_items_se_hace_UNA_vez_por_peticion():
+    """`investment` y `stalled` comparten el mismo conteo.
+
+    Si cada uno llama a `_tracks_por_device()` por su cuenta, la peticion
+    recorre la biblioteca entera dos veces — que es justo el camino que tumbo
+    produccion.
+    """
+    src = _src('routes/admin_panel.py')
+    i = src.index('_por_device = _tracks_por_device()')
+    bloque = src[i:i + 1200]
+    assert '_library_investment_real(_por_device)' in bloque
+    assert '_por_que_se_quedan_cortos(_por_device)' in bloque
 
 
 # ============================================================================

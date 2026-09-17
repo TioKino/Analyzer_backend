@@ -2025,10 +2025,28 @@ async def retention(request: Request):
     #
     # Con los dos sesgos jugando en direcciones opuestas, la mediana no se
     # podia corregir a ojo. Y la mediana era el numero que decidia.
+    #
+    # UN escaneo de `sync_items` para los dos consumidores: el reparto y el
+    # diagnostico de los que se quedan cortos. Ese escaneo recorre la
+    # biblioteca entera, asi que hacerlo dos veces por peticion no es una
+    # ineficiencia menor — es el camino que ya tumbo produccion con un OOM.
     try:
-        investment = _library_investment_real()
+        _por_device = _tracks_por_device()
+    except Exception:  # noqa: BLE001
+        _por_device = None
+    try:
+        investment = _library_investment_real(_por_device)
     except Exception:  # noqa: BLE001
         investment = {}
+    # `stalled`: de los que tienen biblioteca pequena, POR QUE se quedaron ahi.
+    # Con su propio try/except a proposito. La leccion es de `#87`: un agregado
+    # nuevo que comparte el except de otro amplia el radio de lo que se rompe,
+    # y aquel dia una excepcion aqui devolvio el embudo ENTERO a ceros.
+    try:
+        stalled = _por_que_se_quedan_cortos(_por_device)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Retention] diagnostico de cortos no disponible: {e}")
+        stalled = {}
     # La cuenta vieja se conserva bajo otro nombre: mide algo distinto y real
     # (actividad de import del trimestre), solo que no es "cuanta biblioteca
     # tiene la gente".
@@ -2041,6 +2059,7 @@ async def retention(request: Request):
         "returns": returns,
         "tool": tool,
         "investment": investment,
+        "stalled": stalled,
         "import_activity_90d": imports_90d,
     }
 
@@ -2060,18 +2079,20 @@ def _percentil(ordenados, pct):
     return ordenados[k]
 
 
-def _library_investment_real() -> dict:
-    """Inversion por usuario contada sobre las bibliotecas de `sync.db`.
+def _tracks_por_device() -> Dict[str, int]:
+    """`{device_id: numero de tracks}` de las bibliotecas de `sync.db`.
 
-    Es la misma fuente y el mismo dedup que usa `/admin/users` para el
-    `track_count` de cada device, asi que los dos numeros cuadran.
+    Se saco a funcion propia para que el escaneo de `sync_items` —que recorre
+    la biblioteca ENTERA y ya tumbo produccion con un OOM una vez— se haga UNA
+    sola vez y lo compartan sus dos consumidores: el reparto de `investment` y
+    el diagnostico de los que se quedan cortos. Cursor sin `fetchall()`.
 
-    Cursor sin `fetchall()` y una sola pasada: estos endpoints recorren la
-    biblioteca entera y ya tumbaron produccion con un OOM una vez.
+    Solo salen devices con al menos un track: un device sin biblioteca no es un
+    device con biblioteca de tamano cero, es otra cosa.
     """
     conn = _get_sync_conn()
     try:
-        por_device: dict[str, list] = {}
+        filas_por_device = {}
         rows = conn.execute(
             "SELECT last_device_id, item_key, payload FROM sync_items "
             "WHERE data_type = 'analysis'"
@@ -2080,66 +2101,219 @@ def _library_investment_real() -> dict:
             dev = r["last_device_id"]
             if not dev:
                 continue
-            por_device.setdefault(dev, []).append(r)
+            filas_por_device.setdefault(dev, []).append(r)
 
-        counts = []
-        for dev, filas in por_device.items():
+        out = {}
+        for dev, filas in filas_por_device.items():
             ids, _prev, sin_id = _count_unique_tracks(filas)
             n = len(ids) + sin_id
             if n > 0:
-                counts.append(n)
-
-        counts.sort()
-        if not counts:
-            return {
-                'source': 'sync.db',
-                'devices_with_library': 0,
-                'total_tracks': 0,
-                'median_tracks': 0,
-                'max_tracks': 0,
-                'buckets': {
-                    'gte_10': 0, 'gte_25': 0, 'gte_50': 0,
-                    'gte_100': 0, 'gte_200': 0, 'gte_500': 0, 'gte_1000': 0,
-                },
-                'percentiles': {'p50': 0, 'p75': 0, 'p90': 0, 'p95': 0},
-            }
-        mid = len(counts) // 2
-        median = (counts[mid] if len(counts) % 2
-                  else (counts[mid - 1] + counts[mid]) / 2.0)
-        return {
-            # Se dice de donde sale: el denominador de `sync.db` (bibliotecas
-            # de usuarios) NO es el mismo universo que el de `analysis.db`
-            # (analisis del backend, con borrados y nunca sincronizados
-            # dentro). El panel los enseña juntos y eso ya despisto una vez.
-            'source': 'sync.db',
-            'devices_with_library': len(counts),
-            'total_tracks': sum(counts),
-            'median_tracks': round(float(median), 1),
-            'max_tracks': counts[-1],
-            # Los cortes finos (10/25/50/200) NO son adorno: son los unicos
-            # con los que se puede ELEGIR donde poner el limite del plan
-            # gratuito. Con solo 100/500/1000 y una mediana de 4, entre la
-            # mediana y el primer bucket hay un agujero donde vive casi todo
-            # el parque, y cualquier limite ahi dentro se elige a ojo.
-            # Cuestan cero: `counts` ya esta en memoria y ordenado.
-            'buckets': {
-                'gte_10': sum(1 for n in counts if n >= 10),
-                'gte_25': sum(1 for n in counts if n >= 25),
-                'gte_50': sum(1 for n in counts if n >= 50),
-                'gte_100': sum(1 for n in counts if n >= 100),
-                'gte_200': sum(1 for n in counts if n >= 200),
-                'gte_500': sum(1 for n in counts if n >= 500),
-                'gte_1000': sum(1 for n in counts if n >= 1000),
-            },
-            'percentiles': {
-                'p50': _percentil(counts, 50),
-                'p75': _percentil(counts, 75),
-                'p90': _percentil(counts, 90),
-                'p95': _percentil(counts, 95),
-            },
-        }
+                out[dev] = n
+        return out
     finally:
         conn.close()
+
+
+def _library_investment_real(
+    por_device: Optional[Dict[str, int]] = None,
+) -> dict:
+    """Inversion por usuario contada sobre las bibliotecas de `sync.db`.
+
+    Es la misma fuente y el mismo dedup que usa `/admin/users` para el
+    `track_count` de cada device, asi que los dos numeros cuadran.
+
+    `por_device` se puede pasar ya calculado para que el llamante comparta UN
+    escaneo de `sync_items` entre este reparto y el diagnostico de los que se
+    quedan cortos: ese escaneo recorre la biblioteca entera y ya tumbo
+    produccion con un OOM una vez, asi que hacerlo dos veces por peticion no es
+    una ineficiencia menor.
+    """
+    if por_device is None:
+        por_device = _tracks_por_device()
+    counts = sorted(por_device.values())
+    if not counts:
+        return {
+            'source': 'sync.db',
+            'devices_with_library': 0,
+            'total_tracks': 0,
+            'median_tracks': 0,
+            'max_tracks': 0,
+            'buckets': {
+                'gte_10': 0, 'gte_25': 0, 'gte_50': 0,
+                'gte_100': 0, 'gte_200': 0, 'gte_500': 0, 'gte_1000': 0,
+            },
+            'percentiles': {'p50': 0, 'p75': 0, 'p90': 0, 'p95': 0},
+        }
+    mid = len(counts) // 2
+    median = (counts[mid] if len(counts) % 2
+              else (counts[mid - 1] + counts[mid]) / 2.0)
+    return {
+        # Se dice de donde sale: el denominador de `sync.db` (bibliotecas
+        # de usuarios) NO es el mismo universo que el de `analysis.db`
+        # (analisis del backend, con borrados y nunca sincronizados
+        # dentro). El panel los enseña juntos y eso ya despisto una vez.
+        'source': 'sync.db',
+        'devices_with_library': len(counts),
+        'total_tracks': sum(counts),
+        'median_tracks': round(float(median), 1),
+        'max_tracks': counts[-1],
+        # Los cortes finos (10/25/50/200) NO son adorno: son los unicos
+        # con los que se puede ELEGIR donde poner el limite del plan
+        # gratuito. Con solo 100/500/1000 y una mediana de 4, entre la
+        # mediana y el primer bucket hay un agujero donde vive casi todo
+        # el parque, y cualquier limite ahi dentro se elige a ojo.
+        # Cuestan cero: `counts` ya esta en memoria y ordenado.
+        'buckets': {
+            'gte_10': sum(1 for n in counts if n >= 10),
+            'gte_25': sum(1 for n in counts if n >= 25),
+            'gte_50': sum(1 for n in counts if n >= 50),
+            'gte_100': sum(1 for n in counts if n >= 100),
+            'gte_200': sum(1 for n in counts if n >= 200),
+            'gte_500': sum(1 for n in counts if n >= 500),
+            'gte_1000': sum(1 for n in counts if n >= 1000),
+        },
+        'percentiles': {
+            'p50': _percentil(counts, 50),
+            'p75': _percentil(counts, 75),
+            'p90': _percentil(counts, 90),
+            'p95': _percentil(counts, 95),
+        },
+    }
+
+
+def _por_que_se_quedan_cortos(
+    por_device: Optional[Dict[str, int]] = None,
+    umbral: int = 10,
+) -> dict:
+    """De los dispositivos con biblioteca PEQUENA, por que se quedaron ahi.
+
+    El 2026-09-17 el reparto de `investment` enseno que 217 de 359
+    dispositivos con biblioteca tienen menos de 10 tracks — el 60 %. Ese
+    numero es EL numero del producto, y hasta ahora era un solo contador para
+    tres situaciones que piden arreglos OPUESTOS:
+
+      - **Probo y le valio**: sigue abriendo la app, su import termino bien, y
+        simplemente no ha traido su biblioteca de verdad todavia. No hay nada
+        roto; falta una razon para volver con la carpeta entera.
+      - **Se le atasco el import**: empezo mas imports de los que termino. Si
+        eso es un bug, es trabajo de producto AHORA.
+      - **No volvio**: instalo, probo y desaparecio. Eso es activacion /
+        primera impresion, y no lo arregla tocar el import.
+
+    Con un solo numero, «ampliar el onboarding» parece la respuesta en los tres
+    casos y no lo es en ninguno. Es la misma leccion que `failedAudd` y que
+    `by_outcome` de la huella: dos causas que piden arreglos opuestos no pueden
+    compartir contador.
+
+    **El ORDEN de las comprobaciones manda**, y va de menos a mas concluyente:
+
+      1. `recien_llegado` — alta hace menos de 7 dias. **No esta estancado
+         todavia**: tener 3 tracks el primer dia es lo normal. Si no se saca
+         primero, cada alta nueva engorda el numero que intentamos bajar.
+      2. `import_sin_terminar` — mas `import_started` que `import_completed`.
+      3. `no_volvio` — sin ningun evento en los ultimos 30 dias.
+      4. `activo_sin_traer_mas` — el resto: sigue vivo y no ha traido mas.
+
+    ⚠️ **`import_sin_terminar` es una COTA SUPERIOR, no una medida de bugs.**
+    Abrir el dialogo de import y cancelar dispara `import_started` sin
+    `import_completed`, y eso es un usuario cambiando de opinion, no una
+    averia. El numero sirve para saber si merece la pena mirar; no para decir
+    cuantos imports fallan.
+
+    ⚠️ **`events` se purga a los 90 dias.** Un veterano que importo hace seis
+    meses no tiene ni un evento, asi que cae en `no_volvio` aunque siga
+    abriendo la app... salvo que la abra, porque entonces tiene eventos
+    recientes. El sesgo real es otro: de un veterano activo NO se puede saber
+    si su import de hace seis meses termino. Por eso `sin_rastro_de_import`
+    se cuenta aparte en vez de repartirse.
+    """
+    if por_device is None:
+        por_device = _tracks_por_device()
+
+    cortos = {d: n for d, n in por_device.items() if n < umbral}
+    vacio = {
+        'umbral': umbral,
+        'devices': len(cortos),
+        'de_un_total_de': len(por_device),
+        'por_causa': {},
+        'nota': 'sin datos de eventos',
+    }
+    if not cortos:
+        return vacio
+
+    analysis_db_path = os.environ.get("ANALYSIS_DB_PATH", "analysis.db")
+    try:
+        adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    except sqlite3.Error as e:  # noqa: BLE001
+        logger.debug(f"[Cortos] analysis.db no disponible: {e}")
+        return vacio
+
+    try:
+        # Agregados por device en UNA pasada, y se guarda solo lo de los que
+        # nos interesan: el cursor se itera, nada de `fetchall()`.
+        eventos = {}
+        rows = adb.execute(
+            "SELECT device_id,"
+            " MAX(substr(timestamp,1,10)) AS ultimo,"
+            " SUM(CASE WHEN event_name='import_started' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN event_name='import_completed' THEN 1 ELSE 0 END)"
+            " FROM events WHERE device_id IS NOT NULL GROUP BY device_id"
+        )
+        for dev, ultimo, ini, fin in rows:
+            if dev in cortos:
+                eventos[dev] = (ultimo, int(ini or 0), int(fin or 0))
+
+        altas = {}
+        try:
+            for dev, primer_dia in adb.execute(
+                "SELECT device_id, first_day FROM device_first_seen"
+                " WHERE device_id IS NOT NULL"
+            ):
+                if dev in cortos:
+                    altas[dev] = primer_dia
+        except sqlite3.Error as e:  # noqa: BLE001  (BD vieja sin la tabla)
+            logger.debug(f"[Cortos] device_first_seen no disponible: {e}")
+    finally:
+        adb.close()
+
+    hoy = datetime.now(timezone.utc).date()
+    limite_nuevo = (hoy - timedelta(days=7)).isoformat()
+    limite_vivo = (hoy - timedelta(days=30)).isoformat()
+
+    causas = {
+        'recien_llegado': 0,
+        'import_sin_terminar': 0,
+        'no_volvio': 0,
+        'activo_sin_traer_mas': 0,
+        'sin_rastro_de_import': 0,
+    }
+    for dev in cortos:
+        alta = altas.get(dev)
+        if alta and alta >= limite_nuevo:
+            causas['recien_llegado'] += 1
+            continue
+        ultimo, ini, fin = eventos.get(dev, (None, 0, 0))
+        if ini > fin:
+            causas['import_sin_terminar'] += 1
+        elif ultimo is None or ultimo < limite_vivo:
+            causas['no_volvio'] += 1
+        elif ini == 0:
+            # Sigue vivo pero no hay ni un `import_started` en los 90 dias que
+            # sobreviven a la purga: no se puede decir si su import termino.
+            # Va aparte en vez de engordar `activo_sin_traer_mas`, que es una
+            # afirmacion mas fuerte de lo que este caso sostiene.
+            causas['sin_rastro_de_import'] += 1
+        else:
+            causas['activo_sin_traer_mas'] += 1
+
+    return {
+        'umbral': umbral,
+        'devices': len(cortos),
+        'de_un_total_de': len(por_device),
+        'por_causa': causas,
+        'nota': ('import_sin_terminar es COTA SUPERIOR: cancelar el dialogo '
+                 'tambien deja un import_started suelto'),
+    }
 
 
 # ── GET /admin/activity ────────────────────────────────────
