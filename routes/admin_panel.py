@@ -2287,16 +2287,69 @@ def _por_que_se_quedan_cortos(
         'activo_sin_traer_mas': 0,
         'sin_rastro_de_import': 0,
     }
+    # `ultima_senal`: cuando se le vio por ultima vez a CADA dispositivo corto,
+    # este en la causa que este. Va aparte de `por_causa` a proposito, porque
+    # contesta una pregunta que `por_causa` NO puede contestar: si la gente se
+    # esta yendo AHORA o se fue hace meses.
+    #
+    # Y hay un motivo por el que no basta con partir `no_volvio`: quien se fue
+    # hace cinco dias NO esta en `no_volvio` —tiene un evento dentro de los 30
+    # dias— sino en `activo_sin_traer_mas`. O sea que los abandonos recientes
+    # estan escondidos justo en el cajon que dice «no hay nada roto». El
+    # histograma no depende del corte de 30 dias y por eso si los ve.
+    ultima_senal = {
+        'hasta_7d': 0, 'de_8_a_30d': 0, 'de_31_a_60d': 0,
+        'de_61_a_90d': 0, 'sin_eventos': 0,
+    }
+    # Y de los que YA no vuelven, cuando se dieron de alta. Una cohorte vieja
+    # muriendose es un cementerio heredado; una cohorte de este mes muriendose
+    # es una fuga abierta, y son cosas distintas con urgencias distintas.
+    idos_por_alta = {
+        'alta_ultimos_30d': 0, 'alta_31_a_90d': 0,
+        'alta_mas_de_90d': 0, 'sin_fecha_de_alta': 0,
+    }
+
+    cortes_senal = [
+        (7, 'hasta_7d'), (30, 'de_8_a_30d'),
+        (60, 'de_31_a_60d'), (90, 'de_61_a_90d'),
+    ]
+    limites_senal = [((hoy - timedelta(days=d)).isoformat(), k)
+                     for d, k in cortes_senal]
+    limite_alta_30 = (hoy - timedelta(days=30)).isoformat()
+    limite_alta_90 = (hoy - timedelta(days=90)).isoformat()
+
     for dev in cortos:
         alta = altas.get(dev)
+        ultimo, ini, fin = eventos.get(dev, (None, 0, 0))
+
+        # Histograma de ultima senal: sobre TODOS los cortos, sin excepciones.
+        if ultimo is None:
+            ultima_senal['sin_eventos'] += 1
+        else:
+            for limite, clave in limites_senal:
+                if ultimo >= limite:
+                    ultima_senal[clave] += 1
+                    break
+            else:
+                # Mas viejo que 90 dias no deberia existir: `events` se purga
+                # ahi. Si aparece, es una fila que la purga no alcanzo.
+                ultima_senal['sin_eventos'] += 1
+
         if alta and alta >= limite_nuevo:
             causas['recien_llegado'] += 1
             continue
-        ultimo, ini, fin = eventos.get(dev, (None, 0, 0))
         if ini > fin:
             causas['import_sin_terminar'] += 1
         elif ultimo is None or ultimo < limite_vivo:
             causas['no_volvio'] += 1
+            if not alta:
+                idos_por_alta['sin_fecha_de_alta'] += 1
+            elif alta >= limite_alta_30:
+                idos_por_alta['alta_ultimos_30d'] += 1
+            elif alta >= limite_alta_90:
+                idos_por_alta['alta_31_a_90d'] += 1
+            else:
+                idos_por_alta['alta_mas_de_90d'] += 1
         elif ini == 0:
             # Sigue vivo pero no hay ni un `import_started` en los 90 dias que
             # sobreviven a la purga: no se puede decir si su import termino.
@@ -2311,8 +2364,13 @@ def _por_que_se_quedan_cortos(
         'devices': len(cortos),
         'de_un_total_de': len(por_device),
         'por_causa': causas,
+        'ultima_senal': ultima_senal,
+        'idos_por_alta': idos_por_alta,
         'nota': ('import_sin_terminar es COTA SUPERIOR: cancelar el dialogo '
                  'tambien deja un import_started suelto'),
+        'nota_senal': ('la purga de events a los 90 dias es el TECHO de lo que '
+                       'se puede ver: sin_eventos mezcla purgado con nunca '
+                       'reporto, y no se puede fechar'),
     }
 
 
