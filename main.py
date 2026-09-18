@@ -27,6 +27,11 @@ from fastapi.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 import librosa
 import numpy as np
+
+# Rejilla de beats (intervalo + fase + downbeat). Modulo propio y compartido
+# con el analizador por chunks; el cliente lleva el mismo algoritmo en
+# lib/services/beat_grid_detector.dart.
+from beat_grid import fit_beat_grid, onset_envelope as beat_grid_onset_envelope
 import sys
 import tempfile
 import os
@@ -541,7 +546,9 @@ try:
         extract_artwork_from_file,
         extract_id3_metadata,
         detect_cue_points,
-        detect_beat_grid,
+        # detect_beat_grid ya NO se importa: la rejilla vive en beat_grid.py y
+        # no depende de que cargue este modulo. Ver el comentario de la seccion
+        # BEAT GRID en analyze_audio.
         save_artwork_to_cache,
         search_artwork_online,
         ARTWORK_CACHE_DIR
@@ -2411,13 +2418,40 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # ==================== CUE POINTS ====================
     cue_points = []
     first_beat = 0.0
-    beat_interval = 0.5
-    
+    # Lo peor que puede salir es 60/bpm, no 0.5: ese 0.5 son 120 BPM clavados,
+    # un intervalo que no tiene nada que ver con el track y que ademas se
+    # exporta tal cual al XML de Rekordbox.
+    beat_interval = 60.0 / bpm if bpm > 0 else 0.5
+
     if ARTWORK_ENABLED:
         cue_points = detect_cue_points(y, sr, duration, segments)
-        beat_grid = detect_beat_grid(y, sr, bpm)
-        first_beat = beat_grid.get('first_beat', 0.0)
-        beat_interval = beat_grid.get('beat_interval', 0.5)
+
+    # ==================== BEAT GRID ====================
+    # La rejilla NO depende del modulo de artwork. Que estuviera dentro de su
+    # `if` era un accidente de donde vivia la funcion, y tenia consecuencia: si
+    # ese modulo no cargaba, el track salia con la rejilla anclada al 0 y a 120
+    # BPM sin un solo error.
+    #
+    # `fit_beat_grid` da fase Y downbeat, que es lo que le faltaba a la version
+    # anterior: con el BPM y la fase perfectos, la linea de compas podia caer
+    # igualmente en el 3. Devuelve None cuando no hay pulso que medir, y
+    # entonces se deja el 0 — una fase inventada mueve la rejilla a un sitio que
+    # no es y el usuario deja de fiarse.
+    try:
+        _env, _env_fps = beat_grid_onset_envelope(y, sr)
+        _fit = fit_beat_grid(_env, _env_fps, bpm)
+        if _fit:
+            first_beat = _fit['first_beat']
+            beat_interval = _fit['beat_interval']
+            logger.info(
+                f"  [BeatGrid] first_beat={first_beat:.3f}s "
+                f"iv={beat_interval:.5f}s downbeat={_fit['downbeat_index']} "
+                f"conf={_fit['confidence']:.2f}"
+            )
+        else:
+            logger.info("  [BeatGrid] sin pulso claro; rejilla sin fase")
+    except Exception as e:
+        logger.warning(f"  [BeatGrid] fallo la fase ({type(e).__name__}): {e}")
     
     # ==================== ARTWORK ====================
     artwork_embedded = False

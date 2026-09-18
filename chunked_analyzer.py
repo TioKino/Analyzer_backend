@@ -21,6 +21,11 @@ import os
 import subprocess
 import numpy as np
 from typing import Dict, List, Optional, Tuple
+
+# La rejilla (fase + downbeat) vive aparte y la comparten los dos caminos de
+# analisis. El cliente lleva el MISMO algoritmo en beat_grid_detector.dart: si
+# tocas uno, toca el otro.
+from beat_grid import fit_beat_grid, onset_envelope as beat_grid_onset_envelope
 import warnings
 import gc
 
@@ -871,12 +876,44 @@ class ChunkedAudioAnalyzer:
         
         return cleaned
     
-    def calculate_beat_grid(self, bpm: float, first_beat_offset: float = 0.0) -> Dict:
-        """Calcula el beat grid basado en BPM."""
+    def calculate_beat_grid(self, bpm: float, onset=None, onset_fps=None) -> Dict:
+        """Rejilla de beats: intervalo, FASE y DOWNBEAT.
+
+        Con `onset` se busca donde cae de verdad el primer beat. Sin el se
+        devuelve lo unico que se puede decir sin mirar el audio —el intervalo—
+        y `first_beat` queda a 0, que es lo que hacia SIEMPRE esta funcion
+        hasta el 2026-09-18: nadie le pasaba nunca el offset y el parametro
+        existia solo de adorno.
+
+        `fit_beat_grid` devuelve None cuando no hay pulso que medir (ambient,
+        una grabacion de voz). Ahi tambien se cae al 0: una fase inventada
+        mueve la rejilla a un sitio que no es y el usuario deja de fiarse.
+        """
         beat_interval = 60.0 / bpm if bpm > 0 else 0.5
+        first_beat = 0.0
+        confidence = 0.0
+
+        if onset is not None and onset_fps and bpm > 0:
+            try:
+                fit = fit_beat_grid(onset, onset_fps, bpm)
+                if fit:
+                    first_beat = fit['first_beat']
+                    beat_interval = fit['beat_interval']
+                    confidence = fit['confidence']
+                    logger.info(
+                        f"[BeatGrid] first_beat={first_beat:.3f}s "
+                        f"iv={beat_interval:.5f}s downbeat={fit['downbeat_index']} "
+                        f"conf={confidence:.2f}"
+                    )
+                else:
+                    logger.info("[BeatGrid] sin pulso claro; rejilla sin fase")
+            except Exception as e:
+                logger.warning(f"[BeatGrid] fallo la fase ({type(e).__name__}): {e}")
+
         return {
-            'first_beat': first_beat_offset,
+            'first_beat': first_beat,
             'beat_interval': round(beat_interval, 6),
+            'beat_confidence': confidence,
             'bpm': bpm
         }
     
@@ -909,6 +946,8 @@ class ChunkedAudioAnalyzer:
         key_results = []
         energy_results = []
         spectral_results = []
+        onset_partes = []
+        onset_fps = None
         
         # Procesar cada chunk
         for i, start_time in enumerate(chunk_starts):
@@ -939,6 +978,24 @@ class ChunkedAudioAnalyzer:
             key_results.append(key_result)
             energy_results.append(energy_result)
             spectral_results.append(spectral_result)
+
+            # Envolvente de onset del track ENTERO, cosida chunk a chunk. Sale
+            # gratis: el audio ya esta cargado aqui y se tira a la linea
+            # siguiente. Es lo que necesita la fase de la rejilla, y sin esto
+            # habria que volver a leer el fichero.
+            #
+            # Se recorta el solape para no coser dos veces el mismo trozo: un
+            # tramo repetido desplazaria el histograma de fase hacia ese trozo.
+            try:
+                env, env_fps = beat_grid_onset_envelope(y, sr)
+                if onset_fps is None:
+                    onset_fps = env_fps
+                if i < num_chunks - 1:
+                    utiles = int(round((self.chunk_duration - self.chunk_overlap) * env_fps))
+                    env = env[:max(0, utiles)]
+                onset_partes.append(env)
+            except Exception as e:
+                logger.debug(f"[BeatGrid] onset del chunk {i+1} descartado: {e}")
             
             # ⚡ CRÍTICO: Liberar memoria del chunk
             del y
@@ -964,8 +1021,17 @@ class ChunkedAudioAnalyzer:
         # Cue points automaticos deshabilitados - el usuario los pone a mano
         cue_points = []
         
-        # Beat grid
-        beat_grid = self.calculate_beat_grid(bpm_final['bpm'])
+        # Beat grid: fase + downbeat REALES sobre la envolvente cosida.
+        #
+        # Hasta el 2026-09-18 esto era `calculate_beat_grid(bpm)`, que devolvia
+        # `first_beat: 0.0` sin mirar el audio — o sea que TODO lo que pasa de
+        # 4 minutos (casi cualquier tema de club) salia con la rejilla anclada
+        # al segundo 0 del fichero. El usuario tenia que dar al tap siempre.
+        beat_grid = self.calculate_beat_grid(
+            bpm_final['bpm'],
+            onset=np.concatenate(onset_partes) if onset_partes else None,
+            onset_fps=onset_fps,
+        )
         
         # Energía DJ (1-10)
         energy_mean = np.mean([r.get('energy_mean', 0.1) for r in energy_results])
