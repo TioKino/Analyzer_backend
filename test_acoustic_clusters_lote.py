@@ -164,11 +164,99 @@ def test_el_endpoint_separa_las_sin_cluster():
     assert '"clusters": clusters' in fn
 
 
-def test_una_sola_query_no_una_por_huella():
+def _db_real(tmp_path, filas):
+    """`AnalysisDB` de verdad sobre un fichero temporal, con su esquema y sus
+    indices. Antes esto se comprobaba leyendo el FUENTE de `acoustic_ids_for`
+    y buscando el `','.join('?' * len(fps))` dentro; el dia que la query se
+    movio al ayudante `_tracks_por_huella_o_id` el test se cayo sin que nada
+    se hubiera roto. Lo que importa no es donde este escrita la query: es
+    cuantas salen."""
+    from database import AnalysisDB
+
+    db = AnalysisDB(str(tmp_path / 'real.db'))
+    conn = sqlite3.connect(str(tmp_path / 'real.db'))
+    conn.executemany(
+        'INSERT INTO tracks (id, fingerprint, acoustic_id) VALUES (?,?,?)',
+        filas,
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _sql_de(db, fn):
+    """Las sentencias que `fn()` lanza de verdad contra `tracks`."""
+    sentencias = []
+    abrir = db._open_conn
+
+    def espiada():
+        conn = abrir()
+        conn.set_trace_callback(sentencias.append)
+        return conn
+
+    db._open_conn = espiada
+    try:
+        resultado = fn()
+    finally:
+        db._open_conn = abrir
+    return resultado, [s for s in sentencias if 'FROM tracks' in s]
+
+
+def test_el_coste_NO_crece_con_el_tamano_del_lote(tmp_path):
     """Con 500 elementos, la diferencia entre un IN y un bucle de SELECTs son
     dos ordenes de magnitud — y esto corre sobre la tabla colectiva."""
-    src = _src('database.py')
-    i = src.index('def acoustic_ids_for(')
-    fn = src[i:i + 2200]
-    assert "','.join('?' * len(fps))" in fn
-    assert fn.count('c.execute(') == 1
+    db = _db_real(tmp_path, [('t1', 'md5_1', 'ac_1')])
+
+    _, con_una = _sql_de(db, lambda: db.acoustic_ids_for(['md5_1']))
+    _, con_300 = _sql_de(
+        db, lambda: db.acoustic_ids_for(['md5_%d' % i for i in range(300)])
+    )
+
+    assert len(con_una) == len(con_300) == 2, (
+        'el numero de queries tiene que ser CONSTANTE, no uno por huella'
+    )
+
+
+def test_NO_se_vuelve_al_OR_entre_columnas(tmp_path):
+    """`WHERE fingerprint IN (...) OR id IN (...)` NO usa indice en SQLite
+    cuando el OR cruza columnas distintas: recorrido completo de las 122.103
+    filas, que es de donde salian los TimeoutException de 12 s. Por eso son
+    dos queries y no una, aunque una parezca mas limpia."""
+    db = _db_real(tmp_path, [('t1', 'md5_1', 'ac_1')])
+
+    _, sqls = _sql_de(db, lambda: db.acoustic_ids_for(['md5_1', 'md5_2']))
+
+    for s in sqls:
+        assert not ('fingerprint IN' in s and ' id IN' in s), (
+            'las dos columnas en la MISMA sentencia = escaneo completo: %s' % s
+        )
+
+
+def test_el_resultado_es_el_MISMO_que_daba_el_OR(tmp_path):
+    """Partir la query no puede cambiar lo que sale: la fila legacy (id = MD5,
+    `fingerprint` a NULL) tiene que seguir apareciendo, y una fila que casa por
+    las dos columnas no puede salir duplicada."""
+    filas = [
+        ('t1', 'md5_flac', 'ac_shivers'),
+        ('t2', 'md5_mp3', 'ac_shivers'),
+        ('md5_legacy', None, 'ac_9'),
+        ('md5_ambas', 'md5_ambas', 'ac_2'),
+    ]
+    db = _db_real(tmp_path, filas)
+    pedidas = ['md5_flac', 'md5_mp3', 'md5_legacy', 'md5_ambas', 'md5_no_esta']
+
+    real, _ = _sql_de(db, lambda: db.acoustic_ids_for(pedidas))
+
+    conn = sqlite3.connect(str(tmp_path / 'real.db'))
+    conn.row_factory = sqlite3.Row
+    try:
+        assert real == _clusters(conn, pedidas)
+    finally:
+        conn.close()
+
+    assert real == {
+        'md5_flac': 'ac_shivers',
+        'md5_mp3': 'ac_shivers',
+        'md5_legacy': 'ac_9',
+        'md5_ambas': 'ac_2',
+    }

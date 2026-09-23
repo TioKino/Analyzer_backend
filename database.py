@@ -256,6 +256,16 @@ class AnalysisDB:
         # idx_acoustic: lookup O(1) del cluster por fingerprint canonico +
         # candidatos para el barrido Hamming acotado por duracion.
         c.execute('CREATE INDEX IF NOT EXISTS idx_acoustic ON tracks(acoustic_id)')
+        # idx_tracks_fingerprint: FALTABA, y se notaba. Todo lo batch de
+        # community (rating propio, popularidad, huella acustica) busca por
+        # `fingerprint`, y sin indice cada peticion recorria las 122.103
+        # filas enteras. Con el cliente mandando ~23 lotes seguidos al
+        # cargar la libreria, eso eran los TimeoutException de 12 s en
+        # cadena de `/community/my-ratings/batch` (medido 2026-09-23).
+        # Habia indice para artista, genero, bpm, energia, key, camelot,
+        # chromaprint, acoustic_id e isrc — y no para la columna con la que
+        # se busca desde fuera.
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_fingerprint ON tracks(fingerprint)')
         # idx_isrc: lookup O(1) del track por su codigo de grabacion (AudD).
         c.execute('CREATE INDEX IF NOT EXISTS idx_isrc ON tracks(isrc)')
 
@@ -901,6 +911,45 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def _tracks_por_huella_o_id(self, c, columnas: str, fps: List[str],
+                                extra: str = ''):
+        """Filas de `tracks` cuyo `fingerprint` O cuyo `id` esté en `fps`, en
+        DOS queries en vez de un `OR`.
+
+        POR QUÉ DOS Y NO UNA, que es lo que no se deduce leyendo:
+        SQLite **no usa índice** en un `OR` entre columnas DISTINTAS — hace
+        recorrido completo. Con 122.103 filas y el cliente mandando ~23 lotes
+        seguidos al cargar la librería, eso eran los `TimeoutException` de 12 s
+        en cadena de `/community/my-ratings/batch` (medido 2026-09-23). Partido
+        en dos, cada mitad entra por su índice.
+
+        De regalo, la mitad de parámetros: el `OR` ataba `fps + fps` y SQLite
+        tiene tope de variables por sentencia.
+
+        Se mira `fingerprint` **Y** `id` porque en los registros antiguos el id
+        ES el MD5; con una sola columna se queda fuera media biblioteca
+        histórica. Se deduplica por `id`, que es la clave primaria, así que
+        `columnas` TIENE que incluirlo.
+        """
+        fps = [f for f in (fps or []) if f]
+        if not fps:
+            return []
+        marcas = ','.join('?' * len(fps))
+        cond = f' AND {extra}' if extra else ''
+        vistas = set()
+        salida = []
+        for col in ('fingerprint', 'id'):
+            c.execute(
+                f'SELECT {columnas} FROM tracks WHERE {col} IN ({marcas}){cond}',
+                fps,
+            )
+            for r in c.fetchall():
+                if r['id'] in vistas:
+                    continue
+                vistas.add(r['id'])
+                salida.append(r)
+        return salida
+
     def canonical_community_keys(self, fingerprints):
         """Version batch de canonical_community_key: mapa {fingerprint ->
         clave del cluster} para una lista, en UNA query. Los que no matchean un
@@ -912,17 +961,12 @@ class AnalysisDB:
             return {}
         out = {f: f for f in fps}  # fallback: cada uno a si mismo
         want = set(fps)
-        placeholders = ','.join('?' * len(fps))
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            c.execute(
-                'SELECT fingerprint, id, acoustic_id FROM tracks '
-                'WHERE acoustic_id IS NOT NULL AND '
-                f'(fingerprint IN ({placeholders}) OR id IN ({placeholders}))',
-                fps + fps,
-            )
-            for row in c.fetchall():
+            for row in self._tracks_por_huella_o_id(
+                    c, 'fingerprint, id, acoustic_id', fps,
+                    extra='acoustic_id IS NOT NULL'):
                 aid = row['acoustic_id']
                 if row['fingerprint'] in want:
                     out[row['fingerprint']] = aid
@@ -1349,15 +1393,10 @@ class AnalysisDB:
             examples = []
             if touched:
                 sample = list(touched)[:max_examples]
-                ph2 = ','.join('?' * len(sample))
                 try:
-                    c.execute(
-                        f'SELECT fingerprint, id, artist, title FROM tracks '
-                        f'WHERE fingerprint IN ({ph2}) OR id IN ({ph2})',
-                        sample + sample,
-                    )
                     seen = set()
-                    for row in c.fetchall():
+                    for row in self._tracks_por_huella_o_id(
+                            c, 'fingerprint, id, artist, title', sample):
                         key = row['fingerprint'] or row['id']
                         if key in seen:
                             continue
@@ -3531,18 +3570,15 @@ class AnalysisDB:
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            marcas = ','.join('?' * len(fps))
-            # Una sola query, no una por huella: con 500 elementos la diferencia
-            # entre un IN y un bucle es de dos ordenes de magnitud.
-            c.execute(
-                f'SELECT id, fingerprint, acoustic_id FROM tracks '
-                f'WHERE acoustic_id IS NOT NULL '
-                f'  AND (fingerprint IN ({marcas}) OR id IN ({marcas}))',
-                fps + fps,
-            )
+            # Dos queries, no una por huella: con 500 elementos la diferencia
+            # entre un IN y un bucle es de dos ordenes de magnitud. Y dos en
+            # vez de un OR porque SQLite no indexa el OR entre columnas — ver
+            # `_tracks_por_huella_o_id`.
             fuera: Dict[str, str] = {}
             pedidas = set(fps)
-            for r in c.fetchall():
+            for r in self._tracks_por_huella_o_id(
+                    c, 'id, fingerprint, acoustic_id', fps,
+                    extra='acoustic_id IS NOT NULL'):
                 ac = r['acoustic_id']
                 if not ac:
                     continue
@@ -3585,15 +3621,10 @@ class AnalysisDB:
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            marcas = ','.join('?' * len(fps))
-            c.execute(
-                f'SELECT id, fingerprint, chromaprint FROM tracks '
-                f'WHERE fingerprint IN ({marcas}) OR id IN ({marcas})',
-                fps + fps,
-            )
             fuera: Dict[str, bool] = {}
             pedidas = set(fps)
-            for r in c.fetchall():
+            for r in self._tracks_por_huella_o_id(
+                    c, 'id, fingerprint, chromaprint', fps):
                 tiene = bool(r['chromaprint'])
                 # La clave devuelta es la que PIDIO el cliente, igual que en
                 # acoustic_ids_for: devolverle la otra columna seria darle una

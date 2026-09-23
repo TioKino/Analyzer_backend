@@ -716,6 +716,14 @@ def detect_cue_points(y, sr, duration: float, segments: dict) -> List[Dict]:
 
 def detect_beat_grid(y, sr, bpm: float) -> Dict:
     """
+    OBSOLETA desde el 2026-09-18 — la rejilla se calcula en `beat_grid.py`.
+
+    No la arregles ni la uses: se queda por si algo externo la importa. Tenia
+    dos problemas que el modulo nuevo resuelve y que no se ven leyendo esta
+    funcion: probaba 100 fases sueltas en bucles de Python (resolucion de una
+    centesima de beat) y NO miraba el downbeat, asi que con el BPM y la fase
+    perfectos la linea de compas podia caer igualmente en el 3.
+
     Detecta el beat grid preciso para sincronización.
 
     v3: Enfoque onset-first — usa onset strength para encontrar los transitorios
