@@ -179,9 +179,37 @@ class TestBeatGrid:
         assert g['bpm'] == 128.0
         assert g['first_beat'] == 0.0
 
-    def test_respeta_el_offset_del_primer_beat(self, analyzer):
-        g = analyzer.calculate_beat_grid(120.0, first_beat_offset=0.35)
-        assert g['first_beat'] == 0.35
+    def test_con_la_envolvente_encuentra_la_FASE(self, analyzer):
+        """Hasta el 2026-09-18 esta funcion tenia un parametro
+        `first_beat_offset` que NADIE le pasaba nunca, asi que `first_beat`
+        salia 0.0 siempre: la rejilla arrancaba donde arranca el FICHERO. El
+        test de entonces comprobaba que el parametro se respetaba —y se
+        respetaba— mientras el bug seguia entero. Lo que hay que comprobar es
+        que la fase se BUSCA en el audio."""
+        bpm, fase, fps = 128.0, 0.137, 86.13
+        rnd = np.random.RandomState(1)
+        n = int(360 * fps)
+        onset = rnd.rand(n) * 0.05
+        iv = 60.0 / bpm
+        k = 0
+        while fase + k * iv < 360:
+            i = int(round((fase + k * iv) * fps))
+            if 0 <= i < n:
+                onset[i] += 2.2 if k % 4 == 0 else 1.0
+            k += 1
+
+        g = analyzer.calculate_beat_grid(bpm, onset=onset, onset_fps=fps)
+
+        d = (fase - g['first_beat']) % g['beat_interval']
+        assert min(d, g['beat_interval'] - d) < 0.012
+        assert g['beat_confidence'] > 0.5
+
+    def test_sin_envolvente_no_se_inventa_la_fase(self, analyzer):
+        """Sin audio que mirar solo se puede decir el intervalo. Un 0.0 aqui es
+        honesto; una fase inventada mueve la rejilla a un sitio que no es."""
+        g = analyzer.calculate_beat_grid(120.0)
+        assert g['first_beat'] == 0.0
+        assert g['beat_interval'] == pytest.approx(0.5, abs=1e-6)
 
     def test_bpm_cero_no_divide_por_cero(self, analyzer):
         """Un análisis fallido deja bpm=0; el grid tiene que degradar, no

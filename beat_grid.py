@@ -33,11 +33,15 @@ QUÉ HACE DISTINTO
 * **Centroide** del pico en vez del bin ganador: la envolvente va a ~86 frames
   por segundo, así que un beat cae repartido entre varios bins y quedarse con
   el más alto deja ~12 ms de error. Con el centroide, ~2 ms.
-* **Afinado del intervalo por deriva de fase**: se mide la fase en la primera
-  mitad y en la segunda; si el intervalo fuera el bueno serían la misma. Un
-  tema masterizado a 127,96 etiquetado «128» acumula ~113 ms en seis minutos
-  (un cuarto de beat: entra clavada y sale con el beat cambiado) y con esto
-  baja a ~11 ms. Medido sobre señal sintética, ver `test_beat_grid.py`.
+* **Afinado del intervalo por NITIDEZ del pliegue**: se prueban intervalos
+  alrededor de 60/BPM y gana el que deja el histograma más picudo, porque con
+  el intervalo bueno todos los beats caen en el mismo sitio al doblar y con uno
+  torcido se reparten. Un tema masterizado a 127,96 etiquetado «128» acumula
+  ~113 ms en seis minutos —un cuarto de beat: entra clavada y sale con el beat
+  cambiado— y con esto baja a 0,1 ms. **Lo que había antes restaba la fase de
+  las dos mitades del track, y sobre un tema BIEN etiquetado inventaba 24 ms de
+  deriva que no existía**: los detalles y las medidas, en `_afinar_intervalo`.
+  Todo sobre señal sintética, ver `tests/test_beat_grid.py`.
 * **Downbeat**: se suma la fuerza del onset en los beats de cada residuo mod 4
   y gana el más fuerte.
 
@@ -63,6 +67,21 @@ SUAVIZADO_MS = 25
 # Cuánto se deja estirar el intervalo respecto a 60/BPM. Con más margen, en vez
 # de afinar el tempo se salta al de al lado.
 TOL_INTERVALO = 0.015
+
+# Candidatos del barrido de intervalo. El pico de nitidez mide ~3e-4 de ancho
+# relativo, así que con este paso (1,25e-4) caen cinco puntos dentro y la
+# parábola afina por debajo del paso. Subirlo no mejora la medida y el coste es
+# lineal: son ~0,2 s sobre un tema de seis minutos.
+PASOS_INTERVALO = 241
+
+# Cuántas veces tiene que superar el candidato ganador al candidato TÍPICO para
+# que nos creamos que el barrido ha encontrado un tempo y no la fluctuación más
+# afortunada. Un barrido es un optimizador: sobre ruido puro también devuelve un
+# máximo, y sin esta puerta pasaba de MIN_CONFIANZA y dibujaba rejilla donde no
+# hay pulso. Medido sobre 360 s: ruido puro da 7,1-7,4 y una pista de verdad
+# 30-61, incluida la más sucia. Fallar la puerta NO tira la rejilla: devuelve
+# 60/BPM sin afinar, que es la dirección segura.
+MIN_PICO_INTERVALO = 12.0
 
 # Por debajo de esto no se devuelve rejilla. Un track sin pulso claro daría una
 # fase cualquiera, y una rejilla inventada es peor que ninguna.
@@ -123,14 +142,84 @@ def _fase_de(onset: np.ndarray, fps: float, intervalo: float,
     return fase, confianza
 
 
-def _envolver(x: float, iv: float) -> float:
-    """Lleva x al rango (-iv/2, iv/2]. La diferencia entre dos fases del mismo
-    beat es circular: sin esto, −1 ms se lee como +467 y la corrección sale del
-    revés."""
-    v = x % iv
-    if v > iv / 2:
-        v -= iv
-    return v
+def _nitidez(onset: np.ndarray, fps: float, intervalo: float) -> float:
+    """Cuánto PICO tiene el histograma al doblar el track con este intervalo.
+
+    Es el criterio entero del afinado: con el intervalo bueno todos los beats
+    caen en el mismo sitio del pliegue y el histograma sale picudo; con uno
+    ligeramente corto o largo la fase deriva a lo largo del tema, los golpes se
+    reparten por todo el beat y el pico se aplana.
+    """
+    h = _suavizar_circular(
+        _histograma_de_fase(onset, fps, intervalo),
+        SUAVIZADO_MS // MS_POR_BIN,
+    )
+    media = float(h.mean())
+    if media <= 0:
+        return 0.0
+    return (float(h.max()) - media) / media
+
+
+def _afinar_intervalo(onset: np.ndarray, fps: float, base: float) -> float:
+    """El intervalo que deja el histograma más picudo, dentro de TOL_INTERVALO.
+
+    POR QUÉ UN BARRIDO Y NO LA DERIVA ENTRE LAS DOS MITADES, que es como estaba
+    hasta el 2026-09-23 y parece más barato y más directo:
+
+    * **Sobre un track BIEN etiquetado inventaba deriva.** Las dos mitades daban
+      fases que diferían ~12 ms por puro ruido de estimación, y eso se convertía
+      en tempo: un tema exactamente a 128 salía con el intervalo 31 µs corto, o
+      sea 24 ms de deriva al final de seis minutos METIDOS por el afinado. Y
+      después «convergía», porque con el intervalo ya torcido las dos mitades
+      vuelven a concordar. Ese es el caso COMÚN —la mayoría de los tracks van al
+      tempo que dice su BPM—, así que el afinado empeoraba el caso mayoritario
+      para arreglar el raro.
+    * **Con deriva grande salía del revés.** La diferencia de fases es circular:
+      en cuanto la deriva entre las dos mitades pasa de medio beat, el envoltorio
+      la lee por el otro lado. Un 128,35 etiquetado «128» acababa con casi un
+      segundo de error al final del tema.
+    * **Iterar lo empeoraba.** Sobre el 127,96 la primera pasada acertaba y las
+      siguientes oscilaban alrededor.
+
+    La nitidez del pliegue no tiene ninguno de los tres problemas: no resta dos
+    medidas ruidosas, no envuelve, y no hace falta iterar porque el máximo se
+    busca de una vez. Medido sobre señal sintética (`tests/test_beat_grid.py`),
+    deriva al final de un tema de seis minutos:
+
+        tempo real   antes      ahora
+        128,00       24,2 ms     2,5 ms   ← el caso común, lo ROMPÍA
+        127,96       34,1 ms     0,1 ms
+        128,35      928,2 ms    14,5 ms
+        127,50     1078,7 ms     5,6 ms
+    """
+    cands = base * (1.0 + np.linspace(-TOL_INTERVALO, TOL_INTERVALO,
+                                      PASOS_INTERVALO))
+    puntuacion = np.array([_nitidez(onset, fps, c) for c in cands])
+
+    i = int(np.argmax(puntuacion))
+    if i <= 0 or i >= len(cands) - 1:
+        # El máximo cae en un borde: no hay pico, hay una rampa. Fiarse de él
+        # sería estirar el tempo hasta el tope de la tolerancia por nada.
+        return base
+
+    # ¿Ha encontrado algo, o ha elegido la fluctuación con más suerte? Con un
+    # pulso de verdad el intervalo bueno saca MUCHO al candidato típico; sobre
+    # ruido, todos los intervalos son igual de malos y el ganador apenas
+    # destaca. Ver MIN_PICO_INTERVALO.
+    tipico = float(np.median(puntuacion))
+    if tipico <= 0 or float(puntuacion[i]) / tipico < MIN_PICO_INTERVALO:
+        return base
+
+    # Parábola por los tres puntos de alrededor: el paso del barrido es más
+    # grueso que la precisión que da el pico, y esto la recupera.
+    y0, y1, y2 = puntuacion[i - 1], puntuacion[i], puntuacion[i + 1]
+    den = y0 - 2 * y1 + y2
+    # den < 0 es la condición de máximo de verdad (cóncavo). Con den >= 0 los
+    # tres puntos no dibujan un pico y el vértice saldría disparado.
+    desplaz = 0.5 * (y0 - y2) / den if den < 0 else 0.0
+    desplaz = max(-1.0, min(1.0, float(desplaz)))
+    paso = float(cands[1] - cands[0])
+    return float(cands[i] + desplaz * paso)
 
 
 def fit_beat_grid(onset: Sequence[float], fps: float, bpm: float,
@@ -165,18 +254,7 @@ def fit_beat_grid(onset: Sequence[float], fps: float, bpm: float,
     intervalo = base
 
     if afinar_intervalo and duracion > base * 32:
-        mitad = onset.size // 2
-        t1 = (mitad / 2) / fps
-        t2 = (mitad + (onset.size - mitad) / 2) / fps
-        for _ in range(2):
-            f1, _c1 = _fase_de(onset, fps, intervalo, 0, mitad)
-            f2, _c2 = _fase_de(onset, fps, intervalo, mitad, onset.size)
-            d = _envolver(f2 - f1, intervalo)
-            candidato = intervalo + (d / (t2 - t1)) * intervalo
-            if abs(candidato - base) / base > TOL_INTERVALO:
-                intervalo = base
-                break
-            intervalo = candidato
+        intervalo = _afinar_intervalo(onset, fps, base)
 
     fase, confianza = _fase_de(onset, fps, intervalo)
     if confianza < MIN_CONFIANZA:

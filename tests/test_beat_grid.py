@@ -46,6 +46,8 @@ def test_la_fase_cae_sobre_el_bombo():
     assert fit is not None
     # Menos de un frame (11,6 ms). Con la rejilla anclada en 0 el error seria
     # de 137 ms: un tercio de beat, que es lo que obligaba a dar al tap.
+    # Depende de la semilla del ruido: 1,9 / 8,6 / 10,2 / 10,8 ms en las cuatro
+    # probadas. Un frame es el limite honesto de lo que sostiene la envolvente.
     assert distancia_a_la_rejilla(fase, fit["first_beat"], fit["beat_interval"]) < 0.012
     assert fit["confidence"] > 0.5
 
@@ -84,9 +86,51 @@ def test_un_tempo_mal_etiquetado_deja_de_derivar():
     deriva_con = abs(fit["beat_interval"] - iv_real) * beats
 
     # Sin afinar son ~113 ms al final: un cuarto de beat. La rejilla entra
-    # clavada y sale con el beat cambiado.
+    # clavada y sale con el beat cambiado. Con el afinado por nitidez, 0,36 ms
+    # medidos; el margen del assert es para no atarlo a la version de numpy.
     assert deriva_sin > 0.08
-    assert deriva_con < 0.030
+    assert deriva_con < 0.015
+
+
+def test_un_tempo_BIEN_etiquetado_no_se_toca():
+    """REGRESION. El afinado por deriva entre las dos mitades (hasta 2026-09-23)
+    INVENTABA tempo aqui: las dos mitades daban fases que diferian ~12 ms por
+    puro ruido de estimacion, eso se convertia en intervalo, y un tema
+    exactamente a 128 salia con 24 ms de deriva al final de seis minutos —
+    metidos por el afinado, que venia justo a quitarlos. Y encima se
+    autoconfirmaba: con el intervalo ya torcido las dos mitades vuelven a
+    concordar, asi que la segunda iteracion decia que todo estaba bien.
+
+    Este es el caso MAYORITARIO: casi todos los tracks van al tempo que dice su
+    BPM. El afinado empeoraba el caso comun para arreglar el raro."""
+    duracion = 360.0
+    fit = fit_beat_grid(pista(128.0, 0.5, duracion), FPS, 128.0)
+    assert fit is not None
+
+    iv_real = 60.0 / 128.0
+    deriva = abs(fit["beat_interval"] - iv_real) * (duracion / iv_real)
+    assert deriva < 0.015, "el afinado esta metiendo deriva donde no la habia"
+
+
+@pytest.mark.parametrize("real", [128.35, 127.5])
+def test_una_deriva_GRANDE_no_sale_del_reves(real):
+    """REGRESION. La diferencia entre dos fases es circular: en cuanto la deriva
+    entre las dos mitades pasaba de medio beat, el metodo viejo la leia por el
+    otro lado y corregia en sentido CONTRARIO. Un 128,35 etiquetado «128»
+    acababa con 928 ms de error al final del tema, y un 127,5 con 1.079 ms —
+    peor que no afinar nada. La nitidez del pliegue no resta fases, asi que no
+    tiene donde envolverse."""
+    duracion = 360.0
+    fit = fit_beat_grid(pista(real, 0.3, duracion), FPS, 128.0)
+    assert fit is not None
+
+    iv_real = 60.0 / real
+    beats = duracion / iv_real
+    deriva_sin = abs(60.0 / 128.0 - iv_real) * beats
+    deriva_con = abs(fit["beat_interval"] - iv_real) * beats
+
+    assert deriva_sin > 0.9, "el caso deberia empezar siendo malo"
+    assert deriva_con < 0.05
 
 
 def test_con_bpm_manual_el_intervalo_se_respeta_exacto():
