@@ -20,7 +20,7 @@ from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
-from validation import is_desktop_platform, is_mobile_platform
+from validation import DESKTOP_PLATFORMS, is_desktop_platform, is_mobile_platform
 
 logger = logging.getLogger(__name__)
 
@@ -1806,6 +1806,8 @@ async def funnel(request: Request, platform: str = None):
     counts = {}
     window = {}
     versions = {}
+    vinculacion = None
+    puertas = None
     cohort_size = 0
     if os.path.exists(analysis_db_path):
         adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
@@ -1915,6 +1917,24 @@ async def funnel(request: Request, platform: str = None):
             except sqlite3.Error as e:  # noqa: BLE001
                 logger.debug(f"[Funnel] reparto por version no disponible: {e}")
                 versions = {}
+
+            # La vinculacion del movil, contada donde vive de verdad: sync.db.
+            # Mismo criterio que el bloque de arriba — con SU PROPIO except, para
+            # que un fallo aqui no se lleve el embudo por delante.
+            if _funnel_steps_for(platform) is _FUNNEL_MOBILE:
+                try:
+                    vinculacion = _vinculacion_segun_sync(
+                        adb, FIRSTS, plat_sql, plat_params)
+                except sqlite3.Error as e:  # noqa: BLE001
+                    logger.debug(f"[Funnel] vinculacion segun sync no disponible: {e}")
+                    vinculacion = None
+                # Por que puerta se llega a vincular. Su propio except, igual.
+                try:
+                    puertas = _puertas_de_vinculacion(
+                        adb, FIRSTS, plat_sql, plat_params)
+                except sqlite3.Error as e:  # noqa: BLE001
+                    logger.debug(f"[Funnel] puertas de vinculacion no disponibles: {e}")
+                    puertas = None
         except sqlite3.OperationalError:
             # `events` o `device_first_seen` aun no existen (BD vieja).
             counts = {}
@@ -1972,8 +1992,182 @@ async def funnel(request: Request, platform: str = None):
         # «¿llegan mis releases?», que hasta ahora no se podia contestar con
         # nada del panel. Ver `_reparto_por_version`.
         "versions": versions,
+        # Solo en el embudo de movil: la vinculacion segun sync.db, al lado de
+        # la que cuentan los eventos. Ver `_vinculacion_segun_sync`.
+        "vinculacion_segun_sync": vinculacion,
+        # Solo en el embudo de movil: por que puerta se abre la hoja de
+        # vincular y que salida se elige en el onboarding. Ver
+        # `_puertas_de_vinculacion`.
+        "puertas_vinculacion": puertas,
         "raw": counts,  # eventos de la cohorte (incluye los no-embudo)
     }
+
+
+# Que `device_type` es un ordenador se decide en UN sitio (`validation`): una
+# lista a mano aqui se dejaria fuera el siguiente valor nuevo, como ya paso con
+# `macos-dmg` en /sync/publish.
+_TIPOS_ORDENADOR = tuple(sorted(DESKTOP_PLATFORMS))
+
+
+def _en_lotes(valores, n=500):
+    """Trozos de como mucho [n]: SQLite no admite mas de 999 `?` por consulta."""
+    valores = list(valores)
+    for i in range(0, len(valores), n):
+        yield valores[i:i + n]
+
+
+def _puertas_de_vinculacion(adb, firsts_sql, plat_sql, plat_params) -> dict:
+    """Por que puerta llega el movil a vincular, sobre la misma cohorte.
+
+    La hoja de vincular se abre desde TRES sitios que se ofrecen a gente
+    distinta —Ajustes, el estado vacio de la biblioteca y, desde el
+    2026-09-24, la salida «Tengo mi musica en el ordenador» del onboarding—, y
+    `link_sheet_opened` lleva en `props.origen` cual fue. Sin esto, la puerta
+    nueva del onboarding se habria puesto a ciegas: no habria forma de saber si
+    alguien la usa ni si los que entran por ella acaban vinculando.
+
+      hoja_por_origen        {origen: {abrieron, vincularon}}. `vincularon` es
+                             cuantos de los que abrieron por ahi tienen
+                             `device_linked` (el evento del que TECLEA el
+                             codigo, que en el camino del onboarding es el
+                             propio movil). Un aparato que abrio la hoja por
+                             dos puertas cuenta en las dos.
+      onboarding_por_accion  {accion: aparatos} de `onboarding_completed`
+                             (`listen`, `linkComputer`, `importMusic`).
+
+    `sin_dato` = cliente anterior a que el evento llevara la prop. Se vacia
+    solo segun actualice el parque; no lo leas como una puerta mas.
+    """
+    plat_e = plat_sql.replace(" AND LOWER(platform)", " AND LOWER(e.platform)")
+    cohorte = (
+        "JOIN firsts f ON f.device_id = e.device_id "
+        "WHERE f.d0 >= date('now','-30 days')" + plat_e
+    )
+    hoja = {}
+    for origen, abrieron, vincularon in adb.execute(
+        firsts_sql +
+        "SELECT COALESCE(json_extract(e.props, '$.origen'), 'sin_dato') AS o, "
+        "       COUNT(DISTINCT e.device_id), "
+        "       COUNT(DISTINCT CASE WHEN EXISTS ("
+        "           SELECT 1 FROM events l WHERE l.device_id = e.device_id "
+        "           AND l.event_name = 'device_linked') "
+        "         THEN e.device_id END) "
+        "FROM events e " + cohorte +
+        " AND e.event_name = 'link_sheet_opened' GROUP BY o",
+        plat_params,
+    ):
+        hoja[str(origen)] = {
+            "abrieron": int(abrieron or 0),
+            "vincularon": int(vincularon or 0),
+        }
+    onboarding = {
+        str(r[0]): int(r[1] or 0)
+        for r in adb.execute(
+            firsts_sql +
+            "SELECT COALESCE(json_extract(e.props, '$.accion'), 'sin_dato') AS a, "
+            "       COUNT(DISTINCT e.device_id) "
+            "FROM events e " + cohorte +
+            " AND e.event_name = 'onboarding_completed' GROUP BY a",
+            plat_params,
+        )
+    }
+    return {"hoja_por_origen": hoja, "onboarding_por_accion": onboarding}
+
+
+def _vinculacion_segun_sync(adb, firsts_sql, plat_sql, plat_params) -> dict:
+    """La vinculacion del movil contada en `sync.db`, no en los eventos.
+
+    El paso `device_linked` del embudo sale de un evento del cliente, y ese
+    evento solo lo emite el aparato que TECLEA el codigo (`joinWithCode`). Si
+    el codigo se genera en el movil y se teclea en el ordenador —la hoja del
+    movil ofrece las dos cosas— el evento sale del ordenador y el embudo de
+    movil no lo ve nunca. Ademas solo existe desde la 2.9.10 y se pierde si no
+    hay red en ese momento. O sea que el 3-4 % que daba ese paso era una cota
+    inferior de tamano desconocido: no se podia saber si media la vinculacion
+    o la instrumentacion.
+
+    `sync.db` tiene la verdad, venga el codigo de donde venga y la version que
+    sea: cada aparato se registra con su propia cuenta, y vincularse lo MUEVE a
+    la cuenta del otro. Un movil de la cohorte esta vinculado si su cuenta tiene
+    dos o mas aparatos.
+
+    Devuelve, sobre los moviles de la cohorte (mismo filtro que los pasos):
+
+      registrados            tienen fila en `user_devices` (llegaron a sync)
+      vinculados             su cuenta tiene >= 2 aparatos
+      con_ordenador          ... y al menos uno de ellos es un ordenador
+      recibieron_biblioteca  se les ha entregado al menos un analisis subido
+                             por OTRO aparato (`device_seen` cruzado con
+                             `sync_items.last_device_id`). Lo suyo propio no
+                             cuenta: un pull full=true tambien devuelve el eco.
+    """
+    ids = [r[0] for r in adb.execute(
+        firsts_sql +
+        "SELECT DISTINCT f.device_id FROM firsts f "
+        "WHERE f.d0 >= date('now','-30 days')" +
+        ("" if not plat_sql else
+         " AND EXISTS (SELECT 1 FROM events e2 WHERE e2.device_id = f.device_id"
+         + plat_sql.replace(" AND LOWER(platform)", " AND LOWER(e2.platform)")
+         + ")"),
+        plat_params,
+    ).fetchall()]
+    res = {
+        "cohorte": len(ids),
+        "registrados": 0,
+        "vinculados": 0,
+        "con_ordenador": 0,
+        "recibieron_biblioteca": 0,
+    }
+    if not ids:
+        return res
+
+    sconn = _get_sync_conn()
+    try:
+        usuario_de = {}
+        for lote in _en_lotes(ids):
+            ph = ",".join("?" * len(lote))
+            for r in sconn.execute(
+                f"SELECT device_id, user_id FROM user_devices "
+                f"WHERE device_id IN ({ph})", lote,
+            ):
+                usuario_de[r[0]] = r[1]
+        res["registrados"] = len(usuario_de)
+
+        aparatos, ordenadores = {}, {}
+        tipos_ph = ",".join("?" * len(_TIPOS_ORDENADOR))
+        for lote in _en_lotes(set(usuario_de.values())):
+            ph = ",".join("?" * len(lote))
+            for r in sconn.execute(
+                f"SELECT user_id, COUNT(*), "
+                f"       SUM(CASE WHEN LOWER(device_type) IN ({tipos_ph}) "
+                f"           THEN 1 ELSE 0 END) "
+                f"FROM user_devices WHERE user_id IN ({ph}) GROUP BY user_id",
+                list(_TIPOS_ORDENADOR) + lote,
+            ):
+                aparatos[r[0]] = int(r[1] or 0)
+                ordenadores[r[0]] = int(r[2] or 0)
+
+        vinculados = [d for d, u in usuario_de.items() if aparatos.get(u, 0) >= 2]
+        res["vinculados"] = len(vinculados)
+        res["con_ordenador"] = sum(
+            1 for d in vinculados if ordenadores.get(usuario_de[d], 0) >= 1)
+
+        recibieron = set()
+        for lote in _en_lotes(vinculados):
+            ph = ",".join("?" * len(lote))
+            for r in sconn.execute(
+                f"SELECT DISTINCT ds.device_id FROM device_seen ds "
+                f"JOIN sync_items si ON si.key = ds.item_key "
+                f"WHERE ds.device_id IN ({ph}) "
+                f"  AND si.data_type IN ('analysis', 'all_analysis') "
+                f"  AND si.last_device_id != ds.device_id",
+                lote,
+            ):
+                recibieron.add(r[0])
+        res["recibieron_biblioteca"] = len(recibieron)
+    finally:
+        sconn.close()
+    return res
 
 
 # ── GET /admin/retention ───────────────────────────────────
