@@ -1807,6 +1807,7 @@ async def funnel(request: Request, platform: str = None):
     window = {}
     versions = {}
     vinculacion = None
+    puertas = None
     cohort_size = 0
     if os.path.exists(analysis_db_path):
         adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
@@ -1927,6 +1928,13 @@ async def funnel(request: Request, platform: str = None):
                 except sqlite3.Error as e:  # noqa: BLE001
                     logger.debug(f"[Funnel] vinculacion segun sync no disponible: {e}")
                     vinculacion = None
+                # Por que puerta se llega a vincular. Su propio except, igual.
+                try:
+                    puertas = _puertas_de_vinculacion(
+                        adb, FIRSTS, plat_sql, plat_params)
+                except sqlite3.Error as e:  # noqa: BLE001
+                    logger.debug(f"[Funnel] puertas de vinculacion no disponibles: {e}")
+                    puertas = None
         except sqlite3.OperationalError:
             # `events` o `device_first_seen` aun no existen (BD vieja).
             counts = {}
@@ -1987,6 +1995,10 @@ async def funnel(request: Request, platform: str = None):
         # Solo en el embudo de movil: la vinculacion segun sync.db, al lado de
         # la que cuentan los eventos. Ver `_vinculacion_segun_sync`.
         "vinculacion_segun_sync": vinculacion,
+        # Solo en el embudo de movil: por que puerta se abre la hoja de
+        # vincular y que salida se elige en el onboarding. Ver
+        # `_puertas_de_vinculacion`.
+        "puertas_vinculacion": puertas,
         "raw": counts,  # eventos de la cohorte (incluye los no-embudo)
     }
 
@@ -2002,6 +2014,64 @@ def _en_lotes(valores, n=500):
     valores = list(valores)
     for i in range(0, len(valores), n):
         yield valores[i:i + n]
+
+
+def _puertas_de_vinculacion(adb, firsts_sql, plat_sql, plat_params) -> dict:
+    """Por que puerta llega el movil a vincular, sobre la misma cohorte.
+
+    La hoja de vincular se abre desde TRES sitios que se ofrecen a gente
+    distinta —Ajustes, el estado vacio de la biblioteca y, desde el
+    2026-09-24, la salida «Tengo mi musica en el ordenador» del onboarding—, y
+    `link_sheet_opened` lleva en `props.origen` cual fue. Sin esto, la puerta
+    nueva del onboarding se habria puesto a ciegas: no habria forma de saber si
+    alguien la usa ni si los que entran por ella acaban vinculando.
+
+      hoja_por_origen        {origen: {abrieron, vincularon}}. `vincularon` es
+                             cuantos de los que abrieron por ahi tienen
+                             `device_linked` (el evento del que TECLEA el
+                             codigo, que en el camino del onboarding es el
+                             propio movil). Un aparato que abrio la hoja por
+                             dos puertas cuenta en las dos.
+      onboarding_por_accion  {accion: aparatos} de `onboarding_completed`
+                             (`listen`, `linkComputer`, `importMusic`).
+
+    `sin_dato` = cliente anterior a que el evento llevara la prop. Se vacia
+    solo segun actualice el parque; no lo leas como una puerta mas.
+    """
+    plat_e = plat_sql.replace(" AND LOWER(platform)", " AND LOWER(e.platform)")
+    cohorte = (
+        "JOIN firsts f ON f.device_id = e.device_id "
+        "WHERE f.d0 >= date('now','-30 days')" + plat_e
+    )
+    hoja = {}
+    for origen, abrieron, vincularon in adb.execute(
+        firsts_sql +
+        "SELECT COALESCE(json_extract(e.props, '$.origen'), 'sin_dato') AS o, "
+        "       COUNT(DISTINCT e.device_id), "
+        "       COUNT(DISTINCT CASE WHEN EXISTS ("
+        "           SELECT 1 FROM events l WHERE l.device_id = e.device_id "
+        "           AND l.event_name = 'device_linked') "
+        "         THEN e.device_id END) "
+        "FROM events e " + cohorte +
+        " AND e.event_name = 'link_sheet_opened' GROUP BY o",
+        plat_params,
+    ):
+        hoja[str(origen)] = {
+            "abrieron": int(abrieron or 0),
+            "vincularon": int(vincularon or 0),
+        }
+    onboarding = {
+        str(r[0]): int(r[1] or 0)
+        for r in adb.execute(
+            firsts_sql +
+            "SELECT COALESCE(json_extract(e.props, '$.accion'), 'sin_dato') AS a, "
+            "       COUNT(DISTINCT e.device_id) "
+            "FROM events e " + cohorte +
+            " AND e.event_name = 'onboarding_completed' GROUP BY a",
+            plat_params,
+        )
+    }
+    return {"hoja_por_origen": hoja, "onboarding_por_accion": onboarding}
 
 
 def _vinculacion_segun_sync(adb, firsts_sql, plat_sql, plat_params) -> dict:

@@ -34,7 +34,7 @@ def bases(monkeypatch):
     analysis = _tmp_db()
     a = sqlite3.connect(analysis)
     a.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, "
-              "device_id TEXT, event_name TEXT, platform TEXT)")
+              "device_id TEXT, event_name TEXT, props TEXT, platform TEXT)")
     a.execute("CREATE TABLE device_first_seen (device_id TEXT PRIMARY KEY, "
               "first_day TEXT NOT NULL, first_platform TEXT, "
               "first_app_version TEXT)")
@@ -55,6 +55,21 @@ def bases(monkeypatch):
     # iban en una version sin el evento.
     a.execute("INSERT INTO events (timestamp, device_id, event_name, platform) "
               "VALUES (datetime('now'), 'm_pc_ok', 'device_linked', 'ios')")
+    # Las puertas: por donde se abrio la hoja y que salida se eligio en el
+    # onboarding. `m_solo` va en una version sin las props.
+    for dev, evento, props, plat in [
+        ('m_pc_ok', 'onboarding_completed', '{"accion": "linkComputer"}', 'ios'),
+        ('m_pc_ok', 'link_sheet_opened', '{"origen": "onboarding"}', 'ios'),
+        ('m_pc_vacio', 'onboarding_completed', '{"accion": "listen"}', 'android'),
+        ('m_pc_vacio', 'link_sheet_opened', '{"origen": "biblioteca_vacia"}', 'android'),
+        ('m_pc_vacio', 'link_sheet_opened', '{"origen": "onboarding"}', 'android'),
+        ('m_solo', 'onboarding_completed', None, 'ios'),
+        ('m_solo', 'link_sheet_opened', None, 'ios'),
+        ('pc1', 'link_sheet_opened', '{"origen": "ajustes"}', 'macos'),
+    ]:
+        a.execute("INSERT INTO events (timestamp, device_id, event_name, props, "
+                  "platform) VALUES (datetime('now'), ?, ?, ?, ?)",
+                  (dev, evento, props, plat))
     a.commit()
     a.close()
 
@@ -140,7 +155,53 @@ def test_el_eco_propio_no_es_recibir_biblioteca(bases):
 
 
 def test_solo_en_el_embudo_de_movil(bases):
-    assert _funnel('desktop')['vinculacion_segun_sync'] is None
+    body = _funnel('desktop')
+    assert body['vinculacion_segun_sync'] is None
+    assert body['puertas_vinculacion'] is None
+
+
+def test_por_que_puerta_se_llega_a_vincular(bases):
+    # La salida «Tengo mi musica en el ordenador» del onboarding (2026-09-24)
+    # solo sirve si se puede ver quien la usa y si acaba vinculando.
+    p = _funnel('mobile')['puertas_vinculacion']
+    assert p['hoja_por_origen'] == {
+        # m_pc_ok (vinculo) y m_pc_vacio (sin device_linked): cuenta en las
+        # dos puertas por las que entro.
+        'onboarding': {'abrieron': 2, 'vincularon': 1},
+        'biblioteca_vacia': {'abrieron': 1, 'vincularon': 0},
+        # Cliente sin la prop: se ve aparte, no se reparte entre las demas.
+        'sin_dato': {'abrieron': 1, 'vincularon': 0},
+        # `ajustes` no sale: solo lo abrio el PC, que no es de la cohorte movil.
+    }
+    assert p['onboarding_por_accion'] == {
+        'linkComputer': 1, 'listen': 1, 'sin_dato': 1,
+    }
+
+
+def test_una_bd_sin_props_no_se_lleva_el_embudo(bases, monkeypatch):
+    # `events` de una BD antigua sin la columna: el agregado nuevo se queda en
+    # None y los pasos salen igual.
+    analysis, _ = bases
+    viejo = _tmp_db()
+    v = sqlite3.connect(viejo)
+    v.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, "
+              "device_id TEXT, event_name TEXT, platform TEXT)")
+    v.execute("CREATE TABLE device_first_seen (device_id TEXT PRIMARY KEY, "
+              "first_day TEXT NOT NULL, first_platform TEXT, "
+              "first_app_version TEXT)")
+    v.execute("INSERT INTO events (timestamp, device_id, event_name, platform) "
+              "VALUES (datetime('now'), 'm1', 'app_opened', 'ios')")
+    v.execute("INSERT INTO device_first_seen (device_id, first_day, "
+              "first_platform) VALUES ('m1', date('now'), 'ios')")
+    v.commit()
+    v.close()
+    monkeypatch.setenv('DATABASE_PATH', viejo)
+    try:
+        body = _funnel('mobile')
+        assert body['puertas_vinculacion'] is None
+        assert body['steps'][0]['devices'] == 1
+    finally:
+        os.unlink(viejo)
 
 
 def test_sin_sync_db_el_embudo_sigue_entero(bases, monkeypatch):
