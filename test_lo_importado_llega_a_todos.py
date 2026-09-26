@@ -180,8 +180,13 @@ def _token():
 
 
 def _resultado(fp, fuente='analysis'):
-    """Un AnalysisResult completo, como lo guarda /analyze."""
-    from models import AnalysisResult
+    """Un AnalysisResult completo, como lo guarda /analyze.
+
+    El de `main`, no el de `models`: son dos clases distintas, y con la de
+    `models` (que sí tenía `grid_source`) estos tests pasaban mientras la de
+    /analyze reventaba al adoptar la rejilla.
+    """
+    from main import AnalysisResult
 
     campos = {}
     for nombre, info in AnalysisResult.model_fields.items():
@@ -205,6 +210,16 @@ def _analizado(app_mod, fuente='analysis'):
     fila.update(id=fp, filename=f'{fp}.mp3')
     app_mod.db.save_track(fila)
     return fp
+
+
+def test_adoptar_la_rejilla_no_revienta_con_la_clase_de_analyze(app_mod):
+    r = _resultado(_fp(), fuente='rekordbox')
+    r.key_source = 'analysis'   # la tonalidad aún es nuestra
+    app_mod._adopt_better_metadata(r, {
+        'bpm': 128.0, 'bpm_source': 'rekordbox', 'first_beat': 0.25,
+        'key': 'Am', 'camelot': '8A', 'key_source': 'rekordbox'})
+    assert (r.first_beat, r.grid_source) == (0.25, 'rekordbox')
+    assert r.key == 'Am', 'lo de después de la rejilla también se adopta'
 
 
 def test_sin_aparato_registrado_401(app_mod):

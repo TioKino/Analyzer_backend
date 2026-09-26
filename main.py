@@ -418,15 +418,19 @@ def _sign_write_payload(body: bytes) -> Dict[str, str]:
     }
 
 
-def _upload_to_render_cache(track_data: dict):
+def _upload_to_render_cache(track_data: dict, analista: str = ''):
     """
     Sube resultado de análisis local a Render como cache comunitario.
     Fire & forget: no bloquea si falla.
+
+    [analista] es el aparato que lo analizó: Render lo cuenta en la
+    popularidad, que hasta el 2026-09-26 no veía nada de los motores locales.
     """
     import threading
     def _do_upload():
         try:
             payload = {
+                'analista': analista,
                 'fingerprint': track_data.get('fingerprint', track_data.get('id', '')),
                 'filename': track_data.get('filename', ''),
                 'artist': track_data.get('artist', ''),
@@ -1217,6 +1221,13 @@ class AnalysisResult(BaseModel):
     #  Beat Grid
     first_beat: float = 0.0
     beat_interval: float = 0.5
+    # De qué programa de DJ sale `first_beat` ('rekordbox', 'traktor',
+    # 'virtualdj'), si sale de uno. Lo escribe `_adopt_better_metadata` al
+    # adoptar lo importado de la comunidad. Faltaba aquí (estaba solo en el
+    # AnalysisResult de models.py): la adopción reventaba a mitad —con el BPM
+    # ya cambiado y sin la tonalidad— y el `try` de `_mejorar_con_la_comunidad`
+    # se lo tragaba.
+    grid_source: Optional[str] = None
     #  Artwork
     artwork_embedded: bool = False
     artwork_url: Optional[str] = None
@@ -3045,6 +3056,17 @@ async def analyze_track(
     result = await _analizar(request, file, force, force_audd)
     if isinstance(result, AnalysisResult):
         await run_in_threadpool(_mejorar_con_la_comunidad, result)
+        # Quien sube un tema ya analizado también lo tiene: cuenta como un DJ
+        # más en la popularidad (ver `registrar_analista`). En el motor local
+        # no: su BD no es la de la comunidad, y lo suyo llega a Render por
+        # `/cache-analysis`.
+        huella = getattr(result, 'fingerprint', None)
+        analista = request.headers.get('X-Device-Id') or ''
+        if not IS_LOCAL_ENGINE and huella and analista:
+            try:
+                await run_in_threadpool(db.registrar_analista, huella, analista)
+            except Exception as e:  # noqa: BLE001 - contar nunca tumba /analyze
+                logger.warning(f"[Popularidad] registrar analista fallo: {e}")
     return result
 
 
@@ -3662,7 +3684,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
 
         # Auto-upload a Render como cache comunitario (solo en modo local)
         if IS_LOCAL_ENGINE:
-            _upload_to_render_cache(track_data)
+            _upload_to_render_cache(
+                track_data, request.headers.get('X-Device-Id') or '')
 
         result.fingerprint = fingerprint
         return result
@@ -4848,6 +4871,17 @@ async def cache_analysis(request: Request, signed: bool = Depends(verify_write_a
     fingerprint = data.get('fingerprint')
     if not fingerprint:
         raise HTTPException(400, "fingerprint requerido")
+
+    # Lo que analiza un motor local cuenta en la popularidad (hasta el
+    # 2026-09-26 no contaba: solo sumaba el análisis hecho AQUÍ). Antes del
+    # ranking, porque un tema que Render ya tiene («exists») también lo ha
+    # analizado este DJ. Solo firmado: sin firma cualquiera inflaría los DJs.
+    analista = str(data.pop('analista', '') or '')[:64]
+    if signed and analista:
+        try:
+            db.increment_popularity(fingerprint, analista)
+        except Exception as e:  # noqa: BLE001 - contar nunca tumba la caché
+            logger.warning(f"[Popularidad] motor local: {e}")
 
     # Cortar el envenenamiento ANTES de que el ranking mire las prioridades.
     _clamp_untrusted_source(data, signed)

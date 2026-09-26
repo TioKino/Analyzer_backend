@@ -2461,6 +2461,43 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def registrar_analista(self, fingerprint: str, device_id: str) -> bool:
+        """El aparato [device_id] tiene este tema analizado, aunque no lo haya
+        analizado aquí: un acierto de caché de /analyze. Suma un DJ a la
+        popularidad SIN subir `analysis_count` (reimportar la carpeta no es
+        analizar otra vez).
+
+        Hasta el 2026-09-26 «N DJs lo han analizado» solo contaba el análisis
+        NUEVO: el segundo DJ con el mismo fichero caía en la caché y no sumaba,
+        justo en los temas más compartidos. Devuelve True si era un DJ nuevo.
+        """
+        from datetime import datetime
+        fingerprint = self.canonical_community_key(fingerprint)
+        device_id = (device_id or '').strip()
+        if not fingerprint or not device_id:
+            return False
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            now = datetime.utcnow().isoformat()
+            c.execute('INSERT OR IGNORE INTO track_analyzers '
+                      '(fingerprint, device_id, first_seen) VALUES (?, ?, ?)',
+                      (fingerprint, device_id, now))
+            if c.rowcount == 0:
+                return False  # ya contaba: no hay nada que tocar
+            c.execute('SELECT COUNT(*) FROM track_analyzers WHERE fingerprint = ?',
+                      (fingerprint,))
+            djs = max(1, int((c.fetchone() or [0])[0] or 0))
+            c.execute(
+                'INSERT INTO track_popularity (fingerprint, analysis_count, '
+                'dj_count, last_analyzed) VALUES (?, 1, ?, ?) '
+                'ON CONFLICT(fingerprint) DO UPDATE SET dj_count = excluded.dj_count',
+                (fingerprint, djs, now))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
     def rate_track(self, fingerprint: str, device_id: str, rating: int) -> Dict:
         from datetime import datetime
         fingerprint = self.canonical_community_key(fingerprint)
