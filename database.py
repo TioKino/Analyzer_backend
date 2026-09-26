@@ -116,7 +116,83 @@ def derive_error_meta(error_class: str, error_msg: Optional[str],
         'human_message': human_message,
     }
 
+def _un_voto_por_cuenta(votos, cuentas):
+    """De `(votante, cuando, valor)` a `{votante: valor}`, uno por CUENTA.
+
+    `cuentas` es {device_id: user_id}; un aparato sin cuenta vota por su cuenta
+    (su propio id). Si varios aparatos de la misma cuenta votan distinto, vale
+    el voto más reciente: es una sola persona que ha cambiado de opinión.
+    """
+    ultimo = {}
+    for votante, cuando, valor in votos:
+        clave = ('u:' + cuentas[votante]) if votante in cuentas else votante
+        previo = ultimo.get(clave)
+        if previo is None or (cuando or '') >= (previo[0] or ''):
+            ultimo[clave] = (cuando, valor)
+    return {k: v for k, (_, v) in ultimo.items()}
+
+
+def _reparto(votos_por_cuenta):
+    """{valor: votos}, del más votado al menos."""
+    reparto = {}
+    for valor in votos_por_cuenta.values():
+        reparto[valor] = reparto.get(valor, 0) + 1
+    return dict(sorted(reparto.items(), key=lambda kv: -kv[1]))
+
+
+# Cuántas CUENTAS tienen que coincidir para que un cambio hecho A MANO llegue
+# a los demás DJs. Decisión owner 2026-09-26: «un DJ puede estar equivocado,
+# pero tres no». Lo que se IMPORTA de un programa de DJ no pasa por aquí: con
+# uno basta (ver `lo_importado_de`).
+MIN_CUENTAS_CAMBIO_MANUAL = 3
+
+# Dos correcciones de rejilla son «la misma» si el BPM final difiere menos de
+# esto y la fase menos de esto otro. Los controles de la app van de 0,01 BPM y
+# de 2 ms, así que dos DJs que cuadran el mismo tema caen dentro.
+_TOL_BPM_REJILLA = 0.02
+_TOL_FASE_REJILLA = 0.005
+
+
+def _coinciden_rejillas(a, b):
+    """¿Dicen lo mismo dos correcciones `(ajuste, fase, bpm_original)`?
+
+    El ajuste es un DELTA sobre el BPM que cada uno tenía, y dos DJs pueden
+    partir de BPMs distintos, así que se compara el BPM FINAL cuando los dos lo
+    saben. Si alguno no trae el original, solo queda comparar los deltas."""
+    if a[2] > 0 and b[2] > 0:
+        bpm_iguales = abs((a[2] + a[0]) - (b[2] + b[0])) <= _TOL_BPM_REJILLA
+    else:
+        bpm_iguales = abs(a[0] - b[0]) <= _TOL_BPM_REJILLA
+    return bpm_iguales and abs(a[1] - b[1]) <= _TOL_FASE_REJILLA
+
+
+def _grupo_que_coincide(correcciones):
+    """El grupo más grande de correcciones que coinciden con una de ellas."""
+    mejor = []
+    for centro in correcciones:
+        grupo = [c for c in correcciones if _coinciden_rejillas(centro, c)]
+        if len(grupo) > len(mejor):
+            mejor = grupo
+    return mejor
+
+
 class AnalysisDB:
+    # Resuelve device_id -> user_id (vive en sync.db, otra base: lo inyecta
+    # main.py). Sin él cada aparato cuenta como un votante, que es como se
+    # contaba hasta el 2026-09-26.
+    cuentas_de = None
+
+    def cuentas_de_votantes(self, device_ids) -> Dict[str, str]:
+        """{device_id: user_id} de los votantes con cuenta. Best-effort: si
+        sync.db no responde, {} y se cuenta por aparato como antes."""
+        ids = {d for d in device_ids if d}
+        if not ids or self.cuentas_de is None:
+            return {}
+        try:
+            return self.cuentas_de(ids) or {}
+        except Exception:  # noqa: BLE001 - contar nunca tumba un voto
+            return {}
+
     def __init__(self, db_path=None):
         if db_path is None:
             db_path = os.getenv("DATABASE_PATH", "/data/analysis.db")
@@ -269,6 +345,25 @@ class AnalysisDB:
         # idx_isrc: lookup O(1) del track por su codigo de grabacion (AudD).
         c.execute('CREATE INDEX IF NOT EXISTS idx_isrc ON tracks(isrc)')
 
+        # Lo que dice un programa de DJ (Rekordbox, Traktor, VirtualDJ) de una
+        # huella, tal como llega del XML que importó alguien. Un voto por
+        # aparato y campo; reimportar lo sustituye. Va APARTE de la fila del
+        # análisis a propósito: así se puede descontar o purgar por fuente y
+        # fecha sin tocar nada más (ver `lo_importado_de`).
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS imported_values (
+                fingerprint TEXT NOT NULL,
+                field TEXT NOT NULL,
+                value TEXT NOT NULL,
+                camelot TEXT,
+                first_beat REAL,
+                source TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, field, device_id)
+            )
+        ''')
+
         # Correcciones manuales (memoria colectiva)
         c.execute('''
             CREATE TABLE IF NOT EXISTS corrections (
@@ -282,6 +377,11 @@ class AnalysisDB:
                 FOREIGN KEY (track_id) REFERENCES tracks(id)
             )
         ''')
+
+        # Se busca y se muda por clave (`get_consensus`,
+        # `_mudar_memoria_al_cluster`): sin indice, cada una recorre la tabla.
+        c.execute('CREATE INDEX IF NOT EXISTS idx_corrections_fp '
+                  'ON corrections(fingerprint)')
 
         # Notas DJ
         c.execute('''
@@ -807,8 +907,17 @@ class AnalysisDB:
                 'WHERE fingerprint = ? OR id = ?',
                 (chromaprint_b64, acoustic_id, fingerprint, fingerprint),
             )
+            actualizadas = c.rowcount
+            if actualizadas and acoustic_id:
+                # El tema acaba de entrar en un cluster: lo que se guardó bajo
+                # su huella se muda con él (ver `_mudar_memoria_al_cluster`).
+                claves = {fingerprint}
+                for f in self._tracks_por_huella_o_id(c, 'id, fingerprint',
+                                                      [fingerprint]):
+                    claves.update((f['id'], f['fingerprint']))
+                self._mudar_memoria_al_cluster(c, claves, acoustic_id)
             conn.commit()
-            return c.rowcount > 0
+            return actualizadas > 0
         finally:
             conn.close()
 
@@ -992,14 +1101,12 @@ class AnalysisDB:
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            # Cluster del fingerprint pedido (por fingerprint o por id).
-            c.execute(
-                'SELECT acoustic_id FROM tracks WHERE fingerprint = ? OR id = ? '
-                'LIMIT 1',
-                (fingerprint, fingerprint),
-            )
-            row = c.fetchone()
-            aid = row['acoustic_id'] if row else None
+            # Cluster del fingerprint pedido (por fingerprint o por id). En
+            # dos queries y no con un `OR`: ver `_tracks_por_huella_o_id`.
+            filas = self._tracks_por_huella_o_id(
+                c, 'id, acoustic_id', [fingerprint])
+            aid = next((f['acoustic_id'] for f in filas if f['acoustic_id']),
+                       None)
             if aid:
                 c.execute(
                     'SELECT fingerprint, id FROM tracks WHERE acoustic_id = ?',
@@ -1013,6 +1120,146 @@ class AnalysisDB:
         finally:
             conn.close()
         return list(keys)
+
+    # Lo que la memoria colectiva guarda con la clave del CLUSTER
+    # (`canonical_community_key`): notas, valoraciones, rejilla corregida,
+    # votos de cambios a mano y quién lo analizó. `track_popularity` también,
+    # pero es un contador y se suma aparte. Los cues comunitarios NO: van por
+    # huella y se leen juntando el cluster (`fingerprints_in_cluster`); y lo
+    # importado tampoco, que va por huella EXACTA a propósito.
+    _MEMORIA_POR_CLUSTER = (
+        'community_notes', 'track_ratings', 'beat_grid_corrections',
+        'community_overrides', 'corrections', 'track_analyzers',
+    )
+
+    def _mudar_memoria_al_cluster(self, c, viejas, aid) -> int:
+        """Muda a la clave del cluster [aid] lo que se guardó bajo [viejas]
+        (la huella o el id de un tema) antes de que ese tema tuviera cluster.
+
+        La clave de la memoria colectiva se decide al ESCRIBIR y al LEER con
+        `canonical_community_key`: el cluster si el tema lo tiene, y si no, su
+        huella. Así que en cuanto un tema recibe su huella acústica (backfill,
+        o la cura del cache-hit) la clave CAMBIA, y todo lo escrito antes
+        —notas, valoraciones, votos— se queda debajo de la vieja, donde ya no
+        lo lee nadie: ni el que lo escribió ni el que tiene otro fichero del
+        mismo tema. Medido el 2026-09-26: una nota escrita antes del backfill
+        desaparecía después, también para su autor.
+
+        Un choque (el mismo aparato ya tiene fila bajo el cluster) se queda
+        donde estaba (`UPDATE OR IGNORE`): la de debajo del cluster es la más
+        nueva. No hace commit. Devuelve cuántas filas se mudaron.
+        """
+        viejas = sorted({k for k in viejas if k and k != aid})
+        if not aid or not viejas:
+            return 0
+        ph = ','.join('?' * len(viejas))
+        movidas = 0
+        for tabla in self._MEMORIA_POR_CLUSTER:
+            try:
+                c.execute(
+                    f'UPDATE OR IGNORE {tabla} SET fingerprint = ? '
+                    f'WHERE fingerprint IN ({ph})', [aid, *viejas])
+                movidas += max(c.rowcount, 0)
+            except sqlite3.OperationalError:
+                continue  # tabla ausente en una BD vieja
+
+        # La popularidad es un contador por clave: se SUMA a la del cluster.
+        c.execute(
+            'SELECT COALESCE(SUM(analysis_count), 0) AS n, MAX(last_analyzed) AS l, '
+            f'COUNT(*) AS filas FROM track_popularity WHERE fingerprint IN ({ph})',
+            viejas)
+        pop = c.fetchone()
+        if pop and pop['filas']:
+            c.execute(
+                'INSERT INTO track_popularity (fingerprint, analysis_count, last_analyzed) '
+                'VALUES (?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET '
+                'analysis_count = analysis_count + excluded.analysis_count, '
+                'last_analyzed = MAX(COALESCE(last_analyzed, \'\'), '
+                'COALESCE(excluded.last_analyzed, \'\'))',
+                (aid, pop['n'], pop['l']))
+            c.execute(f'DELETE FROM track_popularity WHERE fingerprint IN ({ph})',
+                      viejas)
+            movidas += pop['filas']
+
+        if movidas:
+            # Lo que se deriva de lo mudado, recontado sobre el cluster.
+            c.execute('SELECT COUNT(*) FROM track_analyzers WHERE fingerprint = ?',
+                      (aid,))
+            djs = max(1, int((c.fetchone() or [0])[0] or 0))
+            c.execute('SELECT AVG(rating) AS avg, COUNT(*) AS cnt '
+                      'FROM track_ratings WHERE fingerprint = ?', (aid,))
+            agg = c.fetchone()
+            c.execute(
+                'UPDATE track_popularity SET dj_count = ?, avg_rating = ?, '
+                'total_ratings = ? WHERE fingerprint = ?',
+                (djs, agg['avg'] or 0, agg['cnt'] or 0, aid))
+        return movidas
+
+    def realinear_memoria_colectiva(self) -> int:
+        """Muda al cluster lo que se quedó huérfano ANTES de que existiera
+        `_mudar_memoria_al_cluster`: todo lo escrito bajo la huella de un tema
+        que después recibió cluster. Idempotente y barato (recorre las tablas
+        de la memoria, que son pequeñas, no `tracks`). Va al arrancar.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            por_cluster: Dict[str, set] = {}
+            for tabla in (*self._MEMORIA_POR_CLUSTER, 'track_popularity'):
+                for col in ('fingerprint', 'id'):
+                    try:
+                        c.execute(
+                            f'SELECT DISTINCT m.fingerprint AS k, t.acoustic_id AS aid '
+                            f'FROM {tabla} m JOIN tracks t ON t.{col} = m.fingerprint '
+                            'WHERE t.acoustic_id IS NOT NULL '
+                            'AND t.acoustic_id != m.fingerprint')
+                    except sqlite3.OperationalError:
+                        continue
+                    for r in c.fetchall():
+                        por_cluster.setdefault(r['aid'], set()).add(r['k'])
+            movidas = 0
+            for aid, viejas in por_cluster.items():
+                movidas += self._mudar_memoria_al_cluster(c, viejas, aid)
+            conn.commit()
+            return movidas
+        finally:
+            conn.close()
+
+    def lo_de_este_aparato(self, device_id: str) -> Dict[str, list]:
+        """Las valoraciones y notas de [device_id], cada una con la huella de
+        su fichero (ver `/community/de-este-aparato`)."""
+        if not device_id:
+            return {'ratings': [], 'notes': []}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            huellas: Dict[str, Optional[str]] = {}
+
+            def huella(clave):
+                if clave not in huellas:
+                    fila = None
+                    for col in ('fingerprint', 'id', 'acoustic_id'):
+                        c.execute(
+                            f'SELECT fingerprint FROM tracks WHERE {col} = ? '
+                            'AND fingerprint IS NOT NULL LIMIT 1', (clave,))
+                        fila = c.fetchone()
+                        if fila:
+                            break
+                    huellas[clave] = fila['fingerprint'] if fila else clave
+                return huellas[clave]
+
+            c.execute('SELECT fingerprint, rating FROM track_ratings '
+                      'WHERE device_id = ? AND rating > 0', (device_id,))
+            ratings = [{'fingerprint': r['fingerprint'], 'rating': r['rating']}
+                       for r in c.fetchall()]
+            c.execute('SELECT fingerprint, note_text, note_type, display_name '
+                      'FROM community_notes WHERE device_id = ?', (device_id,))
+            notes = [dict(r) for r in c.fetchall()]
+            for fila in (*ratings, *notes):
+                fila['fingerprint'] = huella(fila['fingerprint'])
+            return {'ratings': ratings, 'notes': notes}
+        finally:
+            conn.close()
 
     def get_return_rates(self) -> dict:
         """RETENCION "ROLLING": de los que instalaron, cuantos VOLVIERON ALGUNA
@@ -1462,8 +1709,8 @@ class AnalysisDB:
         try:
             c = conn.cursor()
             c.execute(
-                'SELECT bpm, key, camelot, genre, analysis_json FROM tracks '
-                'WHERE acoustic_id = ?',
+                'SELECT fingerprint, bpm, key, camelot, genre, analysis_json '
+                'FROM tracks WHERE acoustic_id = ?',
                 (acoustic_id,),
             )
             rows = c.fetchall()
@@ -1471,6 +1718,10 @@ class AnalysisDB:
             conn.close()
         if not rows:
             return None
+        # Lo que los programas de DJ dicen de CUALQUIER versión de este sonido.
+        # Hasta el 2026-09-26 no llegaba nada de esto al servidor, así que el
+        # ranking de abajo nunca veía un `rekordbox`.
+        importado = self.lo_importado_de([r['fingerprint'] for r in rows])
 
         best = {}
         best_prio = {'bpm': -1, 'key': -1, 'genre': -1}
@@ -1506,6 +1757,17 @@ class AnalysisDB:
                     best_prio['genre'] = p
                     best['genre'] = genre
                     best['genre_source'] = aj.get('genre_source')
+
+        for campo, extras in (('bpm', ()), ('key', ('camelot',))):
+            fuente = importado.get(f'{campo}_source')
+            p = get_source_priority(fuente)
+            if fuente and p > best_prio[campo]:
+                best_prio[campo] = p
+                best[campo] = importado[campo]
+                best[f'{campo}_source'] = fuente
+                for e in extras:
+                    if importado.get(e):
+                        best[e] = importado[e]
 
         best['_priorities'] = best_prio
         return best if (len(best) > 1) else None
@@ -1570,6 +1832,15 @@ class AnalysisDB:
                 track_data.get('platform'),
             ))
 
+            # Si el tema llega con cluster, lo que se guardó bajo su huella
+            # antes de tenerlo se muda con él (la cura del cache-hit rellena
+            # el chromaprint por aquí). Sin nada que mudar son UPDATEs por
+            # índice sobre tablas pequeñas.
+            if track_data.get('acoustic_id'):
+                self._mudar_memoria_al_cluster(
+                    c, (track_data['id'], track_data.get('fingerprint')),
+                    track_data['acoustic_id'])
+
             conn.commit()
         finally:
             conn.close()
@@ -1619,36 +1890,40 @@ class AnalysisDB:
         try:
             c = conn.cursor()
 
-            # Un voto por DISPOSITIVO, no por marca de tiempo.
+            # Un voto por CUENTA, no por aparato ni por marca de tiempo.
             #
             # `DISTINCT track_id || corrected_at` contaba cada correccion como
             # un voto, asi que el mismo aparato pulsando tres veces fabricaba
             # un `consensus_3` — que en `ANALYSIS_SOURCE_PRIORITY` vale 80 y
-            # gana al motor local (50) y al id3 (30).
+            # gana al motor local (50) y al id3 (30). Y contando por aparato
+            # (2026-08-27 → 2026-09-26) el DJ con escritorio + móvil + tablet
+            # valía TRES votos siendo una opinión. La cuenta sale de sync.db
+            # (`cuentas_de_votantes`) y se resuelve al LEER, no al escribir:
+            # vincular un aparato después de votar tiene que juntar sus votos.
             #
-            # `COALESCE(device_id, 'anon:' || id)`: las filas anteriores a la
-            # columna tienen `device_id` NULL, y `COUNT(DISTINCT device_id)`
-            # IGNORA los NULL en SQL — sin el COALESCE, todo el consenso
-            # historico caeria a 0 de golpe. Cada fila vieja sigue valiendo
-            # uno, que es exactamente lo que valia antes. Es la misma trampa
-            # que ya mordio en el embudo con los eventos anonimos de la web.
+            # `'anon:' || id`: las filas anteriores a la columna tienen
+            # `device_id` NULL y cada una sigue valiendo uno, que es lo que
+            # valia antes. Sin eso todo el consenso historico caeria a 0 (es la
+            # trampa de `COUNT(DISTINCT device_id)`, que ignora los NULL).
             c.execute('''
-                SELECT new_value,
-                       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS vote_count
+                SELECT COALESCE(device_id, 'anon:' || id) AS votante,
+                       corrected_at, new_value
                 FROM corrections
                 WHERE fingerprint = ? AND field = ?
-                GROUP BY new_value
-                ORDER BY vote_count DESC
-                LIMIT 1
             ''', (fingerprint, field))
-
-            result = c.fetchone()
-
-            if result and result['vote_count'] >= min_votes:
-                return result['new_value'], result['vote_count']
-            return None, 0
+            filas = [(r['votante'], r['corrected_at'], r['new_value'])
+                     for r in c.fetchall()]
         finally:
             conn.close()
+
+        cuentas = self.cuentas_de_votantes(v for v, _, _ in filas)
+        reparto = _reparto(_un_voto_por_cuenta(filas, cuentas))
+        if not reparto:
+            return None, 0
+        valor, votos = next(iter(reparto.items()))
+        if votos >= min_votes:
+            return valor, votos
+        return None, 0
 
     def get_collective_genre(self, fingerprint):
         """Legacy: usa get_consensus con minimo 3 votos."""
@@ -1668,32 +1943,30 @@ class AnalysisDB:
         try:
             c = conn.cursor()
 
+            # Mismo criterio que `get_consensus`: un voto por CUENTA.
+            # Tenerlo distinto en los dos sitios haria que el mismo track diera
+            # consensos diferentes segun por donde se preguntara.
             c.execute('''
-                -- Mismo criterio que `get_consensus`: un voto por
-                -- DISPOSITIVO. Tenerlo distinto en los dos sitios haria
-                -- que el mismo track diera consensos diferentes segun
-                -- por donde se preguntara.
-                SELECT field, new_value,
-                       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS vote_count
+                SELECT field, COALESCE(device_id, 'anon:' || id) AS votante,
+                       corrected_at, new_value
                 FROM corrections
                 WHERE fingerprint = ?
-                GROUP BY field, new_value
-                ORDER BY field, vote_count DESC
             ''', (fingerprint,))
-
             rows = c.fetchall()
-
-            result = {}
-            for row in rows:
-                field = row['field']
-                value = row['new_value']
-                count = row['vote_count']
-                if field not in result or count > result[field][1]:
-                    result[field] = (value, count)
-
-            return result
         finally:
             conn.close()
+
+        cuentas = self.cuentas_de_votantes(r['votante'] for r in rows)
+        por_campo = {}
+        for r in rows:
+            por_campo.setdefault(r['field'], []).append(
+                (r['votante'], r['corrected_at'], r['new_value']))
+        result = {}
+        for field, filas in por_campo.items():
+            reparto = _reparto(_un_voto_por_cuenta(filas, cuentas))
+            if reparto:
+                result[field] = next(iter(reparto.items()))
+        return result
 
     # ==================== BUSQUEDAS ====================
 
@@ -2288,6 +2561,148 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    # ==================== LO IMPORTADO DE LOS PROGRAMAS DE DJ ====================
+
+    def guardar_lo_importado(self, device_id: str, items: List[Dict]) -> int:
+        """Guarda lo que el XML de Rekordbox/Traktor/VirtualDJ de un aparato
+        dice de cada huella. Un voto por aparato y campo: reimportar lo
+        sustituye. `items` llega ya validado (endpoint): `fingerprint`,
+        `source` y, cada uno opcional, `bpm` (+ `first_beat`) y `key`
+        (+ `camelot`). Devuelve cuántos votos se escribieron."""
+        ahora = datetime.utcnow().isoformat()
+        filas = []
+        for it in items:
+            fp, fuente = it['fingerprint'], it['source']
+            if it.get('bpm'):
+                filas.append((fp, 'bpm', f"{it['bpm']:.2f}", None,
+                              it.get('first_beat'), fuente, device_id, ahora))
+            if it.get('key'):
+                filas.append((fp, 'key', it['key'], it.get('camelot'), None,
+                              fuente, device_id, ahora))
+        if not filas:
+            return 0
+        conn = self._open_conn()
+        try:
+            conn.executemany('''
+                INSERT INTO imported_values (fingerprint, field, value, camelot,
+                    first_beat, source, device_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint, field, device_id) DO UPDATE SET
+                    value = excluded.value,
+                    camelot = excluded.camelot,
+                    first_beat = excluded.first_beat,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+            ''', filas)
+            conn.commit()
+        finally:
+            conn.close()
+        return len(filas)
+
+    def resumen_lo_importado(self) -> Dict:
+        """Cuánto de lo importado ha llegado a la memoria colectiva, para el
+        panel: votos, huellas y aparatos distintos, por programa y campo.
+        Agregado de una tabla pequeña (un voto por aparato, campo y tema), sin
+        recorrer `tracks`."""
+        conn = self._open_conn()
+        try:
+            total = conn.execute(
+                'SELECT COUNT(*) AS votos, COUNT(DISTINCT fingerprint) AS huellas, '
+                'COUNT(DISTINCT device_id) AS aparatos FROM imported_values'
+            ).fetchone()
+            por = conn.execute(
+                'SELECT source, field, COUNT(*) AS n FROM imported_values '
+                'GROUP BY source, field'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {'votos': 0, 'huellas': 0, 'aparatos': 0, 'por_fuente': {}}
+        finally:
+            conn.close()
+        por_fuente = {}
+        for r in por:
+            por_fuente.setdefault(r['source'], {})[r['field']] = r['n']
+        return {
+            'votos': total['votos'],
+            'huellas': total['huellas'],
+            'aparatos': total['aparatos'],
+            'por_fuente': por_fuente,
+        }
+
+    def lo_importado_de(self, fingerprints, exacta: Optional[str] = None) -> Dict:
+        """Lo que los programas de DJ dicen de estas huellas (las versiones de
+        un mismo sonido), listo para competir en el ranking.
+
+        Con UN voto basta (decisión owner 2026-09-26: «con que se detecte una
+        vez es suficiente»). Si discrepan, gana el valor con más CUENTAS; a
+        igualdad, el programa de más rango.
+
+        La rejilla (`first_beat`) solo sale de la huella `exacta`, nunca de
+        otra versión del cluster: dos codificaciones del mismo audio no
+        empiezan en la misma muestra (el retardo del codificador MP3 son
+        ~25 ms), así que el primer beat de una no vale para la otra. El BPM y
+        la tonalidad sí valen.
+
+        Devuelve {} o un dict con `bpm`/`bpm_source`[/`first_beat`] y
+        `key`/`camelot`/`key_source`.
+        """
+        from analysis_ranking import get_source_priority
+        fps = [f for f in dict.fromkeys(fingerprints or []) if f]
+        if not fps:
+            return {}
+        marcas = ','.join('?' * len(fps))
+        conn = self._open_conn()
+        try:
+            filas = conn.execute(
+                'SELECT fingerprint, field, value, camelot, first_beat, source, '
+                f'device_id, updated_at FROM imported_values '
+                f'WHERE fingerprint IN ({marcas})',
+                fps,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+        if not filas:
+            return {}
+
+        cuentas = self.cuentas_de_votantes(f['device_id'] for f in filas)
+        salida = {}
+        for campo in ('bpm', 'key'):
+            votos = [
+                (f['device_id'], f['updated_at'],
+                 (f['value'], f['source'], f['camelot'],
+                  f['first_beat'] if f['fingerprint'] == exacta else None))
+                for f in filas if f['field'] == campo
+            ]
+            if not votos:
+                continue
+            grupos = {}
+            for valor, fuente, camelot, primer in _un_voto_por_cuenta(
+                    votos, cuentas).values():
+                g = grupos.setdefault(valor, {'n': 0, 'fuente': fuente,
+                                              'camelot': camelot,
+                                              'primer': None})
+                g['n'] += 1
+                if get_source_priority(fuente) > get_source_priority(g['fuente']):
+                    g['fuente'] = fuente
+                g['primer'] = g['primer'] or primer
+            valor, g = max(
+                grupos.items(),
+                key=lambda kv: (kv[1]['n'], get_source_priority(kv[1]['fuente']),
+                                kv[0]),
+            )
+            if campo == 'bpm':
+                salida['bpm'] = float(valor)
+                salida['bpm_source'] = g['fuente']
+                if g['primer']:
+                    salida['first_beat'] = g['primer']
+            else:
+                salida['key'] = valor
+                salida['key_source'] = g['fuente']
+                if g['camelot']:
+                    salida['camelot'] = g['camelot']
+        return salida
+
     # ==================== COMMUNITY BEAT GRID ====================
 
     def submit_beat_grid_correction(self, fingerprint: str, device_id: str,
@@ -2314,37 +2729,62 @@ class AnalysisDB:
             conn.close()
 
     def get_community_beat_grid(self, fingerprint: str) -> Dict:
-        """Obtiene la correccion promedio de la comunidad para un track"""
+        """La corrección de rejilla de la comunidad, SOLO si la comparten
+        tres cuentas.
+
+        Es un cambio hecho a mano, y la regla del owner (2026-09-26) para
+        todo cambio manual que llega a otros es: «un DJ puede estar
+        equivocado, pero tres no». Hasta ese día aquí bastaba con UNA: el
+        cliente aplicaba cualquier corrección con `contributors > 0`, y
+        `validated` pedía dos aparatos (no cuentas) sin mirar siquiera si
+        decían lo mismo — se promediaban +0,5 y +0,9 BPM y salía +0,7, que no
+        era de nadie.
+
+        Ahora: un voto por CUENTA (el más reciente de sus aparatos), se busca
+        el grupo más grande de correcciones que COINCIDEN (mismo BPM final a
+        ±0,02 y misma fase a ±5 ms) y solo si ese grupo llega a tres se
+        devuelve su media. Si no llega, el ajuste va a CERO: los clientes ya
+        publicados aplican cualquier ajuste distinto de cero que les llegue,
+        así que callarlo aquí es lo único que los frena.
+        """
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            c.execute('''
-                SELECT AVG(bpm_adjust) AS bpm_adj, AVG(beat_offset) AS beat_off,
-                       COUNT(*) AS contributors, AVG(original_bpm) AS orig_bpm
-                FROM beat_grid_corrections
-                WHERE fingerprint = ?
-            ''', (fingerprint,))
-            row = c.fetchone()
-            if row and row['contributors'] and row['contributors'] > 0:
-                contributors = row['contributors']
-                # Validado si >= 2 DJs con ajustes similares
-                validated = contributors >= 2
-                return {
-                    'bpm_adjust': round(row['bpm_adj'] or 0.0, 4),
-                    'beat_offset': round(row['beat_off'] or 0.0, 6),
-                    'contributors': contributors,
-                    'validated': validated,
-                    'original_bpm': round(row['orig_bpm'] or 0.0, 2),
-                }
-            return {
-                'bpm_adjust': 0.0,
-                'beat_offset': 0.0,
-                'contributors': 0,
-                'validated': False,
-            }
+            c.execute(
+                'SELECT device_id, bpm_adjust, beat_offset, original_bpm, '
+                "COALESCE(updated_at, created_at, '') AS cuando "
+                'FROM beat_grid_corrections WHERE fingerprint = ?',
+                (fingerprint,),
+            )
+            filas = c.fetchall()
         finally:
             conn.close()
+
+        cuentas = self.cuentas_de_votantes(r['device_id'] for r in filas)
+        correcciones = list(_un_voto_por_cuenta(
+            ((r['device_id'], r['cuando'],
+              (r['bpm_adjust'] or 0.0, r['beat_offset'] or 0.0,
+               r['original_bpm'] or 0.0))
+             for r in filas),
+            cuentas,
+        ).values())
+        grupo = _grupo_que_coincide(correcciones)
+        if len(grupo) >= MIN_CUENTAS_CAMBIO_MANUAL:
+            n = len(grupo)
+            return {
+                'bpm_adjust': round(sum(g[0] for g in grupo) / n, 4),
+                'beat_offset': round(sum(g[1] for g in grupo) / n, 6),
+                'contributors': n,
+                'validated': True,
+                'original_bpm': round(sum(g[2] for g in grupo) / n, 2),
+            }
+        return {
+            'bpm_adjust': 0.0,
+            'beat_offset': 0.0,
+            'contributors': len(grupo),
+            'validated': False,
+        }
 
     # ==================== COMMUNITY OVERRIDES GENERICOS (Fase 4) ====================
     # Sistema unificado para CUALQUIER campo categorico: track_type, key,
@@ -2473,29 +2913,14 @@ class AnalysisDB:
           - >= 3 votos totales al winner.
           - winner supera al 2do por >= 2 votos.
         """
-        fingerprint = self.canonical_community_key(fingerprint)
-        conn = self._open_conn()
-        try:
-            c = conn.cursor()
-            c.execute('''
-                SELECT value, COUNT(*) AS votes
-                FROM community_overrides
-                WHERE fingerprint = ? AND field = ?
-                GROUP BY value
-                ORDER BY votes DESC
-            ''', (fingerprint, field))
-            rows = c.fetchall()
-        finally:
-            conn.close()
-
-        if not rows:
+        distribution = self.get_community_votes(fingerprint, field)
+        if not distribution:
             return None
 
-        distribution = {r['value']: r['votes'] for r in rows}
         total = sum(distribution.values())
-        winner_value = rows[0]['value']
-        winner_votes = rows[0]['votes']
-        second_votes = rows[1]['votes'] if len(rows) > 1 else 0
+        ranking = list(distribution.items())
+        winner_value, winner_votes = ranking[0]
+        second_votes = ranking[1][1] if len(ranking) > 1 else 0
 
         if winner_votes < 3:
             return None
@@ -2538,22 +2963,7 @@ class AnalysisDB:
         - Si algun valor no parsea a float se ignora (defensivo, los votos
           deberian estar normalizados por _validate_community_field).
         """
-        fingerprint = self.canonical_community_key(fingerprint)
-        conn = self._open_conn()
-        try:
-            c = conn.cursor()
-            c.execute('''
-                SELECT value, COUNT(*) AS votes
-                FROM community_overrides
-                WHERE fingerprint = ? AND field = ?
-                GROUP BY value
-                ORDER BY votes DESC
-            ''', (fingerprint, field))
-            rows = c.fetchall()
-        finally:
-            conn.close()
-
-        distribution = {r['value']: r['votes'] for r in rows}
+        distribution = self.get_community_votes(fingerprint, field)
         total_voters = sum(distribution.values())
 
         if total_voters < threshold:
@@ -2598,22 +3008,27 @@ class AnalysisDB:
         }
 
     def get_community_votes(self, fingerprint: str, field: str) -> Dict:
-        """Distribucion bruta de votos por (fp, field). Siempre devuelve dict."""
+        """Reparto de votos por (fp, field), del más votado al menos. Siempre
+        devuelve dict.
+
+        Un voto por CUENTA (sync.db), no por aparato: el DJ con escritorio y
+        móvil es una opinión, no dos. Si dos aparatos de la misma cuenta votan
+        distinto, vale el más reciente. Es la base de los dos consensos
+        (`get_community_consensus` y el numérico), así que cuentan igual.
+        """
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         try:
-            c = conn.cursor()
-            c.execute('''
-                SELECT value, COUNT(*) AS votes
+            rows = conn.execute('''
+                SELECT device_id, created_at, value
                 FROM community_overrides
                 WHERE fingerprint = ? AND field = ?
-                GROUP BY value
-                ORDER BY votes DESC
-            ''', (fingerprint, field))
-            rows = c.fetchall()
+            ''', (fingerprint, field)).fetchall()
         finally:
             conn.close()
-        return {r['value']: r['votes'] for r in rows}
+        filas = [(r['device_id'], r['created_at'], r['value']) for r in rows]
+        cuentas = self.cuentas_de_votantes(d for d, _, _ in filas)
+        return _reparto(_un_voto_por_cuenta(filas, cuentas))
 
     def delete_community_override(
         self, fingerprint: str, device_id: str, field: str,

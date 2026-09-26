@@ -89,8 +89,13 @@ def test_second_device_same_fingerprint_coexists():
             bpm_adjust=0.9, beat_offset=0.0, original_bpm=128.0,
         )
         result = db.get_community_beat_grid('fp1')
-        # 2 devices distintos para el mismo fingerprint -> 2 contribuidores.
-        assert result['contributors'] == 2
-        assert result['validated'] is True
+        # Los dos votos se guardan (no se pisan), pero dicen cosas distintas y
+        # son dos: una corrección a mano necesita TRES cuentas que coincidan
+        # (test_cambio_manual_pide_tres.py).
+        filas = db._open_conn().execute(
+            "SELECT COUNT(*) FROM beat_grid_corrections WHERE fingerprint='fp1'"
+        ).fetchone()[0]
+        assert filas == 2
+        assert result['validated'] is False
     finally:
         os.remove(path)

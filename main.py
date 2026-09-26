@@ -15,7 +15,8 @@ Estructura:
 from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sync_endpoints import sync_router, admin_sync_router
+from sync_endpoints import (sync_router, admin_sync_router, cuentas_de_dispositivos,
+                            dispositivo_del_token)
 from routes.admin_panel import admin_panel_router
 from routes.search import search_router, init as init_search
 from routes.community import community_router, init as init_community
@@ -537,7 +538,7 @@ def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
 
 
 # ==================== IMPORTS LOCALES ====================
-from database import AnalysisDB
+from database import AnalysisDB, MIN_CUENTAS_CAMBIO_MANUAL
 
 
 # Importar funciones de artwork y cue points
@@ -969,6 +970,8 @@ async def report_client_event(payload: ClientEventPayload, request: Request):
 
 # Inicializar BD con path de config (no hardcoded)
 db = AnalysisDB(db_path=DATABASE_PATH)
+# El consenso de la comunidad cuenta por CUENTA, y las cuentas viven en sync.db.
+db.cuentas_de = cuentas_de_dispositivos
 
 # Sembrar `device_first_seen` ANTES de purgar, no despues: la purga borra los
 # eventos de los que hay que leer el D0. Al reves, cada deploy tiraria justo lo
@@ -983,6 +986,17 @@ try:
         logger.info(f"[Events] D0 sembrado para {_sembrados} dispositivos")
 except Exception as _e:  # noqa: BLE001 - best-effort
     logger.warning(f"[Events] backfill de first_seen fallo: {_e}")
+
+# La memoria colectiva que se quedó huérfana al entrar su tema en un cluster
+# acústico (notas, valoraciones, votos escritos bajo la huella ANTES de que el
+# tema tuviera cluster: ver `_mudar_memoria_al_cluster`). Desde 2026-09-26 se
+# muda en el momento; esto recoge lo de antes. Idempotente.
+try:
+    _mudadas = db.realinear_memoria_colectiva()
+    if _mudadas:
+        logger.info(f"[Community] {_mudadas} filas de la memoria mudadas a su cluster")
+except Exception as _e:  # noqa: BLE001 - best-effort
+    logger.warning(f"[Community] realinear la memoria fallo: {_e}")
 
 # Purga best-effort de eventos viejos (>90d) para que la tabla `events` del
 # embudo no crezca sin limite. No bloquea el arranque si falla.
@@ -1053,6 +1067,10 @@ init_lookup(
     # mismo. Hace que el pre-check de dedup del cliente funcione en una maquina
     # recien formateada, donde la BD local esta vacia pero Render lo tiene todo.
     render_cache_lookup=(_fetch_render_cache if IS_LOCAL_ENGINE else None),
+    # Lambda y no la función: `_lo_mejor_para` se define más abajo.
+    # Sin ir a Render desde el motor local: es la lectura por huella del
+    # pre-check del import, una por tema (ver `_lo_mejor_para`).
+    lo_mejor=lambda *a: _lo_mejor_para(*a, a_render=False),
 )
 app.include_router(lookup_router)
 
@@ -1401,7 +1419,7 @@ def _adopt_better_metadata(result, best):
     """Adopta en `result` (AnalysisResult) los campos de `best` cuya fuente sea
     MAS FIABLE que la actual (analysis_ranking: rekordbox/beatport/consenso >
     analysis). Solo SUBE de fiabilidad — nunca degrada. `best` es el dict que
-    devuelve best_cluster_analysis o el endpoint /cluster-best."""
+    devuelve `_lo_mejor_para` o el endpoint /cluster-best."""
     if not best:
         return
     from analysis_ranking import get_source_priority
@@ -1409,6 +1427,13 @@ def _adopt_better_metadata(result, best):
             > get_source_priority(getattr(result, 'bpm_source', None))):
         result.bpm = best['bpm']
         result.bpm_source = best['bpm_source']
+    # La rejilla de un programa de DJ va con SU BPM: solo si el BPM que queda
+    # es de ese mismo programa. `first_beat` solo viene de la huella exacta
+    # (ver `lo_importado_de`).
+    if (best.get('first_beat') and best.get('bpm_source')
+            and getattr(result, 'bpm_source', None) == best['bpm_source']):
+        result.first_beat = best['first_beat']
+        result.grid_source = best['bpm_source']
     if ('key' in best and best.get('key') and get_source_priority(best.get('key_source'))
             > get_source_priority(getattr(result, 'key_source', None))):
         result.key = best['key']
@@ -1419,6 +1444,99 @@ def _adopt_better_metadata(result, best):
             > get_source_priority(getattr(result, 'genre_source', None))):
         result.genre = best['genre']
         result.genre_source = best['genre_source']
+
+
+def _sumar_lo_importado(best, exacto):
+    """Mete en `best` lo que los programas de DJ dicen de la huella EXACTA, si
+    gana en el ranking. Lo del resto del cluster ya viene dentro de `best`
+    (`best_cluster_analysis`), pero sin rejilla: esa solo vale para el mismo
+    fichero, y es lo que se añade aquí."""
+    from analysis_ranking import get_source_priority
+    for campo, extras in (('bpm', ('first_beat',)), ('key', ('camelot',))):
+        fuente = exacto.get(f'{campo}_source')
+        if not fuente:
+            continue
+        actual = best.get(f'{campo}_source')
+        if get_source_priority(fuente) > get_source_priority(actual):
+            best[campo] = exacto[campo]
+            best[f'{campo}_source'] = fuente
+            for e in extras:
+                if exacto.get(e):
+                    best[e] = exacto[e]
+        elif (campo == 'bpm' and actual == fuente and exacto.get('first_beat')
+              and best.get('bpm') == exacto['bpm']):
+            best['first_beat'] = exacto['first_beat']
+
+
+def _lo_mejor_para(fingerprint, acoustic_id=None, chromaprint=None,
+                   duration=None, a_render=True):
+    """Lo MEJOR que la memoria colectiva sabe de este fichero: el análisis más
+    fiable del cluster acústico más lo que los programas de DJ de cualquiera
+    dicen de él (`imported_values`). None si no aporta nada.
+
+    El motor local no tiene la memoria colectiva (su analysis.db es solo de
+    esta máquina): pregunta a Render por `/cluster-best` — pero SOLO si
+    `a_render`. Una consulta a Render por tema en los caminos rápidos
+    (acierto de caché, lectura por huella) convertía reimportar 5.000 temas
+    ya analizados en 5.000 viajes a Render. Ahí se queda con su BD, como
+    antes, y la memoria colectiva le llega por el análisis NUEVO y al abrir la
+    ficha, que el cliente pregunta directamente a Render."""
+    if IS_LOCAL_ENGINE and a_render:
+        return _lo_mejor_de_render(fingerprint, chromaprint, duration)
+    best = dict(db.best_cluster_analysis(acoustic_id) or {}) if acoustic_id else {}
+    if fingerprint:
+        _sumar_lo_importado(
+            best, db.lo_importado_de([fingerprint], exacta=fingerprint))
+    best.pop('_priorities', None)
+    return best or None
+
+
+def _lo_mejor_de_render(fingerprint, chromaprint, duration):
+    """(Motor local) `_lo_mejor_para` preguntado a Render. Best-effort: si
+    Render duerme o no contesta, None y el análisis local sigue igual."""
+    if not fingerprint and not chromaprint:
+        return None
+    try:
+        resp = requests.post(
+            f"{RENDER_BACKEND_URL}/cluster-best",
+            json={"chromaprint": chromaprint or "", "duration": duration,
+                  "fingerprint": fingerprint},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        best = resp.json()
+        return best if best.get('found') else None
+    except Exception as e:  # noqa: BLE001 - best-effort
+        logger.warning(f"[Cluster] consulta Render /cluster-best fallo (no critico): {e}")
+        return None
+
+
+def _mejorar_con_la_comunidad(result, fingerprint=None, a_render=False):
+    """Aplica al resultado de /analyze lo mejor que sabe la memoria colectiva
+    de ese fichero, salga por el camino que salga (análisis nuevo, acierto por
+    nombre o por huella, fallback a Render).
+
+    Antes solo lo miraba el análisis NUEVO, y un fichero ya analizado —el
+    caso de quien reimporta su carpeta— se devolvía tal cual estaba guardado.
+    Solo SUBE de fiabilidad; nunca rompe /analyze."""
+    from analysis_ranking import get_source_priority
+    fp = fingerprint or getattr(result, 'fingerprint', None)
+    if not fp:
+        return
+    # Si el BPM y la tonalidad ya son de un programa de DJ, no hay nada mejor
+    # que buscar: ahorra la llamada a Render del motor local.
+    if (get_source_priority(getattr(result, 'bpm_source', None)) >= 100
+            and get_source_priority(getattr(result, 'key_source', None)) >= 100):
+        return
+    try:
+        fila = db.get_track_by_fingerprint(fp) or {}
+        best = _lo_mejor_para(fp, fila.get('acoustic_id'),
+                              fila.get('chromaprint'), fila.get('duration'),
+                              a_render=a_render)
+        _adopt_better_metadata(result, best)
+    except Exception as e:  # noqa: BLE001 - best-effort
+        logger.warning(f"[Comunidad] mejorar /analyze fallo (no critico): {e}")
 
 
 def _pick_clean_identity(identities):
@@ -1451,53 +1569,6 @@ def _cluster_clean_identity(audio_path, duration):
         logger.warning(f"[AudD-skip] cluster identity fallo (no critico): {e}")
         return None
 
-
-def _apply_cluster_best(result, acoustic_id):
-    """(Local) Adopta la metadata MAS FIABLE del cluster acustico de ESTA BD: si
-    otra version del mismo audio tiene el BPM/key/genero de una fuente mejor, la
-    copia dudosa la hereda. Debe llamarse DESPUES de save_track (para que el
-    cluster incluya ya el track recien analizado). Best-effort."""
-    if not acoustic_id:
-        return
-    try:
-        _adopt_better_metadata(result, db.best_cluster_analysis(acoustic_id))
-    except Exception as e:  # noqa: BLE001 - best-effort
-        logger.warning(f"[Cluster] adoptar mejor metadata fallo (no critico): {e}")
-
-
-def _apply_render_cluster_best(result, chromaprint_b64, duration):
-    """(Motor local) Pregunta a Render por el mejor analisis del cluster POR
-    SONIDO (chromaprint) y lo adopta. Cierra el hueco del motor local: adopta el
-    mejor analisis de OTRO usuario del mismo audio aunque sea otra copia (otro
-    MD5) — el `acoustic_id` es local a cada BD, pero el chromaprint es universal.
-    Best-effort: si Render duerme / no responde, el analisis local sigue igual."""
-    if not chromaprint_b64:
-        return
-    # Optimizacion premium: si el analisis local YA es de fuente fiable
-    # (beatport/rekordbox/traktor/consenso, prioridad >= 70), NO preguntamos a
-    # Render — dificilmente aporte algo mejor y ahorramos la llamada HTTP por
-    # track. Solo consultamos cuando el BPM local es de fuente debil (analysis,
-    # id3, discogs...), que es justo cuando el cluster puede corregirlo.
-    from analysis_ranking import get_source_priority
-    if get_source_priority(getattr(result, 'bpm_source', None)) >= 70:
-        return
-    try:
-        resp = requests.post(
-            f"{RENDER_BACKEND_URL}/cluster-best",
-            json={"chromaprint": chromaprint_b64, "duration": duration},
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            return
-        best = resp.json()
-        if best.get('found'):
-            _adopt_better_metadata(result, best)
-            logger.info(
-                f"[Cluster] Render aporto mejor metadata "
-                f"(bpm_source={best.get('bpm_source')}, key_source={best.get('key_source')})"
-            )
-    except Exception as e:  # noqa: BLE001 - best-effort
-        logger.warning(f"[Cluster] consulta Render /cluster-best fallo (no critico): {e}")
 
 def parse_filename(filename: str) -> dict:
     name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
@@ -2964,6 +3035,17 @@ async def analyze_track(
                     "que el usuario quiere reemplazar. Daily cap se respeta.",
     ),
 ):
+    result = await _analizar(request, file, force, force_audd)
+    if isinstance(result, AnalysisResult):
+        await run_in_threadpool(_mejorar_con_la_comunidad, result)
+    return result
+
+
+async def _analizar(request: Request, file: UploadFile, force: bool,
+                    force_audd: bool):
+    """El cuerpo de /analyze. Tiene cinco salidas (acierto por nombre, por
+    huella, fallback a Render, análisis nuevo y el de emergencia), y por eso
+    lo común a todas va en `analyze_track`, que lo envuelve."""
     # force_audd implica force=true: el usuario pidio explicitamente AudD y el
     # registro cacheado debe sobreescribirse con el resultado nuevo.
     if force_audd:
@@ -3434,15 +3516,16 @@ async def analyze_track(
         # PRIORIDAD DE GENERO:
         #   Consenso >=3 > Discogs > MusicBrainz > ID3 > AcousticBrainz > Analisis
         # ================================================================
+        # Un cambio hecho a mano llega a los demás con TRES cuentas, nunca con
+        # menos (decisión owner 2026-09-26: «un DJ puede estar equivocado,
+        # pero tres no»). Hasta ese día dos votos de género se aplicaban como
+        # `suggestion_2`, que gana al análisis y a Discogs.
         genre_consensus = consensus.get('genre')
-        if genre_consensus and genre_consensus[1] >= 3:
+        if genre_consensus and genre_consensus[1] >= MIN_CUENTAS_CAMBIO_MANUAL:
             result.genre = genre_consensus[0]
             result.genre_source = f"consensus_{genre_consensus[1]}"
         elif result.genre_source in ["discogs", "musicbrainz"]:
             pass
-        elif genre_consensus and genre_consensus[1] >= 2:
-            result.genre = genre_consensus[0]
-            result.genre_source = f"suggestion_{genre_consensus[1]}"
         elif result.genre_source == "id3":
             if ab_genre and ab_genre.lower() not in ["electronic", "dance"]:
                 result.subgenre = result.genre
@@ -3469,7 +3552,7 @@ async def analyze_track(
                 if votes >= 5:
                     result.bpm = consensus_bpm
                     result.bpm_source = f"consensus_{votes}"
-                elif votes >= 3 and result.bpm_source not in ["rekordbox", "traktor", "beatport"]:
+                elif votes >= MIN_CUENTAS_CAMBIO_MANUAL and result.bpm_source not in ["rekordbox", "traktor", "virtualdj", "beatport"]:
                     result.bpm = consensus_bpm
                     result.bpm_source = f"consensus_{votes}"
             except (ValueError, TypeError):
@@ -3481,7 +3564,7 @@ async def analyze_track(
             if votes >= 5:
                 result.key = key_consensus[0]
                 result.key_source = f"consensus_{votes}"
-            elif votes >= 3 and result.key_source not in ["rekordbox", "traktor"]:
+            elif votes >= MIN_CUENTAS_CAMBIO_MANUAL and result.key_source not in ["rekordbox", "traktor", "virtualdj"]:
                 result.key = key_consensus[0]
                 result.key_source = f"consensus_{votes}"
 
@@ -3490,7 +3573,7 @@ async def analyze_track(
             votes = energy_consensus[1]
             try:
                 consensus_energy = float(energy_consensus[0])
-                if votes >= 3:
+                if votes >= MIN_CUENTAS_CAMBIO_MANUAL:
                     result.energy_dj = int(consensus_energy)
                     result.energy_source = f"consensus_{votes}"
             except (ValueError, TypeError):
@@ -3519,15 +3602,14 @@ async def analyze_track(
         # Huella acustica + cluster para la memoria colectiva por sonido.
         _attach_acoustic(track_data, tmp_path)
         db.save_track(track_data)
-        # Adoptar la metadata mas fiable del cluster (otra version del mismo
-        # audio con fuente superior: rekordbox/beatport de otro usuario).
-        _apply_cluster_best(result, track_data.get('acoustic_id'))
-        # Motor local: preguntar tambien al cluster de RENDER por sonido (su BD
-        # tiene la memoria colectiva de todos; el acoustic_id local no cruza).
+        # Lo mejor del cluster acustico (otra version del mismo audio con
+        # fuente superior) y lo que los programas de DJ de otros dicen de el
+        # lo aplica `_mejorar_con_la_comunidad` al salir de /analyze, para
+        # TODOS los caminos. El motor local pregunta a Render SOLO aqui, en el
+        # analisis nuevo, que ya tarda segundos: en los aciertos de cache seria
+        # un viaje a Render por tema (ver `_lo_mejor_para`).
         if IS_LOCAL_ENGINE:
-            _apply_render_cluster_best(
-                result, track_data.get('chromaprint'), track_data.get('duration'),
-            )
+            _mejorar_con_la_comunidad(result, fingerprint, a_render=True)
 
         # Incrementar contador de popularidad. El device_id va AHORA (BUG-01):
         # la cabecera ya se leia unas lineas mas arriba para la contabilidad de
@@ -3749,7 +3831,7 @@ async def save_correction(request: CorrectionRequest):
         _, votes = db.get_consensus(request.fingerprint, field)
         if votes >= 5:
             status = "applied_override"
-        elif votes >= 3:
+        elif votes >= MIN_CUENTAS_CAMBIO_MANUAL:
             status = "applied"
         elif votes >= 2:
             status = "suggestion"
@@ -4863,8 +4945,11 @@ async def cache_analysis(request: Request, signed: bool = Depends(verify_write_a
 
 
 class ClusterBestRequest(BaseModel):
-    chromaprint: str            # huella acustica serializada (encode_raw base64)
+    chromaprint: str = ""       # huella acustica serializada (encode_raw base64)
     duration: Optional[float] = None
+    # La huella de CONTENIDO del fichero, si se sabe: con ella entra también
+    # lo que los programas de DJ dicen de ese fichero exacto, rejilla incluida.
+    fingerprint: Optional[str] = None
 
 
 @app.post("/cluster-best")
@@ -4879,13 +4964,16 @@ async def cluster_best_endpoint(request: ClusterBestRequest):
     aunque sea otra copia distinta. Solo lectura: no crea cluster ni guarda nada.
     """
     from acoustic_fingerprint import decode_raw
-    raw = decode_raw(request.chromaprint)
-    if not raw:
+    acoustic_id = None
+    raw = decode_raw(request.chromaprint) if request.chromaprint else None
+    if raw:
+        acoustic_id = db.find_acoustic_cluster(raw, request.duration)
+    fp = re.sub(r'[^a-fA-F0-9]', '', request.fingerprint or '') or None
+    if not acoustic_id and fp:
+        acoustic_id = db.acoustic_ids_for([fp]).get(fp)
+    if not acoustic_id and not fp:
         return {"found": False}
-    acoustic_id = db.find_acoustic_cluster(raw, request.duration)
-    if not acoustic_id:
-        return {"found": False}
-    best = db.best_cluster_analysis(acoustic_id)
+    best = _lo_mejor_para(fp, acoustic_id)
     if not best:
         return {"found": False}
     return {
@@ -4893,12 +4981,105 @@ async def cluster_best_endpoint(request: ClusterBestRequest):
         "acoustic_id": acoustic_id,
         "bpm": best.get('bpm'),
         "bpm_source": best.get('bpm_source'),
+        "first_beat": best.get('first_beat'),
         "key": best.get('key'),
         "camelot": best.get('camelot'),
         "key_source": best.get('key_source'),
         "genre": best.get('genre'),
         "genre_source": best.get('genre_source'),
     }
+
+
+# ==================== LO IMPORTADO → MEMORIA COLECTIVA ====================
+
+# Solo los programas de DJ: su BPM, su tonalidad y su rejilla los midió el
+# programa y los cuadró una persona delante de los platos. El género NO viaja:
+# en un XML es una etiqueta que pone cada uno, y con prioridad 110 ganaría al
+# consenso de tres DJs — o sea, un cambio a mano de uno solo pasaría por
+# delante de la regla de los tres.
+PROGRAMAS_DE_DJ = ('rekordbox', 'traktor', 'virtualdj')
+_MAX_LO_IMPORTADO = 500
+
+
+class LoImportadoItem(BaseModel):
+    fingerprint: str
+    source: str
+    bpm: Optional[float] = None
+    first_beat: Optional[float] = None
+    key: Optional[str] = None
+
+
+class LoImportadoRequest(BaseModel):
+    items: List[LoImportadoItem]
+
+
+def _limpiar_lo_importado(items):
+    """Lo que de verdad se guarda de un lote: huella MD5 bien formada, un
+    programa de DJ, BPM entre 40 y 250, tonalidad que se entienda. Lo demás se
+    descarta sin tumbar el lote."""
+    validos = []
+    for it in items:
+        fp = re.sub(r'[^a-fA-F0-9]', '', it.fingerprint or '').lower()
+        fuente = (it.source or '').lower()
+        if len(fp) != 32 or fuente not in PROGRAMAS_DE_DJ:
+            continue
+        item = {'fingerprint': fp, 'source': fuente}
+        if it.bpm is not None and 40 <= it.bpm <= 250:
+            item['bpm'] = round(float(it.bpm), 2)
+            if it.first_beat is not None and 0 < it.first_beat < 600:
+                item['first_beat'] = float(it.first_beat)
+        norm = normalize_musical_key(it.key) if it.key else None
+        if norm:
+            item['key'], item['camelot'] = norm
+        if 'bpm' in item or 'key' in item:
+            validos.append(item)
+    return validos
+
+
+@app.post("/community/imported")
+async def lo_importado_endpoint(req: LoImportadoRequest, request: Request):
+    """Lo que el Rekordbox, Traktor o VirtualDJ de este aparato dice de sus
+    temas, para que llegue a todos los que tienen ese sonido.
+
+    Hasta el 2026-09-26 lo importado se quedaba en el aparato de quien lo
+    importaba (y en su sync, que es personal): el servidor tenía montado el
+    ranking que lo adoptaría y nunca le llegaba nada. Con UN aparato basta
+    (decisión owner: «con que se detecte una vez es suficiente»), pero tiene
+    que ser uno REGISTRADO: sin `X-Device-Token` válido, 401. Es la misma
+    credencial que pisar una portada.
+    """
+    device = dispositivo_del_token(request.headers.get("X-Device-Token", ""))
+    if not device:
+        raise HTTPException(401, "Device token required")
+    if len(req.items) > _MAX_LO_IMPORTADO:
+        raise HTTPException(400, f"Máximo {_MAX_LO_IMPORTADO} temas por petición")
+    validos = _limpiar_lo_importado(req.items)
+    votos = await run_in_threadpool(db.guardar_lo_importado, device, validos)
+    return {"status": "ok", "votos": votos,
+            "descartados": len(req.items) - len(validos)}
+
+
+@app.get("/community/de-este-aparato")
+async def lo_de_este_aparato(device_id: str):
+    """SOLO en el motor local: las valoraciones y notas que este aparato dejó
+    en la memoria colectiva MIENTRAS apuntaba al motor local.
+
+    Hasta el 2026-09-26 el escritorio mandaba todo `/community/*` a
+    `backendUrl`, que con el motor local arrancado es 127.0.0.1: las notas,
+    las estrellas, las zonas de cues y los votos del EXE de Windows y del DMG
+    se guardaban en la BD de esta máquina y no salían de ella. Hoy van a
+    Render, y la app usa esto UNA vez para llevarse lo que quedó aquí. Las
+    valoraciones sobre todo: son personales, solo viven en el servidor, y sin
+    mudarlas el DJ vería desaparecer sus estrellas.
+
+    Cada fila sale con la HUELLA del fichero, no con la clave local: el
+    cluster de esta BD es de esta máquina y en Render no significa nada.
+
+    En Render da 404: listar lo de un aparato por su id no se ofrece ahí.
+    """
+    if not IS_LOCAL_ENGINE:
+        raise HTTPException(404, "Solo en el motor local")
+    return await run_in_threadpool(db.lo_de_este_aparato, device_id)
 
 
 class BackfillFingerprintRequest(BaseModel):
@@ -5381,7 +5562,7 @@ async def reset_database(
     Borra SIEMPRE:
         analysis.db: tracks, corrections, dj_notes, community_cues,
             community_notes, track_ratings, track_popularity,
-            beat_grid_corrections, audd_call_log
+            beat_grid_corrections, audd_call_log, imported_values
         sync.db: sync_items, device_seen, users, user_devices,
             link_codes, detected_tracks_sync
 
@@ -5433,7 +5614,7 @@ async def reset_database(
             "tracks", "corrections", "dj_notes",
             "community_cues", "community_notes",
             "track_ratings", "track_popularity",
-            "beat_grid_corrections", "audd_call_log",
+            "beat_grid_corrections", "audd_call_log", "imported_values",
         )
         conn = sqlite3.connect(db.db_path, timeout=30.0)
         conn.execute("PRAGMA busy_timeout=30000")

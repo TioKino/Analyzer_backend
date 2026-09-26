@@ -57,6 +57,9 @@ class AnalysisResult(BaseModel):
     cue_points: List[Dict] = []
     first_beat: float = 0.0
     beat_interval: float = 0.5
+    # De qué programa de DJ es `first_beat` cuando no es nuestro (lo trajo el
+    # XML de alguien, ver `lo_importado_de`). None = lo midió el análisis.
+    grid_source: Optional[str] = None
     artwork_embedded: bool = False
     artwork_url: Optional[str] = None
     preview_url: Optional[str] = None

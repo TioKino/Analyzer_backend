@@ -25,6 +25,9 @@ from typing import Optional
 ANALYSIS_SOURCE_PRIORITY = {
     'rekordbox': 110,
     'traktor': 105,
+    # Faltaba: el cliente ya lo tenía a 100 (`analysis_priority.dart`) y aquí
+    # valía 0, o sea MENOS que el análisis del servidor.
+    'virtualdj': 100,
     'consensus_10': 95,
     'consensus_9': 94,
     'consensus_8': 93,

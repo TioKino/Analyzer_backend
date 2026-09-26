@@ -41,6 +41,7 @@ from fastapi.responses import FileResponse, Response
 
 from validation import artwork_online_allowed, get_client_ip
 from pydantic import BaseModel
+from sync_endpoints import dispositivo_del_token
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +61,13 @@ fetch_render_cache = None
 
 def init(database, is_analysis_current, artwork_cache_dir,
          search_online=None, save_to_cache=None, render_cache_lookup=None,
-         buscar=None):
+         buscar=None, lo_mejor=None):
     """Inyecta deps desde main.py. Llamar ANTES de include_router(router)."""
     global db, _is_analysis_current, ARTWORK_CACHE_DIR, buscar_portada
     global search_artwork_online, save_artwork_to_cache, fetch_render_cache
+    global lo_mejor_para
     buscar_portada = buscar
+    lo_mejor_para = lo_mejor
     db = database
     _is_analysis_current = is_analysis_current
     ARTWORK_CACHE_DIR = artwork_cache_dir
@@ -77,21 +80,40 @@ def init(database, is_analysis_current, artwork_cache_dir,
 router = APIRouter(tags=["analysis-artwork"])
 
 
-def _merge_cluster_best_into(result, acoustic_id):
-    """Sobre un dict de analisis, adopta la metadata MAS FIABLE del cluster
-    acustico (otra version del mismo audio con fuente superior). Solo sube de
-    fiabilidad (compara analysis_ranking); best-effort, nunca lanza."""
-    if not acoustic_id or not isinstance(result, dict):
+# `main._lo_mejor_para`: el mejor análisis del cluster MÁS lo que los programas
+# de DJ de cualquiera dicen del fichero (y en el motor local, preguntado a
+# Render). None en los tests que montan el router sin main.
+lo_mejor_para = None
+
+
+def _merge_cluster_best_into(result, fingerprint, fila):
+    """Sobre un dict de analisis, adopta lo MAS FIABLE que sabe la memoria
+    colectiva de este fichero: otra version del mismo audio con fuente
+    superior, o lo que dice de él el Rekordbox/Traktor/VirtualDJ de alguien.
+    Solo sube de fiabilidad (compara analysis_ranking); best-effort, nunca
+    lanza."""
+    if not isinstance(result, dict):
         return
     try:
         from analysis_ranking import get_source_priority
-        best = db.best_cluster_analysis(acoustic_id)
+        if lo_mejor_para is not None:
+            best = lo_mejor_para(fingerprint, fila.get('acoustic_id'),
+                                 fila.get('chromaprint'), fila.get('duration'))
+        elif fila.get('acoustic_id'):
+            best = db.best_cluster_analysis(fila['acoustic_id'])
+        else:
+            best = None
         if not best:
             return
         if ('bpm' in best and get_source_priority(best.get('bpm_source'))
                 > get_source_priority(result.get('bpm_source'))):
             result['bpm'] = best['bpm']
             result['bpm_source'] = best['bpm_source']
+        # La rejilla del programa va con SU BPM (ver `_adopt_better_metadata`).
+        if (best.get('first_beat') and best.get('bpm_source')
+                and result.get('bpm_source') == best['bpm_source']):
+            result['first_beat'] = best['first_beat']
+            result['grid_source'] = best['bpm_source']
         if ('key' in best and get_source_priority(best.get('key_source'))
                 > get_source_priority(result.get('key_source'))):
             result['key'] = best['key']
@@ -326,7 +348,7 @@ async def get_analysis_by_fingerprint(fingerprint: str):
     # Corregir con la MEJOR metadata del cluster acustico (RETROACTIVO): si otra
     # version del mismo audio (otro usuario) aporto una fuente superior despues
     # de que este track se analizara, el cliente la recibe al re-consultar.
-    _merge_cluster_best_into(result, existing.get('acoustic_id'))
+    _merge_cluster_best_into(result, safe_fp, existing)
     return result
 
 
@@ -532,26 +554,41 @@ async def get_artwork(track_id: str, request: Request = None, online: int = 1):
 
 
 @router.post("/artwork/upload/{fingerprint}")
-async def upload_artwork(fingerprint: str, file: UploadFile = File(...),
+async def upload_artwork(fingerprint: str, request: Request,
+                         file: UploadFile = File(...),
                          solo_si_falta: int = 0):
     """Recibe artwork desde el local engine para que Render lo sirva
     también a otros devices vía `/artwork/{fingerprint}`. Sin esto,
     cuando el local engine analiza un track el artwork se queda en
     disco PC y los móviles ven placeholder.
 
-    Sanitiza el fingerprint (solo hex 32 chars). Acepta JPEG/PNG.
-    Idempotente: re-subir el mismo fp sobreescribe.
+    Sanitiza el fingerprint (solo hex 32 chars). Acepta JPEG/PNG/WEBP/GIF.
 
     `solo_si_falta=1`: si ya hay portada para esa huella, no se toca y se
     contesta `exists`. Lo manda el escritorio con todo lo que NO sale del
     propio fichero (una busqueda o una identificacion pueden equivocarse, y la
     portada de una huella la ven todos los que tienen ese fichero). La que
     viene DENTRO del fichero si pisa: es parte de su contenido.
+
+    Pisar exige ser un aparato registrado (`X-Device-Token` del sync). Sin
+    credencial la subida vale igual, pero como `solo_si_falta`: la portada de
+    una huella la ven todos los que tienen ese fichero, y hasta el 2026-09-26
+    un curl sin nada podía cambiársela a todos. No lo hace imposible (el
+    token lo saca cualquiera que se registre con el secreto del binario),
+    pero lo sube de «un curl» a «registrarse», y cada pisada queda en el log
+    con el aparato que la hizo.
     """
     safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
     if not safe_fp or len(safe_fp) > 64:
         raise HTTPException(400, "fingerprint inválido")
-    if solo_si_falta and _cacheada(safe_fp)[0]:
+    quien = None
+    if not solo_si_falta:
+        quien = await run_in_threadpool(
+            dispositivo_del_token, request.headers.get("X-Device-Token", ""))
+        if not quien:
+            solo_si_falta = 1
+    habia = _cacheada(safe_fp)[0]
+    if solo_si_falta and habia:
         return {"status": "exists", "fingerprint": safe_fp}
 
     content = await file.read()
@@ -590,5 +627,7 @@ async def upload_artwork(fingerprint: str, file: UploadFile = File(...),
     with open(cache_path, 'wb') as f:
         f.write(content)
     _SIN_PORTADA.pop(safe_fp, None)
+    if habia:
+        logger.info(f"[Artwork] {safe_fp} pisada por {quien}")
 
     return {"status": "ok", "fingerprint": safe_fp, "size": len(content), "ext": ext}
