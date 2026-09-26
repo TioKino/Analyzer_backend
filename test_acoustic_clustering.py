@@ -152,12 +152,13 @@ def test_beatgrid_shared_across_versions(two_versions):
     db, fp_flac, fp_mp3 = two_versions
     db.submit_beat_grid_correction(fp_flac, 'devA', 0.5, 0.01, 128.0)
     db.submit_beat_grid_correction(fp_mp3, 'devB', 0.5, 0.01, 128.0)
+    db.submit_beat_grid_correction(fp_mp3, 'devC', 0.5, 0.01, 128.0)
 
     grid_from_mp3 = db.get_community_beat_grid(fp_mp3)
     grid_from_flac = db.get_community_beat_grid(fp_flac)
-    assert grid_from_mp3['contributors'] == 2
-    assert grid_from_flac['contributors'] == 2
-    assert grid_from_mp3['validated'] is True  # >= 2 DJs
+    assert grid_from_mp3['contributors'] == 3
+    assert grid_from_flac['contributors'] == 3
+    assert grid_from_mp3['validated'] is True  # 3 DJs que coinciden
 
 
 def test_consensus_votes_merge_across_versions(two_versions):

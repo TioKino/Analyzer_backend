@@ -61,11 +61,13 @@ fetch_render_cache = None
 
 def init(database, is_analysis_current, artwork_cache_dir,
          search_online=None, save_to_cache=None, render_cache_lookup=None,
-         buscar=None):
+         buscar=None, lo_mejor=None):
     """Inyecta deps desde main.py. Llamar ANTES de include_router(router)."""
     global db, _is_analysis_current, ARTWORK_CACHE_DIR, buscar_portada
     global search_artwork_online, save_artwork_to_cache, fetch_render_cache
+    global lo_mejor_para
     buscar_portada = buscar
+    lo_mejor_para = lo_mejor
     db = database
     _is_analysis_current = is_analysis_current
     ARTWORK_CACHE_DIR = artwork_cache_dir
@@ -78,21 +80,40 @@ def init(database, is_analysis_current, artwork_cache_dir,
 router = APIRouter(tags=["analysis-artwork"])
 
 
-def _merge_cluster_best_into(result, acoustic_id):
-    """Sobre un dict de analisis, adopta la metadata MAS FIABLE del cluster
-    acustico (otra version del mismo audio con fuente superior). Solo sube de
-    fiabilidad (compara analysis_ranking); best-effort, nunca lanza."""
-    if not acoustic_id or not isinstance(result, dict):
+# `main._lo_mejor_para`: el mejor análisis del cluster MÁS lo que los programas
+# de DJ de cualquiera dicen del fichero (y en el motor local, preguntado a
+# Render). None en los tests que montan el router sin main.
+lo_mejor_para = None
+
+
+def _merge_cluster_best_into(result, fingerprint, fila):
+    """Sobre un dict de analisis, adopta lo MAS FIABLE que sabe la memoria
+    colectiva de este fichero: otra version del mismo audio con fuente
+    superior, o lo que dice de él el Rekordbox/Traktor/VirtualDJ de alguien.
+    Solo sube de fiabilidad (compara analysis_ranking); best-effort, nunca
+    lanza."""
+    if not isinstance(result, dict):
         return
     try:
         from analysis_ranking import get_source_priority
-        best = db.best_cluster_analysis(acoustic_id)
+        if lo_mejor_para is not None:
+            best = lo_mejor_para(fingerprint, fila.get('acoustic_id'),
+                                 fila.get('chromaprint'), fila.get('duration'))
+        elif fila.get('acoustic_id'):
+            best = db.best_cluster_analysis(fila['acoustic_id'])
+        else:
+            best = None
         if not best:
             return
         if ('bpm' in best and get_source_priority(best.get('bpm_source'))
                 > get_source_priority(result.get('bpm_source'))):
             result['bpm'] = best['bpm']
             result['bpm_source'] = best['bpm_source']
+        # La rejilla del programa va con SU BPM (ver `_adopt_better_metadata`).
+        if (best.get('first_beat') and best.get('bpm_source')
+                and result.get('bpm_source') == best['bpm_source']):
+            result['first_beat'] = best['first_beat']
+            result['grid_source'] = best['bpm_source']
         if ('key' in best and get_source_priority(best.get('key_source'))
                 > get_source_priority(result.get('key_source'))):
             result['key'] = best['key']
@@ -327,7 +348,7 @@ async def get_analysis_by_fingerprint(fingerprint: str):
     # Corregir con la MEJOR metadata del cluster acustico (RETROACTIVO): si otra
     # version del mismo audio (otro usuario) aporto una fuente superior despues
     # de que este track se analizara, el cliente la recibe al re-consultar.
-    _merge_cluster_best_into(result, existing.get('acoustic_id'))
+    _merge_cluster_best_into(result, safe_fp, existing)
     return result
 
 

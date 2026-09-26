@@ -140,6 +140,42 @@ def _reparto(votos_por_cuenta):
     return dict(sorted(reparto.items(), key=lambda kv: -kv[1]))
 
 
+# Cuántas CUENTAS tienen que coincidir para que un cambio hecho A MANO llegue
+# a los demás DJs. Decisión owner 2026-09-26: «un DJ puede estar equivocado,
+# pero tres no». Lo que se IMPORTA de un programa de DJ no pasa por aquí: con
+# uno basta (ver `lo_importado_de`).
+MIN_CUENTAS_CAMBIO_MANUAL = 3
+
+# Dos correcciones de rejilla son «la misma» si el BPM final difiere menos de
+# esto y la fase menos de esto otro. Los controles de la app van de 0,01 BPM y
+# de 2 ms, así que dos DJs que cuadran el mismo tema caen dentro.
+_TOL_BPM_REJILLA = 0.02
+_TOL_FASE_REJILLA = 0.005
+
+
+def _coinciden_rejillas(a, b):
+    """¿Dicen lo mismo dos correcciones `(ajuste, fase, bpm_original)`?
+
+    El ajuste es un DELTA sobre el BPM que cada uno tenía, y dos DJs pueden
+    partir de BPMs distintos, así que se compara el BPM FINAL cuando los dos lo
+    saben. Si alguno no trae el original, solo queda comparar los deltas."""
+    if a[2] > 0 and b[2] > 0:
+        bpm_iguales = abs((a[2] + a[0]) - (b[2] + b[0])) <= _TOL_BPM_REJILLA
+    else:
+        bpm_iguales = abs(a[0] - b[0]) <= _TOL_BPM_REJILLA
+    return bpm_iguales and abs(a[1] - b[1]) <= _TOL_FASE_REJILLA
+
+
+def _grupo_que_coincide(correcciones):
+    """El grupo más grande de correcciones que coinciden con una de ellas."""
+    mejor = []
+    for centro in correcciones:
+        grupo = [c for c in correcciones if _coinciden_rejillas(centro, c)]
+        if len(grupo) > len(mejor):
+            mejor = grupo
+    return mejor
+
+
 class AnalysisDB:
     # Resuelve device_id -> user_id (vive en sync.db, otra base: lo inyecta
     # main.py). Sin él cada aparato cuenta como un votante, que es como se
@@ -308,6 +344,25 @@ class AnalysisDB:
         c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_fingerprint ON tracks(fingerprint)')
         # idx_isrc: lookup O(1) del track por su codigo de grabacion (AudD).
         c.execute('CREATE INDEX IF NOT EXISTS idx_isrc ON tracks(isrc)')
+
+        # Lo que dice un programa de DJ (Rekordbox, Traktor, VirtualDJ) de una
+        # huella, tal como llega del XML que importó alguien. Un voto por
+        # aparato y campo; reimportar lo sustituye. Va APARTE de la fila del
+        # análisis a propósito: así se puede descontar o purgar por fuente y
+        # fecha sin tocar nada más (ver `lo_importado_de`).
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS imported_values (
+                fingerprint TEXT NOT NULL,
+                field TEXT NOT NULL,
+                value TEXT NOT NULL,
+                camelot TEXT,
+                first_beat REAL,
+                source TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, field, device_id)
+            )
+        ''')
 
         # Correcciones manuales (memoria colectiva)
         c.execute('''
@@ -1032,14 +1087,12 @@ class AnalysisDB:
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            # Cluster del fingerprint pedido (por fingerprint o por id).
-            c.execute(
-                'SELECT acoustic_id FROM tracks WHERE fingerprint = ? OR id = ? '
-                'LIMIT 1',
-                (fingerprint, fingerprint),
-            )
-            row = c.fetchone()
-            aid = row['acoustic_id'] if row else None
+            # Cluster del fingerprint pedido (por fingerprint o por id). En
+            # dos queries y no con un `OR`: ver `_tracks_por_huella_o_id`.
+            filas = self._tracks_por_huella_o_id(
+                c, 'id, acoustic_id', [fingerprint])
+            aid = next((f['acoustic_id'] for f in filas if f['acoustic_id']),
+                       None)
             if aid:
                 c.execute(
                     'SELECT fingerprint, id FROM tracks WHERE acoustic_id = ?',
@@ -1502,8 +1555,8 @@ class AnalysisDB:
         try:
             c = conn.cursor()
             c.execute(
-                'SELECT bpm, key, camelot, genre, analysis_json FROM tracks '
-                'WHERE acoustic_id = ?',
+                'SELECT fingerprint, bpm, key, camelot, genre, analysis_json '
+                'FROM tracks WHERE acoustic_id = ?',
                 (acoustic_id,),
             )
             rows = c.fetchall()
@@ -1511,6 +1564,10 @@ class AnalysisDB:
             conn.close()
         if not rows:
             return None
+        # Lo que los programas de DJ dicen de CUALQUIER versión de este sonido.
+        # Hasta el 2026-09-26 no llegaba nada de esto al servidor, así que el
+        # ranking de abajo nunca veía un `rekordbox`.
+        importado = self.lo_importado_de([r['fingerprint'] for r in rows])
 
         best = {}
         best_prio = {'bpm': -1, 'key': -1, 'genre': -1}
@@ -1546,6 +1603,17 @@ class AnalysisDB:
                     best_prio['genre'] = p
                     best['genre'] = genre
                     best['genre_source'] = aj.get('genre_source')
+
+        for campo, extras in (('bpm', ()), ('key', ('camelot',))):
+            fuente = importado.get(f'{campo}_source')
+            p = get_source_priority(fuente)
+            if fuente and p > best_prio[campo]:
+                best_prio[campo] = p
+                best[campo] = importado[campo]
+                best[f'{campo}_source'] = fuente
+                for e in extras:
+                    if importado.get(e):
+                        best[e] = importado[e]
 
         best['_priorities'] = best_prio
         return best if (len(best) > 1) else None
@@ -2330,6 +2398,119 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    # ==================== LO IMPORTADO DE LOS PROGRAMAS DE DJ ====================
+
+    def guardar_lo_importado(self, device_id: str, items: List[Dict]) -> int:
+        """Guarda lo que el XML de Rekordbox/Traktor/VirtualDJ de un aparato
+        dice de cada huella. Un voto por aparato y campo: reimportar lo
+        sustituye. `items` llega ya validado (endpoint): `fingerprint`,
+        `source` y, cada uno opcional, `bpm` (+ `first_beat`) y `key`
+        (+ `camelot`). Devuelve cuántos votos se escribieron."""
+        ahora = datetime.utcnow().isoformat()
+        filas = []
+        for it in items:
+            fp, fuente = it['fingerprint'], it['source']
+            if it.get('bpm'):
+                filas.append((fp, 'bpm', f"{it['bpm']:.2f}", None,
+                              it.get('first_beat'), fuente, device_id, ahora))
+            if it.get('key'):
+                filas.append((fp, 'key', it['key'], it.get('camelot'), None,
+                              fuente, device_id, ahora))
+        if not filas:
+            return 0
+        conn = self._open_conn()
+        try:
+            conn.executemany('''
+                INSERT INTO imported_values (fingerprint, field, value, camelot,
+                    first_beat, source, device_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint, field, device_id) DO UPDATE SET
+                    value = excluded.value,
+                    camelot = excluded.camelot,
+                    first_beat = excluded.first_beat,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+            ''', filas)
+            conn.commit()
+        finally:
+            conn.close()
+        return len(filas)
+
+    def lo_importado_de(self, fingerprints, exacta: Optional[str] = None) -> Dict:
+        """Lo que los programas de DJ dicen de estas huellas (las versiones de
+        un mismo sonido), listo para competir en el ranking.
+
+        Con UN voto basta (decisión owner 2026-09-26: «con que se detecte una
+        vez es suficiente»). Si discrepan, gana el valor con más CUENTAS; a
+        igualdad, el programa de más rango.
+
+        La rejilla (`first_beat`) solo sale de la huella `exacta`, nunca de
+        otra versión del cluster: dos codificaciones del mismo audio no
+        empiezan en la misma muestra (el retardo del codificador MP3 son
+        ~25 ms), así que el primer beat de una no vale para la otra. El BPM y
+        la tonalidad sí valen.
+
+        Devuelve {} o un dict con `bpm`/`bpm_source`[/`first_beat`] y
+        `key`/`camelot`/`key_source`.
+        """
+        from analysis_ranking import get_source_priority
+        fps = [f for f in dict.fromkeys(fingerprints or []) if f]
+        if not fps:
+            return {}
+        marcas = ','.join('?' * len(fps))
+        conn = self._open_conn()
+        try:
+            filas = conn.execute(
+                'SELECT fingerprint, field, value, camelot, first_beat, source, '
+                f'device_id, updated_at FROM imported_values '
+                f'WHERE fingerprint IN ({marcas})',
+                fps,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+        if not filas:
+            return {}
+
+        cuentas = self.cuentas_de_votantes(f['device_id'] for f in filas)
+        salida = {}
+        for campo in ('bpm', 'key'):
+            votos = [
+                (f['device_id'], f['updated_at'],
+                 (f['value'], f['source'], f['camelot'],
+                  f['first_beat'] if f['fingerprint'] == exacta else None))
+                for f in filas if f['field'] == campo
+            ]
+            if not votos:
+                continue
+            grupos = {}
+            for valor, fuente, camelot, primer in _un_voto_por_cuenta(
+                    votos, cuentas).values():
+                g = grupos.setdefault(valor, {'n': 0, 'fuente': fuente,
+                                              'camelot': camelot,
+                                              'primer': None})
+                g['n'] += 1
+                if get_source_priority(fuente) > get_source_priority(g['fuente']):
+                    g['fuente'] = fuente
+                g['primer'] = g['primer'] or primer
+            valor, g = max(
+                grupos.items(),
+                key=lambda kv: (kv[1]['n'], get_source_priority(kv[1]['fuente']),
+                                kv[0]),
+            )
+            if campo == 'bpm':
+                salida['bpm'] = float(valor)
+                salida['bpm_source'] = g['fuente']
+                if g['primer']:
+                    salida['first_beat'] = g['primer']
+            else:
+                salida['key'] = valor
+                salida['key_source'] = g['fuente']
+                if g['camelot']:
+                    salida['camelot'] = g['camelot']
+        return salida
+
     # ==================== COMMUNITY BEAT GRID ====================
 
     def submit_beat_grid_correction(self, fingerprint: str, device_id: str,
@@ -2356,37 +2537,62 @@ class AnalysisDB:
             conn.close()
 
     def get_community_beat_grid(self, fingerprint: str) -> Dict:
-        """Obtiene la correccion promedio de la comunidad para un track"""
+        """La corrección de rejilla de la comunidad, SOLO si la comparten
+        tres cuentas.
+
+        Es un cambio hecho a mano, y la regla del owner (2026-09-26) para
+        todo cambio manual que llega a otros es: «un DJ puede estar
+        equivocado, pero tres no». Hasta ese día aquí bastaba con UNA: el
+        cliente aplicaba cualquier corrección con `contributors > 0`, y
+        `validated` pedía dos aparatos (no cuentas) sin mirar siquiera si
+        decían lo mismo — se promediaban +0,5 y +0,9 BPM y salía +0,7, que no
+        era de nadie.
+
+        Ahora: un voto por CUENTA (el más reciente de sus aparatos), se busca
+        el grupo más grande de correcciones que COINCIDEN (mismo BPM final a
+        ±0,02 y misma fase a ±5 ms) y solo si ese grupo llega a tres se
+        devuelve su media. Si no llega, el ajuste va a CERO: los clientes ya
+        publicados aplican cualquier ajuste distinto de cero que les llegue,
+        así que callarlo aquí es lo único que los frena.
+        """
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            c.execute('''
-                SELECT AVG(bpm_adjust) AS bpm_adj, AVG(beat_offset) AS beat_off,
-                       COUNT(*) AS contributors, AVG(original_bpm) AS orig_bpm
-                FROM beat_grid_corrections
-                WHERE fingerprint = ?
-            ''', (fingerprint,))
-            row = c.fetchone()
-            if row and row['contributors'] and row['contributors'] > 0:
-                contributors = row['contributors']
-                # Validado si >= 2 DJs con ajustes similares
-                validated = contributors >= 2
-                return {
-                    'bpm_adjust': round(row['bpm_adj'] or 0.0, 4),
-                    'beat_offset': round(row['beat_off'] or 0.0, 6),
-                    'contributors': contributors,
-                    'validated': validated,
-                    'original_bpm': round(row['orig_bpm'] or 0.0, 2),
-                }
-            return {
-                'bpm_adjust': 0.0,
-                'beat_offset': 0.0,
-                'contributors': 0,
-                'validated': False,
-            }
+            c.execute(
+                'SELECT device_id, bpm_adjust, beat_offset, original_bpm, '
+                "COALESCE(updated_at, created_at, '') AS cuando "
+                'FROM beat_grid_corrections WHERE fingerprint = ?',
+                (fingerprint,),
+            )
+            filas = c.fetchall()
         finally:
             conn.close()
+
+        cuentas = self.cuentas_de_votantes(r['device_id'] for r in filas)
+        correcciones = list(_un_voto_por_cuenta(
+            ((r['device_id'], r['cuando'],
+              (r['bpm_adjust'] or 0.0, r['beat_offset'] or 0.0,
+               r['original_bpm'] or 0.0))
+             for r in filas),
+            cuentas,
+        ).values())
+        grupo = _grupo_que_coincide(correcciones)
+        if len(grupo) >= MIN_CUENTAS_CAMBIO_MANUAL:
+            n = len(grupo)
+            return {
+                'bpm_adjust': round(sum(g[0] for g in grupo) / n, 4),
+                'beat_offset': round(sum(g[1] for g in grupo) / n, 6),
+                'contributors': n,
+                'validated': True,
+                'original_bpm': round(sum(g[2] for g in grupo) / n, 2),
+            }
+        return {
+            'bpm_adjust': 0.0,
+            'beat_offset': 0.0,
+            'contributors': len(grupo),
+            'validated': False,
+        }
 
     # ==================== COMMUNITY OVERRIDES GENERICOS (Fase 4) ====================
     # Sistema unificado para CUALQUIER campo categorico: track_type, key,
