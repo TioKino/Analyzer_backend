@@ -118,11 +118,10 @@ def test_solo_con_huella():
     r = _enviar(tok, [
         {'fingerprint': 'imp_' + 'a' * 28, 'cues': [_cue(1000)]},   # ghost
         {'fingerprint': 'no-es-una-huella', 'cues': [_cue(1000)]},
-        {'fingerprint': _fp(), 'cues': []},                          # sin cues
         {'fingerprint': _fp(), 'cues': [_cue(1000)]},
     ])
     assert r.json()['temas'] == 1
-    assert r.json()['descartados'] == 3
+    assert r.json()['descartados'] == 2
 
 
 def test_la_clave_vieja_de_este_aparato_se_limpia():
@@ -167,3 +166,30 @@ def test_dos_aparatos_de_la_misma_cuenta_son_un_dj():
     _enviar(tok_mac, [{'fingerprint': fp, 'cues': [_cue(64000)]}], ip='10.0.2.1')
     _enviar(tok_movil, [{'fingerprint': fp, 'cues': [_cue(64000)]}], ip='10.0.2.2')
     assert client.get(f'/community/cues/{fp}').json()['zones'] == []
+
+
+def test_sin_cues_retira_lo_que_aportaba_este_aparato():
+    # Borrar todos los cues de un tema retira tu aportación a las zonas; hasta
+    # el 2026-09-26 una lista vacía era un error y los viejos seguían contando.
+    dev, tok, _ = _aparato()
+    otro, tok_otro, _ = _aparato()
+    fp = _fp()
+    _enviar(tok, [{'fingerprint': fp, 'cues': [_cue(64000)]}], ip='10.0.3.1')
+    _enviar(tok_otro, [{'fingerprint': fp, 'cues': [_cue(64000)]}], ip='10.0.3.2')
+    assert len(client.get(f'/community/cues/{fp}').json()['zones']) == 1
+    r = _enviar(tok, [{'fingerprint': fp, 'cues': []}], ip='10.0.3.1')
+    assert r.json()['temas'] == 1
+    assert _mis_cues(fp, dev) == []
+    assert _mis_cues(fp, otro) == [64000], 'lo de los demás no se toca'
+    assert client.get(f'/community/cues/{fp}').json()['zones'] == []
+
+
+def test_el_envio_suelto_sin_cues_tambien_retira():
+    dev = 'cuesvacios_' + uuid.uuid4().hex[:8]
+    fp = _fp()
+    client.post('/community/cues', json={'fingerprint': fp, 'device_id': dev,
+                                         'cues': [_cue(1000)]})
+    r = client.post('/community/cues', json={'fingerprint': fp, 'device_id': dev,
+                                             'cues': []})
+    assert r.json()['status'] == 'ok'
+    assert _mis_cues(fp, dev) == []
