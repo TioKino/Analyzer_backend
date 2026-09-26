@@ -182,6 +182,11 @@ class AnalysisDB:
     # contaba hasta el 2026-09-26.
     cuentas_de = None
 
+    # Se llama tras apuntar una llamada a AudD. Solo lo cablea el motor local
+    # (main.py), para mandar sus cuentas a Render: su `audd_call_log` es de
+    # esta máquina y el panel no lo ve.
+    al_apuntar_audd = None
+
     def cuentas_de_votantes(self, device_ids) -> Dict[str, str]:
         """{device_id: user_id} de los votantes con cuenta. Best-effort: si
         sync.db no responde, {} y se cuenta por aparato como antes."""
@@ -653,6 +658,23 @@ class AnalysisDB:
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_audd_src_dev '
             'ON audd_call_log(source, device_id, called_at)')
+
+        # Lo que gastan en AudD los MOTORES LOCALES (EXE de Windows y DMG),
+        # que llaman con su propio token y lo apuntan en su propia BD. Hasta el
+        # 2026-09-26 no llegaba aquí y el panel contaba de menos. Un total por
+        # día, vía y motor: el motor manda sus totales y se sustituyen, así que
+        # repetir un envío no suma dos veces.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS audd_motor_local (
+                dia       TEXT NOT NULL,
+                source    TEXT NOT NULL,
+                motor_id  TEXT NOT NULL,
+                llamadas  INTEGER NOT NULL,
+                aciertos  INTEGER NOT NULL DEFAULT 0,
+                recibido_at TEXT,
+                PRIMARY KEY (dia, source, motor_id)
+            )
+        ''')
 
         # Tabla de errores de analisis (privacy-first: filename hasheado).
         # Captura fallos de /analyze y /identify para diagnostico operacional
@@ -3115,6 +3137,73 @@ class AnalysisDB:
                  source, device_id, reason),
             )
             conn.commit()
+        finally:
+            conn.close()
+        if self.al_apuntar_audd is not None:
+            try:
+                self.al_apuntar_audd()
+            except Exception:  # noqa: BLE001 - avisar nunca tumba el apunte
+                pass
+
+    # ==================== AudD DE LOS MOTORES LOCALES ====================
+
+    _VIAS_AUDD = ('analyze', 'recognize', 'identify')
+
+    def cuentas_audd_por_dia(self, desde_ts: float) -> List[Dict]:
+        """Llamadas a AudD de ESTA BD por día y vía desde [desde_ts]. Sin los
+        marcadores de sesión de Escuchar, que no son llamadas."""
+        conn = self._open_conn()
+        try:
+            filas = conn.execute(
+                "SELECT date(called_at, 'unixepoch') AS dia, "
+                "COALESCE(source, 'analyze') AS s, COUNT(*) AS n, "
+                "COALESCE(SUM(success), 0) AS ok FROM audd_call_log "
+                "WHERE called_at >= ? AND "
+                "(source IS NULL OR source != 'recognize_session') "
+                "GROUP BY dia, s", (desde_ts,)).fetchall()
+            return [{'dia': f['dia'], 'source': f['s'], 'llamadas': f['n'],
+                     'aciertos': f['ok']} for f in filas
+                    if f['s'] in self._VIAS_AUDD]
+        finally:
+            conn.close()
+
+    def guardar_audd_motor_local(self, motor_id: str, dias: List[Dict]) -> int:
+        """Guarda los totales de un motor local (sustituye, no suma)."""
+        from datetime import datetime
+        ahora = datetime.utcnow().isoformat()
+        conn = self._open_conn()
+        try:
+            conn.executemany(
+                'INSERT OR REPLACE INTO audd_motor_local '
+                '(dia, source, motor_id, llamadas, aciertos, recibido_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                [(d['dia'], d['source'], motor_id, d['llamadas'],
+                  d.get('aciertos', 0), ahora) for d in dias])
+            conn.commit()
+            return len(dias)
+        finally:
+            conn.close()
+
+    def resumen_audd_motor_local(self, dias: int = 30) -> Dict:
+        """Lo que han gastado en AudD los motores locales en los últimos
+        [dias]: por vía, aciertos y cuántos motores lo cuentan."""
+        conn = self._open_conn()
+        try:
+            desde = conn.execute(
+                "SELECT date('now', ?)", (f'-{int(dias)} day',)).fetchone()[0]
+            por_via = {v: 0 for v in self._VIAS_AUDD}
+            aciertos = 0
+            for f in conn.execute(
+                    'SELECT source, SUM(llamadas) AS n, SUM(aciertos) AS ok '
+                    'FROM audd_motor_local WHERE dia >= ? GROUP BY source',
+                    (desde,)):
+                por_via[f['source']] = int(f['n'] or 0)
+                aciertos += int(f['ok'] or 0)
+            motores = conn.execute(
+                'SELECT COUNT(DISTINCT motor_id) FROM audd_motor_local '
+                'WHERE dia >= ?', (desde,)).fetchone()[0]
+            return {'by_source': por_via, 'total': sum(por_via.values()),
+                    'aciertos': aciertos, 'motores': int(motores or 0)}
         finally:
             conn.close()
 
