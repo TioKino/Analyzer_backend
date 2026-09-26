@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sync_endpoints import (sync_router, admin_sync_router, cuentas_de_dispositivos,
+                            aparatos_de_la_misma_cuenta,
                             dispositivo_del_token)
 from routes.admin_panel import admin_panel_router
 from routes.search import search_router, init as init_search
@@ -44,6 +45,7 @@ import requests
 import shutil
 import sqlite3
 import time
+import uuid
 import asyncio
 from typing import Any, Dict, List, Optional
 
@@ -417,15 +419,19 @@ def _sign_write_payload(body: bytes) -> Dict[str, str]:
     }
 
 
-def _upload_to_render_cache(track_data: dict):
+def _upload_to_render_cache(track_data: dict, analista: str = ''):
     """
     Sube resultado de análisis local a Render como cache comunitario.
     Fire & forget: no bloquea si falla.
+
+    [analista] es el aparato que lo analizó: Render lo cuenta en la
+    popularidad, que hasta el 2026-09-26 no veía nada de los motores locales.
     """
     import threading
     def _do_upload():
         try:
             payload = {
+                'analista': analista,
                 'fingerprint': track_data.get('fingerprint', track_data.get('id', '')),
                 'filename': track_data.get('filename', ''),
                 'artist': track_data.get('artist', ''),
@@ -972,6 +978,8 @@ async def report_client_event(payload: ClientEventPayload, request: Request):
 db = AnalysisDB(db_path=DATABASE_PATH)
 # El consenso de la comunidad cuenta por CUENTA, y las cuentas viven en sync.db.
 db.cuentas_de = cuentas_de_dispositivos
+# Y las estrellas propias se leen por cuenta, no por aparato.
+db.aparatos_de = aparatos_de_la_misma_cuenta
 
 # Sembrar `device_first_seen` ANTES de purgar, no despues: la purga borra los
 # eventos de los que hay que leer el D0. Al reves, cada deploy tiraria justo lo
@@ -997,6 +1005,12 @@ try:
         logger.info(f"[Community] {_mudadas} filas de la memoria mudadas a su cluster")
 except Exception as _e:  # noqa: BLE001 - best-effort
     logger.warning(f"[Community] realinear la memoria fallo: {_e}")
+
+# El motor local manda a Render lo que gasta en AudD (ver
+# `_mandar_audd_a_render`): tras cada llamada, con un rato de espera, y una vez
+# al arrancar para recoger lo de antes.
+if IS_LOCAL_ENGINE:
+    db.al_apuntar_audd = lambda: _programar_audd_a_render()
 
 # Purga best-effort de eventos viejos (>90d) para que la tabla `events` del
 # embudo no crezca sin limite. No bloquea el arranque si falla.
@@ -1210,6 +1224,13 @@ class AnalysisResult(BaseModel):
     #  Beat Grid
     first_beat: float = 0.0
     beat_interval: float = 0.5
+    # De qué programa de DJ sale `first_beat` ('rekordbox', 'traktor',
+    # 'virtualdj'), si sale de uno. Lo escribe `_adopt_better_metadata` al
+    # adoptar lo importado de la comunidad. Faltaba aquí (estaba solo en el
+    # AnalysisResult de models.py): la adopción reventaba a mitad —con el BPM
+    # ya cambiado y sin la tonalidad— y el `try` de `_mejorar_con_la_comunidad`
+    # se lo tragaba.
+    grid_source: Optional[str] = None
     #  Artwork
     artwork_embedded: bool = False
     artwork_url: Optional[str] = None
@@ -3038,6 +3059,17 @@ async def analyze_track(
     result = await _analizar(request, file, force, force_audd)
     if isinstance(result, AnalysisResult):
         await run_in_threadpool(_mejorar_con_la_comunidad, result)
+        # Quien sube un tema ya analizado también lo tiene: cuenta como un DJ
+        # más en la popularidad (ver `registrar_analista`). En el motor local
+        # no: su BD no es la de la comunidad, y lo suyo llega a Render por
+        # `/cache-analysis`.
+        huella = getattr(result, 'fingerprint', None)
+        analista = request.headers.get('X-Device-Id') or ''
+        if not IS_LOCAL_ENGINE and huella and analista:
+            try:
+                await run_in_threadpool(db.registrar_analista, huella, analista)
+            except Exception as e:  # noqa: BLE001 - contar nunca tumba /analyze
+                logger.warning(f"[Popularidad] registrar analista fallo: {e}")
     return result
 
 
@@ -3655,7 +3687,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
 
         # Auto-upload a Render como cache comunitario (solo en modo local)
         if IS_LOCAL_ENGINE:
-            _upload_to_render_cache(track_data)
+            _upload_to_render_cache(
+                track_data, request.headers.get('X-Device-Id') or '')
 
         result.fingerprint = fingerprint
         return result
@@ -4842,6 +4875,17 @@ async def cache_analysis(request: Request, signed: bool = Depends(verify_write_a
     if not fingerprint:
         raise HTTPException(400, "fingerprint requerido")
 
+    # Lo que analiza un motor local cuenta en la popularidad (hasta el
+    # 2026-09-26 no contaba: solo sumaba el análisis hecho AQUÍ). Antes del
+    # ranking, porque un tema que Render ya tiene («exists») también lo ha
+    # analizado este DJ. Solo firmado: sin firma cualquiera inflaría los DJs.
+    analista = str(data.pop('analista', '') or '')[:64]
+    if signed and analista:
+        try:
+            db.increment_popularity(fingerprint, analista)
+        except Exception as e:  # noqa: BLE001 - contar nunca tumba la caché
+            logger.warning(f"[Popularidad] motor local: {e}")
+
     # Cortar el envenenamiento ANTES de que el ranking mire las prioridades.
     _clamp_untrusted_source(data, signed)
     nested_pre = data.get('analysis_json')
@@ -5061,8 +5105,9 @@ async def lo_importado_endpoint(req: LoImportadoRequest, request: Request):
 
 @app.get("/community/de-este-aparato")
 async def lo_de_este_aparato(device_id: str):
-    """SOLO en el motor local: las valoraciones y notas que este aparato dejó
-    en la memoria colectiva MIENTRAS apuntaba al motor local.
+    """SOLO en el motor local: lo que este aparato dejó en la memoria colectiva
+    MIENTRAS apuntaba al motor local (valoraciones, notas, votos de cambios a
+    mano y rejillas corregidas).
 
     Hasta el 2026-09-26 el escritorio mandaba todo `/community/*` a
     `backendUrl`, que con el motor local arrancado es 127.0.0.1: las notas,
@@ -5080,6 +5125,118 @@ async def lo_de_este_aparato(device_id: str):
     if not IS_LOCAL_ENGINE:
         raise HTTPException(404, "Solo en el motor local")
     return await run_in_threadpool(db.lo_de_este_aparato, device_id)
+
+
+# ==================== AudD DE LOS MOTORES LOCALES ====================
+#
+# El motor local (EXE de Windows y DMG) llama a AudD con su propio token al
+# analizar y en Escuchar, y lo apunta en SU `audd_call_log`. Hasta el
+# 2026-09-26 eso no llegaba a Render, así que `by_source_30d` —el número con el
+# que se decide el precio de Pro— contaba de menos, en la proporción de
+# análisis locales. Ahora cada motor manda sus totales por día y vía (sin
+# huellas ni títulos) y el panel los enseña al lado de los de Render.
+
+_DIAS_AUDD_A_RENDER = 35
+_temporizador_audd: Optional[threading.Timer] = None
+_cerrojo_audd = threading.Lock()
+
+
+def _id_del_motor() -> str:
+    """Un id estable por instalación del motor local, guardado junto a su BD.
+    No es el aparato del usuario: solo sirve para que dos motores no se pisen
+    los totales en Render."""
+    ruta = os.path.join(os.path.dirname(os.path.abspath(DATABASE_PATH)), 'motor_id')
+    try:
+        with open(ruta, encoding='utf-8') as f:
+            guardado = f.read().strip()
+        if 8 <= len(guardado) <= 64:
+            return guardado
+    except OSError:
+        pass
+    nuevo = uuid.uuid4().hex
+    try:
+        with open(ruta, 'w', encoding='utf-8') as f:
+            f.write(nuevo)
+    except OSError:
+        pass
+    return nuevo
+
+
+def _mandar_audd_a_render() -> bool:
+    """Manda a Render los totales de AudD de este motor (los últimos días;
+    Render los sustituye, así que repetir no suma). Best-effort."""
+    if not IS_LOCAL_ENGINE:
+        return False
+    try:
+        dias = db.cuentas_audd_por_dia(time.time() - _DIAS_AUDD_A_RENDER * 86400)
+        if not dias:
+            return True
+        body = json.dumps({'motor_id': _id_del_motor(), 'dias': dias}).encode('utf-8')
+        headers = {'Content-Type': 'application/json'}
+        headers.update(_sign_write_payload(body))
+        resp = requests.post(f"{RENDER_BACKEND_URL}/audd/motor-local",
+                             data=body, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(f"[AudD→Render] {resp.status_code}: {resp.text[:100]}")
+            return False
+        return True
+    except Exception as e:  # noqa: BLE001 - contar nunca tumba el motor
+        logger.warning(f"[AudD→Render] sin enviar: {e}")
+        return False
+
+
+def _programar_audd_a_render(espera: float = 60.0) -> None:
+    """Junta las llamadas de un rato en un solo envío."""
+    global _temporizador_audd
+    with _cerrojo_audd:
+        if _temporizador_audd is not None:
+            _temporizador_audd.cancel()
+        _temporizador_audd = threading.Timer(espera, _mandar_audd_a_render)
+        _temporizador_audd.daemon = True
+        _temporizador_audd.start()
+
+
+if IS_LOCAL_ENGINE:
+    # Lo gastado antes de esta versión (y lo que no salió por falta de red),
+    # una vez al arrancar.
+    _programar_audd_a_render(espera=30.0)
+
+
+class UsoAuddDia(BaseModel):
+    dia: str
+    source: str
+    llamadas: int
+    aciertos: int = 0
+
+
+class UsoAuddMotorLocal(BaseModel):
+    motor_id: str
+    dias: List[UsoAuddDia]
+
+
+_DIA = re.compile(r'\d{4}-\d{2}-\d{2}')
+
+
+@app.post("/audd/motor-local")
+async def audd_motor_local(req: UsoAuddMotorLocal, request: Request,
+                           signed: bool = Depends(verify_write_auth)):
+    """Lo que un motor local ha gastado en AudD, por día y vía (ver arriba).
+
+    Pide la firma de escritura, como `/cache-analysis`: el motor la tiene. Lo
+    que no cuadra (una vía desconocida, una fecha rara, cifras imposibles) se
+    descarta sin tumbar el resto.
+    """
+    if not signed:
+        raise HTTPException(401, "Missing X-Signature header")
+    if not 8 <= len(req.motor_id) <= 64 or len(req.dias) > 100:
+        raise HTTPException(400, "Envío fuera de rango")
+    validos = [d.model_dump() for d in req.dias
+               if _DIA.fullmatch(d.dia) and d.source in db._VIAS_AUDD
+               and 0 <= d.aciertos <= d.llamadas <= 100_000]
+    guardados = await run_in_threadpool(
+        db.guardar_audd_motor_local, req.motor_id, validos)
+    return {"status": "ok", "dias": guardados,
+            "descartados": len(req.dias) - len(validos)}
 
 
 class BackfillFingerprintRequest(BaseModel):
@@ -5615,6 +5772,7 @@ async def reset_database(
             "community_cues", "community_notes",
             "track_ratings", "track_popularity",
             "beat_grid_corrections", "audd_call_log", "imported_values",
+            "audd_motor_local",
         )
         conn = sqlite3.connect(db.db_path, timeout=30.0)
         conn.execute("PRAGMA busy_timeout=30000")

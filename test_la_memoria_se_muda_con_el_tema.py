@@ -144,10 +144,14 @@ def test_lo_de_este_aparato_sale_con_la_huella_del_fichero(db):
     db.rate_track(fp, 'devA', 5)
     db.save_community_note(fp, 'devA', 'para el cierre')
     db.rate_track(_fp(), 'otro', 1)
+    db.submit_community_override(fp, 'devA', 'genre', 'Techno')
+    db.submit_beat_grid_correction(fp, 'devA', 0.1, 0.02, 128.0)
     r = db.lo_de_este_aparato('devA')
     assert r['ratings'] == [{'fingerprint': fp, 'rating': 5}]
     assert [(n['fingerprint'], n['note_text']) for n in r['notes']] == \
         [(fp, 'para el cierre')]
+    assert r['overrides'] == [{'fingerprint': fp, 'field': 'genre', 'value': 'Techno'}]
+    assert [(g['fingerprint'], g['bpm_adjust']) for g in r['rejillas']] == [(fp, 0.1)]
 
 
 def test_lo_de_este_aparato_no_existe_en_render(monkeypatch):
