@@ -25,219 +25,290 @@ logger = logging.getLogger(__name__)
 os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
 
 # ==================== 0. BUSQUEDA DE ARTWORK ONLINE ====================
+#
+# Auditado el 2026-09-26. La busqueda cogia el PRIMER resultado que tuviera
+# imagen, sin mirar de quien era, y la guardaba bajo la huella: la veian todos
+# los que tienen ese fichero. Y el ultimo recurso de Last.fm era la portada del
+# ALBUM MAS POPULAR del artista (`artist.getTopAlbums`), o sea casi siempre la
+# de otro disco. Ahora:
+#   - se limpia el nombre y se prueban variantes (la ultima, solo por titulo,
+#     es la unica que encuentra algo con el artista mal escrito);
+#   - solo vale un resultado cuyo artista y titulo se parezcan a los buscados;
+#   - Deezer primero (1000 px); iTunes solo con dos variantes; Last.fm solo con
+#     `track.getInfo` (nombre exacto), sin el album popular;
+#   - `buscar_portada` dice si fue «no hay» o «no contesto», que piden cosas
+#     opuestas (ver `routes/analysis_artwork.py`).
+# Es el espejo de `lib/services/busqueda_de_portadas.dart` en el cliente.
+
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from typing import Tuple
+
+_TIMEOUT = 6
+
+
+def es_imagen(b) -> bool:
+    """JPEG, PNG, GIF o WEBP, por la cabecera."""
+    if not b or len(b) < 12:
+        return False
+    return (b[:3] == b'\xff\xd8\xff' or b[:8] == b'\x89PNG\r\n\x1a\n'
+            or b[:4] == b'GIF8' or (b[:4] == b'RIFF' and b[8:12] == b'WEBP'))
+
+
+def mime_de(b) -> str:
+    if b[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'image/png'
+    if b[:4] == b'GIF8':
+        return 'image/gif'
+    if b[:4] == b'RIFF' and b[8:12] == b'WEBP':
+        return 'image/webp'
+    return 'image/jpeg'
+
+
+def _plano(s: str) -> str:
+    s = unicodedata.normalize('NFKD', s or '').lower()
+    s = ''.join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
+    return s[4:] if s.startswith('the ') else s
+
+
+def _suave(s: str) -> str:
+    r = (s or '').replace('_', ' ')
+    r = re.sub(r'\.(mp3|wav|flac|m4a|aiff?|aac|ogg)$', '', r, flags=re.I)
+    r = re.sub(r'^\d{3,}[\s.\-]+', '', r)
+    r = re.sub(r'(?<=\S)-[a-z0-9]{2,10}$', '', r)
+    r = re.sub(r'[()\[\]{}]', ' ', r)
+    return re.sub(r'\s+', ' ', r).strip()
+
+
+def limpiar_titulo(s: str) -> str:
+    r = (s or '').replace('_', ' ')
+    r = re.sub(r'\([^)]*\)|\[[^\]]*\]|\{[^}]*\}', ' ', r)
+    r = _suave(r)
+    r = re.sub(r'\s+-\s+[^-]{1,30}$', '', r)
+    r = re.sub(r'\b(original|extended|radio|club|album|dub)\s+(mix|edit|version)\b'
+               r'|\bremaster(ed)?\b', ' ', r, flags=re.I)
+    return re.sub(r'\s+', ' ', r).strip()
+
+
+_SEPARADORES = re.compile(
+    r'\s+(?:feat\.?|ft\.?|featuring|vs\.?|x|with|&|and|y)\s+|[,;/]', re.I)
+
+
+def artista_principal(a: str) -> str:
+    return _SEPARADORES.split(a or '')[0].strip()
+
+
+def _se_parecen(a: str, b: str, umbral: float) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    corto, largo = sorted((a, b), key=len)
+    if len(corto) >= 4 and f' {corto} ' in f' {largo} ':
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= umbral
+
+
+def mismo_artista(buscado: str, encontrado: str) -> bool:
+    """Tolera una errata, acentos y colaboraciones en los dos lados."""
+    b, e = _plano(buscado), _plano(encontrado)
+    if _se_parecen(b, e, 0.8):
+        return True
+    principal = _plano(artista_principal(buscado))
+    return any(_se_parecen(principal, _plano(p), 0.8) or _se_parecen(b, _plano(p), 0.8)
+               for p in _SEPARADORES.split(encontrado or ''))
+
+
+def mismo_titulo(buscado: str, encontrado: str) -> bool:
+    b, e = _plano(limpiar_titulo(buscado)), _plano(limpiar_titulo(encontrado))
+    if len(b) < 3 or len(e) < 3:
+        return bool(b) and b == e
+    return _se_parecen(b, e, 0.75)
+
+
+def variantes_de_busqueda(artist: str, title: str):
+    """(artista_buscado, titulo_buscado, [(artista|None, titulo), ...]) o None."""
+    a, t = (artist or '').strip(), (title or '').strip()
+    if not a:
+        limpio = t.replace('_', ' ')
+        if ' - ' in limpio:
+            a, t = limpio.split(' - ', 1)
+    a_suave, t_suave, t_fuerte = _suave(a), _suave(t), limpiar_titulo(t)
+    if not a_suave or not t_fuerte:
+        return None
+    vistas, consultas = set(), []
+    for ar, ti in ((a_suave, t_suave), (a_suave, t_fuerte),
+                   (artista_principal(a_suave), t_fuerte), (None, t_fuerte)):
+        clave = (_plano(ar or ''), _plano(ti))
+        if ti and clave not in vistas:
+            vistas.add(clave)
+            consultas.append((ar, ti))
+    return a_suave, t_fuerte, consultas
+
+
+def _descargar(url: str) -> Tuple[Optional[Dict], bool]:
+    """(portada, definitivo). Un 404 es «no hay»; lo demas, «no lo se»."""
+    try:
+        r = requests.get(url, timeout=_TIMEOUT)
+    except requests.RequestException:
+        return None, False
+    if r.status_code == 200 and len(r.content) > 1000 and es_imagen(r.content):
+        return {'url': url, 'data': r.content, 'mime_type': mime_de(r.content),
+                'size': len(r.content)}, True
+    return None, r.status_code in (404, 410)
+
+
+def _json(url: str):
+    """(json, definitivo)."""
+    try:
+        r = requests.get(url, timeout=_TIMEOUT)
+    except requests.RequestException:
+        return None, False
+    if r.status_code != 200:
+        return None, False
+    try:
+        return r.json(), True
+    except ValueError:
+        return None, False
+
+
+def _primera_que_baje(urls, fuente) -> Tuple[Optional[Dict], bool]:
+    definitivo = True
+    for u in urls[:3]:
+        portada, ok = _descargar(u)
+        if portada:
+            portada['source'] = fuente
+            return portada, True
+        definitivo = definitivo and ok
+    return None, definitivo
+
+
+def _deezer(consulta, artista_b, titulo_b) -> Tuple[Optional[Dict], bool]:
+    from urllib.parse import quote
+    ar, ti = consulta
+    q = ti if ar is None else f'artist:"{ar}" track:"{ti}"'
+    datos, ok = _json(f"https://api.deezer.com/search?q={quote(q)}"
+                      f"&limit={25 if ar is None else 10}")
+    if not ok or not isinstance(datos, dict) or datos.get('error'):
+        return None, False
+    urls = []
+    for item in datos.get('data') or []:
+        album = item.get('album') or {}
+        portada = album.get('cover_xl') or album.get('cover_big')
+        nombre = (item.get('artist') or {}).get('name') or ''
+        titulo = item.get('title_short') or item.get('title') or ''
+        if portada and mismo_artista(artista_b, nombre) and mismo_titulo(titulo_b, titulo):
+            urls.append(portada)
+    return _primera_que_baje(urls, 'deezer')
+
+
+def _itunes(consulta, artista_b, titulo_b) -> Tuple[Optional[Dict], bool]:
+    from urllib.parse import quote
+    ar, ti = consulta
+    term = f"{ar} {ti}" if ar else ti
+    datos, ok = _json(f"https://itunes.apple.com/search?term={quote(term)}"
+                      f"&media=music&entity=song&limit={25 if ar is None else 10}")
+    if not ok or not isinstance(datos, dict):
+        return None, False
+    urls = []
+    for item in datos.get('results') or []:
+        portada = item.get('artworkUrl100') or ''
+        if (portada and mismo_artista(artista_b, item.get('artistName') or '')
+                and mismo_titulo(titulo_b, item.get('trackName') or '')):
+            urls.append(portada.replace('100x100', '600x600'))
+    return _primera_que_baje(urls, 'itunes')
+
+
+def _lastfm(artista_b, titulo_b) -> Tuple[Optional[Dict], bool]:
+    """Solo `track.getInfo`: el album de ESE tema. El `artist.getTopAlbums` de
+    antes devolvia el album mas popular del artista, casi nunca el bueno."""
+    if not LASTFM_API_KEY:
+        return None, True
+    from urllib.parse import quote
+    datos, ok = _json("https://ws.audioscrobbler.com/2.0/?method=track.getInfo"
+                      f"&api_key={LASTFM_API_KEY}&artist={quote(artista_b)}"
+                      f"&track={quote(titulo_b)}&format=json")
+    if not ok or not isinstance(datos, dict):
+        return None, False
+    if 'error' in datos:
+        return None, True
+    track = datos.get('track') or {}
+    if not (mismo_artista(artista_b, (track.get('artist') or {}).get('name') or '')
+            and mismo_titulo(titulo_b, track.get('name') or '')):
+        return None, True
+    urls = [i.get('#text') for i in reversed((track.get('album') or {}).get('image') or [])
+            if i.get('#text')]
+    return _primera_que_baje(urls, 'lastfm')
+
+
+def buscar_portada(artist: str, title: str) -> Tuple[Optional[Dict], bool]:
+    """La portada de ESE tema en internet, y si el «no» es definitivo.
+
+    Definitivo = todas las fuentes contestaron y ninguna la tenia. Un 403 de
+    iTunes, la cuota de Deezer o un timeout NO lo son: recordarlos como «no
+    hay» dejaria el tema sin portada aunque la tenga.
+    """
+    variantes = variantes_de_busqueda(artist, title)
+    if not variantes:
+        return None, True
+    artista_b, titulo_b, consultas = variantes
+    definitivo = True
+    for c in consultas:
+        portada, ok = _deezer(c, artista_b, titulo_b)
+        if portada:
+            return portada, True
+        definitivo = definitivo and ok
+    for c in dict.fromkeys([consultas[0], consultas[-1]]):
+        portada, ok = _itunes(c, artista_b, titulo_b)
+        if portada:
+            return portada, True
+        definitivo = definitivo and ok
+    portada, ok = _lastfm(artista_b, titulo_b)
+    if portada:
+        return portada, True
+    return None, definitivo and ok
+
 
 def search_artwork_online(artist: str, title: str, album: str = None) -> Optional[Dict]:
+    """Compatibilidad: la portada verificada, o None. Ver `buscar_portada`."""
+    if not artist or not title:
+        return None
+    try:
+        return buscar_portada(artist, title)[0]
+    except Exception as e:  # noqa: BLE001 - auxiliar, nunca tumba un analisis
+        logger.warning(f"Busqueda de portada fallo: {type(e).__name__}: {e}")
+        return None
+
+
+def elegir_portada(file_path: str, artist: str, title: str,
+                   audd_artwork: Optional[Dict] = None):
+    """La portada que se guarda al analizar: (portada, embebida, fuente).
+
+    **La del fichero gana.** Es parte de su contenido (la huella es el MD5 de
+    ese contenido), es la que ensenan Rekordbox, Traktor y VirtualDJ, y una
+    busqueda por texto, aunque se verifique, puede traer la de otra edicion.
+    Antes se preferia la de internet si pesaba mas, sin comprobar de quien era.
+    La unica que puede mejorarla es la de AudD, que identifica el AUDIO exacto.
+    Por debajo de 10 KB la del fichero suele ser una miniatura: entonces se
+    busca, y si no aparece nada se usa igual.
     """
-    Busca artwork en servicios online cuando no hay ID3 o es invalido.
-    Intenta: iTunes -> Deezer -> Last.fm
-    
-    Returns:
-        Dict con 'url', 'data' (bytes), 'mime_type', 'size', 'source' o None
-    """
-    if not artist or not title:
-        logger.warning(f"No se puede buscar artwork: artist={artist}, title={title}")
-        return None
-    
-    # Limpiar query
-    query = f"{artist} {title}".replace("(", "").replace(")", "").replace("-", " ")
-    logger.info(f"Buscando artwork online: {artist} - {title}")
-    
-    # 1. Intentar iTunes (no requiere API key)
-    logger.debug("Intentando iTunes...")
-    artwork = _search_itunes(query)
-    if artwork:
-        logger.debug("iTunes encontro artwork")
-        return artwork
-    logger.debug("iTunes no encontro")
-    
-    # 2. Intentar Deezer (no requiere API key)
-    logger.debug("Intentando Deezer...")
-    artwork = _search_deezer(artist, title)
-    if artwork:
-        logger.debug("Deezer encontro artwork")
-        return artwork
-    logger.debug("Deezer no encontro")
-    
-    # 3. Intentar Last.fm
-    logger.debug("Intentando Last.fm...")
-    artwork = _search_lastfm(artist, title)
-    if artwork:
-        logger.debug("Last.fm encontro artwork")
-        return artwork
-    logger.debug("Last.fm no encontro")
-    
-    return None
+    embebida = extract_artwork_from_file(file_path)
+    tam = embebida.get('size', 0) if embebida else 0
+    if audd_artwork and es_imagen(audd_artwork.get('data')) \
+            and audd_artwork.get('size', 0) > tam:
+        return audd_artwork, False, audd_artwork.get('source', 'audd')
+    if embebida and tam >= 10000:
+        return embebida, True, 'id3'
+    if artist and title:
+        online = search_artwork_online(artist, title)
+        if online:
+            return online, False, online.get('source', 'online')
+    if embebida:
+        return embebida, True, 'id3'
+    return None, False, None
 
-def _search_itunes(query: str) -> Optional[Dict]:
-    """Buscar artwork en iTunes API"""
-    if not query:
-        return None
-    try:
-        from urllib.parse import quote
-        url = f"https://itunes.apple.com/search?term={quote(query)}&media=music&limit=5"
-        
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('resultCount', 0) > 0:
-                # Buscar en los primeros resultados
-                for result in data['results'][:5]:
-                    # Obtener imagen grande (600x600)
-                    artwork_url = result.get('artworkUrl100', '').replace('100x100', '600x600')
-                    
-                    if artwork_url:
-                        # Descargar imagen
-                        img_response = requests.get(artwork_url, timeout=5)
-                        if img_response.status_code == 200 and len(img_response.content) > 10000:
-                            return {
-                                'url': artwork_url,
-                                'data': img_response.content,
-                                'mime_type': 'image/jpeg',
-                                'size': len(img_response.content),
-                                'source': 'itunes'
-                            }
-    except requests.RequestException as e:
-        logger.error(f"Error iTunes: {e}")
-    
-    return None
-
-def _search_deezer(artist: str, title: str) -> Optional[Dict]:
-    """Buscar artwork en Deezer API"""
-    # Defensive: el caller search_artwork_online() ya filtra None, pero
-    # estos helpers son publicos a nivel modulo y un crash aqui aborta
-    # todo el /analyze (TypeError "NoneType + str" visto en panel admin).
-    if not artist or not title:
-        return None
-    try:
-        from urllib.parse import quote
-        # Intentar busqueda exacta primero
-        url = f"https://api.deezer.com/search?q=artist:\"{quote(artist)}\" track:\"{quote(title)}\"&limit=5"
-        
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('data') and len(data['data']) > 0:
-                for track in data['data'][:5]:
-                    album = track.get('album', {})
-                    # cover_xl es 1000x1000
-                    artwork_url = album.get('cover_xl') or album.get('cover_big') or album.get('cover_medium')
-                    
-                    if artwork_url:
-                        img_response = requests.get(artwork_url, timeout=5)
-                        if img_response.status_code == 200 and len(img_response.content) > 10000:
-                            return {
-                                'url': artwork_url,
-                                'data': img_response.content,
-                                'mime_type': 'image/jpeg',
-                                'size': len(img_response.content),
-                                'source': 'deezer'
-                            }
-        
-        # Si no encuentra con busqueda exacta, intentar busqueda general
-        url = f"https://api.deezer.com/search?q={quote(f'{artist} {title}')}&limit=5"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('data'):
-                for track in data['data'][:5]:
-                    album = track.get('album', {})
-                    artwork_url = album.get('cover_xl') or album.get('cover_big')
-                    if artwork_url:
-                        img_response = requests.get(artwork_url, timeout=5)
-                        if img_response.status_code == 200 and len(img_response.content) > 10000:
-                            return {
-                                'url': artwork_url,
-                                'data': img_response.content,
-                                'mime_type': 'image/jpeg',
-                                'size': len(img_response.content),
-                                'source': 'deezer'
-                            }
-    except requests.RequestException as e:
-        logger.error(f"Error Deezer: {e}")
-    
-    return None
-
-def _search_spotify(artist: str, title: str) -> Optional[Dict]:
-    """Spotify requiere OAuth - no disponible sin autenticacion"""
-    # La API de Spotify requiere token de acceso
-    # No es posible buscar sin autenticacion
-    return None
-
-def _search_lastfm(artist: str, title: str) -> Optional[Dict]:
-    """Buscar artwork en Last.fm"""
-    if not artist or not title:
-        return None
-    try:
-        from urllib.parse import quote
-        
-        # Intentar primero buscar el track
-        url = f"https://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key={LASTFM_API_KEY}&artist={quote(artist)}&track={quote(title)}&format=json"
-        
-        response = requests.get(url, timeout=8)
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Verificar si hay error
-            if 'error' in data:
-                logger.debug(f"Last.fm: {data.get('message', 'Track no encontrado')}")
-            else:
-                track = data.get('track', {})
-                album = track.get('album', {})
-                images = album.get('image', [])
-                
-                # Buscar imagen mas grande (ultima en la lista)
-                for img in reversed(images):
-                    img_url = img.get('#text', '')
-                    if img_url and len(img_url) > 10:
-                        # Last.fm a veces devuelve URLs vacias o placeholder
-                        # Intentar obtener version grande
-                        if '/i/u/' in img_url:
-                            # Formato: https://lastfm.freetls.fastly.net/i/u/300x300/xxx.jpg
-                            img_url = img_url.replace('/64s/', '/300x300/').replace('/174s/', '/300x300/')
-                        
-                        try:
-                            img_response = requests.get(img_url, timeout=5)
-                            if img_response.status_code == 200 and len(img_response.content) > 5000:
-                                logger.debug(f"Artwork Last.fm: {len(img_response.content)} bytes")
-                                return {
-                                    'url': img_url,
-                                    'data': img_response.content,
-                                    'mime_type': 'image/jpeg',
-                                    'size': len(img_response.content),
-                                    'source': 'lastfm'
-                                }
-                        except:
-                            continue
-        
-        # Si no encontro por track, intentar por album/artista
-        url = f"https://ws.audioscrobbler.com/2.0/?method=artist.getTopAlbums&api_key={LASTFM_API_KEY}&artist={quote(artist)}&limit=1&format=json"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            albums = data.get('topalbums', {}).get('album', [])
-            if albums and len(albums) > 0:
-                images = albums[0].get('image', [])
-                for img in reversed(images):
-                    img_url = img.get('#text', '')
-                    if img_url and len(img_url) > 10:
-                        try:
-                            img_response = requests.get(img_url, timeout=5)
-                            if img_response.status_code == 200 and len(img_response.content) > 5000:
-                                logger.debug(f"Artwork Last.fm (album): {len(img_response.content)} bytes")
-                                return {
-                                    'url': img_url,
-                                    'data': img_response.content,
-                                    'mime_type': 'image/jpeg',
-                                    'size': len(img_response.content),
-                                    'source': 'lastfm'
-                                }
-                        except:
-                            continue
-                            
-    except requests.RequestException as e:
-        logger.error(f"Error Last.fm: {e}")
-    
-    return None
 
 # ==================== 1. EXTRACCIN DE ARTWORK ====================
 
@@ -269,25 +340,31 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
         artwork_data = None
         mime_type = 'image/jpeg'
         
-        # MP3 con ID3 tags
-        if isinstance(audio, MP3) or file_path.lower().endswith('.mp3'):
+        # MP3, y tambien AIFF y WAV: los tres llevan una etiqueta ID3 (en AIFF
+        # y WAV, dentro de un bloque del contenedor). Antes AIFF/WAV caian en el
+        # fallback generico, que busca `.pictures`, y no la tienen: sus
+        # portadas no se leian nunca. Con varias imagenes manda la PORTADA
+        # frontal (tipo 3), no la primera que aparezca.
+        ext = file_path.lower()
+        if (isinstance(audio, MP3) or ext.endswith(('.mp3', '.aiff', '.aif', '.aifc', '.wav'))):
             try:
-                tags = ID3(file_path)
-                for key in tags.keys():
-                    if key.startswith('APIC'):
-                        apic = tags[key]
-                        artwork_data = apic.data
-                        mime_type = apic.mime or 'image/jpeg'
-                        break
-            except:
+                tags = audio.tags if getattr(audio, 'tags', None) is not None else ID3(file_path)
+                fotos = [tags[k] for k in tags.keys() if k.startswith('APIC')]
+                fotos = [f for f in fotos if es_imagen(f.data)]
+                fotos.sort(key=lambda f: 0 if getattr(f, 'type', None) == 3 else 1)
+                if fotos:
+                    artwork_data = fotos[0].data
+                    mime_type = fotos[0].mime or 'image/jpeg'
+            except Exception:
                 pass
-        
+
         # FLAC
         elif isinstance(audio, FLAC):
-            if audio.pictures:
-                pic = audio.pictures[0]
-                artwork_data = pic.data
-                mime_type = pic.mime or 'image/jpeg'
+            fotos = sorted((p for p in audio.pictures if es_imagen(p.data)),
+                           key=lambda p: 0 if p.type == 3 else 1)
+            if fotos:
+                artwork_data = fotos[0].data
+                mime_type = fotos[0].mime or 'image/jpeg'
         
         # M4A/MP4/AAC
         elif isinstance(audio, MP4) or file_path.lower().endswith(('.m4a', '.mp4', '.aac')):
@@ -310,10 +387,11 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
                 artwork_data = pic.data
                 mime_type = getattr(pic, 'mime', 'image/jpeg')
         
-        if artwork_data:
+        # Lo que no es una imagen no se guarda como portada: se serviria rota.
+        if artwork_data and es_imagen(artwork_data):
             return {
                 'data': artwork_data,  # Devuelve bytes directamente
-                'mime_type': mime_type,
+                'mime_type': mime_de(artwork_data),
                 'size': len(artwork_data),
             }
         
@@ -334,17 +412,30 @@ def extract_artwork_from_file(file_path: str) -> Optional[Dict]:
         return None
 
 
+_EXTENSIONES = {'image/jpeg': 'jpg', 'image/png': 'png',
+                'image/webp': 'webp', 'image/gif': 'gif'}
+
+
 def save_artwork_to_cache(fingerprint: str, artwork_data: bytes, mime_type: str) -> str:
+    """Guarda la portada de una huella y devuelve el nombre del fichero.
+
+    La extension sale de los BYTES, no del MIME que diga quien la manda: un
+    WEBP guardado como `.jpg` se servia con el tipo equivocado. Y se borran
+    las de otras extensiones de la misma huella, que si no se quedaba
+    sirviendose la vieja (GET mira `jpg` antes que `png`).
     """
-    Guarda artwork en cache local y devuelve el nombre del archivo
-    """
-    ext = 'jpg' if 'jpeg' in mime_type else 'png' if 'png' in mime_type else 'jpg'
+    ext = _EXTENSIONES.get(mime_de(artwork_data), 'jpg')
+    for otra in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
+        if otra != ext:
+            vieja = os.path.join(ARTWORK_CACHE_DIR, f"{fingerprint}.{otra}")
+            if os.path.exists(vieja):
+                try:
+                    os.unlink(vieja)
+                except OSError:
+                    pass
     filename = f"{fingerprint}.{ext}"
-    cache_path = os.path.join(ARTWORK_CACHE_DIR, filename)
-    
-    with open(cache_path, 'wb') as f:
+    with open(os.path.join(ARTWORK_CACHE_DIR, filename), 'wb') as f:
         f.write(artwork_data)
-    
     return filename
 
 

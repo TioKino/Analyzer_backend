@@ -72,7 +72,7 @@ class TestElCaminoBaratoNoSeCapa:
 
 class TestElCaminoCaroSiSeCapa:
     def test_el_cupo_corta_la_salida_a_internet(self, app_mod, monkeypatch):
-        """Se cuenta cuántas veces se llama de verdad a `search_artwork_online`.
+        """Se cuenta cuántas veces se sale de verdad a internet.
         Es la métrica que importa: peticiones salientes, no códigos HTTP."""
         import validation
         from routes import analysis_artwork as aw
@@ -84,6 +84,11 @@ class TestElCaminoCaroSiSeCapa:
             return None  # no encuentra nada -> el handler cae a 404
 
         monkeypatch.setattr(aw, "search_artwork_online", _fake_online)
+        # La ruta llama a `buscar_portada` (dice si el «no» es definitivo). Se
+        # le contesta «sin respuesta» para que el recuerdo de «no hay» no corte
+        # antes que el cupo, que es lo que se mide aqui.
+        monkeypatch.setattr(aw, "buscar_portada",
+                            lambda a, t: (_fake_online(a, t), False))
 
         # Un track EN BD pero SIN fichero de carátula -> siempre cae al online.
         fp = uuid.uuid4().hex
@@ -113,6 +118,7 @@ class TestElCaminoCaroSiSeCapa:
         from routes import analysis_artwork as aw
 
         monkeypatch.setattr(aw, "search_artwork_online", lambda a, t: None)
+        monkeypatch.setattr(aw, "buscar_portada", lambda a, t: (None, False))
 
         fp = uuid.uuid4().hex
         app_mod.db.save_track({
@@ -143,6 +149,11 @@ class TestElCaminoCaroSiSeCapa:
             return None
 
         monkeypatch.setattr(aw, "search_artwork_online", _fake_online)
+        # La ruta llama a `buscar_portada` (dice si el «no» es definitivo). Se
+        # le contesta «sin respuesta» para que el recuerdo de «no hay» no corte
+        # antes que el cupo, que es lo que se mide aqui.
+        monkeypatch.setattr(aw, "buscar_portada",
+                            lambda a, t: (_fake_online(a, t), False))
 
         fp = uuid.uuid4().hex
         app_mod.db.save_track({
