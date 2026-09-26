@@ -135,7 +135,20 @@ _CUES_COLUMNS = (
 )
 
 
-def aggregate_cues_into_zones(rows, duration_seconds: float = 0) -> List[dict]:
+def _dj(device_id, cuentas: Optional[dict]) -> str:
+    """Quién es el DJ detrás de un aparato: su cuenta si la tiene."""
+    if cuentas and device_id in cuentas:
+        return 'u:' + cuentas[device_id]
+    return device_id
+
+
+def contribuyentes(rows, cuentas: Optional[dict] = None) -> int:
+    """Cuántos DJs distintos (cuentas) han subido cues."""
+    return len({_dj(r['device_id'], cuentas) for r in rows})
+
+
+def aggregate_cues_into_zones(rows, duration_seconds: float = 0,
+                              cuentas: Optional[dict] = None) -> List[dict]:
     """
     Agrega cues individuales de multiples DJs en zonas comunitarias.
 
@@ -182,7 +195,11 @@ def aggregate_cues_into_zones(rows, duration_seconds: float = 0) -> List[dict]:
 
         # Convertir clusters en zonas
         for cluster in clusters:
-            unique_djs = set(c['device_id'] for c in cluster)
+            # DJs = CUENTAS, no aparatos: los cues viajan por sync entre el
+            # escritorio y el móvil de la misma persona, y si los dos los
+            # suben, contando aparatos una sola persona fabricaba una zona
+            # «de 2 DJs» consigo misma.
+            unique_djs = set(_dj(c['device_id'], cuentas) for c in cluster)
             dj_count = len(unique_djs)
 
             # Minimo 2 DJs para crear una zona comunitaria
@@ -326,7 +343,7 @@ def register_community_endpoints(app, db):
                 cluster,
             )
             all_rows = c.fetchall()
-            unique_devices = set(r['device_id'] for r in all_rows)
+            cuentas = db.cuentas_de_votantes(r['device_id'] for r in all_rows)
 
             # Obtener duracion del track si existe (cualquier version del cluster)
             c.execute(
@@ -337,12 +354,12 @@ def register_community_endpoints(app, db):
             dur_row = c.fetchone()
             duration = dur_row['duration'] if dur_row else 0
 
-            zones = aggregate_cues_into_zones(all_rows, duration)
+            zones = aggregate_cues_into_zones(all_rows, duration, cuentas)
 
             return {
                 "status": "ok",
                 "cues_saved": len(sanitized),
-                "total_contributors": len(unique_devices),
+                "total_contributors": contribuyentes(all_rows, cuentas),
                 "zones": zones,
             }
 
@@ -384,7 +401,7 @@ def register_community_endpoints(app, db):
                 total_contributors=0,
             )
 
-        unique_devices = set(r['device_id'] for r in rows)
+        cuentas = db.cuentas_de_votantes(r['device_id'] for r in rows)
 
         # Obtener duracion (de cualquier version del cluster).
         c.execute(
@@ -395,7 +412,7 @@ def register_community_endpoints(app, db):
         dur_row = c.fetchone()
         duration = dur_row['duration'] if dur_row else 0
 
-        zones_raw = aggregate_cues_into_zones(rows, duration)
+        zones_raw = aggregate_cues_into_zones(rows, duration, cuentas)
         zones = [CommunityZoneResponse(**z) for z in zones_raw]
 
         # Ultima actualizacion
@@ -404,7 +421,7 @@ def register_community_endpoints(app, db):
         return CommunityResponse(
             fingerprint=fingerprint,
             zones=zones,
-            total_contributors=len(unique_devices),
+            total_contributors=contribuyentes(rows, cuentas),
             last_updated=last,
         )
 

@@ -26,7 +26,7 @@ import string
 from fastapi import APIRouter, Request, HTTPException, Depends
 from starlette.requests import ClientDisconnect
 from pydantic import BaseModel
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 
 # Dias sin que NINGUN compañero suba nada para dejar de llamarlo «al dia» y
@@ -411,6 +411,31 @@ def _get_user_id_for_device(conn: sqlite3.Connection, device_id: str) -> Optiona
     return row[0] if row else None
 
 
+def cuentas_de_dispositivos(device_ids) -> Dict[str, str]:
+    """{device_id: user_id} de los que están registrados, en lotes.
+
+    Para contar el consenso de la comunidad por CUENTA y no por aparato
+    (`AnalysisDB.cuentas_de`, lo cablea main.py): el DJ con escritorio y móvil
+    es una opinión. Los que no están registrados no salen, y se cuentan por su
+    propio id. Si sync.db falla, {} — contar nunca tumba un voto.
+    """
+    ids = [d for d in set(device_ids) if d]
+    out: Dict[str, str] = {}
+    try:
+        conn = _get_conn()
+        for i in range(0, len(ids), 500):
+            lote = ids[i:i + 500]
+            ph = ','.join('?' * len(lote))
+            for d, u in conn.execute(
+                f"SELECT device_id, user_id FROM user_devices "
+                f"WHERE device_id IN ({ph})", lote):
+                if u:
+                    out[d] = u
+    except sqlite3.Error:
+        return {}
+    return out
+
+
 def _get_all_device_ids_for_user(conn: sqlite3.Connection, user_id: str) -> list[str]:
     """Retorna todos los device_id vinculados a un user_id."""
     rows = conn.execute(
@@ -463,6 +488,26 @@ def _issue_device_token(conn: sqlite3.Connection, device_id: str) -> Optional[st
     )
     conn.commit()
     return token
+
+
+def dispositivo_del_token(token: str) -> Optional[str]:
+    """El `device_id` dueño de este `X-Device-Token`, o None.
+
+    Para lo que no es /sync y quiere saber si quien llama es un aparato
+    registrado: hoy, pisar la portada de una huella. El token es aleatorio y
+    se entrega una sola vez, así que basta con buscarlo. Best-effort: si
+    sync.db falla, None — nunca tumba la petición de fuera.
+    """
+    if not token or len(token) < 16:
+        return None
+    try:
+        row = _get_conn().execute(
+            "SELECT device_id FROM user_devices WHERE device_token = ?",
+            (token,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
 
 
 def _record_sync_auth(secret_slot: int, has_token: bool) -> None:

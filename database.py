@@ -116,7 +116,47 @@ def derive_error_meta(error_class: str, error_msg: Optional[str],
         'human_message': human_message,
     }
 
+def _un_voto_por_cuenta(votos, cuentas):
+    """De `(votante, cuando, valor)` a `{votante: valor}`, uno por CUENTA.
+
+    `cuentas` es {device_id: user_id}; un aparato sin cuenta vota por su cuenta
+    (su propio id). Si varios aparatos de la misma cuenta votan distinto, vale
+    el voto más reciente: es una sola persona que ha cambiado de opinión.
+    """
+    ultimo = {}
+    for votante, cuando, valor in votos:
+        clave = ('u:' + cuentas[votante]) if votante in cuentas else votante
+        previo = ultimo.get(clave)
+        if previo is None or (cuando or '') >= (previo[0] or ''):
+            ultimo[clave] = (cuando, valor)
+    return {k: v for k, (_, v) in ultimo.items()}
+
+
+def _reparto(votos_por_cuenta):
+    """{valor: votos}, del más votado al menos."""
+    reparto = {}
+    for valor in votos_por_cuenta.values():
+        reparto[valor] = reparto.get(valor, 0) + 1
+    return dict(sorted(reparto.items(), key=lambda kv: -kv[1]))
+
+
 class AnalysisDB:
+    # Resuelve device_id -> user_id (vive en sync.db, otra base: lo inyecta
+    # main.py). Sin él cada aparato cuenta como un votante, que es como se
+    # contaba hasta el 2026-09-26.
+    cuentas_de = None
+
+    def cuentas_de_votantes(self, device_ids) -> Dict[str, str]:
+        """{device_id: user_id} de los votantes con cuenta. Best-effort: si
+        sync.db no responde, {} y se cuenta por aparato como antes."""
+        ids = {d for d in device_ids if d}
+        if not ids or self.cuentas_de is None:
+            return {}
+        try:
+            return self.cuentas_de(ids) or {}
+        except Exception:  # noqa: BLE001 - contar nunca tumba un voto
+            return {}
+
     def __init__(self, db_path=None):
         if db_path is None:
             db_path = os.getenv("DATABASE_PATH", "/data/analysis.db")
@@ -1619,36 +1659,40 @@ class AnalysisDB:
         try:
             c = conn.cursor()
 
-            # Un voto por DISPOSITIVO, no por marca de tiempo.
+            # Un voto por CUENTA, no por aparato ni por marca de tiempo.
             #
             # `DISTINCT track_id || corrected_at` contaba cada correccion como
             # un voto, asi que el mismo aparato pulsando tres veces fabricaba
             # un `consensus_3` — que en `ANALYSIS_SOURCE_PRIORITY` vale 80 y
-            # gana al motor local (50) y al id3 (30).
+            # gana al motor local (50) y al id3 (30). Y contando por aparato
+            # (2026-08-27 → 2026-09-26) el DJ con escritorio + móvil + tablet
+            # valía TRES votos siendo una opinión. La cuenta sale de sync.db
+            # (`cuentas_de_votantes`) y se resuelve al LEER, no al escribir:
+            # vincular un aparato después de votar tiene que juntar sus votos.
             #
-            # `COALESCE(device_id, 'anon:' || id)`: las filas anteriores a la
-            # columna tienen `device_id` NULL, y `COUNT(DISTINCT device_id)`
-            # IGNORA los NULL en SQL — sin el COALESCE, todo el consenso
-            # historico caeria a 0 de golpe. Cada fila vieja sigue valiendo
-            # uno, que es exactamente lo que valia antes. Es la misma trampa
-            # que ya mordio en el embudo con los eventos anonimos de la web.
+            # `'anon:' || id`: las filas anteriores a la columna tienen
+            # `device_id` NULL y cada una sigue valiendo uno, que es lo que
+            # valia antes. Sin eso todo el consenso historico caeria a 0 (es la
+            # trampa de `COUNT(DISTINCT device_id)`, que ignora los NULL).
             c.execute('''
-                SELECT new_value,
-                       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS vote_count
+                SELECT COALESCE(device_id, 'anon:' || id) AS votante,
+                       corrected_at, new_value
                 FROM corrections
                 WHERE fingerprint = ? AND field = ?
-                GROUP BY new_value
-                ORDER BY vote_count DESC
-                LIMIT 1
             ''', (fingerprint, field))
-
-            result = c.fetchone()
-
-            if result and result['vote_count'] >= min_votes:
-                return result['new_value'], result['vote_count']
-            return None, 0
+            filas = [(r['votante'], r['corrected_at'], r['new_value'])
+                     for r in c.fetchall()]
         finally:
             conn.close()
+
+        cuentas = self.cuentas_de_votantes(v for v, _, _ in filas)
+        reparto = _reparto(_un_voto_por_cuenta(filas, cuentas))
+        if not reparto:
+            return None, 0
+        valor, votos = next(iter(reparto.items()))
+        if votos >= min_votes:
+            return valor, votos
+        return None, 0
 
     def get_collective_genre(self, fingerprint):
         """Legacy: usa get_consensus con minimo 3 votos."""
@@ -1668,32 +1712,30 @@ class AnalysisDB:
         try:
             c = conn.cursor()
 
+            # Mismo criterio que `get_consensus`: un voto por CUENTA.
+            # Tenerlo distinto en los dos sitios haria que el mismo track diera
+            # consensos diferentes segun por donde se preguntara.
             c.execute('''
-                -- Mismo criterio que `get_consensus`: un voto por
-                -- DISPOSITIVO. Tenerlo distinto en los dos sitios haria
-                -- que el mismo track diera consensos diferentes segun
-                -- por donde se preguntara.
-                SELECT field, new_value,
-                       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS vote_count
+                SELECT field, COALESCE(device_id, 'anon:' || id) AS votante,
+                       corrected_at, new_value
                 FROM corrections
                 WHERE fingerprint = ?
-                GROUP BY field, new_value
-                ORDER BY field, vote_count DESC
             ''', (fingerprint,))
-
             rows = c.fetchall()
-
-            result = {}
-            for row in rows:
-                field = row['field']
-                value = row['new_value']
-                count = row['vote_count']
-                if field not in result or count > result[field][1]:
-                    result[field] = (value, count)
-
-            return result
         finally:
             conn.close()
+
+        cuentas = self.cuentas_de_votantes(r['votante'] for r in rows)
+        por_campo = {}
+        for r in rows:
+            por_campo.setdefault(r['field'], []).append(
+                (r['votante'], r['corrected_at'], r['new_value']))
+        result = {}
+        for field, filas in por_campo.items():
+            reparto = _reparto(_un_voto_por_cuenta(filas, cuentas))
+            if reparto:
+                result[field] = next(iter(reparto.items()))
+        return result
 
     # ==================== BUSQUEDAS ====================
 
@@ -2473,29 +2515,14 @@ class AnalysisDB:
           - >= 3 votos totales al winner.
           - winner supera al 2do por >= 2 votos.
         """
-        fingerprint = self.canonical_community_key(fingerprint)
-        conn = self._open_conn()
-        try:
-            c = conn.cursor()
-            c.execute('''
-                SELECT value, COUNT(*) AS votes
-                FROM community_overrides
-                WHERE fingerprint = ? AND field = ?
-                GROUP BY value
-                ORDER BY votes DESC
-            ''', (fingerprint, field))
-            rows = c.fetchall()
-        finally:
-            conn.close()
-
-        if not rows:
+        distribution = self.get_community_votes(fingerprint, field)
+        if not distribution:
             return None
 
-        distribution = {r['value']: r['votes'] for r in rows}
         total = sum(distribution.values())
-        winner_value = rows[0]['value']
-        winner_votes = rows[0]['votes']
-        second_votes = rows[1]['votes'] if len(rows) > 1 else 0
+        ranking = list(distribution.items())
+        winner_value, winner_votes = ranking[0]
+        second_votes = ranking[1][1] if len(ranking) > 1 else 0
 
         if winner_votes < 3:
             return None
@@ -2538,22 +2565,7 @@ class AnalysisDB:
         - Si algun valor no parsea a float se ignora (defensivo, los votos
           deberian estar normalizados por _validate_community_field).
         """
-        fingerprint = self.canonical_community_key(fingerprint)
-        conn = self._open_conn()
-        try:
-            c = conn.cursor()
-            c.execute('''
-                SELECT value, COUNT(*) AS votes
-                FROM community_overrides
-                WHERE fingerprint = ? AND field = ?
-                GROUP BY value
-                ORDER BY votes DESC
-            ''', (fingerprint, field))
-            rows = c.fetchall()
-        finally:
-            conn.close()
-
-        distribution = {r['value']: r['votes'] for r in rows}
+        distribution = self.get_community_votes(fingerprint, field)
         total_voters = sum(distribution.values())
 
         if total_voters < threshold:
@@ -2598,22 +2610,27 @@ class AnalysisDB:
         }
 
     def get_community_votes(self, fingerprint: str, field: str) -> Dict:
-        """Distribucion bruta de votos por (fp, field). Siempre devuelve dict."""
+        """Reparto de votos por (fp, field), del más votado al menos. Siempre
+        devuelve dict.
+
+        Un voto por CUENTA (sync.db), no por aparato: el DJ con escritorio y
+        móvil es una opinión, no dos. Si dos aparatos de la misma cuenta votan
+        distinto, vale el más reciente. Es la base de los dos consensos
+        (`get_community_consensus` y el numérico), así que cuentan igual.
+        """
         fingerprint = self.canonical_community_key(fingerprint)
         conn = self._open_conn()
         try:
-            c = conn.cursor()
-            c.execute('''
-                SELECT value, COUNT(*) AS votes
+            rows = conn.execute('''
+                SELECT device_id, created_at, value
                 FROM community_overrides
                 WHERE fingerprint = ? AND field = ?
-                GROUP BY value
-                ORDER BY votes DESC
-            ''', (fingerprint, field))
-            rows = c.fetchall()
+            ''', (fingerprint, field)).fetchall()
         finally:
             conn.close()
-        return {r['value']: r['votes'] for r in rows}
+        filas = [(r['device_id'], r['created_at'], r['value']) for r in rows]
+        cuentas = self.cuentas_de_votantes(d for d, _, _ in filas)
+        return _reparto(_un_voto_por_cuenta(filas, cuentas))
 
     def delete_community_override(
         self, fingerprint: str, device_id: str, field: str,

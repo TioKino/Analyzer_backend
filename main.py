@@ -15,7 +15,7 @@ Estructura:
 from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sync_endpoints import sync_router, admin_sync_router
+from sync_endpoints import sync_router, admin_sync_router, cuentas_de_dispositivos
 from routes.admin_panel import admin_panel_router
 from routes.search import search_router, init as init_search
 from routes.community import community_router, init as init_community
@@ -969,6 +969,8 @@ async def report_client_event(payload: ClientEventPayload, request: Request):
 
 # Inicializar BD con path de config (no hardcoded)
 db = AnalysisDB(db_path=DATABASE_PATH)
+# El consenso de la comunidad cuenta por CUENTA, y las cuentas viven en sync.db.
+db.cuentas_de = cuentas_de_dispositivos
 
 # Sembrar `device_first_seen` ANTES de purgar, no despues: la purga borra los
 # eventos de los que hay que leer el D0. Al reves, cada deploy tiraria justo lo

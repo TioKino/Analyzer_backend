@@ -208,6 +208,27 @@ def test_la_ultima_senal_cubre_a_TODOS_los_cortos_no_solo_a_los_idos(analysis_db
     assert r['por_causa']['activo_sin_traer_mas'] == 1
 
 
+def test_de_los_GRANDES_tambien_se_sabe_si_siguen_vivos(analysis_db):
+    # El hueco que quedo apuntado el 2026-09-17: la señal solo se miraba en
+    # los cortos, así que no se sabía cuántos de los de biblioteca grande
+    # siguen vivos — y todas las proporciones van sobre ese total.
+    _sembrar(
+        analysis_db,
+        eventos=[('grande_vivo', 'app_opened', _dias(3) + 'T10:00', 'macos_dmg'),
+                 ('grande_ido', 'app_opened', _dias(45) + 'T10:00', 'windows'),
+                 ('corto', 'app_opened', _dias(3) + 'T10:00', 'ios')],
+        altas=[('grande_vivo', _dias(200)), ('grande_ido', _dias(200)),
+               ('corto', _dias(60))])
+    r = admin_panel._por_que_se_quedan_cortos(
+        {'grande_vivo': 3000, 'grande_ido': 800, 'grande_mudo': 50, 'corto': 2},
+        umbral=10)
+    g = r['ultima_senal_grandes']
+    assert g['hasta_7d'] == 1 and g['de_31_a_60d'] == 1 and g['sin_eventos'] == 1
+    assert sum(g.values()) == 3
+    # Y los grandes no se cuelan en el histograma de los cortos.
+    assert sum(r['ultima_senal'].values()) == r['devices'] == 1
+
+
 def test_sin_eventos_cae_en_su_cajon_porque_no_se_puede_fechar(analysis_db):
     # `events` se purga a los 90 dias: sin filas no hay forma de saber si se
     # fue hace cuatro meses o si nunca reporto. Inventar una fecha seria peor

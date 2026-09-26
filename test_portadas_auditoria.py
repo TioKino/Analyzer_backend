@@ -7,7 +7,8 @@ Auditoria de portadas (2026-09-26): lo que se arreglo en el backend.
 - `/analyze` preferia la de internet a la del fichero si pesaba mas.
 - Los AIFF/WAV no daban portada (llevan ID3 dentro y se buscaba `.pictures`).
 - Cada peticion de una huella sin portada volvia a salir a internet.
-- La subida pisaba siempre; ahora el cliente puede pedir `solo_si_falta`.
+- La subida pisaba siempre; ahora el cliente puede pedir `solo_si_falta`, y
+  pisar exige el `X-Device-Token` de un aparato registrado.
 - El escritorio busca por su cuenta: `GET /artwork/{fp}?online=0`.
 """
 
@@ -206,6 +207,34 @@ def cupo_limpio():
     yield
 
 
+def _token_registrado():
+    """Un aparato dado de alta en sync.db, con su token."""
+    import sync_endpoints as se
+
+    conn = se._get_conn()
+    device_id, token = uuid.uuid4().hex, "tok-" + uuid.uuid4().hex
+    conn.execute("INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)",
+                 ("u-portadas", se._now_iso()))
+    conn.execute(
+        "INSERT INTO user_devices (device_id, user_id, device_type, device_name, "
+        "linked_at, device_token) VALUES (?, 'u-portadas', 'macos', 'Mac', ?, ?)",
+        (device_id, se._now_iso(), token))
+    conn.commit()
+    return token
+
+
+@pytest.fixture
+def subida(app_mod):
+    from routes import analysis_artwork as aw
+
+    fp = uuid.uuid4().hex
+    yield fp, TestClient(app_mod.app)
+    for ext in ("jpg", "png"):
+        ruta = os.path.join(aw.ARTWORK_CACHE_DIR, f"{fp}.{ext}")
+        if os.path.exists(ruta):
+            os.unlink(ruta)
+
+
 def _track_en_bd(app_mod):
     fp = uuid.uuid4().hex
     app_mod.db.save_track({
@@ -243,25 +272,31 @@ class TestLasRutas:
         cliente.get(f"/artwork/{fp}", headers=h)
         assert len(llamadas) == 3, "un «no hay» seguro no vuelve a salir a internet"
 
-    def test_solo_si_falta_no_pisa(self, app_mod):
-        from routes import analysis_artwork as aw
-        fp = uuid.uuid4().hex
-        cliente = TestClient(app_mod.app)
+    def test_solo_si_falta_no_pisa(self, app_mod, subida):
+        fp, cliente = subida
         r = cliente.post(f"/artwork/upload/{fp}", files={"file": ("a.jpg", JPG)})
+        assert r.json()["status"] == "ok", "la primera entra aunque no traiga credencial"
+        r = cliente.post(f"/artwork/upload/{fp}?solo_si_falta=1",
+                         files={"file": ("b.jpg", JPG_OTRA)},
+                         headers={"X-Device-Token": _token_registrado()})
+        assert r.json()["status"] == "exists"
+        assert cliente.get(f"/artwork/{fp}").content == JPG
+
+    def test_pisar_exige_un_aparato_registrado(self, app_mod, subida):
+        fp, cliente = subida
+        cliente.post(f"/artwork/upload/{fp}", files={"file": ("a.jpg", JPG)})
+        for cabeceras in ({}, {"X-Device-Token": "inventado-" + "x" * 30}):
+            r = cliente.post(f"/artwork/upload/{fp}",
+                             files={"file": ("b.jpg", JPG_OTRA)}, headers=cabeceras)
+            assert r.json()["status"] == "exists", cabeceras
+            assert cliente.get(f"/artwork/{fp}").content == JPG, (
+                "sin credencial, un curl cambiaba la portada a todos los que "
+                "tienen ese fichero")
+        # La del propio fichero, desde un aparato registrado, sí pisa.
+        r = cliente.post(f"/artwork/upload/{fp}", files={"file": ("b.jpg", JPG_OTRA)},
+                         headers={"X-Device-Token": _token_registrado()})
         assert r.json()["status"] == "ok"
-        try:
-            r = cliente.post(f"/artwork/upload/{fp}?solo_si_falta=1",
-                             files={"file": ("b.jpg", JPG_OTRA)})
-            assert r.json()["status"] == "exists"
-            assert cliente.get(f"/artwork/{fp}").content == JPG
-            # Sin la marca, pisa (la del propio fichero).
-            cliente.post(f"/artwork/upload/{fp}", files={"file": ("b.jpg", JPG_OTRA)})
-            assert cliente.get(f"/artwork/{fp}").content == JPG_OTRA
-        finally:
-            for ext in ("jpg", "png"):
-                ruta = os.path.join(aw.ARTWORK_CACHE_DIR, f"{fp}.{ext}")
-                if os.path.exists(ruta):
-                    os.unlink(ruta)
+        assert cliente.get(f"/artwork/{fp}").content == JPG_OTRA
 
     def test_id_raro_es_404(self, app_mod):
         cliente = TestClient(app_mod.app)

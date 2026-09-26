@@ -193,8 +193,12 @@ def test_los_DOS_caminos_de_consenso_cuentan_igual():
     # Acotado a las dos funciones: ese mismo COUNT se usa tambien en una query
     # de dispositivos que no tiene nada que ver, y contar sobre el fichero
     # entero ataria el test a codigo ajeno.
+    # Desde el 2026-09-26 cuentan por CUENTA (test_consenso_por_cuenta.py):
+    # los dos pasan por el mismo `_un_voto_por_cuenta`, y los dos siguen
+    # contando una a una las filas viejas sin device_id.
     for fn in ('def get_consensus(', 'def get_all_consensus('):
         i = src.index(fn)
-        cuerpo = src[i:i + 2500]
-        assert "COUNT(DISTINCT COALESCE(device_id, 'anon:' || id))" in cuerpo, fn
+        cuerpo = src[i:i + 3000]
+        assert "COALESCE(device_id, 'anon:' || id)" in cuerpo, fn
+        assert '_un_voto_por_cuenta(' in cuerpo, fn
     assert 'COUNT(DISTINCT track_id || corrected_at)' not in src

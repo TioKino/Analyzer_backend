@@ -2425,6 +2425,10 @@ def _por_que_se_quedan_cortos(
         por_device = _tracks_por_device()
 
     cortos = {d: n for d, n in por_device.items() if n < umbral}
+    # Los de biblioteca grande solo se miran para una cosa: si siguen vivos.
+    # Sin eso no se sabe cuántos de ellos son parque real, y todas las
+    # proporciones de los cortos van sobre un total que podría estar inflado.
+    grandes = {d for d, n in por_device.items() if n >= umbral}
     vacio = {
         'umbral': umbral,
         'devices': len(cortos),
@@ -2446,6 +2450,7 @@ def _por_que_se_quedan_cortos(
         # Agregados por device en UNA pasada, y se guarda solo lo de los que
         # nos interesan: el cursor se itera, nada de `fetchall()`.
         eventos = {}
+        ultimo_de_grande = {}
         rows = adb.execute(
             "SELECT device_id,"
             " MAX(substr(timestamp,1,10)) AS ultimo,"
@@ -2456,6 +2461,8 @@ def _por_que_se_quedan_cortos(
         for dev, ultimo, ini, fin in rows:
             if dev in cortos:
                 eventos[dev] = (ultimo, int(ini or 0), int(fin or 0))
+            elif dev in grandes:
+                ultimo_de_grande[dev] = ultimo
 
         altas = {}
         try:
@@ -2512,22 +2519,28 @@ def _por_que_se_quedan_cortos(
     limite_alta_30 = (hoy - timedelta(days=30)).isoformat()
     limite_alta_90 = (hoy - timedelta(days=90)).isoformat()
 
+    def _cajon_de_senal(ultimo):
+        if ultimo is None:
+            return 'sin_eventos'
+        for limite, clave in limites_senal:
+            if ultimo >= limite:
+                return clave
+        # Mas viejo que 90 dias no deberia existir: `events` se purga ahi. Si
+        # aparece, es una fila que la purga no alcanzo.
+        return 'sin_eventos'
+
+    # El mismo histograma para los de biblioteca GRANDE (el «hueco conocido»
+    # que quedo apuntado el 2026-09-17): cuántos de ellos siguen vivos.
+    ultima_senal_grandes = dict.fromkeys(ultima_senal, 0)
+    for dev in grandes:
+        ultima_senal_grandes[_cajon_de_senal(ultimo_de_grande.get(dev))] += 1
+
     for dev in cortos:
         alta = altas.get(dev)
         ultimo, ini, fin = eventos.get(dev, (None, 0, 0))
 
         # Histograma de ultima senal: sobre TODOS los cortos, sin excepciones.
-        if ultimo is None:
-            ultima_senal['sin_eventos'] += 1
-        else:
-            for limite, clave in limites_senal:
-                if ultimo >= limite:
-                    ultima_senal[clave] += 1
-                    break
-            else:
-                # Mas viejo que 90 dias no deberia existir: `events` se purga
-                # ahi. Si aparece, es una fila que la purga no alcanzo.
-                ultima_senal['sin_eventos'] += 1
+        ultima_senal[_cajon_de_senal(ultimo)] += 1
 
         if alta and alta >= limite_nuevo:
             causas['recien_llegado'] += 1
@@ -2559,6 +2572,7 @@ def _por_que_se_quedan_cortos(
         'de_un_total_de': len(por_device),
         'por_causa': causas,
         'ultima_senal': ultima_senal,
+        'ultima_senal_grandes': ultima_senal_grandes,
         'idos_por_alta': idos_por_alta,
         'nota': ('import_sin_terminar es COTA SUPERIOR: cancelar el dialogo '
                  'tambien deja un import_started suelto'),

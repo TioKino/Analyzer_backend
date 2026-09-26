@@ -41,6 +41,7 @@ from fastapi.responses import FileResponse, Response
 
 from validation import artwork_online_allowed, get_client_ip
 from pydantic import BaseModel
+from sync_endpoints import dispositivo_del_token
 
 logger = logging.getLogger(__name__)
 
@@ -532,26 +533,41 @@ async def get_artwork(track_id: str, request: Request = None, online: int = 1):
 
 
 @router.post("/artwork/upload/{fingerprint}")
-async def upload_artwork(fingerprint: str, file: UploadFile = File(...),
+async def upload_artwork(fingerprint: str, request: Request,
+                         file: UploadFile = File(...),
                          solo_si_falta: int = 0):
     """Recibe artwork desde el local engine para que Render lo sirva
     también a otros devices vía `/artwork/{fingerprint}`. Sin esto,
     cuando el local engine analiza un track el artwork se queda en
     disco PC y los móviles ven placeholder.
 
-    Sanitiza el fingerprint (solo hex 32 chars). Acepta JPEG/PNG.
-    Idempotente: re-subir el mismo fp sobreescribe.
+    Sanitiza el fingerprint (solo hex 32 chars). Acepta JPEG/PNG/WEBP/GIF.
 
     `solo_si_falta=1`: si ya hay portada para esa huella, no se toca y se
     contesta `exists`. Lo manda el escritorio con todo lo que NO sale del
     propio fichero (una busqueda o una identificacion pueden equivocarse, y la
     portada de una huella la ven todos los que tienen ese fichero). La que
     viene DENTRO del fichero si pisa: es parte de su contenido.
+
+    Pisar exige ser un aparato registrado (`X-Device-Token` del sync). Sin
+    credencial la subida vale igual, pero como `solo_si_falta`: la portada de
+    una huella la ven todos los que tienen ese fichero, y hasta el 2026-09-26
+    un curl sin nada podía cambiársela a todos. No lo hace imposible (el
+    token lo saca cualquiera que se registre con el secreto del binario),
+    pero lo sube de «un curl» a «registrarse», y cada pisada queda en el log
+    con el aparato que la hizo.
     """
     safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
     if not safe_fp or len(safe_fp) > 64:
         raise HTTPException(400, "fingerprint inválido")
-    if solo_si_falta and _cacheada(safe_fp)[0]:
+    quien = None
+    if not solo_si_falta:
+        quien = await run_in_threadpool(
+            dispositivo_del_token, request.headers.get("X-Device-Token", ""))
+        if not quien:
+            solo_si_falta = 1
+    habia = _cacheada(safe_fp)[0]
+    if solo_si_falta and habia:
         return {"status": "exists", "fingerprint": safe_fp}
 
     content = await file.read()
@@ -590,5 +606,7 @@ async def upload_artwork(fingerprint: str, file: UploadFile = File(...),
     with open(cache_path, 'wb') as f:
         f.write(content)
     _SIN_PORTADA.pop(safe_fp, None)
+    if habia:
+        logger.info(f"[Artwork] {safe_fp} pisada por {quien}")
 
     return {"status": "ok", "fingerprint": safe_fp, "size": len(content), "ext": ext}
