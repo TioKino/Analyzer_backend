@@ -1057,7 +1057,9 @@ init_lookup(
     # recien formateada, donde la BD local esta vacia pero Render lo tiene todo.
     render_cache_lookup=(_fetch_render_cache if IS_LOCAL_ENGINE else None),
     # Lambda y no la función: `_lo_mejor_para` se define más abajo.
-    lo_mejor=lambda *a: _lo_mejor_para(*a),
+    # Sin ir a Render desde el motor local: es la lectura por huella del
+    # pre-check del import, una por tema (ver `_lo_mejor_para`).
+    lo_mejor=lambda *a: _lo_mejor_para(*a, a_render=False),
 )
 app.include_router(lookup_router)
 
@@ -1456,14 +1458,19 @@ def _sumar_lo_importado(best, exacto):
 
 
 def _lo_mejor_para(fingerprint, acoustic_id=None, chromaprint=None,
-                   duration=None):
+                   duration=None, a_render=True):
     """Lo MEJOR que la memoria colectiva sabe de este fichero: el análisis más
     fiable del cluster acústico más lo que los programas de DJ de cualquiera
     dicen de él (`imported_values`). None si no aporta nada.
 
     El motor local no tiene la memoria colectiva (su analysis.db es solo de
-    esta máquina): pregunta a Render por `/cluster-best`."""
-    if IS_LOCAL_ENGINE:
+    esta máquina): pregunta a Render por `/cluster-best` — pero SOLO si
+    `a_render`. Una consulta a Render por tema en los caminos rápidos
+    (acierto de caché, lectura por huella) convertía reimportar 5.000 temas
+    ya analizados en 5.000 viajes a Render. Ahí se queda con su BD, como
+    antes, y la memoria colectiva le llega por el análisis NUEVO y al abrir la
+    ficha, que el cliente pregunta directamente a Render."""
+    if IS_LOCAL_ENGINE and a_render:
         return _lo_mejor_de_render(fingerprint, chromaprint, duration)
     best = dict(db.best_cluster_analysis(acoustic_id) or {}) if acoustic_id else {}
     if fingerprint:
@@ -1494,7 +1501,7 @@ def _lo_mejor_de_render(fingerprint, chromaprint, duration):
         return None
 
 
-def _mejorar_con_la_comunidad(result):
+def _mejorar_con_la_comunidad(result, fingerprint=None, a_render=False):
     """Aplica al resultado de /analyze lo mejor que sabe la memoria colectiva
     de ese fichero, salga por el camino que salga (análisis nuevo, acierto por
     nombre o por huella, fallback a Render).
@@ -1503,7 +1510,7 @@ def _mejorar_con_la_comunidad(result):
     caso de quien reimporta su carpeta— se devolvía tal cual estaba guardado.
     Solo SUBE de fiabilidad; nunca rompe /analyze."""
     from analysis_ranking import get_source_priority
-    fp = getattr(result, 'fingerprint', None)
+    fp = fingerprint or getattr(result, 'fingerprint', None)
     if not fp:
         return
     # Si el BPM y la tonalidad ya son de un programa de DJ, no hay nada mejor
@@ -1514,7 +1521,8 @@ def _mejorar_con_la_comunidad(result):
     try:
         fila = db.get_track_by_fingerprint(fp) or {}
         best = _lo_mejor_para(fp, fila.get('acoustic_id'),
-                              fila.get('chromaprint'), fila.get('duration'))
+                              fila.get('chromaprint'), fila.get('duration'),
+                              a_render=a_render)
         _adopt_better_metadata(result, best)
     except Exception as e:  # noqa: BLE001 - best-effort
         logger.warning(f"[Comunidad] mejorar /analyze fallo (no critico): {e}")
@@ -3586,7 +3594,11 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # Lo mejor del cluster acustico (otra version del mismo audio con
         # fuente superior) y lo que los programas de DJ de otros dicen de el
         # lo aplica `_mejorar_con_la_comunidad` al salir de /analyze, para
-        # TODOS los caminos, no solo este. En el motor local pregunta a Render.
+        # TODOS los caminos. El motor local pregunta a Render SOLO aqui, en el
+        # analisis nuevo, que ya tarda segundos: en los aciertos de cache seria
+        # un viaje a Render por tema (ver `_lo_mejor_para`).
+        if IS_LOCAL_ENGINE:
+            _mejorar_con_la_comunidad(result, fingerprint, a_render=True)
 
         # Incrementar contador de popularidad. El device_id va AHORA (BUG-01):
         # la cabecera ya se leia unas lineas mas arriba para la contabilidad de

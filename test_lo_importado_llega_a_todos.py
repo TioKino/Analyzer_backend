@@ -307,3 +307,39 @@ def test_analyze_mejora_en_todas_sus_salidas():
     envoltorio = fuente[fuente.index('async def analyze_track('):
                         fuente.index('async def _analizar(')]
     assert '_mejorar_con_la_comunidad' in envoltorio
+
+
+def test_el_motor_local_no_va_a_render_en_los_caminos_rapidos(app_mod, monkeypatch):
+    """Un acierto de caché o una lectura por huella en el motor local no puede
+    costar un viaje a Render: reimportar 5.000 temas ya analizados serían
+    5.000. Solo el análisis NUEVO pregunta (y el cliente, al abrir la ficha,
+    va directo a Render)."""
+    llamadas = []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {'found': False}
+
+    monkeypatch.setattr(app_mod, 'IS_LOCAL_ENGINE', True)
+    monkeypatch.setattr(app_mod.requests, 'post',
+                        lambda *a, **k: llamadas.append(a) or _Resp())
+    fp = _analizado(app_mod)
+
+    app_mod._mejorar_con_la_comunidad(_resultado(fp))   # salida de /analyze
+    TestClient(app_mod.app).get(f'/analysis/by-fingerprint/{fp}')
+    assert llamadas == []
+
+    app_mod._mejorar_con_la_comunidad(_resultado(fp), fp, a_render=True)
+    assert len(llamadas) == 1, 'el análisis nuevo sí pregunta a Render'
+
+
+def test_el_panel_cuenta_lo_que_de_verdad_se_comparte(db):
+    fp1, fp2 = _fp(), _fp()
+    _voto(db, 'a', fp1, fuente='rekordbox', bpm=128.0, key='Am', camelot='8A')
+    _voto(db, 'b', fp2, fuente='traktor', bpm=124.0)
+    r = db.resumen_lo_importado()
+    assert (r['votos'], r['huellas'], r['aparatos']) == (3, 2, 2)
+    assert r['por_fuente'] == {'rekordbox': {'bpm': 1, 'key': 1},
+                               'traktor': {'bpm': 1}}

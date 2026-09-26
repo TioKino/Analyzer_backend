@@ -1609,7 +1609,21 @@ async def telemetry(request: Request):
         # metrica refleja "del total de tracks de los usuarios, cuantos
         # tienen ALGUNA fuente de artwork".
         "artwork_real": artwork_coverage_real,
+        # Lo que los programas de DJ de los usuarios dicen de sus temas y ha
+        # llegado a la memoria colectiva (`imported_values`, desde el
+        # 2026-09-26). OJO: `sources` de arriba sale de sync.db, o sea de las
+        # bibliotecas PERSONALES, y por eso enseñaba `rekordbox` mientras al
+        # servidor no llegaba ni uno. Esto es lo que de verdad comparten.
+        "lo_importado": _resumen_lo_importado(),
     }
+
+
+def _resumen_lo_importado():
+    try:
+        return db.resumen_lo_importado()
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] resumen de lo importado fallo: {e}")
+        return None
 
 
 # ── GET /admin/funnel ──────────────────────────────────────

@@ -2436,6 +2436,35 @@ class AnalysisDB:
             conn.close()
         return len(filas)
 
+    def resumen_lo_importado(self) -> Dict:
+        """Cuánto de lo importado ha llegado a la memoria colectiva, para el
+        panel: votos, huellas y aparatos distintos, por programa y campo.
+        Agregado de una tabla pequeña (un voto por aparato, campo y tema), sin
+        recorrer `tracks`."""
+        conn = self._open_conn()
+        try:
+            total = conn.execute(
+                'SELECT COUNT(*) AS votos, COUNT(DISTINCT fingerprint) AS huellas, '
+                'COUNT(DISTINCT device_id) AS aparatos FROM imported_values'
+            ).fetchone()
+            por = conn.execute(
+                'SELECT source, field, COUNT(*) AS n FROM imported_values '
+                'GROUP BY source, field'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {'votos': 0, 'huellas': 0, 'aparatos': 0, 'por_fuente': {}}
+        finally:
+            conn.close()
+        por_fuente = {}
+        for r in por:
+            por_fuente.setdefault(r['source'], {})[r['field']] = r['n']
+        return {
+            'votos': total['votos'],
+            'huellas': total['huellas'],
+            'aparatos': total['aparatos'],
+            'por_fuente': por_fuente,
+        }
+
     def lo_importado_de(self, fingerprints, exacta: Optional[str] = None) -> Dict:
         """Lo que los programas de DJ dicen de estas huellas (las versiones de
         un mismo sonido), listo para competir en el ranking.
