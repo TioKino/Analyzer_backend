@@ -987,6 +987,17 @@ try:
 except Exception as _e:  # noqa: BLE001 - best-effort
     logger.warning(f"[Events] backfill de first_seen fallo: {_e}")
 
+# La memoria colectiva que se quedó huérfana al entrar su tema en un cluster
+# acústico (notas, valoraciones, votos escritos bajo la huella ANTES de que el
+# tema tuviera cluster: ver `_mudar_memoria_al_cluster`). Desde 2026-09-26 se
+# muda en el momento; esto recoge lo de antes. Idempotente.
+try:
+    _mudadas = db.realinear_memoria_colectiva()
+    if _mudadas:
+        logger.info(f"[Community] {_mudadas} filas de la memoria mudadas a su cluster")
+except Exception as _e:  # noqa: BLE001 - best-effort
+    logger.warning(f"[Community] realinear la memoria fallo: {_e}")
+
 # Purga best-effort de eventos viejos (>90d) para que la tabla `events` del
 # embudo no crezca sin limite. No bloquea el arranque si falla.
 try:
@@ -5046,6 +5057,29 @@ async def lo_importado_endpoint(req: LoImportadoRequest, request: Request):
     votos = await run_in_threadpool(db.guardar_lo_importado, device, validos)
     return {"status": "ok", "votos": votos,
             "descartados": len(req.items) - len(validos)}
+
+
+@app.get("/community/de-este-aparato")
+async def lo_de_este_aparato(device_id: str):
+    """SOLO en el motor local: las valoraciones y notas que este aparato dejó
+    en la memoria colectiva MIENTRAS apuntaba al motor local.
+
+    Hasta el 2026-09-26 el escritorio mandaba todo `/community/*` a
+    `backendUrl`, que con el motor local arrancado es 127.0.0.1: las notas,
+    las estrellas, las zonas de cues y los votos del EXE de Windows y del DMG
+    se guardaban en la BD de esta máquina y no salían de ella. Hoy van a
+    Render, y la app usa esto UNA vez para llevarse lo que quedó aquí. Las
+    valoraciones sobre todo: son personales, solo viven en el servidor, y sin
+    mudarlas el DJ vería desaparecer sus estrellas.
+
+    Cada fila sale con la HUELLA del fichero, no con la clave local: el
+    cluster de esta BD es de esta máquina y en Render no significa nada.
+
+    En Render da 404: listar lo de un aparato por su id no se ofrece ahí.
+    """
+    if not IS_LOCAL_ENGINE:
+        raise HTTPException(404, "Solo en el motor local")
+    return await run_in_threadpool(db.lo_de_este_aparato, device_id)
 
 
 class BackfillFingerprintRequest(BaseModel):

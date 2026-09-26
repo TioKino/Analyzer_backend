@@ -378,6 +378,11 @@ class AnalysisDB:
             )
         ''')
 
+        # Se busca y se muda por clave (`get_consensus`,
+        # `_mudar_memoria_al_cluster`): sin indice, cada una recorre la tabla.
+        c.execute('CREATE INDEX IF NOT EXISTS idx_corrections_fp '
+                  'ON corrections(fingerprint)')
+
         # Notas DJ
         c.execute('''
             CREATE TABLE IF NOT EXISTS dj_notes (
@@ -902,8 +907,17 @@ class AnalysisDB:
                 'WHERE fingerprint = ? OR id = ?',
                 (chromaprint_b64, acoustic_id, fingerprint, fingerprint),
             )
+            actualizadas = c.rowcount
+            if actualizadas and acoustic_id:
+                # El tema acaba de entrar en un cluster: lo que se guardó bajo
+                # su huella se muda con él (ver `_mudar_memoria_al_cluster`).
+                claves = {fingerprint}
+                for f in self._tracks_por_huella_o_id(c, 'id, fingerprint',
+                                                      [fingerprint]):
+                    claves.update((f['id'], f['fingerprint']))
+                self._mudar_memoria_al_cluster(c, claves, acoustic_id)
             conn.commit()
-            return c.rowcount > 0
+            return actualizadas > 0
         finally:
             conn.close()
 
@@ -1106,6 +1120,146 @@ class AnalysisDB:
         finally:
             conn.close()
         return list(keys)
+
+    # Lo que la memoria colectiva guarda con la clave del CLUSTER
+    # (`canonical_community_key`): notas, valoraciones, rejilla corregida,
+    # votos de cambios a mano y quién lo analizó. `track_popularity` también,
+    # pero es un contador y se suma aparte. Los cues comunitarios NO: van por
+    # huella y se leen juntando el cluster (`fingerprints_in_cluster`); y lo
+    # importado tampoco, que va por huella EXACTA a propósito.
+    _MEMORIA_POR_CLUSTER = (
+        'community_notes', 'track_ratings', 'beat_grid_corrections',
+        'community_overrides', 'corrections', 'track_analyzers',
+    )
+
+    def _mudar_memoria_al_cluster(self, c, viejas, aid) -> int:
+        """Muda a la clave del cluster [aid] lo que se guardó bajo [viejas]
+        (la huella o el id de un tema) antes de que ese tema tuviera cluster.
+
+        La clave de la memoria colectiva se decide al ESCRIBIR y al LEER con
+        `canonical_community_key`: el cluster si el tema lo tiene, y si no, su
+        huella. Así que en cuanto un tema recibe su huella acústica (backfill,
+        o la cura del cache-hit) la clave CAMBIA, y todo lo escrito antes
+        —notas, valoraciones, votos— se queda debajo de la vieja, donde ya no
+        lo lee nadie: ni el que lo escribió ni el que tiene otro fichero del
+        mismo tema. Medido el 2026-09-26: una nota escrita antes del backfill
+        desaparecía después, también para su autor.
+
+        Un choque (el mismo aparato ya tiene fila bajo el cluster) se queda
+        donde estaba (`UPDATE OR IGNORE`): la de debajo del cluster es la más
+        nueva. No hace commit. Devuelve cuántas filas se mudaron.
+        """
+        viejas = sorted({k for k in viejas if k and k != aid})
+        if not aid or not viejas:
+            return 0
+        ph = ','.join('?' * len(viejas))
+        movidas = 0
+        for tabla in self._MEMORIA_POR_CLUSTER:
+            try:
+                c.execute(
+                    f'UPDATE OR IGNORE {tabla} SET fingerprint = ? '
+                    f'WHERE fingerprint IN ({ph})', [aid, *viejas])
+                movidas += max(c.rowcount, 0)
+            except sqlite3.OperationalError:
+                continue  # tabla ausente en una BD vieja
+
+        # La popularidad es un contador por clave: se SUMA a la del cluster.
+        c.execute(
+            'SELECT COALESCE(SUM(analysis_count), 0) AS n, MAX(last_analyzed) AS l, '
+            f'COUNT(*) AS filas FROM track_popularity WHERE fingerprint IN ({ph})',
+            viejas)
+        pop = c.fetchone()
+        if pop and pop['filas']:
+            c.execute(
+                'INSERT INTO track_popularity (fingerprint, analysis_count, last_analyzed) '
+                'VALUES (?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET '
+                'analysis_count = analysis_count + excluded.analysis_count, '
+                'last_analyzed = MAX(COALESCE(last_analyzed, \'\'), '
+                'COALESCE(excluded.last_analyzed, \'\'))',
+                (aid, pop['n'], pop['l']))
+            c.execute(f'DELETE FROM track_popularity WHERE fingerprint IN ({ph})',
+                      viejas)
+            movidas += pop['filas']
+
+        if movidas:
+            # Lo que se deriva de lo mudado, recontado sobre el cluster.
+            c.execute('SELECT COUNT(*) FROM track_analyzers WHERE fingerprint = ?',
+                      (aid,))
+            djs = max(1, int((c.fetchone() or [0])[0] or 0))
+            c.execute('SELECT AVG(rating) AS avg, COUNT(*) AS cnt '
+                      'FROM track_ratings WHERE fingerprint = ?', (aid,))
+            agg = c.fetchone()
+            c.execute(
+                'UPDATE track_popularity SET dj_count = ?, avg_rating = ?, '
+                'total_ratings = ? WHERE fingerprint = ?',
+                (djs, agg['avg'] or 0, agg['cnt'] or 0, aid))
+        return movidas
+
+    def realinear_memoria_colectiva(self) -> int:
+        """Muda al cluster lo que se quedó huérfano ANTES de que existiera
+        `_mudar_memoria_al_cluster`: todo lo escrito bajo la huella de un tema
+        que después recibió cluster. Idempotente y barato (recorre las tablas
+        de la memoria, que son pequeñas, no `tracks`). Va al arrancar.
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            por_cluster: Dict[str, set] = {}
+            for tabla in (*self._MEMORIA_POR_CLUSTER, 'track_popularity'):
+                for col in ('fingerprint', 'id'):
+                    try:
+                        c.execute(
+                            f'SELECT DISTINCT m.fingerprint AS k, t.acoustic_id AS aid '
+                            f'FROM {tabla} m JOIN tracks t ON t.{col} = m.fingerprint '
+                            'WHERE t.acoustic_id IS NOT NULL '
+                            'AND t.acoustic_id != m.fingerprint')
+                    except sqlite3.OperationalError:
+                        continue
+                    for r in c.fetchall():
+                        por_cluster.setdefault(r['aid'], set()).add(r['k'])
+            movidas = 0
+            for aid, viejas in por_cluster.items():
+                movidas += self._mudar_memoria_al_cluster(c, viejas, aid)
+            conn.commit()
+            return movidas
+        finally:
+            conn.close()
+
+    def lo_de_este_aparato(self, device_id: str) -> Dict[str, list]:
+        """Las valoraciones y notas de [device_id], cada una con la huella de
+        su fichero (ver `/community/de-este-aparato`)."""
+        if not device_id:
+            return {'ratings': [], 'notes': []}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            huellas: Dict[str, Optional[str]] = {}
+
+            def huella(clave):
+                if clave not in huellas:
+                    fila = None
+                    for col in ('fingerprint', 'id', 'acoustic_id'):
+                        c.execute(
+                            f'SELECT fingerprint FROM tracks WHERE {col} = ? '
+                            'AND fingerprint IS NOT NULL LIMIT 1', (clave,))
+                        fila = c.fetchone()
+                        if fila:
+                            break
+                    huellas[clave] = fila['fingerprint'] if fila else clave
+                return huellas[clave]
+
+            c.execute('SELECT fingerprint, rating FROM track_ratings '
+                      'WHERE device_id = ? AND rating > 0', (device_id,))
+            ratings = [{'fingerprint': r['fingerprint'], 'rating': r['rating']}
+                       for r in c.fetchall()]
+            c.execute('SELECT fingerprint, note_text, note_type, display_name '
+                      'FROM community_notes WHERE device_id = ?', (device_id,))
+            notes = [dict(r) for r in c.fetchall()]
+            for fila in (*ratings, *notes):
+                fila['fingerprint'] = huella(fila['fingerprint'])
+            return {'ratings': ratings, 'notes': notes}
+        finally:
+            conn.close()
 
     def get_return_rates(self) -> dict:
         """RETENCION "ROLLING": de los que instalaron, cuantos VOLVIERON ALGUNA
@@ -1677,6 +1831,15 @@ class AnalysisDB:
                 track_data.get('isrc'),
                 track_data.get('platform'),
             ))
+
+            # Si el tema llega con cluster, lo que se guardó bajo su huella
+            # antes de tenerlo se muda con él (la cura del cache-hit rellena
+            # el chromaprint por aquí). Sin nada que mudar son UPDATEs por
+            # índice sobre tablas pequeñas.
+            if track_data.get('acoustic_id'):
+                self._mudar_memoria_al_cluster(
+                    c, (track_data['id'], track_data.get('fingerprint')),
+                    track_data['acoustic_id'])
 
             conn.commit()
         finally:

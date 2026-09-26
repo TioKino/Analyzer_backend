@@ -38,6 +38,7 @@
 # lectura: no hay forma de tocar datos de otro usuario con ellos.
 # ============================================================================
 
+import re
 import sqlite3
 from pydantic import BaseModel
 from typing import List, Optional
@@ -70,6 +71,19 @@ class CueUpload(BaseModel):
     legacy_key: Optional[str] = None
 
 
+class CueBatchItem(BaseModel):
+    """Los cues de UN tema dentro de un envío por lotes."""
+    fingerprint: str
+    cues: List[CueSubmission]
+    legacy_key: Optional[str] = None
+
+
+class CueBatchUpload(BaseModel):
+    """Los cues de muchos temas de un aparato, de una vez. El aparato NO va en
+    el cuerpo: sale del `X-Device-Token` (ver `/community/cues/batch`)."""
+    items: List[CueBatchItem]
+
+
 class CommunityZoneResponse(BaseModel):
     type: str
     start: float  # segundos
@@ -94,6 +108,11 @@ class CommunityResponse(BaseModel):
 # comunitaria. La SQL ya es parametrizada (sin inyeccion); esto acota volumen.
 MAX_CUES_PER_UPLOAD = 200
 MAX_CUE_NOTE_LEN = 500
+# Temas por petición en `/community/cues/batch`. Una biblioteca importada de
+# 3.000 temas son 15 peticiones, no 3.000.
+MAX_TEMAS_POR_LOTE = 200
+
+_HUELLA = re.compile(r'[0-9a-f]{32}')
 
 
 def sanitize_cue_submissions(cues) -> list:
@@ -250,6 +269,67 @@ def aggregate_cues_into_zones(rows, duration_seconds: float = 0,
 
 # ==================== ENDPOINTS ====================
 
+def _guardar_cues(c, fingerprint: str, device_id: str, cues, legacy_key,
+                  now: str) -> list:
+    """Sustituye los cues de ESTE aparato para este tema por [cues].
+
+    Lo comparten el envío de un tema (`/community/cues`) y el de muchos
+    (`/community/cues/batch`). Devuelve los cues guardados, ya saneados. No
+    hace commit: eso le toca a quien llama, una vez por petición.
+    """
+    # Borrar cues anteriores de este device para este track
+    c.execute(
+        'DELETE FROM community_cues WHERE fingerprint = ? AND device_id = ?',
+        (fingerprint, device_id)
+    )
+
+    # Insertar nuevos cues (acotados/saneados — input no confiable)
+    sanitized = sanitize_cue_submissions(cues)
+    for cue_type, position_ms, end_position_ms, note in sanitized:
+        # OR REPLACE: si el mismo upload trae dos cues con igual
+        # (cue_type, position_ms) — o el DELETE previo no cubrió una
+        # colisión — no reventamos por el UNIQUE; nos quedamos con el
+        # último. (Bug visto en prod: "UNIQUE constraint failed:
+        # community_cues.fingerprint, device_id, cue_type, position_ms".)
+        c.execute('''
+            INSERT OR REPLACE INTO community_cues
+            (fingerprint, device_id, cue_type, position_ms, end_position_ms, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            fingerprint,
+            device_id,
+            cue_type,
+            position_ms,
+            end_position_ms,
+            note,
+            now,
+        ))
+
+    # Migracion silenciosa: las filas que este MISMO device dejo bajo
+    # su clave vieja ya estan representadas por las que acabamos de
+    # insertar, asi que sobran. Y no solo sobran: si el DJ movio un
+    # cue, la posicion antigua sigue ahi y la zona sale DOS VECES, en
+    # dos sitios distintos de la onda.
+    #
+    # Acotado a (clave vieja, este device_id): no puede tocar datos de
+    # nadie mas ni la clave nueva. Y solo si de verdad es OTRA clave —
+    # un cliente sin huella manda las dos iguales y ahi borrar seria
+    # borrarse lo que se acaba de escribir.
+    if legacy_key and legacy_key != fingerprint:
+        c.execute(
+            'DELETE FROM community_cues '
+            'WHERE fingerprint = ? AND device_id = ?',
+            (legacy_key, device_id),
+        )
+        if c.rowcount:
+            logger.info(
+                "community_cues: migradas %s filas de %s -> %s (device %s)",
+                c.rowcount, legacy_key[:8],
+                fingerprint[:8], device_id[:12],
+            )
+    return sanitized
+
+
 def register_community_endpoints(app, db):
     """Registra los endpoints de community cues en la app FastAPI"""
 
@@ -280,58 +360,10 @@ def register_community_endpoints(app, db):
         c = conn.cursor()
 
         try:
-            # Borrar cues anteriores de este device para este track
-            c.execute(
-                'DELETE FROM community_cues WHERE fingerprint = ? AND device_id = ?',
-                (upload.fingerprint, upload.device_id)
+            sanitized = _guardar_cues(
+                c, upload.fingerprint, upload.device_id, upload.cues,
+                upload.legacy_key, datetime.now().isoformat(),
             )
-
-            # Insertar nuevos cues (acotados/saneados — input no confiable)
-            now = datetime.now().isoformat()
-            sanitized = sanitize_cue_submissions(upload.cues)
-            for cue_type, position_ms, end_position_ms, note in sanitized:
-                # OR REPLACE: si el mismo upload trae dos cues con igual
-                # (cue_type, position_ms) — o el DELETE previo no cubrió una
-                # colisión — no reventamos por el UNIQUE; nos quedamos con el
-                # último. (Bug visto en prod: "UNIQUE constraint failed:
-                # community_cues.fingerprint, device_id, cue_type, position_ms".)
-                c.execute('''
-                    INSERT OR REPLACE INTO community_cues
-                    (fingerprint, device_id, cue_type, position_ms, end_position_ms, note, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    upload.fingerprint,
-                    upload.device_id,
-                    cue_type,
-                    position_ms,
-                    end_position_ms,
-                    note,
-                    now,
-                ))
-
-            # Migracion silenciosa: las filas que este MISMO device dejo bajo
-            # su clave vieja ya estan representadas por las que acabamos de
-            # insertar, asi que sobran. Y no solo sobran: si el DJ movio un
-            # cue, la posicion antigua sigue ahi y la zona sale DOS VECES, en
-            # dos sitios distintos de la onda.
-            #
-            # Acotado a (clave vieja, este device_id): no puede tocar datos de
-            # nadie mas ni la clave nueva. Y solo si de verdad es OTRA clave —
-            # un cliente sin huella manda las dos iguales y ahi borrar seria
-            # borrarse lo que se acaba de escribir.
-            if upload.legacy_key and upload.legacy_key != upload.fingerprint:
-                c.execute(
-                    'DELETE FROM community_cues '
-                    'WHERE fingerprint = ? AND device_id = ?',
-                    (upload.legacy_key, upload.device_id),
-                )
-                if c.rowcount:
-                    logger.info(
-                        "community_cues: migradas %s filas de %s -> %s (device %s)",
-                        c.rowcount, upload.legacy_key[:8],
-                        upload.fingerprint[:8], upload.device_id[:12],
-                    )
-
             conn.commit()
 
             # Devolver zonas actualizadas agregando TODO el cluster acustico
@@ -366,6 +398,79 @@ def register_community_endpoints(app, db):
         except sqlite3.Error as e:
             logger.error(f"Error saving community cues: {e}")
             return {"status": "error", "message": str(e)}
+
+    @app.post("/community/cues/batch", response_model=dict)
+    async def upload_community_cues_batch(upload: CueBatchUpload,
+                                          http: Request):
+        """Los cues de muchos temas de un aparato, de una vez.
+
+        Es la puerta de lo IMPORTADO: los cues que trae un XML de Rekordbox,
+        Traktor o VirtualDJ. Hasta el 2026-09-26 se guardaban en la biblioteca
+        del DJ y no salían de ahí: solo subían los cues que se tocaban a mano
+        o se exportaban, así que una biblioteca entera de hot cues no aportaba
+        nada a las zonas de nadie. Un tema por petición serían 3.000
+        peticiones al importar una biblioteca: por eso va por lotes.
+
+        Por tema hace lo mismo que `/community/cues` (sustituye los cues de
+        ESTE aparato para esa huella), pero no devuelve zonas: recalcularlas
+        tema a tema es justo el coste que el lote viene a ahorrar.
+
+        Exige un aparato REGISTRADO: el `device_id` sale del `X-Device-Token`,
+        no del cuerpo, así que no se puede escribir en nombre de otro. Y cada
+        tema pasa por el mismo guard de procedencia que un voto suelto: el
+        que lo rechaza se cuenta y el resto sigue.
+        """
+        from datetime import datetime
+
+        from fastapi import HTTPException
+        from routes.community import _guard_vote_source
+        from sync_endpoints import dispositivo_del_token
+
+        device = dispositivo_del_token(http.headers.get("X-Device-Token", ""))
+        if not device:
+            raise HTTPException(401, "Device token required")
+        if len(upload.items) > MAX_TEMAS_POR_LOTE:
+            raise HTTPException(
+                400, f"Máximo {MAX_TEMAS_POR_LOTE} temas por petición")
+
+        # Primero se decide qué entra y DESPUÉS se escribe. El guard apunta
+        # la procedencia con su propia conexión: si se intercalara con las
+        # escrituras de `db.conn`, esperaría al cerrojo de la transacción
+        # abierta en cada tema.
+        aceptados = []
+        descartados = 0
+        for item in upload.items:
+            # Solo la HUELLA: una clave que no lo es (el `track.id` de un
+            # cliente viejo, un id de ghost) escribiría en un compartimento
+            # que no ve nadie.
+            if not _HUELLA.fullmatch(item.fingerprint or '') or not item.cues:
+                descartados += 1
+                continue
+            try:
+                _guard_vote_source(http, item.fingerprint, device)
+            except HTTPException:
+                descartados += 1
+                continue
+            legacy = item.legacy_key
+            aceptados.append(
+                (item, legacy if legacy and _HUELLA.fullmatch(legacy) else None))
+
+        conn = db.conn
+        c = conn.cursor()
+        now = datetime.now().isoformat()
+        cues = 0
+        try:
+            for item, legacy in aceptados:
+                cues += len(_guardar_cues(
+                    c, item.fingerprint, device, item.cues, legacy, now))
+            conn.commit()
+        except sqlite3.Error as e:
+            conn.rollback()
+            logger.error(f"Error saving community cues batch: {e}")
+            raise HTTPException(503, "No se pudieron guardar los cues")
+
+        return {"status": "ok", "temas": len(aceptados), "cues": cues,
+                "descartados": descartados}
 
     @app.get("/community-cues/{fingerprint}", response_model=CommunityResponse)
     @app.get("/community/cues/{fingerprint}", response_model=CommunityResponse)  # alias barra
