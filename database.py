@@ -1277,10 +1277,11 @@ class AnalysisDB:
             conn.close()
 
     def lo_de_este_aparato(self, device_id: str) -> Dict[str, list]:
-        """Las valoraciones y notas de [device_id], cada una con la huella de
-        su fichero (ver `/community/de-este-aparato`)."""
+        """Lo que [device_id] dejó para la comunidad en esta BD —valoraciones,
+        notas, votos de cambios a mano y rejillas corregidas—, cada cosa con la
+        huella de su fichero (ver `/community/de-este-aparato`)."""
         if not device_id:
-            return {'ratings': [], 'notes': []}
+            return {'ratings': [], 'notes': [], 'overrides': [], 'rejillas': []}
         conn = self._open_conn()
         try:
             c = conn.cursor()
@@ -1306,9 +1307,19 @@ class AnalysisDB:
             c.execute('SELECT fingerprint, note_text, note_type, display_name '
                       'FROM community_notes WHERE device_id = ?', (device_id,))
             notes = [dict(r) for r in c.fetchall()]
-            for fila in (*ratings, *notes):
+            # Los votos a mano cuentan para la regla de los tres, y las
+            # rejillas corregidas también: sin mudarlos, lo que este DJ corrigió
+            # con el motor local no contaría nunca.
+            c.execute('SELECT fingerprint, field, value FROM community_overrides '
+                      'WHERE device_id = ?', (device_id,))
+            overrides = [dict(r) for r in c.fetchall()]
+            c.execute('SELECT fingerprint, bpm_adjust, beat_offset, original_bpm '
+                      'FROM beat_grid_corrections WHERE device_id = ?', (device_id,))
+            rejillas = [dict(r) for r in c.fetchall()]
+            for fila in (*ratings, *notes, *overrides, *rejillas):
                 fila['fingerprint'] = huella(fila['fingerprint'])
-            return {'ratings': ratings, 'notes': notes}
+            return {'ratings': ratings, 'notes': notes, 'overrides': overrides,
+                    'rejillas': rejillas}
         finally:
             conn.close()
 

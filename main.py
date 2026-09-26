@@ -5105,8 +5105,9 @@ async def lo_importado_endpoint(req: LoImportadoRequest, request: Request):
 
 @app.get("/community/de-este-aparato")
 async def lo_de_este_aparato(device_id: str):
-    """SOLO en el motor local: las valoraciones y notas que este aparato dejó
-    en la memoria colectiva MIENTRAS apuntaba al motor local.
+    """SOLO en el motor local: lo que este aparato dejó en la memoria colectiva
+    MIENTRAS apuntaba al motor local (valoraciones, notas, votos de cambios a
+    mano y rejillas corregidas).
 
     Hasta el 2026-09-26 el escritorio mandaba todo `/community/*` a
     `backendUrl`, que con el motor local arrancado es 127.0.0.1: las notas,
