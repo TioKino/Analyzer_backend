@@ -551,6 +551,8 @@ try:
         # BEAT GRID en analyze_audio.
         save_artwork_to_cache,
         search_artwork_online,
+        elegir_portada,
+        buscar_portada,
         ARTWORK_CACHE_DIR
     )
     ARTWORK_ENABLED = True
@@ -1045,6 +1047,8 @@ init_lookup(
     ARTWORK_CACHE_DIR,
     search_online=search_artwork_online,
     save_to_cache=(save_artwork_to_cache if ARTWORK_ENABLED else None),
+    # Dice si un «no hay» es definitivo, para recordarlo (auditoria 2026-09-26).
+    buscar=(buscar_portada if ARTWORK_ENABLED else None),
     # Solo el motor local pregunta a Render: en Render seria consultarse a si
     # mismo. Hace que el pre-check de dedup del cliente funcione en una maquina
     # recien formateada, donde la BD local esta vacia pero Render lo tiene todo.
@@ -2458,92 +2462,23 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     artwork_url = None
     artwork_source = None
 
-    # ID3 grande (>=100KB) se acepta directo. Por debajo, comparamos con
-    # online y nos quedamos con el de mayor tamaño — mejor proxy de
-    # calidad sin parsear dimensiones de imagen. Esto cubre el caso real:
-    # ID3 default cutre (20-50KB, 300x300 borroso) cuando iTunes/Deezer
-    # tienen la version oficial 1200x1200 (>200KB).
-    ID3_TRUSTED_THRESHOLD = 100_000  # 100 KB
-
+    # Quien gana, en `elegir_portada`: la del FICHERO, salvo la exacta de
+    # AudD. Antes se preferia la de internet si pesaba mas, sin comprobar
+    # que fuera de ese tema (auditoria de portadas, 2026-09-26).
     if ARTWORK_ENABLED and fingerprint:
-        artwork_info = extract_artwork_from_file(file_path)
-        id3_size = artwork_info.get('size', 0) if artwork_info else 0
-
-        # Decidir si pedir online: solo si ID3 no es claramente bueno
-        online_artwork = None
-        online_size = 0
-        # Candidata preferente: la portada exacta que AudD ya nos dio (match
-        # exacto del track). Evita la busqueda por texto (menos fiable, mas
-        # latencia) cuando AudD identifico el track.
-        if audd_artwork:
-            online_artwork = audd_artwork
-            online_size = audd_artwork.get('size', 0)
-        # Bug fix 2026-06-05: no sobreescribir artist_name/title_name con id3_data
-        # crudo aqui — ya estan enriquecidos por AudD (linea ~1553). Usar directo.
-        # El path chunked (analyze_audio_chunked) ya lo hacia bien desde siempre.
-        elif id3_size < ID3_TRUSTED_THRESHOLD and artist_name and title_name:
-            album_name = id3_data.get('album')
-            try:
-                from artwork_and_cuepoints import search_artwork_online
-                online_artwork = search_artwork_online(
-                    artist_name, title_name, album_name
-                )
-                online_size = online_artwork.get('size', 0) if online_artwork else 0
-            except Exception as e:
-                logger.warning(f"   Artwork online fallo: {e}")
-                try:
-                    import traceback as _tb
-                    db.log_analysis_error(
-                        device_id=None, filename=None, fingerprint=fingerprint,
-                        error_class=type(e).__name__, error_msg=str(e),
-                        traceback_str=_tb.format_exc(), endpoint='artwork',
-                    )
-                except Exception:
-                    pass
-
-        # Elegir: ID3 si es grande (>=100KB) o si supera al online en tamaño.
-        # Online si es valido (>=10KB) y mayor que ID3. Sino, nada.
-        use_id3 = id3_size >= ID3_TRUSTED_THRESHOLD or (
-            id3_size > 10000 and id3_size >= online_size
-        )
-        use_online = (
-            online_artwork is not None
-            and online_size >= 10000
-            and online_size > id3_size
-        )
-
-        if use_id3 and artwork_info:
-            artwork_embedded = True
-            artwork_source = "id3"
+        portada, artwork_embedded, artwork_source = elegir_portada(
+            file_path, artist_name, title_name, audd_artwork)
+        if portada:
             saved_filename = save_artwork_to_cache(
-                fingerprint, artwork_info['data'], artwork_info['mime_type']
+                fingerprint, portada['data'], portada['mime_type']
             )
             artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
             _push_artwork_async(
                 fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename)
             )
-            logger.info(
-                f"   Artwork ID3: {id3_size} bytes "
-                f"(online disponible: {online_size} bytes)"
-            )
-        elif use_online and online_artwork:
-            artwork_embedded = False
-            artwork_source = online_artwork.get('source', 'online')
-            saved_filename = save_artwork_to_cache(
-                fingerprint, online_artwork['data'], online_artwork['mime_type']
-            )
-            artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-            _push_artwork_async(
-                fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename)
-            )
-            logger.info(
-                f"   Artwork {artwork_source}: {online_size} bytes "
-                f"(ID3 era: {id3_size} bytes)"
-            )
+            logger.info(f"   Artwork {artwork_source}: {portada.get('size', 0)} bytes")
         else:
-            logger.info(
-                f"   Sin artwork: ID3={id3_size}b, online={online_size}b"
-            )
+            logger.info("   Sin artwork")
 
     # ==================== TRACK TYPE: defaults + guards ====================
     track_type_source = 'waveform'
@@ -2859,65 +2794,22 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
             logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
 
     # ==================== ARTWORK ====================
-    # Misma logica que en el flow no-chunked (linea ~1487): ID3 grande
-    # (>=100KB) se acepta directo; por debajo, comparamos con online y
-    # nos quedamos con el de mayor tamaño.
+    # Misma decision que en el flow no-chunked: `elegir_portada`.
     artwork_embedded = False
     artwork_url = None
-    ID3_TRUSTED_THRESHOLD = 100_000
 
     if ARTWORK_ENABLED and fingerprint:
-        artwork_info = extract_artwork_from_file(file_path)
-        id3_size = artwork_info.get('size', 0) if artwork_info else 0
-
-        online_artwork = None
-        online_size = 0
-        # Candidata preferente: portada exacta del match AudD (ver path
-        # no-chunked). Solo si no la hay caemos a la busqueda por texto.
-        if audd_artwork:
-            online_artwork = audd_artwork
-            online_size = audd_artwork.get('size', 0)
-        elif id3_size < ID3_TRUSTED_THRESHOLD and artist_name and title_name:
-            try:
-                online_artwork = search_artwork_online(
-                    artist_name, title_name, id3_data.get('album')
-                )
-                online_size = online_artwork.get('size', 0) if online_artwork else 0
-            except Exception as e:
-                logger.warning(f"   Artwork online fallo: {e}")
-
-        use_id3 = id3_size >= ID3_TRUSTED_THRESHOLD or (
-            id3_size > 10000 and id3_size >= online_size
-        )
-        use_online = (
-            online_artwork is not None
-            and online_size >= 10000
-            and online_size > id3_size
-        )
-
-        if use_id3 and artwork_info:
-            artwork_embedded = True
+        portada, artwork_embedded, _fuente = elegir_portada(
+            file_path, artist_name, title_name, audd_artwork)
+        if portada:
             saved_filename = save_artwork_to_cache(
-                fingerprint, artwork_info['data'], artwork_info['mime_type']
+                fingerprint, portada['data'], portada['mime_type']
             )
             artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
             _push_artwork_async(
                 fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename)
             )
-            logger.info(
-                f"   Artwork ID3: {id3_size}b (online: {online_size}b)"
-            )
-        elif use_online and online_artwork:
-            saved_filename = save_artwork_to_cache(
-                fingerprint, online_artwork['data'], online_artwork['mime_type']
-            )
-            artwork_url = f"{BASE_URL}/artwork/{fingerprint}"
-            _push_artwork_async(
-                fingerprint, os.path.join(ARTWORK_CACHE_DIR, saved_filename)
-            )
-            logger.info(
-                f"   Artwork online: {online_size}b (ID3: {id3_size}b)"
-            )
+            logger.info(f"   Artwork {_fuente}: {portada.get('size', 0)}b")
     
     # ==================== TRACK TYPE ====================
     track_type = result['track_type']

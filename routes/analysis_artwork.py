@@ -50,16 +50,21 @@ _is_analysis_current = None
 ARTWORK_CACHE_DIR = None
 search_artwork_online = None
 save_artwork_to_cache = None
+# `buscar_portada` (artwork_and_cuepoints): como search_artwork_online, pero
+# dice si el «no» es DEFINITIVO. None = no se recuerda nada.
+buscar_portada = None
 # Solo en el motor local: consulta a Render el analisis de un fingerprint.
 # None en Render (no se consulta a si mismo).
 fetch_render_cache = None
 
 
 def init(database, is_analysis_current, artwork_cache_dir,
-         search_online=None, save_to_cache=None, render_cache_lookup=None):
+         search_online=None, save_to_cache=None, render_cache_lookup=None,
+         buscar=None):
     """Inyecta deps desde main.py. Llamar ANTES de include_router(router)."""
-    global db, _is_analysis_current, ARTWORK_CACHE_DIR
+    global db, _is_analysis_current, ARTWORK_CACHE_DIR, buscar_portada
     global search_artwork_online, save_artwork_to_cache, fetch_render_cache
+    buscar_portada = buscar
     db = database
     _is_analysis_current = is_analysis_current
     ARTWORK_CACHE_DIR = artwork_cache_dir
@@ -366,6 +371,38 @@ async def get_analysis(filename: str):
     
     raise HTTPException(404, f"Anlisis no encontrado para: {filename}")
 
+# Ids que se aceptan en /artwork: huellas (hex) y los `imp_…`/detecciones que
+# usa el propio backend. Nada con puntos ni barras llega a `os.path.join`.
+_ID_VALIDO = re.compile(r'^[A-Za-z0-9_\-]{1,80}$')
+
+# «No hay portada», por huella, con la hora en que se supo. Solo lo SEGURO:
+# todas las fuentes contestaron y ninguna la tenia (`buscar_portada`). Sin
+# esto, cada peticion de una huella sin portada salia otra vez a internet: hasta
+# ocho peticiones desde la IP de Render, que comparten todos los usuarios. En
+# memoria a proposito: un deploy lo vacia y se vuelve a mirar, que es barato.
+_SIN_PORTADA = {}
+_SIN_PORTADA_TTL = 7 * 24 * 3600
+
+
+def _sin_portada_reciente(clave: str) -> bool:
+    import time
+    t = _SIN_PORTADA.get(clave)
+    if t is None:
+        return False
+    if time.time() - t > _SIN_PORTADA_TTL:
+        _SIN_PORTADA.pop(clave, None)
+        return False
+    return True
+
+
+def _cacheada(clave: str):
+    for ext in ('jpg', 'png', 'jpeg', 'webp', 'gif'):
+        ruta = os.path.join(ARTWORK_CACHE_DIR, f"{clave}.{ext}")
+        if os.path.exists(ruta):
+            return ruta, ext
+    return None, None
+
+
 @router.head("/artwork/{track_id}")
 async def head_artwork(track_id: str):
     """HEAD para /artwork/{track_id} - el cliente desktop pre-comprueba
@@ -374,6 +411,8 @@ async def head_artwork(track_id: str):
     (search_artwork_online tiene side effects: red + escritura a cache).
     Devuelve 200 con Content-Type/Content-Length, o 404 sin body.
     """
+    if not _ID_VALIDO.match(track_id or ''):
+        raise HTTPException(404, "Artwork no encontrado")
     for ext in ('jpg', 'png', 'jpeg', 'webp', 'gif'):
         cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
         if os.path.exists(cache_path):
@@ -399,7 +438,7 @@ def _artwork_media_type(ext: str) -> str:
 
 
 @router.get("/artwork/{track_id}")
-async def get_artwork(track_id: str, request: Request = None):
+async def get_artwork(track_id: str, request: Request = None, online: int = 1):
     """Devuelve el artwork de un track como imagen.
 
     Cascade:
@@ -409,7 +448,12 @@ async def get_artwork(track_id: str, request: Request = None):
          no se hizo), buscamos artwork online (iTunes/Deezer) usando
          artist+title de la BD y lo cacheamos para futuras peticiones.
       3. 404 si nada de lo anterior funciona.
+
+    `online=0`: no salir a internet. Lo pide el escritorio, que busca por su
+    cuenta desde la IP del usuario y sube lo que encuentra.
     """
+    if not _ID_VALIDO.match(track_id or ''):
+        raise HTTPException(404, "Artwork no encontrado")
     for ext in ['jpg', 'png', 'jpeg', 'webp', 'gif']:
         cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{track_id}.{ext}")
         if os.path.exists(cache_path):
@@ -427,6 +471,8 @@ async def get_artwork(track_id: str, request: Request = None):
                 continue
 
     # Fallback: buscar online por artist+title si tenemos el track en BD.
+    if not online or _sin_portada_reciente(track_id):
+        raise HTTPException(404, "Artwork no encontrado")
     try:
         existing = db.get_track_by_fingerprint(track_id) or db.get_track_by_id(track_id)
         if existing:
@@ -461,15 +507,24 @@ async def get_artwork(track_id: str, request: Request = None):
                     # SINCRONAS (iTunes busqueda + descarga, Deezer x2, Last.fm x2)
                     # con timeouts de 5-8 s. Llamarla directa desde este handler
                     # async congelaba el event loop del unico worker hasta ~45 s.
-                    online = await run_in_threadpool(search_artwork_online, artist, title)
-                    if online and online.get('data'):
+                    if buscar_portada is not None:
+                        encontrada, definitivo = await run_in_threadpool(
+                            buscar_portada, artist, title)
+                    else:
+                        encontrada = await run_in_threadpool(
+                            search_artwork_online, artist, title)
+                        definitivo = False
+                    if encontrada and encontrada.get('data'):
                         save_artwork_to_cache(
-                            track_id, online['data'], online['mime_type'])
+                            track_id, encontrada['data'], encontrada['mime_type'])
                         # Devolver los bytes que ya tenemos en memoria (no re-leer
                         # el fichero recién guardado → no puede fallar por race).
                         return Response(
-                            content=online['data'],
-                            media_type=online['mime_type'])
+                            content=encontrada['data'],
+                            media_type=encontrada['mime_type'])
+                    if definitivo:
+                        import time
+                        _SIN_PORTADA[track_id] = time.time()
     except Exception as e:
         logger.warning(f"[Artwork] Fallback online error: {e}")
 
@@ -477,7 +532,8 @@ async def get_artwork(track_id: str, request: Request = None):
 
 
 @router.post("/artwork/upload/{fingerprint}")
-async def upload_artwork(fingerprint: str, file: UploadFile = File(...)):
+async def upload_artwork(fingerprint: str, file: UploadFile = File(...),
+                         solo_si_falta: int = 0):
     """Recibe artwork desde el local engine para que Render lo sirva
     también a otros devices vía `/artwork/{fingerprint}`. Sin esto,
     cuando el local engine analiza un track el artwork se queda en
@@ -485,10 +541,18 @@ async def upload_artwork(fingerprint: str, file: UploadFile = File(...)):
 
     Sanitiza el fingerprint (solo hex 32 chars). Acepta JPEG/PNG.
     Idempotente: re-subir el mismo fp sobreescribe.
+
+    `solo_si_falta=1`: si ya hay portada para esa huella, no se toca y se
+    contesta `exists`. Lo manda el escritorio con todo lo que NO sale del
+    propio fichero (una busqueda o una identificacion pueden equivocarse, y la
+    portada de una huella la ven todos los que tienen ese fichero). La que
+    viene DENTRO del fichero si pisa: es parte de su contenido.
     """
     safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
     if not safe_fp or len(safe_fp) > 64:
         raise HTTPException(400, "fingerprint inválido")
+    if solo_si_falta and _cacheada(safe_fp)[0]:
+        return {"status": "exists", "fingerprint": safe_fp}
 
     content = await file.read()
     if not content or len(content) < 100:
@@ -525,5 +589,6 @@ async def upload_artwork(fingerprint: str, file: UploadFile = File(...)):
     cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{safe_fp}.{ext}")
     with open(cache_path, 'wb') as f:
         f.write(content)
+    _SIN_PORTADA.pop(safe_fp, None)
 
     return {"status": "ok", "fingerprint": safe_fp, "size": len(content), "ext": ext}
