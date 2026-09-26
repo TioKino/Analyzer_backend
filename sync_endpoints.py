@@ -436,6 +436,24 @@ def cuentas_de_dispositivos(device_ids) -> Dict[str, str]:
     return out
 
 
+def aparatos_de_la_misma_cuenta(device_id: str) -> List[str]:
+    """Los aparatos de la cuenta de [device_id], él incluido. Para lo personal
+    que vive en analysis.db por aparato (las estrellas): el móvil vinculado
+    tiene que ver las que pusiste en el ordenador. Sin cuenta, o si sync.db
+    falla, solo él — que es como estaba."""
+    if not device_id:
+        return []
+    try:
+        conn = _get_conn()
+        user_id = _get_user_id_for_device(conn, device_id)
+        if not user_id:
+            return [device_id]
+        aparatos = _get_all_device_ids_for_user(conn, user_id)
+    except sqlite3.Error:
+        return [device_id]
+    return sorted(set(aparatos) | {device_id})
+
+
 def _get_all_device_ids_for_user(conn: sqlite3.Connection, user_id: str) -> list[str]:
     """Retorna todos los device_id vinculados a un user_id."""
     rows = conn.execute(
