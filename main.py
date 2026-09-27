@@ -1001,8 +1001,9 @@ except Exception as _e:  # noqa: BLE001 - best-effort
 # muda en el momento; esto recoge lo de antes. Idempotente.
 try:
     _mudadas = db.realinear_memoria_colectiva()
-    if _mudadas:
-        logger.info(f"[Community] {_mudadas} filas de la memoria mudadas a su cluster")
+    # SIEMPRE, también con 0: callado con 0, «no había nada» y «no corrió» se
+    # leían igual en el log de arranque (el 2026-09-27 no se pudo saber).
+    logger.info(f"[Community] {_mudadas} filas de la memoria mudadas a su cluster")
 except Exception as _e:  # noqa: BLE001 - best-effort
     logger.warning(f"[Community] realinear la memoria fallo: {_e}")
 
@@ -5170,6 +5171,7 @@ def _mandar_audd_a_render() -> bool:
     try:
         dias = db.cuentas_audd_por_dia(time.time() - _DIAS_AUDD_A_RENDER * 86400)
         if not dias:
+            logger.info("[AudD→Render] nada que contar en los últimos días")
             return True
         body = json.dumps({'motor_id': _id_del_motor(), 'dias': dias}).encode('utf-8')
         headers = {'Content-Type': 'application/json'}
@@ -5179,6 +5181,8 @@ def _mandar_audd_a_render() -> bool:
         if resp.status_code != 200:
             logger.warning(f"[AudD→Render] {resp.status_code}: {resp.text[:100]}")
             return False
+        logger.info(f"[AudD→Render] {sum(d['llamadas'] for d in dias)} llamadas "
+                    f"de {len(dias)} días y vías, enviadas")
         return True
     except Exception as e:  # noqa: BLE001 - contar nunca tumba el motor
         logger.warning(f"[AudD→Render] sin enviar: {e}")
