@@ -182,6 +182,42 @@ class AnalysisDB:
     # contaba hasta el 2026-09-26.
     cuentas_de = None
 
+    # Se llama tras apuntar una llamada a AudD. Solo lo cablea el motor local
+    # (main.py), para mandar sus cuentas a Render: su `audd_call_log` es de
+    # esta máquina y el panel no lo ve.
+    al_apuntar_audd = None
+
+    # Resuelve device_id -> todos los aparatos de su cuenta (sync.db; lo
+    # inyecta main.py). Para las estrellas propias, que se guardan por aparato
+    # y se leen por cuenta. Sin él, cada aparato ve solo las suyas.
+    aparatos_de = None
+
+    def _aparatos(self, device_id: str) -> List[str]:
+        if not device_id:
+            return []
+        if self.aparatos_de is None:
+            return [device_id]
+        try:
+            return list(self.aparatos_de(device_id) or [device_id])
+        except Exception:  # noqa: BLE001 - leer estrellas nunca falla por esto
+            return [device_id]
+
+    def _media_por_cuenta(self, c, fingerprint: str):
+        """Media y número de valoraciones de [fingerprint] contando UNA por
+        cuenta (la más reciente de sus aparatos). Hasta el 2026-09-26 cada
+        aparato era una valoración: quien valoraba en el ordenador y en el
+        móvil contaba dos veces en la media."""
+        filas = c.execute(
+            'SELECT device_id, rating, rated_at FROM track_ratings '
+            'WHERE fingerprint = ? ORDER BY rated_at', (fingerprint,)).fetchall()
+        cuentas = self.cuentas_de_votantes(f['device_id'] for f in filas)
+        por_cuenta = {}
+        for f in filas:  # en orden de fecha: gana la más reciente
+            por_cuenta[cuentas.get(f['device_id'], f['device_id'])] = f['rating']
+        if not por_cuenta:
+            return 0.0, 0
+        return sum(por_cuenta.values()) / len(por_cuenta), len(por_cuenta)
+
     def cuentas_de_votantes(self, device_ids) -> Dict[str, str]:
         """{device_id: user_id} de los votantes con cuenta. Best-effort: si
         sync.db no responde, {} y se cuenta por aparato como antes."""
@@ -653,6 +689,23 @@ class AnalysisDB:
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_audd_src_dev '
             'ON audd_call_log(source, device_id, called_at)')
+
+        # Lo que gastan en AudD los MOTORES LOCALES (EXE de Windows y DMG),
+        # que llaman con su propio token y lo apuntan en su propia BD. Hasta el
+        # 2026-09-26 no llegaba aquí y el panel contaba de menos. Un total por
+        # día, vía y motor: el motor manda sus totales y se sustituyen, así que
+        # repetir un envío no suma dos veces.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS audd_motor_local (
+                dia       TEXT NOT NULL,
+                source    TEXT NOT NULL,
+                motor_id  TEXT NOT NULL,
+                llamadas  INTEGER NOT NULL,
+                aciertos  INTEGER NOT NULL DEFAULT 0,
+                recibido_at TEXT,
+                PRIMARY KEY (dia, source, motor_id)
+            )
+        ''')
 
         # Tabla de errores de analisis (privacy-first: filename hasheado).
         # Captura fallos de /analyze y /identify para diagnostico operacional
@@ -1186,13 +1239,11 @@ class AnalysisDB:
             c.execute('SELECT COUNT(*) FROM track_analyzers WHERE fingerprint = ?',
                       (aid,))
             djs = max(1, int((c.fetchone() or [0])[0] or 0))
-            c.execute('SELECT AVG(rating) AS avg, COUNT(*) AS cnt '
-                      'FROM track_ratings WHERE fingerprint = ?', (aid,))
-            agg = c.fetchone()
+            media, cuantas = self._media_por_cuenta(c, aid)
             c.execute(
                 'UPDATE track_popularity SET dj_count = ?, avg_rating = ?, '
                 'total_ratings = ? WHERE fingerprint = ?',
-                (djs, agg['avg'] or 0, agg['cnt'] or 0, aid))
+                (djs, media, cuantas, aid))
         return movidas
 
     def realinear_memoria_colectiva(self) -> int:
@@ -1226,10 +1277,11 @@ class AnalysisDB:
             conn.close()
 
     def lo_de_este_aparato(self, device_id: str) -> Dict[str, list]:
-        """Las valoraciones y notas de [device_id], cada una con la huella de
-        su fichero (ver `/community/de-este-aparato`)."""
+        """Lo que [device_id] dejó para la comunidad en esta BD —valoraciones,
+        notas, votos de cambios a mano y rejillas corregidas—, cada cosa con la
+        huella de su fichero (ver `/community/de-este-aparato`)."""
         if not device_id:
-            return {'ratings': [], 'notes': []}
+            return {'ratings': [], 'notes': [], 'overrides': [], 'rejillas': []}
         conn = self._open_conn()
         try:
             c = conn.cursor()
@@ -1255,9 +1307,19 @@ class AnalysisDB:
             c.execute('SELECT fingerprint, note_text, note_type, display_name '
                       'FROM community_notes WHERE device_id = ?', (device_id,))
             notes = [dict(r) for r in c.fetchall()]
-            for fila in (*ratings, *notes):
+            # Los votos a mano cuentan para la regla de los tres, y las
+            # rejillas corregidas también: sin mudarlos, lo que este DJ corrigió
+            # con el motor local no contaría nunca.
+            c.execute('SELECT fingerprint, field, value FROM community_overrides '
+                      'WHERE device_id = ?', (device_id,))
+            overrides = [dict(r) for r in c.fetchall()]
+            c.execute('SELECT fingerprint, bpm_adjust, beat_offset, original_bpm '
+                      'FROM beat_grid_corrections WHERE device_id = ?', (device_id,))
+            rejillas = [dict(r) for r in c.fetchall()]
+            for fila in (*ratings, *notes, *overrides, *rejillas):
                 fila['fingerprint'] = huella(fila['fingerprint'])
-            return {'ratings': ratings, 'notes': notes}
+            return {'ratings': ratings, 'notes': notes, 'overrides': overrides,
+                    'rejillas': rejillas}
         finally:
             conn.close()
 
@@ -2439,35 +2501,80 @@ class AnalysisDB:
         finally:
             conn.close()
 
-    def rate_track(self, fingerprint: str, device_id: str, rating: int) -> Dict:
+    def registrar_analista(self, fingerprint: str, device_id: str) -> bool:
+        """El aparato [device_id] tiene este tema analizado, aunque no lo haya
+        analizado aquí: un acierto de caché de /analyze. Suma un DJ a la
+        popularidad SIN subir `analysis_count` (reimportar la carpeta no es
+        analizar otra vez).
+
+        Hasta el 2026-09-26 «N DJs lo han analizado» solo contaba el análisis
+        NUEVO: el segundo DJ con el mismo fichero caía en la caché y no sumaba,
+        justo en los temas más compartidos. Devuelve True si era un DJ nuevo.
+        """
         from datetime import datetime
         fingerprint = self.canonical_community_key(fingerprint)
+        device_id = (device_id or '').strip()
+        if not fingerprint or not device_id:
+            return False
         conn = self._open_conn()
         try:
             c = conn.cursor()
+            now = datetime.utcnow().isoformat()
+            c.execute('INSERT OR IGNORE INTO track_analyzers '
+                      '(fingerprint, device_id, first_seen) VALUES (?, ?, ?)',
+                      (fingerprint, device_id, now))
+            if c.rowcount == 0:
+                return False  # ya contaba: no hay nada que tocar
+            c.execute('SELECT COUNT(*) FROM track_analyzers WHERE fingerprint = ?',
+                      (fingerprint,))
+            djs = max(1, int((c.fetchone() or [0])[0] or 0))
+            c.execute(
+                'INSERT INTO track_popularity (fingerprint, analysis_count, '
+                'dj_count, last_analyzed) VALUES (?, 1, ?, ?) '
+                'ON CONFLICT(fingerprint) DO UPDATE SET dj_count = excluded.dj_count',
+                (fingerprint, djs, now))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def rate_track(self, fingerprint: str, device_id: str, rating: int) -> Dict:
+        """La valoración de un DJ: UNA por cuenta. Valorar desde otro aparato
+        de la misma cuenta sustituye la anterior, y quitarla la quita de todos.
+        La media cuenta una por cuenta (`_media_por_cuenta`)."""
+        from datetime import datetime
+        fingerprint = self.canonical_community_key(fingerprint)
+        aparatos = self._aparatos(device_id) or [device_id]
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            ph = ','.join('?' * len(aparatos))
             if rating <= 0:
-                # rating 0 = el DJ QUITA su valoracion (toggle off en la UI).
-                c.execute('DELETE FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
-                          (fingerprint, device_id))
+                # rating 0 = el DJ QUITA su valoracion (toggle off en la UI), en
+                # todos sus aparatos: si no, la del otro volvería a salir.
+                c.execute(f'DELETE FROM track_ratings WHERE fingerprint = ? '
+                          f'AND device_id IN ({ph})', [fingerprint, *aparatos])
             else:
+                otros = [a for a in aparatos if a != device_id]
+                if otros:
+                    c.execute(
+                        f'DELETE FROM track_ratings WHERE fingerprint = ? AND '
+                        f'device_id IN ({",".join("?" * len(otros))})',
+                        [fingerprint, *otros])
+                ahora = datetime.utcnow().isoformat()
                 c.execute('''
                     INSERT INTO track_ratings (fingerprint, device_id, rating, rated_at)
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(fingerprint, device_id) DO UPDATE SET rating = ?, rated_at = ?
-                ''', (fingerprint, device_id, rating, datetime.utcnow().isoformat(),
-                      rating, datetime.utcnow().isoformat()))
-            # Recalcular media (con count=0 -> avg NULL -> 0)
-            c.execute('SELECT AVG(rating) AS avg, COUNT(*) AS cnt FROM track_ratings WHERE fingerprint = ?', (fingerprint,))
-            agg = c.fetchone()
-            avg = agg['avg']
-            count = agg['cnt']
+                ''', (fingerprint, device_id, rating, ahora, rating, ahora))
+            avg, count = self._media_por_cuenta(c, fingerprint)
             c.execute('''
                 INSERT INTO track_popularity (fingerprint, avg_rating, total_ratings, last_analyzed)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(fingerprint) DO UPDATE SET avg_rating = ?, total_ratings = ?
-            ''', (fingerprint, avg or 0, count or 0, datetime.utcnow().isoformat(), avg or 0, count or 0))
+            ''', (fingerprint, avg, count, datetime.utcnow().isoformat(), avg, count))
             conn.commit()
-            return {'avg_rating': round(avg or 0, 1), 'total_ratings': count or 0}
+            return {'avg_rating': round(avg, 1), 'total_ratings': count}
         finally:
             conn.close()
 
@@ -2525,12 +2632,18 @@ class AnalysisDB:
             conn.close()
 
     def get_my_rating(self, fingerprint: str, device_id: str) -> int:
+        """Tu valoración: la de cualquier aparato de tu cuenta, la más nueva."""
         fingerprint = self.canonical_community_key(fingerprint)
+        aparatos = self._aparatos(device_id)
+        if not aparatos:
+            return 0
         conn = self._open_conn()
         try:
             c = conn.cursor()
-            c.execute('SELECT rating FROM track_ratings WHERE fingerprint = ? AND device_id = ?',
-                      (fingerprint, device_id))
+            c.execute(
+                'SELECT rating FROM track_ratings WHERE fingerprint = ? AND '
+                f'device_id IN ({",".join("?" * len(aparatos))}) '
+                'ORDER BY rated_at DESC LIMIT 1', [fingerprint, *aparatos])
             row = c.fetchone()
             return row['rating'] if row else 0
         finally:
@@ -2551,10 +2664,14 @@ class AnalysisDB:
         conn = self._open_conn()
         try:
             c = conn.cursor()
+            # Por CUENTA: lo que valoraste en el ordenador sale en el móvil.
+            # En orden de fecha, para que gane la más reciente.
+            aparatos = self._aparatos(device_id) or [device_id]
             c.execute(
                 'SELECT fingerprint, rating FROM track_ratings '
-                f'WHERE device_id = ? AND fingerprint IN ({placeholders})',
-                [device_id] + keys,
+                f'WHERE device_id IN ({",".join("?" * len(aparatos))}) '
+                f'AND fingerprint IN ({placeholders}) ORDER BY rated_at',
+                [*aparatos] + keys,
             )
             by_key = {row['fingerprint']: row['rating'] for row in c.fetchall()}
             return {f: by_key[canon[f]] for f in fps if canon[f] in by_key}
@@ -3115,6 +3232,73 @@ class AnalysisDB:
                  source, device_id, reason),
             )
             conn.commit()
+        finally:
+            conn.close()
+        if self.al_apuntar_audd is not None:
+            try:
+                self.al_apuntar_audd()
+            except Exception:  # noqa: BLE001 - avisar nunca tumba el apunte
+                pass
+
+    # ==================== AudD DE LOS MOTORES LOCALES ====================
+
+    _VIAS_AUDD = ('analyze', 'recognize', 'identify')
+
+    def cuentas_audd_por_dia(self, desde_ts: float) -> List[Dict]:
+        """Llamadas a AudD de ESTA BD por día y vía desde [desde_ts]. Sin los
+        marcadores de sesión de Escuchar, que no son llamadas."""
+        conn = self._open_conn()
+        try:
+            filas = conn.execute(
+                "SELECT date(called_at, 'unixepoch') AS dia, "
+                "COALESCE(source, 'analyze') AS s, COUNT(*) AS n, "
+                "COALESCE(SUM(success), 0) AS ok FROM audd_call_log "
+                "WHERE called_at >= ? AND "
+                "(source IS NULL OR source != 'recognize_session') "
+                "GROUP BY dia, s", (desde_ts,)).fetchall()
+            return [{'dia': f['dia'], 'source': f['s'], 'llamadas': f['n'],
+                     'aciertos': f['ok']} for f in filas
+                    if f['s'] in self._VIAS_AUDD]
+        finally:
+            conn.close()
+
+    def guardar_audd_motor_local(self, motor_id: str, dias: List[Dict]) -> int:
+        """Guarda los totales de un motor local (sustituye, no suma)."""
+        from datetime import datetime
+        ahora = datetime.utcnow().isoformat()
+        conn = self._open_conn()
+        try:
+            conn.executemany(
+                'INSERT OR REPLACE INTO audd_motor_local '
+                '(dia, source, motor_id, llamadas, aciertos, recibido_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                [(d['dia'], d['source'], motor_id, d['llamadas'],
+                  d.get('aciertos', 0), ahora) for d in dias])
+            conn.commit()
+            return len(dias)
+        finally:
+            conn.close()
+
+    def resumen_audd_motor_local(self, dias: int = 30) -> Dict:
+        """Lo que han gastado en AudD los motores locales en los últimos
+        [dias]: por vía, aciertos y cuántos motores lo cuentan."""
+        conn = self._open_conn()
+        try:
+            desde = conn.execute(
+                "SELECT date('now', ?)", (f'-{int(dias)} day',)).fetchone()[0]
+            por_via = {v: 0 for v in self._VIAS_AUDD}
+            aciertos = 0
+            for f in conn.execute(
+                    'SELECT source, SUM(llamadas) AS n, SUM(aciertos) AS ok '
+                    'FROM audd_motor_local WHERE dia >= ? GROUP BY source',
+                    (desde,)):
+                por_via[f['source']] = int(f['n'] or 0)
+                aciertos += int(f['ok'] or 0)
+            motores = conn.execute(
+                'SELECT COUNT(DISTINCT motor_id) FROM audd_motor_local '
+                'WHERE dia >= ?', (desde,)).fetchone()[0]
+            return {'by_source': por_via, 'total': sum(por_via.values()),
+                    'aciertos': aciertos, 'motores': int(motores or 0)}
         finally:
             conn.close()
 

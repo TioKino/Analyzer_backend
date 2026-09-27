@@ -1495,6 +1495,11 @@ async def telemetry(request: Request):
             "calls_last_30d": audd_last_30d,
             # De donde viene el gasto AudD (30d): analyze / recognize / identify.
             "by_source_30d": audd_by_source_30d,
+            # Lo que gastan los MOTORES LOCALES (EXE y DMG) con su propio token,
+            # que hasta el 2026-09-26 no llegaba aquí. Aparte, y no sumado a
+            # `by_source_30d`, para no partir la serie de `funnel_data/`: el
+            # gasto real de 30 días es la suma de los dos.
+            "motor_local_30d": _resumen_audd_motor_local(),
             # Success/fail por via (30d): {source: {total, success, fail}}. La
             # mayoria de 'fail' = AudD sin match (normal), NO errores.
             "by_source_stats_30d": audd_by_source_stats_30d,
@@ -1616,6 +1621,14 @@ async def telemetry(request: Request):
         # servidor no llegaba ni uno. Esto es lo que de verdad comparten.
         "lo_importado": _resumen_lo_importado(),
     }
+
+
+def _resumen_audd_motor_local():
+    try:
+        return db.resumen_audd_motor_local(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] AudD de los motores locales fallo: {e}")
+        return None
 
 
 def _resumen_lo_importado():

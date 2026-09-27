@@ -348,8 +348,12 @@ def register_community_endpoints(app, db):
         """
         from datetime import datetime
 
-        if not upload.fingerprint or not upload.cues:
-            return {"status": "error", "message": "fingerprint y cues requeridos"}
+        # Sin cues = el DJ los borró todos: se retira lo que este aparato
+        # aportaba a las zonas. Hasta el 2026-09-26 una lista vacía era un
+        # error y el cliente ni la mandaba, así que borrar los cues de un tema
+        # dejaba los viejos contando en las zonas para siempre.
+        if not upload.fingerprint:
+            return {"status": "error", "message": "fingerprint requerido"}
 
         if http is not None:
             from routes.community import _guard_vote_source
@@ -443,7 +447,9 @@ def register_community_endpoints(app, db):
             # Solo la HUELLA: una clave que no lo es (el `track.id` de un
             # cliente viejo, un id de ghost) escribiría en un compartimento
             # que no ve nadie.
-            if not _HUELLA.fullmatch(item.fingerprint or '') or not item.cues:
+            # Sin cues también entra: retira lo de este aparato (ver el
+            # envío suelto).
+            if not _HUELLA.fullmatch(item.fingerprint or ''):
                 descartados += 1
                 continue
             try:
