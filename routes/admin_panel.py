@@ -1624,8 +1624,12 @@ async def telemetry(request: Request):
 
 
 def _resumen_audd_motor_local():
+    # `_get_db()`, no `db`: este módulo no tiene un `db` global. Con `db` a
+    # secas saltaba un NameError que el `except` de abajo se tragaba, y el
+    # panel decía «servidor anterior al 2026-09-26» con el servidor al día
+    # (medido en la lectura del 2026-09-27).
     try:
-        return db.resumen_audd_motor_local(30)
+        return _get_db().resumen_audd_motor_local(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] AudD de los motores locales fallo: {e}")
         return None
@@ -1633,7 +1637,7 @@ def _resumen_audd_motor_local():
 
 def _resumen_lo_importado():
     try:
-        return db.resumen_lo_importado()
+        return _get_db().resumen_lo_importado()
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] resumen de lo importado fallo: {e}")
         return None
