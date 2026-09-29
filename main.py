@@ -4564,6 +4564,23 @@ def _portada_de_audd(track_data: dict) -> Optional[str]:
     return None
 
 
+def _portada_servible(ficha: Optional[dict]) -> Optional[str]:
+    """La portada de la ficha SOLO si este servidor la tiene: la URL se arma
+    aqui con la huella, no se copia la cadena guardada en la fila. Esa cadena
+    puede ser la de OTRO servidor (el motor local que analizo el tema:
+    127.0.0.1, que un movil no alcanza nunca) o una de Render cuyo fichero ya
+    no esta. Hasta el 2026-09-29 Escuchar la mandaba tal cual y por DELANTE
+    de la de AudD, y el movil pintaba un hueco (visto con «Adagio for
+    Strings», que tiene ficha en la comunidad)."""
+    fp = (ficha or {}).get('fingerprint')
+    if not fp or not ARTWORK_CACHE_DIR:
+        return None
+    for ext in ('jpg', 'png', 'jpeg', 'webp', 'gif'):
+        if os.path.exists(os.path.join(ARTWORK_CACHE_DIR, f"{fp}.{ext}")):
+            return f"{BASE_URL}/artwork/{fp}"
+    return None
+
+
 def _mejorar_ficha_con_la_comunidad(ficha: dict) -> dict:
     """La ficha de Escuchar con lo MEJOR que sabe la memoria colectiva de ese
     tema (`_lo_mejor_para`: el cluster acustico y lo importado de Rekordbox,
@@ -4985,9 +5002,15 @@ async def recognize_audio(
                 if artwork_url:
                     response["artwork_url"] = artwork_url
         elif origen == 'escuchar':
-            response["artwork_url"] = (
-                backend_analysis.get('artwork_url') if backend_analysis else None
-            ) or _portada_de_audd(track_data)
+            # La de AudD primero: es la del audio exacto, y la regla de
+            # `elegir_portada` deja que AudD mejore hasta la del fichero.
+            # Detras, la de la ficha solo si Render la sirve de verdad. Y la
+            # ficha lleva la MISMA: el movil mira la suya antes que la de la
+            # respuesta, y una URL muerta ahi tapaba la buena.
+            portada = (_portada_de_audd(track_data)
+                       or _portada_servible(backend_analysis))
+            response["artwork_url"] = portada
+            backend_analysis['artwork_url'] = portada
 
         _tiempos_al_log(session_reason)
         response["ms_servidor"] = _ms(time.perf_counter() - t_inicio)
