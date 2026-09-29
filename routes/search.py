@@ -192,6 +192,33 @@ def _aplanar(track_dict: Optional[dict]) -> Optional[dict]:
     return track_dict
 
 
+# Las tres busquedas de `buscar_analizado`, de la mas exacta a la mas laxa.
+# Sin mayusculas con `COLLATE NOCASE` y `LIKE` (los dos solo ASCII, igual que
+# el `LOWER()` de antes, con los mismos resultados), para que las use el
+# indice `idx_tracks_ficha`: con `LOWER(artist)` las tres recorrian la tabla
+# entera. Y el tema se elige DENTRO del indice (`rowid`) y solo despues se lee
+# su fila: asi hasta la de los dos `LIKE '%…%'` recorre el indice y no la
+# tabla con su `analysis_json`. Ver el comentario del indice en database.py.
+#
+# El `INDEXED BY` NO sobra: sin el, en la de los dos `LIKE` SQLite prefiere
+# otro indice que tambien sirve —el de `analyzed_at`, para ahorrarse ordenar,
+# o el de `bpm`, por el `bpm > 0`— y cualquiera de los dos lee la tabla fila a
+# fila: medido con 120.000 filas, 200 ms frente a 8 ms, peor que el recorrido
+# completo de antes. Quitarle uno con un `+` le dejaba el otro. El indice lo
+# crea `AnalysisDB` al abrir la base, siempre, y como mucho se recorre entero.
+FICHA_DONDE = (
+    "artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE",
+    "artist = ? COLLATE NOCASE AND title LIKE ?",
+    "artist LIKE ? AND title LIKE ?",
+)
+FICHA_SQL = (
+    "SELECT * FROM tracks WHERE rowid = ("
+    "SELECT rowid FROM tracks INDEXED BY idx_tracks_ficha WHERE {donde} "
+    "AND bpm IS NOT NULL AND bpm > 0 "
+    "ORDER BY analyzed_at DESC LIMIT 1)"
+)
+
+
 def buscar_analizado(artist: str, title: str,
                      isrc: Optional[str] = None) -> Optional[dict]:
     """La ficha de un tema que ALGUIEN ya analizo, o None.
@@ -220,20 +247,13 @@ def buscar_analizado(artist: str, title: str,
         return None
 
     cursor = db.conn.cursor()
-    consultas = (
-        ("LOWER(artist) = ? AND LOWER(title) = ?", (artista, titulo)),
-        ("LOWER(artist) = ? AND LOWER(title) LIKE ?",
-         (artista, f"%{titulo_sin_mezcla}%")),
-        ("LOWER(artist) LIKE ? AND LOWER(title) LIKE ?",
-         (f"%{artista}%", f"%{titulo_sin_mezcla}%")),
+    args_por_consulta = (
+        (artista, titulo),
+        (artista, f"%{titulo_sin_mezcla}%"),
+        (f"%{artista}%", f"%{titulo_sin_mezcla}%"),
     )
-    for donde, args in consultas:
-        cursor.execute(
-            f"SELECT * FROM tracks WHERE {donde} "
-            "AND bpm IS NOT NULL AND bpm > 0 "
-            "ORDER BY analyzed_at DESC LIMIT 1",
-            args,
-        )
+    for donde, args in zip(FICHA_DONDE, args_por_consulta):
+        cursor.execute(FICHA_SQL.format(donde=donde), args)
         row = cursor.fetchone()
         if row:
             return _aplanar(db._row_to_dict(row))

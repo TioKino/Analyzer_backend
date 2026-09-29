@@ -380,6 +380,18 @@ class AnalysisDB:
         c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_fingerprint ON tracks(fingerprint)')
         # idx_isrc: lookup O(1) del track por su codigo de grabacion (AudD).
         c.execute('CREATE INDEX IF NOT EXISTS idx_isrc ON tracks(isrc)')
+        # La ficha de Escuchar (`buscar_analizado`, routes/search.py) busca por
+        # artista y titulo SIN mayusculas. Con `LOWER(artist)` ningun indice
+        # servia y las tres consultas recorrian la tabla entera, con su
+        # `analysis_json` dentro: 35,5 s de «ficha» en la primera pulsacion de
+        # la tarde en el iPhone del owner (2026-09-29, log de Render), y
+        # ~1 s en caliente en CADA acierto, mas que AudD. NOCASE compara igual
+        # que LOWER() (solo ASCII), y con bpm y analyzed_at dentro el indice
+        # CUBRE la consulta: hasta la de los dos `LIKE '%…%'` recorre el
+        # indice (unos MB) y no la tabla. Medido con 120.000 filas: 150 ms →
+        # 0,02 ms la exacta y 142 ms → ~10 ms la aproximada.
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_ficha ON tracks('
+                  'artist COLLATE NOCASE, title COLLATE NOCASE, bpm, analyzed_at)')
 
         # Lo que dice un programa de DJ (Rekordbox, Traktor, VirtualDJ) de una
         # huella, tal como llega del XML que importó alguien. Un voto por
