@@ -680,7 +680,19 @@ class AnalysisDB:
         # mensaje al usuario, pero el dato se tiraba y el panel no podia decir
         # si el 57% de fallos de Escuchar era culpa del catalogo o del micro.
         # Valores: 'matched' | 'no_match' | 'audio_unusable'. Filas legacy NULL.
-        for _col in ('source TEXT', 'device_id TEXT', 'reason TEXT'):
+        # Migracion 2026-09-29: `origen` y `sesion`, solo para /recognize.
+        #   - `origen` = QUIEN llamo: 'escuchar' (el boton del movil),
+        #     'portada' (backfill de portadas del escritorio), 'editar'
+        #     («Identificar» del diálogo Editar) o 'escritorio' (un escritorio
+        #     anterior que
+        #     no lo dice). Hasta ese dia las tres vias escribian el mismo
+        #     marcador de sesion, y la tasa de `no_match` de «Escuchar» llevaba
+        #     dentro ficheros de biblioteca del escritorio.
+        #   - `sesion` = una PULSACION de Escuchar. El movil manda hasta cuatro
+        #     peticiones por pulsacion (reintenta si el audio no vale), y cada
+        #     una dejaba su marcador: el cupo contaba peticiones, no usos.
+        for _col in ('source TEXT', 'device_id TEXT', 'reason TEXT',
+                     'origen TEXT', 'sesion TEXT'):
             try:
                 conn.execute(f'ALTER TABLE audd_call_log ADD COLUMN {_col}')
             except sqlite3.OperationalError:
@@ -938,6 +950,29 @@ class AnalysisDB:
             )
             result = c.fetchone()
             return self._row_to_dict(result)
+        finally:
+            conn.close()
+
+    def get_analyzed_track_by_isrc(self, isrc: str) -> Optional[Dict]:
+        """Como `get_track_by_isrc`, pero solo un tema ANALIZADO (bpm > 0).
+
+        `/recognize` guarda cada deteccion nueva en `tracks` con bpm 0 y un
+        genero, una energia y un tipo de relleno (`analysis_status:
+        recognize_only`). `get_track_by_isrc` devuelve la fila mas reciente, y
+        esa puede ser la deteccion: un analisis de verdad con el mismo ISRC se
+        quedaba detras. Para enseñar datos de un tema, esta."""
+        if not isrc:
+            return None
+        conn = self._open_conn()
+        try:
+            fila = conn.execute(
+                "SELECT * FROM tracks WHERE isrc = ? "
+                "AND bpm IS NOT NULL AND bpm > 0 "
+                "AND instr(COALESCE(analysis_json, ''), 'recognize_only') = 0 "
+                "ORDER BY analyzed_at DESC LIMIT 1",
+                (isrc,),
+            ).fetchone()
+            return self._row_to_dict(fila)
         finally:
             conn.close()
 
@@ -3208,7 +3243,9 @@ class AnalysisDB:
                       title: Optional[str] = None,
                       source: str = 'analyze',
                       device_id: Optional[str] = None,
-                      reason: Optional[str] = None) -> None:
+                      reason: Optional[str] = None,
+                      origen: Optional[str] = None,
+                      sesion: Optional[str] = None) -> None:
         """Registra una llamada AudD (incluso fallidas) para honrar cooldown/cap
         y para CONTABILIDAD real del gasto por via. `source`:
           - 'analyze'   → auto-trigger de /analyze (cuenta para AUDD_DAILY_CAP).
@@ -3218,7 +3255,10 @@ class AnalysisDB:
 
         `reason` explica el DESENLACE cuando se conoce ('matched' / 'no_match' /
         'audio_unusable'); ver el comentario del ALTER en _init_db. Opcional:
-        las vias que no lo distinguen lo dejan a None."""
+        las vias que no lo distinguen lo dejan a None.
+
+        `origen` y `sesion` solo los pone /recognize: quien llamo (Escuchar,
+        portada, editar) y a que pulsacion pertenece. Ver el ALTER."""
         if not fingerprint:
             return
         conn = self._open_conn()
@@ -3226,10 +3266,10 @@ class AnalysisDB:
             conn.execute(
                 'INSERT INTO audd_call_log '
                 '(fingerprint, called_at, success, artist, title, source, '
-                'device_id, reason) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                'device_id, reason, origen, sesion) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (fingerprint, time.time(), 1 if success else 0, artist, title,
-                 source, device_id, reason),
+                 source, device_id, reason, origen, sesion),
             )
             conn.commit()
         finally:
@@ -3468,20 +3508,115 @@ class AnalysisDB:
         usuario es UN uso -> capar por llamada haria el cupo gratis tacaño. El
         coste real se mide aparte con source='recognize' (una fila por llamada).
         Sin device_id devuelve 0 (no capamos lo que no podemos atribuir; el
-        rate-limit por IP cubre el anonimato)."""
+        rate-limit por IP cubre el anonimato).
+
+        Desde el 2026-09-29 cuenta PULSACIONES: las peticiones con el mismo
+        `sesion` son un uso. Hasta ese dia el movil mandaba hasta cuatro por
+        pulsacion con el audio malo y cada una contaba — el cupo gratis se
+        gastaba cuatro veces mas rapido justo en un club ruidoso. Las filas sin
+        `sesion` (clientes viejos, escritorio) siguen contando una a una."""
         if not device_id:
             return 0
         conn = self._open_conn()
         try:
             c = conn.cursor()
             c.execute(
-                "SELECT COUNT(*) AS n FROM audd_call_log "
+                "SELECT COUNT(DISTINCT COALESCE(sesion, 'fila:' || id)) AS n "
+                "FROM audd_call_log "
                 "WHERE called_at >= ? AND source = 'recognize_session' "
                 "AND device_id = ?",
                 (self._utc_today_start(), device_id),
             )
             row = c.fetchone()
             return row['n'] if row else 0
+        finally:
+            conn.close()
+
+    def sesion_contada_hoy(self, device_id: str, sesion: Optional[str]) -> bool:
+        """¿Esta pulsacion ya se conto hoy? El reintento de una pulsacion que
+        ya entro en el cupo no puede quedarse fuera por ese mismo cupo."""
+        if not device_id or not sesion:
+            return False
+        conn = self._open_conn()
+        try:
+            fila = conn.execute(
+                "SELECT 1 FROM audd_call_log WHERE called_at >= ? "
+                "AND source = 'recognize_session' AND device_id = ? "
+                "AND sesion = ? LIMIT 1",
+                (self._utc_today_start(), device_id, sesion),
+            ).fetchone()
+            return fila is not None
+        finally:
+            conn.close()
+
+    # Orden del desenlace de una PULSACION con varias peticiones: gana lo mejor
+    # que llego a pasar. Un audio malo seguido de un acierto es un acierto.
+    _RANGO_DESENLACE = {'matched': 3, 'no_match': 2, 'audio_unusable': 1}
+
+    def resumen_escuchar(self, *, days: int = 30) -> dict:
+        """Escuchar DE VERDAD en los ultimos `days`: solo el boton del movil.
+
+        `get_recognize_reasons` mezcla el backfill de portadas y el «Identificar»
+        del diálogo Editar del escritorio, que pegan al mismo endpoint, y cuenta peticiones
+        en vez de pulsaciones. Esto no:
+
+          pulsaciones   pulsaciones de Escuchar (`origen='escuchar'`), una por
+                        `sesion` (las filas sin `sesion` cuentan una a una)
+          desenlace     {matched, no_match, audio_unusable} POR PULSACION: el
+                        mejor que llego a tener
+          peticiones    marcadores de sesion de Escuchar (>= pulsaciones)
+          por_origen    {origen: {peticiones, matched, no_match,
+                        audio_unusable}} de TODOS los marcadores, por peticion.
+                        `sin_origen` = filas anteriores al 2026-09-29.
+          llamadas_audd {origen: llamadas reales a AudD}
+
+        Recorre el cursor, no `fetchall()` (la trampa del panel)."""
+        conn = self._open_conn()
+        try:
+            cutoff = time.time() - int(days) * 86400
+            por_pulsacion = {}
+            por_origen = {}
+            peticiones = 0
+            cur = conn.execute(
+                "SELECT id, COALESCE(origen, 'sin_origen') AS o, sesion, "
+                "COALESCE(reason, 'unknown') AS r FROM audd_call_log "
+                "WHERE called_at >= ? AND source = 'recognize_session'",
+                (cutoff,),
+            )
+            for fila in cur:
+                o, r = fila['o'], fila['r']
+                d = por_origen.setdefault(o, {
+                    'peticiones': 0, 'matched': 0, 'no_match': 0,
+                    'audio_unusable': 0})
+                d['peticiones'] += 1
+                if r in d:
+                    d[r] += 1
+                if o != 'escuchar':
+                    continue
+                peticiones += 1
+                clave = fila['sesion'] or f"fila:{fila['id']}"
+                previo = por_pulsacion.get(clave)
+                if (previo is None or self._RANGO_DESENLACE.get(r, 0)
+                        > self._RANGO_DESENLACE.get(previo, 0)):
+                    por_pulsacion[clave] = r
+            desenlace = {'matched': 0, 'no_match': 0, 'audio_unusable': 0}
+            for r in por_pulsacion.values():
+                desenlace[r] = desenlace.get(r, 0) + 1
+            llamadas = {}
+            for fila in conn.execute(
+                "SELECT COALESCE(origen, 'sin_origen') AS o, COUNT(*) AS n "
+                "FROM audd_call_log WHERE called_at >= ? "
+                "AND source = 'recognize' GROUP BY o",
+                (cutoff,),
+            ):
+                llamadas[fila['o']] = int(fila['n'] or 0)
+            return {
+                'pulsaciones': len(por_pulsacion),
+                'desenlace': desenlace,
+                'peticiones': peticiones,
+                'por_origen': por_origen,
+                'llamadas_audd': llamadas,
+            }
         finally:
             conn.close()
 

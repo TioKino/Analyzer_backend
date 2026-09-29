@@ -13,13 +13,13 @@ Estructura:
 """
 
 from datetime import datetime, timezone
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sync_endpoints import (sync_router, admin_sync_router, cuentas_de_dispositivos,
                             aparatos_de_la_misma_cuenta,
-                            dispositivo_del_token)
+                            dispositivo_del_token, tipo_de_aparato)
 from routes.admin_panel import admin_panel_router
-from routes.search import search_router, init as init_search
+from routes.search import search_router, init as init_search, buscar_analizado
 from routes.community import community_router, init as init_community
 from routes.preview import preview_router, init as init_preview
 from routes.analysis_artwork import router as lookup_router, init as init_lookup
@@ -40,6 +40,7 @@ import os
 import re
 import json
 import hashlib
+from types import SimpleNamespace
 import hmac
 import requests
 import shutil
@@ -167,6 +168,7 @@ from validation import (
     check_rate_limit,
     get_client_ip,
     client_platform,
+    platform_family,
     ValidationError,
 )
 
@@ -4464,7 +4466,10 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30):
                 'https://api.audd.io/',
                 data={
                     'api_token': api_token,
-                    'return': 'spotify,deezer,apple_music,musicbrainz',
+                    # Sin 'musicbrainz': /recognize no lo usa y lo pediamos en
+                    # cada llamada (cada servicio extra es metadata que AudD
+                    # tiene que ir a buscar antes de contestar).
+                    'return': 'spotify,deezer,apple_music',
                 },
                 files={'file': audio_file},
                 timeout=timeout
@@ -4503,12 +4508,175 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30):
     return track_data, True
 
 
+# Quien llama a /recognize (ver el ALTER de `origen` en database.py). El mismo
+# endpoint sirve al boton Escuchar del movil y, desde el escritorio, al backfill
+# de portadas y al «Identificar» del diálogo Editar. Hasta el 2026-09-29 no se
+# distinguian, y
+# la tasa de `no_match` «de Escuchar» llevaba dentro ficheros de biblioteca.
+_ORIGENES_RECOGNIZE = ('escuchar', 'portada', 'editar')
+_SESION_VALIDA = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+
+def _origen_de_recognize(origen: Optional[str],
+                         device_id: Optional[str]) -> Optional[str]:
+    """Quien llama. Lo dice el cliente desde el 2026-09-29; si no lo dice (un
+    cliente anterior), el tipo de aparato con que se registro: un movil es
+    Escuchar, y un escritorio es el backfill de portadas o el «Identificar» del
+    diálogo Editar, sin poder separarlos ('escritorio'). None = no se sabe."""
+    o = (origen or '').strip().lower()
+    if o in _ORIGENES_RECOGNIZE:
+        return o
+    try:
+        familia = platform_family(tipo_de_aparato(device_id)) if device_id else None
+    except Exception:  # noqa: BLE001 - clasificar nunca tumba Escuchar
+        familia = None
+    if familia == 'mobile':
+        return 'escuchar'
+    if familia == 'desktop':
+        return 'escritorio'
+    return None
+
+
+def _sesion_de_recognize(sesion_id: Optional[str]) -> Optional[str]:
+    """La pulsacion a la que pertenece la peticion, o None si no viene o no
+    tiene forma de id (es texto del cliente: no se guarda cualquier cosa)."""
+    s = (sesion_id or '').strip()
+    return s if _SESION_VALIDA.match(s) else None
+
+
+def _portada_de_audd(track_data: dict) -> Optional[str]:
+    """La portada que AudD ya trae del tema reconocido: Spotify, Apple Music o
+    Deezer. Es la del audio EXACTO que sono y no cuesta ni una peticion."""
+    def _d(v):
+        return v if isinstance(v, dict) else {}
+    album_sp = _d(_d(track_data.get('spotify')).get('album'))
+    imagenes = album_sp.get('images')
+    if isinstance(imagenes, list) and imagenes and isinstance(imagenes[0], dict) \
+            and imagenes[0].get('url'):
+        return imagenes[0]['url']
+    url_am = _d(_d(track_data.get('apple_music')).get('artwork')).get('url')
+    if isinstance(url_am, str) and url_am:
+        return url_am.replace('{w}', '600').replace('{h}', '600')
+    album_dz = _d(_d(track_data.get('deezer')).get('album'))
+    for k in ('cover_xl', 'cover_big', 'cover_medium'):
+        if isinstance(album_dz.get(k), str) and album_dz[k]:
+            return album_dz[k]
+    return None
+
+
+def _mejorar_ficha_con_la_comunidad(ficha: dict) -> dict:
+    """La ficha de Escuchar con lo MEJOR que sabe la memoria colectiva de ese
+    tema (`_lo_mejor_para`: el cluster acustico y lo importado de Rekordbox,
+    Traktor y VirtualDJ), no la fila suelta que casó. Hasta el 2026-09-29
+    Escuchar —la pantalla que mas presume de memoria colectiva— enseñaba la
+    fila tal cual. Solo SUBE de fiabilidad; best-effort."""
+    fp = ficha.get('fingerprint')
+    if not fp:
+        return ficha
+    try:
+        # a_render=False: en el motor local (el escritorio identificando con
+        # su propio motor) no se hace un viaje a Render por cada tema.
+        best = _lo_mejor_para(fp, ficha.get('acoustic_id'), a_render=False)
+        if not best:
+            return ficha
+        campos = ('bpm', 'bpm_source', 'key', 'camelot', 'key_source',
+                  'genre', 'genre_source', 'first_beat', 'grid_source')
+        ns = SimpleNamespace(**{c: ficha.get(c) for c in campos})
+        _adopt_better_metadata(ns, best)
+        for c in campos:
+            v = getattr(ns, c)
+            if v is not None and v != ficha.get(c):
+                ficha[c] = v
+    except Exception as e:  # noqa: BLE001 - mejorar nunca tumba la ficha
+        logger.warning(f"[Recognize] mejorar la ficha con la comunidad fallo: {e}")
+    return ficha
+
+
+def _ficha_para_recognize(artist: str, title: str,
+                          isrc: Optional[str]) -> Optional[dict]:
+    """La ficha del tema reconocido si alguien lo analizo: la MISMA busqueda
+    que /search-analyzed (`buscar_analizado`, que ya no devuelve las
+    detecciones de bpm 0) y mejorada con la comunidad. Con esto el movil ya no
+    tiene que volver a preguntar por /search-analyzed tras cada acierto."""
+    ficha = buscar_analizado(artist, title, isrc)
+    if not ficha:
+        return None
+    return _mejorar_ficha_con_la_comunidad(ficha)
+
+
+def _guardar_deteccion(artist: str, title: str, album, label, isrc,
+                       buscar_portada: bool) -> Optional[str]:
+    """Apunta en la BD colectiva un tema que Escuchar reconocio y nadie ha
+    analizado, y si se pide busca y guarda su portada. Devuelve la URL de la
+    portada guardada, o None. Best-effort.
+
+    Hace red (la busqueda de portada: Deezer, iTunes y Last.fm, 6 s de timeout
+    cada una), asi que NUNCA se llama a pelo desde el `async def`: hasta el
+    2026-09-29 corria dentro de /recognize y congelaba el worker entero."""
+    artwork_url = None
+    try:
+        detect_id = hashlib.md5(
+            f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
+        if buscar_portada and search_artwork_online:
+            artwork_info = search_artwork_online(artist, title)
+            if artwork_info:
+                save_artwork_to_cache(detect_id, artwork_info['data'],
+                                      artwork_info['mime_type'])
+                artwork_url = f"{BASE_URL}/artwork/{detect_id}"
+                logger.info(f"Artwork guardado para deteccion: {detect_id[:12]}")
+        detect_data = {
+            'id': detect_id,
+            'filename': f"{artist} - {title}",
+            'fingerprint': detect_id,
+            'title': title,
+            'artist': artist,
+            'album': album,
+            'label': label,
+            'duration': 0,
+            'bpm': 0,
+            'key': None,
+            'camelot': None,
+            'energy_dj': 5,
+            'genre': 'Electronic',
+            'track_type': 'peak_time',
+            'bpm_source': 'pending',
+            'key_source': 'pending',
+            'isrc': isrc,
+            # Esta fila NO pasa por `_attach_acoustic` — y esta bien asi:
+            # /recognize trabaja sobre un fragmento corto, y la huella de un
+            # fragmento la descarta el clustering por duracion (±2,5 s), igual
+            # que pasaria con el snippet de 6 s. Sacarla seria gastar CPU en
+            # sembrar basura.
+            #
+            # Pero sin decirlo, estas filas caian en `analyzed_ok` del reparto
+            # de `acoustic_gap_breakdown`, o sea contadas como «paso por fpcalc
+            # y fallo: hay bug». Con 407 llamadas en 30 dias eso son ~218
+            # tracks de ruido encima del numero que decide. Se marca para poder
+            # descontarlas. Y por lo mismo (bpm 0, genero y energia de relleno)
+            # `buscar_analizado` no la devuelve nunca como ficha.
+            'analysis_status': 'recognize_only',
+        }
+        if not db.get_track_by_fingerprint(detect_id):
+            db.save_track(detect_data)
+            logger.info(f"Deteccion guardada en BD colectiva: {detect_id[:12]}")
+    except Exception as e:  # noqa: BLE001 - best-effort
+        logger.error(f"Error guardando deteccion en BD: {e}")
+    return artwork_url
+
+
+def _ms(segundos: float) -> int:
+    return int(round(segundos * 1000))
+
+
 @app.post("/recognize")
 async def recognize_audio(
     request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     device_id: Optional[str] = Form(None),
     is_pro: bool = Form(True),
+    origen: Optional[str] = Form(None),
+    sesion_id: Optional[str] = Form(None),
 ):
     """
     Reconoce una canción a partir de audio grabado usando AudD API.
@@ -4520,7 +4688,12 @@ async def recognize_audio(
     amplio (RECOGNIZE_PRO_DAILY_CAP). Sin device_id no se capa (compat con
     clientes viejos; el rate-limit por IP cubre el anonimato). El auto-AudD de
     /analyze tiene su propio cap GLOBAL, independiente de este.
+
+    `origen` (quien llama: 'escuchar' / 'portada' / 'editar') y `sesion_id`
+    (la pulsacion de Escuchar; sus reintentos mandan la misma) llegan desde el
+    2026-09-29. Ver `_origen_de_recognize` y el ALTER de database.py.
     """
+    t_inicio = time.perf_counter()
     # Rate limiting — endpoint caro (preprocesado + AudD retries).
     check_rate_limit(get_client_ip(request))
 
@@ -4532,17 +4705,29 @@ async def recognize_audio(
     if not AUDD_API_TOKEN:
         raise HTTPException(500, "AudD API token no configurado en api_config.py")
 
+    origen = _origen_de_recognize(origen, device_id)
+    sesion = _sesion_de_recognize(sesion_id)
+
     # Cap por dispositivo/dia ANTES de gastar AudD/CPU. Sin device_id no capamos.
+    # Cuenta PULSACIONES: el reintento de una pulsacion que ya entro en el cupo
+    # no se queda fuera por ese mismo cupo.
     recognize_cap = RECOGNIZE_PRO_DAILY_CAP if is_pro else RECOGNIZE_FREE_DAILY_CAP
     if device_id:
         try:
             used_today = db.count_recognition_sessions_today(device_id)
         except Exception:
             used_today = 0
+        ya_contada = False
         if used_today >= recognize_cap:
+            try:
+                ya_contada = db.sesion_contada_hoy(device_id, sesion)
+            except Exception:
+                ya_contada = False
+        if used_today >= recognize_cap and not ya_contada:
             logger.info(
                 f"[Recognize] cap alcanzado device={device_id[:8]} "
-                f"used={used_today} cap={recognize_cap} pro={is_pro}")
+                f"used={used_today} cap={recognize_cap} pro={is_pro} "
+                f"origen={origen}")
             return {
                 "status": "cap_reached",
                 "is_pro": is_pro,
@@ -4553,27 +4738,45 @@ async def recognize_audio(
                 "Has alcanzado el límite diario gratuito de Escuchar.",
             }
 
+    tiempos = {'subida': 0.0, 'ffmpeg': 0.0, 'audd': 0.0, 'ficha': 0.0,
+               'portada': 0.0}
+
     # Cada llamada a AudD de Escuchar se REGISTRA (source='recognize') para la
     # contabilidad real del gasto y para el cap por device. Antes /recognize no
-    # se logueaba → el panel admin infravaloraba el gasto de la feature estrella.
+    # se logueaba → el panel infravaloraba el gasto de la feature estrella.
     async def _audd_and_log(path):
         # AudD con timeout=30 es I/O de red SINCRONA. Llamarla directa desde este
         # handler async BLOQUEA el event loop del unico worker: una sesion de
         # Escuchar encadena hasta 3 intentos, o sea hasta 90 s con la API entera
         # congelada (mismo patron que ya se corrigio para librosa en /analyze).
+        t0 = time.perf_counter()
         td, processed_ok = await run_in_threadpool(
             _send_to_audd, path, AUDD_API_TOKEN, 30
         )
+        tiempos['audd'] += time.perf_counter() - t0
         try:
             db.log_audd_call(
                 fingerprint='recognize', success=bool(td),
                 artist=(td or {}).get('artist'), title=(td or {}).get('title'),
                 source='recognize', device_id=device_id,
                 reason=_recognize_reason(td, processed_ok),
+                origen=origen, sesion=sesion,
             )
         except Exception as e:
             logger.warning(f"[Recognize] log_audd_call fallo: {e}")
         return td, processed_ok
+
+    def _tiempos_al_log(desenlace: str) -> None:
+        # Una linea por peticion, pase lo que pase: sin esto no hay forma de
+        # saber donde se van los segundos de una pulsacion (ver HISTORIAL,
+        # 2026-09-29: se estimaba sobre el codigo porque no se media en ningun
+        # sitio).
+        logger.info(
+            f"[Recognize] origen={origen or 'sin_origen'} desenlace={desenlace} "
+            f"subida={_ms(tiempos['subida'])}ms ffmpeg={_ms(tiempos['ffmpeg'])}ms "
+            f"audd={_ms(tiempos['audd'])}ms ficha={_ms(tiempos['ficha'])}ms "
+            f"portada={_ms(tiempos['portada'])}ms "
+            f"total={_ms(time.perf_counter() - t_inicio)}ms")
 
     tmp_path = None
     processed_paths = []
@@ -4583,6 +4786,7 @@ async def recognize_audio(
         # máximo, así que este endpoint anónimo podía llenar el disco de Render.
         # Una captura de micro son ~100 KB; 100 MB es el mismo techo que /analyze
         # y sobra por varios órdenes de magnitud.
+        t0 = time.perf_counter()
         total_bytes = 0
         with tempfile.NamedTemporaryFile(delete=False, suffix='.m4a') as tmp:
             tmp_path = tmp.name
@@ -4594,6 +4798,7 @@ async def recognize_audio(
                 if total_bytes > MAX_UPLOAD_BYTES:
                     raise HTTPException(400, f"Audio demasiado grande. Máximo: {MAX_UPLOAD_MB} MB")
                 tmp.write(chunk)
+        tiempos['subida'] = time.perf_counter() - t0
 
         logger.info(f"[Recognize] Audio recibido: {file.filename} ({total_bytes} bytes)")
 
@@ -4622,9 +4827,12 @@ async def recognize_audio(
 
             processed_ok = False
             # ffmpeg: subproceso bloqueante, fuera del loop igual que AudD.
-            if await run_in_threadpool(
+            t0 = time.perf_counter()
+            preprocesado = await run_in_threadpool(
                 _preprocess_audio_for_recognition, tmp_path, processed_path, strategy
-            ):
+            )
+            tiempos['ffmpeg'] += time.perf_counter() - t0
+            if preprocesado:
                 processed_size = os.path.getsize(processed_path)
                 logger.info(f"  Procesado: {processed_size} bytes")
                 track_data, processed_ok = await _audd_and_log(processed_path)
@@ -4648,11 +4856,13 @@ async def recognize_audio(
                 break
             logger.info(f"  Intento {i+1} ({strategy}): audio no procesable, reintentando")
 
-        # Marcador de SESION (una pulsacion de Escuchar que llego a AudD), base
+        # Marcador de SESION (una peticion de /recognize que llego a AudD), base
         # del cap por dispositivo. Se registra tanto si identifico como si no
         # (un fallo tambien cuenta como uso), pero NO cuando salto el cap arriba
         # (ahi devolvimos antes sin llegar aqui). Independiente del log por
-        # llamada (source='recognize') que mide el coste real.
+        # llamada (source='recognize') que mide el coste real. Lleva `origen` y
+        # `sesion`: el cap cuenta pulsaciones y el panel separa Escuchar del
+        # escritorio (`resumen_escuchar`).
         # El desenlace se calcula UNA vez y se usa para las dos cosas: sellarlo
         # en el marcador de sesion (de ahi sale el desglose del panel) y elegir
         # el mensaje que ve el usuario. Antes solo existia lo segundo y el dato
@@ -4665,7 +4875,7 @@ async def recognize_audio(
                 artist=(track_data or {}).get('artist'),
                 title=(track_data or {}).get('title'),
                 source='recognize_session', device_id=device_id,
-                reason=session_reason,
+                reason=session_reason, origen=origen, sesion=sesion,
             )
         except Exception as _e:
             logger.warning(f"[Recognize] log sesion fallo: {_e}")
@@ -4678,6 +4888,8 @@ async def recognize_audio(
             #     parar. Mensaje: "no encontrado" (no es culpa del micro).
             #   - audio_ok=False: AudD no pudo generar huella (ruido/silencio/
             #     audio muy corto). Reintentar/acercar el micro SI puede ayudar.
+            _tiempos_al_log(session_reason)
+            ms_servidor = _ms(time.perf_counter() - t_inicio)
             if session_reason == 'no_match':
                 logger.info("[Recognize] ✗ audio válido pero sin match (track no en AudD)")
                 return {
@@ -4685,6 +4897,7 @@ async def recognize_audio(
                     "audio_ok": True,
                     "reason": session_reason,
                     "message": "No encontramos esta canción en la base de datos.",
+                    "ms_servidor": ms_servidor,
                 }
             logger.info("[Recognize] ✗ audio no procesable (ruido/silencio)")
             return {
@@ -4692,6 +4905,7 @@ async def recognize_audio(
                 "audio_ok": False,
                 "reason": session_reason,
                 "message": "No se captó bien el audio. Acerca el micro y evita el ruido.",
+                "ms_servidor": ms_servidor,
             }
 
         # ── Extraer datos del resultado ──
@@ -4708,22 +4922,20 @@ async def recognize_audio(
 
         logger.info(f"[Recognize] Resultado: {artist} - {title}")
 
-        # ── Buscar análisis existente en BD ──
-        # 1º por ISRC (identidad EXACTA de la grabacion, sin fuzzy artist/title):
-        # si ese mismo tema ya lo analizo/limpio otro usuario, lo casamos aunque
-        # los tags difieran. 2º fallback al match por artist+title de siempre.
-        backend_analysis = None
-        if isrc:
-            backend_analysis = db.get_track_by_isrc(isrc)
-            if backend_analysis:
-                logger.info(f"  Encontrado por ISRC {isrc}: {backend_analysis.get('id')}")
-        if not backend_analysis:
-            existing_tracks = db.search_by_artist(artist, limit=50)
-            for track in existing_tracks:
-                if track.get('title', '').lower() == title.lower():
-                    backend_analysis = track
-                    logger.info(f"  Encontrado en biblioteca: {track.get('id')}")
-                    break
+        # ── La ficha de la memoria colectiva ──
+        # Misma busqueda que /search-analyzed (ISRC primero, luego artista y
+        # titulo) y mejorada con lo mejor del cluster. Toca SQLite (LIKE sobre
+        # toda la tabla en el peor caso): fuera del event loop.
+        t0 = time.perf_counter()
+        try:
+            backend_analysis = await run_in_threadpool(
+                _ficha_para_recognize, artist, title, isrc)
+        except Exception as e:  # noqa: BLE001 - sin ficha, el acierto vale igual
+            logger.warning(f"[Recognize] buscar la ficha fallo: {e}")
+            backend_analysis = None
+        tiempos['ficha'] = time.perf_counter() - t0
+        if backend_analysis:
+            logger.info(f"  Ficha de la comunidad: {backend_analysis.get('id')}")
 
         response = {
             "status": "found",
@@ -4736,77 +4948,43 @@ async def recognize_audio(
             "spotify": spotify_data,
             "deezer": deezer_data,
             "apple_music": apple_music_data,
+            # La ficha ya viene aqui, encontrada o no (None), aplanada y con lo
+            # mejor del cluster: el material del DIFERENCIADOR vs Shazam.
+            # `busco_ficha` le dice al movil que este servidor ya busco como
+            # /search-analyzed, asi que no hace falta volver a preguntar (un
+            # servidor anterior no lo manda y el movil pregunta como siempre).
+            "backend_analysis": backend_analysis,
+            "busco_ficha": True,
         }
-
-        if backend_analysis:
-            # Aplanar analysis_json al top-level (igual que /search-analyzed) para
-            # que el movil tenga TODA la info rica lista sin re-parsear un blob:
-            # BPM/key/camelot/energia + has_drop/estructura/cues/confidences. Es
-            # el material del DIFERENCIADOR vs Shazam — la ficha de Escuchar puede
-            # mostrar datos REALES de la comunidad, no solo un link a Spotify.
-            try:
-                _aj = backend_analysis.get('analysis_json')
-                if _aj:
-                    _detail = json.loads(_aj) if isinstance(_aj, str) else _aj
-                    if isinstance(_detail, dict):
-                        backend_analysis.update(_detail)
-            except (json.JSONDecodeError, TypeError):
-                pass
-            backend_analysis.pop('analysis_json', None)
-            response["backend_analysis"] = backend_analysis
 
         # Guardar reconocimiento en BD colectiva para enriquecer futuras consultas
         if not backend_analysis and artist and title:
-            try:
-                artwork_url = None
-                if search_artwork_online:
-                    artwork_info = search_artwork_online(artist, title)
-                    if artwork_info:
-                        detect_id = hashlib.md5(f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
-                        save_artwork_to_cache(detect_id, artwork_info['data'], artwork_info['mime_type'])
-                        artwork_url = f"{BASE_URL}/artwork/{detect_id}"
-                        response["artwork_url"] = artwork_url
-                        logger.info(f"Artwork guardado para deteccion: {detect_id[:12]}")
+            if origen == 'escuchar':
+                # Escuchar: el DJ esta mirando la pantalla. La portada que
+                # enseña es la que AudD ya trae (la del audio exacto), y la
+                # busqueda propia + el apunte en la BD van DESPUES de
+                # responder. Hasta el 2026-09-29 se hacian aqui, en el camino
+                # critico, y encima el movil tiraba esa portada.
+                response["artwork_url"] = _portada_de_audd(track_data)
+                background_tasks.add_task(
+                    _guardar_deteccion, artist, title, album, label, isrc, True)
+            else:
+                # Escritorio (portada / editar): su contrato es la portada
+                # verificada de Render en `artwork_url`, asi que se espera —
+                # pero en un hilo, nunca congelando el worker.
+                t0 = time.perf_counter()
+                artwork_url = await run_in_threadpool(
+                    _guardar_deteccion, artist, title, album, label, isrc, True)
+                tiempos['portada'] = time.perf_counter() - t0
+                if artwork_url:
+                    response["artwork_url"] = artwork_url
+        elif origen == 'escuchar':
+            response["artwork_url"] = (
+                backend_analysis.get('artwork_url') if backend_analysis else None
+            ) or _portada_de_audd(track_data)
 
-                detect_id = hashlib.md5(f"{artist.lower().strip()}|{title.lower().strip()}".encode()).hexdigest()
-                detect_data = {
-                    'id': detect_id,
-                    'filename': f"{artist} - {title}",
-                    'fingerprint': detect_id,
-                    'title': title,
-                    'artist': artist,
-                    'album': album,
-                    'label': label,
-                    'duration': 0,
-                    'bpm': 0,
-                    'key': None,
-                    'camelot': None,
-                    'energy_dj': 5,
-                    'genre': 'Electronic',
-                    'track_type': 'peak_time',
-                    'bpm_source': 'pending',
-                    'key_source': 'pending',
-                    'isrc': isrc,
-                    # Esta fila NO pasa por `_attach_acoustic` — y esta bien
-                    # asi: /recognize trabaja sobre un fragmento corto, y la
-                    # huella de un fragmento la descarta el clustering por
-                    # duracion (±2,5 s), igual que pasaria con el snippet de
-                    # 6 s. Sacarla seria gastar CPU en sembrar basura.
-                    #
-                    # Pero sin decirlo, estas filas caian en `analyzed_ok` del
-                    # reparto de `acoustic_gap_breakdown`, o sea contadas como
-                    # «paso por fpcalc y fallo: hay bug». Con 407 llamadas en
-                    # 30 dias eso son ~218 tracks de ruido encima del numero
-                    # que decide. Se marca para poder descontarlas.
-                    'analysis_status': 'recognize_only',
-                }
-                existing = db.get_track_by_fingerprint(detect_id)
-                if not existing:
-                    db.save_track(detect_data)
-                    logger.info(f"Deteccion guardada en BD colectiva: {detect_id[:12]}")
-            except Exception as e:
-                logger.error(f"Error guardando deteccion en BD: {e}")
-
+        _tiempos_al_log(session_reason)
+        response["ms_servidor"] = _ms(time.perf_counter() - t_inicio)
         return response
 
     except HTTPException:
