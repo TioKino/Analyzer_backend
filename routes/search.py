@@ -168,107 +168,101 @@ async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=2
         "compatible_keys": compatible,
         "tracks": db.search_compatible_keys(camelot, limit)
     }
+# Sufijos de mezcla que no cambian el tema a efectos de «¿alguien lo analizo?».
+_SUFIJOS_DE_MEZCLA = re.compile(
+    r'\s*\(?(Original Mix|Extended Mix|Radio Edit|Remix|Club Mix|Dub Mix)\)?',
+    re.IGNORECASE,
+)
+
+
+def _aplanar(track_dict: Optional[dict]) -> Optional[dict]:
+    """El `analysis_json` al nivel de arriba y fuera el crudo: la ficha lista
+    para el cliente, sin que tenga que re-parsear un blob."""
+    if not track_dict:
+        return None
+    crudo = track_dict.pop('analysis_json', None)
+    if crudo:
+        try:
+            detalle = json.loads(crudo) if isinstance(crudo, str) else crudo
+            if isinstance(detalle, dict):
+                track_dict.update(detalle)
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning("analysis_json corrupto en track %s: %s",
+                           track_dict.get('id'), e)
+    return track_dict
+
+
+def buscar_analizado(artist: str, title: str,
+                     isrc: Optional[str] = None) -> Optional[dict]:
+    """La ficha de un tema que ALGUIEN ya analizo, o None.
+
+    Una sola regla para `/search-analyzed` y `/recognize`. Hasta el 2026-09-29
+    cada uno buscaba a su manera: `/recognize` probaba ISRC y titulo exacto, no
+    miraba si la fila tenia analisis de verdad y podia devolver su propia
+    deteccion (bpm 0 y genero, energia y tipo de relleno); el movil lo tiraba
+    y volvia a preguntar aqui, una peticion mas por cada acierto de Escuchar.
+
+    Orden: ISRC (identidad exacta de la grabacion) → artista y titulo exactos →
+    artista exacto y titulo sin sufijo de mezcla → los dos por aproximacion.
+    Solo filas con bpm > 0: una deteccion de Escuchar no es un analisis.
+    """
+    if isrc:
+        t = db.get_analyzed_track_by_isrc(isrc)
+        if t:
+            return _aplanar(t)
+
+    artista = (artist or '').lower().strip()
+    titulo = (title or '').lower().strip()
+    titulo_sin_mezcla = _SUFIJOS_DE_MEZCLA.sub('', title or '').lower().strip()
+    # Sin artista o con un titulo que era solo el sufijo («Remix»), el LIKE
+    # '%%' casaria con cualquier tema del artista.
+    if not artista or not titulo_sin_mezcla:
+        return None
+
+    cursor = db.conn.cursor()
+    consultas = (
+        ("LOWER(artist) = ? AND LOWER(title) = ?", (artista, titulo)),
+        ("LOWER(artist) = ? AND LOWER(title) LIKE ?",
+         (artista, f"%{titulo_sin_mezcla}%")),
+        ("LOWER(artist) LIKE ? AND LOWER(title) LIKE ?",
+         (f"%{artista}%", f"%{titulo_sin_mezcla}%")),
+    )
+    for donde, args in consultas:
+        cursor.execute(
+            f"SELECT * FROM tracks WHERE {donde} "
+            "AND bpm IS NOT NULL AND bpm > 0 "
+            "ORDER BY analyzed_at DESC LIMIT 1",
+            args,
+        )
+        row = cursor.fetchone()
+        if row:
+            return _aplanar(db._row_to_dict(row))
+    return None
+
+
 @search_router.get("/search-analyzed")
 async def search_analyzed_track(
     artist: str = Query(..., description="Nombre del artista"),
-    title: str = Query(..., description="Ttulo del track"),
+    title: str = Query(..., description="Titulo del track"),
     isrc: Optional[str] = Query(None, description="ISRC (identidad exacta, opcional)")
 ):
     """
-    Busca si un track ya fue analizado por algn usuario.
-    Devuelve TODA la informacin del anlisis si existe.
+    Busca si un track ya fue analizado por algun usuario.
+    Devuelve TODA la informacion del analisis si existe (ver `buscar_analizado`).
 
     Returns:
-        - found: bool - Si se encontr el track
-        - track: dict - Toda la informacin del anlisis (si existe)
-        - in_collective: bool - Si est en la memoria colectiva
+        - found: bool - Si se encontro el track
+        - track: dict - Toda la informacion del analisis (si existe)
+        - in_collective: bool - Si esta en la memoria colectiva
     """
-    import re
-
-    # Validar y sanitizar entrada
     artist_clean = sanitize_string(artist, max_length=200, allow_empty=False, field_name="artist")
     title_clean = sanitize_string(title, max_length=200, allow_empty=False, field_name="title")
 
-    # Normalizar para bsqueda
-    artist_normalized = artist_clean.lower().strip()
-    title_normalized = re.sub(
-        r'\s*\(?(Original Mix|Extended Mix|Radio Edit|Remix|Club Mix|Dub Mix)\)?',
-        '',
-        title_clean,
-        flags=re.IGNORECASE
-    ).lower().strip()
-
     try:
-        # 0) ISRC: identidad EXACTA de la grabacion. Si otro usuario ya analizo
-        # este mismo tema, lo casamos sin depender del fuzzy artist/title. Solo
-        # cuenta si tiene analisis real (bpm>0); un "pending" de /recognize no.
-        if isrc:
-            t = db.get_track_by_isrc(isrc)
-            if t:
-                if t.get('analysis_json'):
-                    try:
-                        t.update(json.loads(t['analysis_json']))
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                t.pop('analysis_json', None)
-                if t.get('bpm'):
-                    return {"found": True, "in_collective": True, "track": t}
-
-        conn = db.conn
-        cursor = conn.cursor()
-
-        # Bsqueda exacta primero
-        cursor.execute("""
-            SELECT * FROM tracks
-            WHERE LOWER(artist) = ? AND LOWER(title) LIKE ?
-            AND bpm IS NOT NULL AND bpm > 0
-            ORDER BY analyzed_at DESC
-            LIMIT 1
-        """, (artist_normalized, f"%{title_normalized}%"))
-
-        row = cursor.fetchone()
-
-        if not row:
-            # Bsqueda ms flexible
-            cursor.execute("""
-                SELECT * FROM tracks
-                WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
-                AND bpm IS NOT NULL AND bpm > 0
-                ORDER BY analyzed_at DESC
-                LIMIT 1
-            """, (f"%{artist_normalized}%", f"%{title_normalized}%"))
-            row = cursor.fetchone()
-
-        if row:
-            # Convertir a dict usando el m(c)todo existente
-            track_dict = db._row_to_dict(row)
-
-            # Si hay analysis_json, parsear para obtener todos los campos
-            if track_dict and track_dict.get('analysis_json'):
-                try:
-                    full_analysis = json.loads(track_dict['analysis_json'])
-                    # Combinar con los campos bsicos
-                    track_dict.update(full_analysis)
-                except (json.JSONDecodeError, TypeError) as e:
-                    logger.warning("analysis_json corrupto en track %s: %s",
-                                   track_dict.get('id'), e)
-
-            # Eliminar el JSON crudo del response
-            if track_dict and 'analysis_json' in track_dict:
-                del track_dict['analysis_json']
-
-            return {
-                "found": True,
-                "in_collective": True,
-                "track": track_dict
-            }
-
-        return {
-            "found": False,
-            "in_collective": False,
-            "track": None
-        }
-
+        ficha = buscar_analizado(artist_clean, title_clean, isrc)
+        if ficha:
+            return {"found": True, "in_collective": True, "track": ficha}
+        return {"found": False, "in_collective": False, "track": None}
     except Exception as e:
         logger.error(f"Error en search-analyzed: {e}")
         return {

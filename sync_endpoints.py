@@ -436,6 +436,25 @@ def cuentas_de_dispositivos(device_ids) -> Dict[str, str]:
     return out
 
 
+def tipo_de_aparato(device_id: str) -> Optional[str]:
+    """El `device_type` con el que se registro [device_id] (`ios`, `android`,
+    `windows`, `macos`…), o None si no esta o sync.db falla.
+
+    Para clasificar las llamadas a `/recognize` de clientes anteriores al
+    2026-09-29, que no dicen quien llama: un movil es Escuchar, un escritorio
+    es el backfill de portadas o el «Identificar» del diálogo Editar."""
+    if not device_id:
+        return None
+    try:
+        fila = _get_conn().execute(
+            "SELECT device_type FROM user_devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return (fila[0] or None) if fila else None
+
+
 def aparatos_de_la_misma_cuenta(device_id: str) -> List[str]:
     """Los aparatos de la cuenta de [device_id], él incluido. Para lo personal
     que vive en analysis.db por aparato (las estrellas): el móvil vinculado

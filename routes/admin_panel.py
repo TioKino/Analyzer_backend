@@ -1510,6 +1510,18 @@ async def telemetry(request: Request):
             # no se puede inferir a posteriori, se vacia solo con el tiempo.
             "recognize_reasons_30d": recognize_reasons_30d,
         },
+        # Escuchar DE VERDAD (desde el 2026-09-29). `recognize_sessions_30d` y
+        # `recognize_reasons_30d` de arriba siguen como estaban para no partir
+        # la serie, pero mezclan el backfill de portadas y el «Identificar» del
+        # diálogo Editar del escritorio y cuentan peticiones, no pulsaciones. Aqui:
+        #   servidor_30d  lo que ve /recognize, por pulsacion y por origen
+        #   movil_30d     lo que cuenta el propio movil (eventos listen_*):
+        #                 latencia, sin permiso, sin red, guardadas, enlaces
+        # None = ese resumen FALLO (no «servidor anterior»: ahi falta la clave).
+        "escuchar": {
+            "servidor_30d": _resumen_escuchar(),
+            "movil_30d": _escuchar_segun_el_movil(),
+        },
         # Estado de la auth de /sync: que secreto valida (para poder retirar el
         # viejo con datos) y cuanto trafico manda ya X-Device-Token (requisito
         # para exigirlo). Ver _get_sync_auth_adoption.
@@ -1633,6 +1645,120 @@ def _resumen_audd_motor_local():
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] AudD de los motores locales fallo: {e}")
         return None
+
+
+def _resumen_escuchar():
+    try:
+        return _get_db().resumen_escuchar(days=30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] resumen de Escuchar fallo: {e}")
+        return None
+
+
+_EVENTOS_ESCUCHAR = ('listen_result', 'listen_saved', 'listen_link',
+                     'listen_pendiente')
+
+
+def _escuchar_segun_el_movil(dias: int = 30):
+    """Escuchar contado por el MOVIL: los eventos `listen_*` (desde el
+    2026-09-29). Hasta ese dia no habia ni uno, y la latencia, el permiso
+    denegado o la falta de red no se podian ver desde ningun lado: el servidor
+    solo ve las peticiones que le llegan.
+
+      pulsaciones    `listen_result`, una por pulsacion
+      aparatos       aparatos distintos que pulsaron
+      por_desenlace  {outcome: n}: found, no_match, audio_unusable, silencio,
+                     sin_permiso, sin_red, error_servidor, cap, cancelado
+      ms_acierto     {n, p50, p90} de `ms` en los aciertos: desde que empieza a
+                     escuchar hasta que se ve el tema. EL numero a bajar.
+      ms_servidor    {n, p50, p90} de lo que tarda /recognize por dentro
+      guardadas      `listen_saved`: el DJ confirmo que era ese tema. Es lo mas
+                     parecido a medir la precision que hay
+      enlaces        {destino: n} de `listen_link`
+      pendientes     {outcome: n} de `listen_pendiente`: capturas sin red que
+                     se identificaron despues
+
+    None si falla (el panel no miente: None es «fallo», no «cero»).
+    """
+    # La misma BD en la que escribe /client-event (`_get_db()`), no una ruta
+    # sacada del entorno: dos caminos a «la» BD pueden no ser la misma.
+    try:
+        adb = _get_db()._open_conn()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[Admin] Escuchar segun el movil: {e}")
+        return None
+    pulsaciones = 0
+    aparatos = set()
+    por_desenlace = {}
+    ms_acierto = []
+    ms_servidor = []
+    guardadas = 0
+    enlaces = {}
+    pendientes = {}
+
+    def _num(v):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return None
+        return n if n >= 0 else None
+
+    try:
+        marcas = ",".join("?" for _ in _EVENTOS_ESCUCHAR)
+        cur = adb.execute(
+            "SELECT device_id, event_name, props FROM events "
+            f"WHERE event_name IN ({marcas}) AND day >= date('now', ?)",
+            _EVENTOS_ESCUCHAR + (f"-{int(dias)} days",),
+        )
+        for dev, nombre, props in (tuple(f) for f in cur):
+            try:
+                p = json.loads(props) if props else {}
+            except (TypeError, ValueError):
+                p = {}
+            if not isinstance(p, dict):
+                p = {}
+            if nombre == 'listen_result':
+                pulsaciones += 1
+                if dev:
+                    aparatos.add(dev)
+                o = str(p.get('outcome') or 'sin_dato')[:32]
+                por_desenlace[o] = por_desenlace.get(o, 0) + 1
+                if o == 'found':
+                    ms = _num(p.get('ms'))
+                    if ms is not None:
+                        ms_acierto.append(ms)
+                srv = _num(p.get('ms_servidor'))
+                if srv is not None:
+                    ms_servidor.append(srv)
+            elif nombre == 'listen_saved':
+                guardadas += 1
+            elif nombre == 'listen_link':
+                d = str(p.get('destino') or 'sin_dato')[:32]
+                enlaces[d] = enlaces.get(d, 0) + 1
+            else:
+                o = str(p.get('outcome') or 'sin_dato')[:32]
+                pendientes[o] = pendientes.get(o, 0) + 1
+    except sqlite3.Error as e:
+        logger.warning(f"[Admin] Escuchar segun el movil: {e}")
+        return None
+    finally:
+        adb.close()
+
+    def _reparto(valores):
+        orden = sorted(valores)
+        return {'n': len(orden), 'p50': int(_percentil(orden, 50)),
+                'p90': int(_percentil(orden, 90))}
+
+    return {
+        'pulsaciones': pulsaciones,
+        'aparatos': len(aparatos),
+        'por_desenlace': por_desenlace,
+        'ms_acierto': _reparto(ms_acierto),
+        'ms_servidor': _reparto(ms_servidor),
+        'guardadas': guardadas,
+        'enlaces': enlaces,
+        'pendientes': pendientes,
+    }
 
 
 def _resumen_lo_importado():

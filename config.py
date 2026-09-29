@@ -69,6 +69,11 @@ AUDD_MAX_DURATION: float = float(os.getenv('AUDD_MAX_DURATION', '720'))
 # tambien de abuso Pro). Se cuenta por SESION (cada pulsacion de Escuchar), no
 # por llamada AudD — una sesion puede gastar hasta 3 llamadas y para el usuario
 # es UN uso. Base: audd_call_log source='recognize_session' por device_id/dia.
+# OJO: hasta el 2026-09-29 eso NO era «cada pulsacion» sino cada PETICION, y el
+# movil manda hasta cuatro por pulsacion cuando el audio no vale. Desde ese dia
+# el movil manda un `sesion_id` por pulsacion y se cuentan pulsaciones
+# (`count_recognition_sessions_today`); las filas sin `sesion` (clientes
+# viejos, escritorio) siguen contando una a una.
 # El coste real se mide aparte (source='recognize', una fila por llamada).
 # Cuando el paywall este activo, el cliente manda is_pro.
 RECOGNIZE_FREE_DAILY_CAP: int = int(os.getenv('RECOGNIZE_FREE_DAILY_CAP', '30'))
