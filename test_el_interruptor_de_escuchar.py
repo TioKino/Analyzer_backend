@@ -175,6 +175,23 @@ class TestEnvioDirecto:
         assert audd.preprocesados == ['normalize', 'aggressive']
         assert len(audd.enviados) == 3
 
+    def test_la_respuesta_trae_el_interruptor(self, client, audd, monkeypatch):
+        # Si el movil no pudo preguntar al arrancar (Render reiniciando: visto
+        # en el iPhone del owner el 2026-09-29), se entera en la primera
+        # pulsacion y la siguiente ya va con lo que toca.
+        monkeypatch.setenv('ESCUCHAR_PRIMER_CLIP_S', '8')
+        audd.respuestas = [(None, True), (_td(), True), (None, False)]
+        for _ in range(3):
+            r = _post(client, device_id='m-aj', origen='escuchar',
+                      sesion_id=uuid.uuid4().hex[:8])
+            assert r.json()['ajustes'] == {'primer_clip_s': 8,
+                                           'envio': 'ffmpeg'}
+        # El escritorio no lo necesita.
+        monkeypatch.setattr(main, 'search_artwork_online', None)
+        audd.respuestas = [(None, True)]
+        r = _post(client, device_id='pc-aj', origen='portada')
+        assert r.json()['ajustes'] is None
+
     def test_directo_no_toca_el_escritorio(self, client, audd, monkeypatch):
         # Portadas y Editar mandan ficheros enteros y no esperan a nadie.
         monkeypatch.setenv('ESCUCHAR_ENVIO', 'directo')

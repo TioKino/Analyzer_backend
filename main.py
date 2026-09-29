@@ -4804,8 +4804,11 @@ async def recognize_audio(
 
     origen = _origen_de_recognize(origen, device_id)
     sesion = _sesion_de_recognize(sesion_id)
-    # El interruptor solo toca Escuchar (ver `_ajustes_de_escuchar`).
-    envio = _ajustes_de_escuchar()['envio'] if origen == 'escuchar' else 'ffmpeg'
+    # El interruptor solo toca Escuchar (ver `_ajustes_de_escuchar`). Va
+    # tambien en la respuesta: si el movil no pudo preguntar al arrancar (Render
+    # reiniciando, mala red), se entera aqui para la pulsacion siguiente.
+    ajustes = _ajustes_de_escuchar() if origen == 'escuchar' else None
+    envio = ajustes['envio'] if ajustes else 'ffmpeg'
     variante = (_variante_de_escuchar(_primer_clip_de(primer_clip_s), envio)
                 if origen == 'escuchar' else None)
 
@@ -5016,6 +5019,7 @@ async def recognize_audio(
                     "message": "No encontramos esta canción en la base de datos.",
                     "ms_servidor": ms_servidor,
                     "envio": envio,
+                    "ajustes": ajustes,
                 }
             logger.info("[Recognize] ✗ audio no procesable (ruido/silencio)")
             return {
@@ -5025,6 +5029,7 @@ async def recognize_audio(
                 "message": "No se captó bien el audio. Acerca el micro y evita el ruido.",
                 "ms_servidor": ms_servidor,
                 "envio": envio,
+                "ajustes": ajustes,
             }
 
         # ── Extraer datos del resultado ──
@@ -5077,6 +5082,7 @@ async def recognize_audio(
             # Con que se mando el audio a AudD: el movil lo apunta en su
             # telemetria para comparar las variantes del interruptor.
             "envio": envio,
+            "ajustes": ajustes,
         }
 
         # Guardar reconocimiento en BD colectiva para enriquecer futuras consultas
