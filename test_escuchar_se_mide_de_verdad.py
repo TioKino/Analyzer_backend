@@ -344,6 +344,35 @@ class TestRecognize:
         assert ficha['bpm'] == 127.8 and ficha['bpm_source'] == 'rekordbox'
         assert ficha['camelot'] == '6A' and ficha['key_source'] == 'traktor'
 
+    def test_con_ficha_la_portada_es_una_que_se_puede_ver(
+            self, client, audd, monkeypatch, tmp_path):
+        # «Adagio for Strings» (iPhone del owner, 2026-09-29): el tema tenia
+        # ficha, la fila guardaba la URL de la portada del motor local que lo
+        # analizo, y Escuchar la mandaba por delante de la de AudD: hueco.
+        monkeypatch.setattr(main, 'ARTWORK_CACHE_DIR', str(tmp_path))
+        artista, titulo = f'A {uuid.uuid4().hex[:6]}', f'T {uuid.uuid4().hex[:6]}'
+        fp = _guardar_analizado(
+            artist=artista, title=titulo, bpm=140.0,
+            artwork_url='http://127.0.0.1:8000/artwork/lo-que-sea')
+        audd.respuestas = [(_track_data(artist=artista, title=titulo), True)]
+        j = _post(client, origen='escuchar').json()
+        assert j['artwork_url'] == SPOTIFY_IMG
+        assert j['backend_analysis']['artwork_url'] == SPOTIFY_IMG
+
+        # Sin portada de AudD: la de Render, SOLO si Render tiene el fichero.
+        sin_portada = _track_data(artist=artista, title=titulo)
+        sin_portada['spotify'] = None
+        audd.respuestas = [(sin_portada, True)]
+        j = _post(client, origen='escuchar').json()
+        assert j['artwork_url'] is None
+        assert j['backend_analysis']['artwork_url'] is None
+
+        (tmp_path / f'{fp}.jpg').write_bytes(b'\xff\xd8jpeg')
+        audd.respuestas = [(sin_portada, True)]
+        j = _post(client, origen='escuchar').json()
+        assert j['artwork_url'] == f'{main.BASE_URL}/artwork/{fp}'
+        assert j['backend_analysis']['artwork_url'] == j['artwork_url']
+
     def test_la_busqueda_de_portada_nunca_va_suelta_en_el_async_def(self):
         # La busqueda propia hace red (6 s de timeout por fuente). Dentro del
         # handler async congela el worker entero: solo por `_guardar_deteccion`,
