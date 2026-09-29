@@ -3830,6 +3830,12 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
             track_data['filename'] = file.filename
             track_data['fingerprint'] = fingerprint
             track_data['analysis_status'] = 'failed'  # Marcador especial
+            # La plataforma SI se sella, igual que en el camino normal. El
+            # motor (`engine_source`) no, y eso es una decision aparte. Sin la
+            # plataforma, una rafaga de fallbacks (289 en 7 dias el 27-sep) no
+            # se podia leer sin abrir los logs: ni de donde venia ni si era un
+            # solo DJ. El aparato lo apunta `registrar_analista` al salir.
+            track_data['platform'] = client_platform(request)
             db.save_track(track_data)
             
             logger.info(f"Fallback creado: {artist} - {title} (anlisis pendiente)")
