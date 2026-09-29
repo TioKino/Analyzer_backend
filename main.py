@@ -4537,6 +4537,64 @@ def _origen_de_recognize(origen: Optional[str],
     return None
 
 
+# ── Escuchar: el interruptor de la latencia (2026-09-29) ──
+# De los ~15 s que tarda un acierto, ~12 son la grabacion del primer clip, y
+# todo el audio de Escuchar pasa por ffmpeg (loudnorm + WAV de ~1 MB) antes de
+# ir a AudD. Las dos cosas pueden bajar el tiempo y las dos pueden empeorar el
+# acierto, asi que se cambian desde aqui, SIN release, y cada pulsacion apunta
+# con cual se hizo (`audd_call_log.variante`) para compararlas en el panel:
+#
+#   ESCUCHAR_PRIMER_CLIP_S  segundos del PRIMER clip que graba el movil (5-12;
+#                           12 = lo de siempre). Lo lee el movil de
+#                           /escuchar/ajustes al arrancar; solo lo obedecen las
+#                           versiones desde la 2026-09-29.
+#   ESCUCHAR_ENVIO          'directo' = el primer intento manda a AudD el AAC
+#                           tal cual lo grabo el movil (~190 KB, sin ffmpeg);
+#                           si AudD no saca huella, se sigue con los
+#                           preprocesados de siempre. Cualquier otro valor =
+#                           'ffmpeg', lo de siempre. Lo aplica el servidor, asi
+#                           que vale para TODOS los moviles, tambien los
+#                           publicados. Solo Escuchar: el escritorio (portadas,
+#                           Editar) manda ficheros enteros y no espera a nadie.
+#
+# En Render: Environment → cambiar la variable → «Save and deploy» (reinicia
+# con el mismo codigo). Volver atras es borrar la variable.
+_CLIP_DE_SIEMPRE = 12   # lo que graban todas las versiones publicadas
+_CLIP_MINIMO = 5
+_ENVIOS_ESCUCHAR = ('ffmpeg', 'directo')
+
+
+def _ajustes_de_escuchar() -> dict:
+    """El interruptor. Se lee en cada peticion, no al importar el modulo, para
+    que los tests puedan cambiarlo (en Render cambiar la variable reinicia el
+    servicio igual)."""
+    try:
+        clip = int((os.getenv('ESCUCHAR_PRIMER_CLIP_S') or '').strip()
+                   or _CLIP_DE_SIEMPRE)
+    except ValueError:
+        clip = _CLIP_DE_SIEMPRE
+    clip = max(_CLIP_MINIMO, min(_CLIP_DE_SIEMPRE, clip))
+    envio = (os.getenv('ESCUCHAR_ENVIO') or '').strip().lower()
+    if envio not in _ENVIOS_ESCUCHAR:
+        envio = 'ffmpeg'
+    return {'primer_clip_s': clip, 'envio': envio}
+
+
+def _primer_clip_de(valor: Optional[str]) -> int:
+    """Los segundos del primer clip de la pulsacion, segun el movil. Sin dato
+    (una version publicada, que no lo manda) = 12: es lo que graban todas."""
+    try:
+        s = int(str(valor).strip())
+    except (TypeError, ValueError):
+        return _CLIP_DE_SIEMPRE
+    return s if 1 <= s <= 60 else _CLIP_DE_SIEMPRE
+
+
+def _variante_de_escuchar(primer_clip_s: int, envio: str) -> str:
+    """`12s+ffmpeg`, `8s+directo`… La etiqueta de la pulsacion en el panel."""
+    return f"{primer_clip_s}s+{envio}"
+
+
 def _sesion_de_recognize(sesion_id: Optional[str]) -> Optional[str]:
     """La pulsacion a la que pertenece la peticion, o None si no viene o no
     tiene forma de id (es texto del cliente: no se guarda cualquier cosa)."""
@@ -4691,6 +4749,14 @@ def _ms(segundos: float) -> int:
     return int(round(segundos * 1000))
 
 
+@app.get("/escuchar/ajustes")
+async def escuchar_ajustes():
+    """Lo que el movil tiene que saber del interruptor antes de grabar: los
+    segundos del primer clip. Va tambien `envio`, para que el movil apunte en
+    su telemetria con que variante se hizo cada pulsacion."""
+    return _ajustes_de_escuchar()
+
+
 @app.post("/recognize")
 async def recognize_audio(
     request: Request,
@@ -4700,11 +4766,14 @@ async def recognize_audio(
     is_pro: bool = Form(True),
     origen: Optional[str] = Form(None),
     sesion_id: Optional[str] = Form(None),
+    primer_clip_s: Optional[str] = Form(None),
 ):
     """
     Reconoce una canción a partir de audio grabado usando AudD API.
     Preprocesa el audio (normalización, filtrado de ruido) y reintenta
-    con diferentes estrategias si el primer intento falla.
+    con diferentes estrategias si el primer intento falla. Con el envio
+    directo (`_ajustes_de_escuchar`, solo Escuchar) el primer intento va sin
+    preprocesar.
 
     `device_id` + `is_pro`: cableado del paywall. Escuchar es GRATIS pero con un
     cap por dispositivo/dia (RECOGNIZE_FREE_DAILY_CAP); Pro tiene uno mucho mas
@@ -4715,6 +4784,11 @@ async def recognize_audio(
     `origen` (quien llama: 'escuchar' / 'portada' / 'editar') y `sesion_id`
     (la pulsacion de Escuchar; sus reintentos mandan la misma) llegan desde el
     2026-09-29. Ver `_origen_de_recognize` y el ALTER de database.py.
+
+    `primer_clip_s` (desde el 2026-09-29): los segundos del PRIMER clip de la
+    pulsacion, que el movil saca del interruptor (`_ajustes_de_escuchar`).
+    Viaja en todas las peticiones de la pulsacion: es su variante, no el largo
+    de esta captura.
     """
     t_inicio = time.perf_counter()
     # Rate limiting — endpoint caro (preprocesado + AudD retries).
@@ -4730,6 +4804,10 @@ async def recognize_audio(
 
     origen = _origen_de_recognize(origen, device_id)
     sesion = _sesion_de_recognize(sesion_id)
+    # El interruptor solo toca Escuchar (ver `_ajustes_de_escuchar`).
+    envio = _ajustes_de_escuchar()['envio'] if origen == 'escuchar' else 'ffmpeg'
+    variante = (_variante_de_escuchar(_primer_clip_de(primer_clip_s), envio)
+                if origen == 'escuchar' else None)
 
     # Cap por dispositivo/dia ANTES de gastar AudD/CPU. Sin device_id no capamos.
     # Cuenta PULSACIONES: el reintento de una pulsacion que ya entro en el cupo
@@ -4783,7 +4861,7 @@ async def recognize_audio(
                 artist=(td or {}).get('artist'), title=(td or {}).get('title'),
                 source='recognize', device_id=device_id,
                 reason=_recognize_reason(td, processed_ok),
-                origen=origen, sesion=sesion,
+                origen=origen, sesion=sesion, variante=variante,
             )
         except Exception as e:
             logger.warning(f"[Recognize] log_audd_call fallo: {e}")
@@ -4795,7 +4873,8 @@ async def recognize_audio(
         # 2026-09-29: se estimaba sobre el codigo porque no se media en ningun
         # sitio).
         logger.info(
-            f"[Recognize] origen={origen or 'sin_origen'} desenlace={desenlace} "
+            f"[Recognize] origen={origen or 'sin_origen'} "
+            f"variante={variante or '-'} desenlace={desenlace} "
             f"subida={_ms(tiempos['subida'])}ms ffmpeg={_ms(tiempos['ffmpeg'])}ms "
             f"audd={_ms(tiempos['audd'])}ms ficha={_ms(tiempos['ficha'])}ms "
             f"portada={_ms(tiempos['portada'])}ms "
@@ -4838,33 +4917,46 @@ async def recognize_audio(
         # otro preprocesado del mismo contenido es tirar cuota -> paramos. Caso
         # comun del DJ: temas underground/promo que AudD no conoce (huella OK,
         # sin match) -> 1 llamada en vez de 3.
-        strategies = ["normalize", "aggressive", "raw_wav"]
+        #
+        # Con el envio directo (el interruptor, `_ajustes_de_escuchar`) el
+        # intento 1 es el AAC tal cual, sin ffmpeg, y los preprocesados pasan a
+        # ser el 2 y el 3 (solo si AudD no pudo sacar huella, como siempre).
+        # `raw_wav` sobra ahi: es el mismo audio que el directo, en WAV.
+        if envio == 'directo':
+            strategies = ["directo", "normalize", "aggressive"]
+        else:
+            strategies = ["normalize", "aggressive", "raw_wav"]
         track_data = None
         audio_processed = False  # ¿AudD llego a fingerprintear algun intento?
 
         for i, strategy in enumerate(strategies):
-            processed_path = tmp_path.replace('.m4a', f'_processed_{strategy}.wav')
-            processed_paths.append(processed_path)
-
             logger.info(f"[Recognize] Intento {i+1}/3 - estrategia: {strategy}")
-
             processed_ok = False
-            # ffmpeg: subproceso bloqueante, fuera del loop igual que AudD.
-            t0 = time.perf_counter()
-            preprocesado = await run_in_threadpool(
-                _preprocess_audio_for_recognition, tmp_path, processed_path, strategy
-            )
-            tiempos['ffmpeg'] += time.perf_counter() - t0
-            if preprocesado:
-                processed_size = os.path.getsize(processed_path)
-                logger.info(f"  Procesado: {processed_size} bytes")
-                track_data, processed_ok = await _audd_and_log(processed_path)
+
+            if strategy == "directo":
+                track_data, processed_ok = await _audd_and_log(tmp_path)
             else:
-                logger.info(f"  Intento {i+1} ({strategy}): preprocesamiento falló")
-                # Si normalize falla, intentar enviar el original directamente.
-                if strategy == "normalize":
-                    logger.info(f"  Intentando enviar archivo original sin procesar...")
-                    track_data, processed_ok = await _audd_and_log(tmp_path)
+                processed_path = tmp_path.replace(
+                    '.m4a', f'_processed_{strategy}.wav')
+                processed_paths.append(processed_path)
+                # ffmpeg: subproceso bloqueante, fuera del loop igual que AudD.
+                t0 = time.perf_counter()
+                preprocesado = await run_in_threadpool(
+                    _preprocess_audio_for_recognition, tmp_path, processed_path,
+                    strategy
+                )
+                tiempos['ffmpeg'] += time.perf_counter() - t0
+                if preprocesado:
+                    processed_size = os.path.getsize(processed_path)
+                    logger.info(f"  Procesado: {processed_size} bytes")
+                    track_data, processed_ok = await _audd_and_log(processed_path)
+                else:
+                    logger.info(f"  Intento {i+1} ({strategy}): preprocesamiento falló")
+                    # Si normalize falla, intentar enviar el original
+                    # directamente (con el envio directo ya se mando).
+                    if strategy == "normalize" and envio != 'directo':
+                        logger.info(f"  Intentando enviar archivo original sin procesar...")
+                        track_data, processed_ok = await _audd_and_log(tmp_path)
 
             audio_processed = audio_processed or processed_ok
             if track_data:
@@ -4899,6 +4991,8 @@ async def recognize_audio(
                 title=(track_data or {}).get('title'),
                 source='recognize_session', device_id=device_id,
                 reason=session_reason, origen=origen, sesion=sesion,
+                variante=variante,
+                ms=_ms(time.perf_counter() - t_inicio) if variante else None,
             )
         except Exception as _e:
             logger.warning(f"[Recognize] log sesion fallo: {_e}")
@@ -4921,6 +5015,7 @@ async def recognize_audio(
                     "reason": session_reason,
                     "message": "No encontramos esta canción en la base de datos.",
                     "ms_servidor": ms_servidor,
+                    "envio": envio,
                 }
             logger.info("[Recognize] ✗ audio no procesable (ruido/silencio)")
             return {
@@ -4929,6 +5024,7 @@ async def recognize_audio(
                 "reason": session_reason,
                 "message": "No se captó bien el audio. Acerca el micro y evita el ruido.",
                 "ms_servidor": ms_servidor,
+                "envio": envio,
             }
 
         # ── Extraer datos del resultado ──
@@ -4978,6 +5074,9 @@ async def recognize_audio(
             # servidor anterior no lo manda y el movil pregunta como siempre).
             "backend_analysis": backend_analysis,
             "busco_ficha": True,
+            # Con que se mando el audio a AudD: el movil lo apunta en su
+            # telemetria para comparar las variantes del interruptor.
+            "envio": envio,
         }
 
         # Guardar reconocimiento en BD colectiva para enriquecer futuras consultas

@@ -703,8 +703,19 @@ class AnalysisDB:
         #   - `sesion` = una PULSACION de Escuchar. El movil manda hasta cuatro
         #     peticiones por pulsacion (reintenta si el audio no vale), y cada
         #     una dejaba su marcador: el cupo contaba peticiones, no usos.
+        # Migracion 2026-09-29 (el interruptor de Escuchar): `variante` y `ms`,
+        # solo en las filas de Escuchar.
+        #   - `variante` = como se hizo esa pulsacion: segundos del PRIMER clip
+        #     que grabo el movil y si el audio fue a AudD tal cual o pasado por
+        #     ffmpeg (`12s+ffmpeg`, `8s+directo`). Es lo que deja comparar las
+        #     dos palancas de latencia contra lo de siempre.
+        #   - `ms` (en el marcador de sesion) = lo que tardo el servidor hasta
+        #     tener la respuesta de AudD: subida + ffmpeg + AudD, sin ficha ni
+        #     portada. Es la parte que cambia el envio directo, y se mide para
+        #     TODOS los clientes, tambien los publicados.
         for _col in ('source TEXT', 'device_id TEXT', 'reason TEXT',
-                     'origen TEXT', 'sesion TEXT'):
+                     'origen TEXT', 'sesion TEXT', 'variante TEXT',
+                     'ms INTEGER'):
             try:
                 conn.execute(f'ALTER TABLE audd_call_log ADD COLUMN {_col}')
             except sqlite3.OperationalError:
@@ -3287,7 +3298,9 @@ class AnalysisDB:
                       device_id: Optional[str] = None,
                       reason: Optional[str] = None,
                       origen: Optional[str] = None,
-                      sesion: Optional[str] = None) -> None:
+                      sesion: Optional[str] = None,
+                      variante: Optional[str] = None,
+                      ms: Optional[int] = None) -> None:
         """Registra una llamada AudD (incluso fallidas) para honrar cooldown/cap
         y para CONTABILIDAD real del gasto por via. `source`:
           - 'analyze'   → auto-trigger de /analyze (cuenta para AUDD_DAILY_CAP).
@@ -3300,7 +3313,9 @@ class AnalysisDB:
         las vias que no lo distinguen lo dejan a None.
 
         `origen` y `sesion` solo los pone /recognize: quien llamo (Escuchar,
-        portada, editar) y a que pulsacion pertenece. Ver el ALTER."""
+        portada, editar) y a que pulsacion pertenece. `variante` y `ms`, solo
+        Escuchar: como se hizo la pulsacion y lo que tardo hasta AudD. Ver el
+        ALTER."""
         if not fingerprint:
             return
         conn = self._open_conn()
@@ -3308,10 +3323,10 @@ class AnalysisDB:
             conn.execute(
                 'INSERT INTO audd_call_log '
                 '(fingerprint, called_at, success, artist, title, source, '
-                'device_id, reason, origen, sesion) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                'device_id, reason, origen, sesion, variante, ms) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (fingerprint, time.time(), 1 if success else 0, artist, title,
-                 source, device_id, reason, origen, sesion),
+                 source, device_id, reason, origen, sesion, variante, ms),
             )
             conn.commit()
         finally:
@@ -3595,6 +3610,26 @@ class AnalysisDB:
     # que llego a pasar. Un audio malo seguido de un acierto es un acierto.
     _RANGO_DESENLACE = {'matched': 3, 'no_match': 2, 'audio_unusable': 1}
 
+    # Lo que fue toda pulsacion de Escuchar antes del interruptor (2026-09-29):
+    # las versiones publicadas graban 12 s y el servidor siempre pasaba el
+    # audio por ffmpeg. Las filas de Escuchar sin `variante` son eso.
+    VARIANTE_DE_SIEMPRE = '12s+ffmpeg'
+
+    @staticmethod
+    def _reparto_ms(valores) -> dict:
+        """{n, p50, p90} por el vecino mas cercano, sin interpolar: el mismo
+        metodo que `_percentil` del panel (cada valor es el de una peticion
+        que existio)."""
+        orden = sorted(valores)
+
+        def pct(p):
+            if not orden:
+                return 0
+            k = max(0, min(len(orden) - 1,
+                           int(round(p / 100.0 * len(orden) + 0.5)) - 1))
+            return int(orden[k])
+        return {'n': len(orden), 'p50': pct(50), 'p90': pct(90)}
+
     def resumen_escuchar(self, *, days: int = 30) -> dict:
         """Escuchar DE VERDAD en los ultimos `days`: solo el boton del movil.
 
@@ -3611,19 +3646,28 @@ class AnalysisDB:
                         audio_unusable}} de TODOS los marcadores, por peticion.
                         `sin_origen` = filas anteriores al 2026-09-29.
           llamadas_audd {origen: llamadas reales a AudD}
+          por_variante  {variante: {pulsaciones, matched, no_match,
+                        audio_unusable, llamadas_audd, ms_hasta_audd}} de
+                        Escuchar: la comparacion del interruptor (primer clip
+                        y envio directo). `ms_hasta_audd` = {n, p50, p90} por
+                        PETICION de lo que tardo el servidor hasta tener la
+                        respuesta de AudD. Sin `variante` = VARIANTE_DE_SIEMPRE.
 
         Recorre el cursor, no `fetchall()` (la trampa del panel)."""
         conn = self._open_conn()
         try:
             cutoff = time.time() - int(days) * 86400
             por_pulsacion = {}
+            variante_de = {}
+            ms_por_variante = {}
             por_origen = {}
             peticiones = 0
             cur = conn.execute(
                 "SELECT id, COALESCE(origen, 'sin_origen') AS o, sesion, "
-                "COALESCE(reason, 'unknown') AS r FROM audd_call_log "
+                "COALESCE(reason, 'unknown') AS r, "
+                "COALESCE(variante, ?) AS v, ms FROM audd_call_log "
                 "WHERE called_at >= ? AND source = 'recognize_session'",
-                (cutoff,),
+                (self.VARIANTE_DE_SIEMPRE, cutoff),
             )
             for fila in cur:
                 o, r = fila['o'], fila['r']
@@ -3637,6 +3681,9 @@ class AnalysisDB:
                     continue
                 peticiones += 1
                 clave = fila['sesion'] or f"fila:{fila['id']}"
+                variante_de.setdefault(clave, fila['v'])
+                if fila['ms'] is not None:
+                    ms_por_variante.setdefault(fila['v'], []).append(fila['ms'])
                 previo = por_pulsacion.get(clave)
                 if (previo is None or self._RANGO_DESENLACE.get(r, 0)
                         > self._RANGO_DESENLACE.get(previo, 0)):
@@ -3652,12 +3699,34 @@ class AnalysisDB:
                 (cutoff,),
             ):
                 llamadas[fila['o']] = int(fila['n'] or 0)
+
+            por_variante = {}
+
+            def _de(v):
+                return por_variante.setdefault(v, {
+                    'pulsaciones': 0, 'matched': 0, 'no_match': 0,
+                    'audio_unusable': 0, 'llamadas_audd': 0,
+                    'ms_hasta_audd': self._reparto_ms([])})
+            for clave, r in por_pulsacion.items():
+                d = _de(variante_de.get(clave, self.VARIANTE_DE_SIEMPRE))
+                d['pulsaciones'] += 1
+                d[r] = d.get(r, 0) + 1
+            for v, lista in ms_por_variante.items():
+                _de(v)['ms_hasta_audd'] = self._reparto_ms(lista)
+            for fila in conn.execute(
+                "SELECT COALESCE(variante, ?) AS v, COUNT(*) AS n "
+                "FROM audd_call_log WHERE called_at >= ? "
+                "AND source = 'recognize' AND origen = 'escuchar' GROUP BY v",
+                (self.VARIANTE_DE_SIEMPRE, cutoff),
+            ):
+                _de(fila['v'])['llamadas_audd'] = int(fila['n'] or 0)
             return {
                 'pulsaciones': len(por_pulsacion),
                 'desenlace': desenlace,
                 'peticiones': peticiones,
                 'por_origen': por_origen,
                 'llamadas_audd': llamadas,
+                'por_variante': por_variante,
             }
         finally:
             conn.close()

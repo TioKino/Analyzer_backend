@@ -1677,6 +1677,11 @@ def _escuchar_segun_el_movil(dias: int = 30):
       enlaces        {destino: n} de `listen_link`
       pendientes     {outcome: n} de `listen_pendiente`: capturas sin red que
                      se identificaron despues
+      por_variante   {variante: {pulsaciones, por_desenlace, ms_acierto}}: la
+                     comparacion del interruptor de Escuchar. La variante sale
+                     de `clip_s` y `envio` del evento (`8s+directo`); sin ellos
+                     es la de siempre, `12s+ffmpeg` (ver
+                     `AnalysisDB.VARIANTE_DE_SIEMPRE`)
 
     None si falla (el panel no miente: None es «fallo», no «cero»).
     """
@@ -1695,6 +1700,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
     guardadas = 0
     enlaces = {}
     pendientes = {}
+    por_variante = {}
 
     def _num(v):
         try:
@@ -1723,10 +1729,15 @@ def _escuchar_segun_el_movil(dias: int = 30):
                     aparatos.add(dev)
                 o = str(p.get('outcome') or 'sin_dato')[:32]
                 por_desenlace[o] = por_desenlace.get(o, 0) + 1
+                pv = por_variante.setdefault(_variante_del_evento(p), {
+                    'pulsaciones': 0, 'por_desenlace': {}, 'ms_acierto': []})
+                pv['pulsaciones'] += 1
+                pv['por_desenlace'][o] = pv['por_desenlace'].get(o, 0) + 1
                 if o == 'found':
                     ms = _num(p.get('ms'))
                     if ms is not None:
                         ms_acierto.append(ms)
+                        pv['ms_acierto'].append(ms)
                 srv = _num(p.get('ms_servidor'))
                 if srv is not None:
                     ms_servidor.append(srv)
@@ -1758,7 +1769,29 @@ def _escuchar_segun_el_movil(dias: int = 30):
         'guardadas': guardadas,
         'enlaces': enlaces,
         'pendientes': pendientes,
+        'por_variante': {
+            v: {'pulsaciones': d['pulsaciones'],
+                'por_desenlace': d['por_desenlace'],
+                'ms_acierto': _reparto(d['ms_acierto'])}
+            for v, d in por_variante.items()},
     }
+
+
+def _variante_del_evento(props: dict) -> str:
+    """La variante de una pulsacion segun el movil: `{clip_s}s+{envio}`, con
+    la misma forma que `audd_call_log.variante`. Lo que falte es lo de
+    siempre (12 s y ffmpeg), que es lo que hacia todo movil antes del
+    interruptor."""
+    try:
+        clip = int(float(props.get('clip_s')))
+    except (TypeError, ValueError):
+        clip = 12
+    if not 1 <= clip <= 60:
+        clip = 12
+    envio = str(props.get('envio') or '').strip().lower()
+    if envio not in ('ffmpeg', 'directo'):
+        envio = 'ffmpeg'
+    return f"{clip}s+{envio}"
 
 
 def _resumen_lo_importado():
