@@ -4554,6 +4554,25 @@ class AnalysisDB:
             fallidos7 = int(r['fallidos'] or 0)
             sin_intento7 = int(r['sin_intento'] or 0)
 
+            # ¿De CUANTOS APARATOS vienen? Con solo el conteo, «un DJ con 300
+            # ficheros rotos» y «300 DJs con uno cada uno» se leen igual, y
+            # piden cosas opuestas: lo primero es un lote y se olvida, lo
+            # segundo es un fallo del producto. El 2026-09-27 salieron 289
+            # fallbacks y 404 analisis OK sin huella en 7 dias, y la unica
+            # forma de saber cual de las dos era fue abrir los logs de Render.
+            #
+            # El aparato ya estaba apuntado: el envoltorio de `/analyze` llama
+            # a `registrar_analista` en TODAS sus salidas —el fallback
+            # incluido— con el `X-Device-Id` que el cliente manda al analizar.
+            # Nadie lo cruzaba. Estas filas no tienen huella acustica, asi que
+            # su clave en `track_analyzers` es la huella del fichero.
+            #
+            # En las DOS ventanas: la de 7 dias para lo de ahora, y la de 30
+            # para poder leer una rafaga que ya paso (la del 27-sep sale del
+            # corte de 7 dias antes de la lectura siguiente).
+            aparatos7 = self._aparatos_de_lo_reciente(c, sin, _marcador, 7)
+            aparatos30 = self._aparatos_de_lo_reciente(c, sin, _marcador, 30)
+
             return {
                 'without_chromaprint': total,
                 'by_engine': por_motor,
@@ -4579,6 +4598,10 @@ class AnalysisDB:
                     'never_tried': sin_intento7,
                     'analyzed_ok': max(recientes7 - fallidos7 - sin_intento7, 0),
                 },
+                # De cuantos aparatos y de que plataforma vienen los de arriba.
+                # `None` = no se pudo calcular (BD sin `track_analyzers`).
+                'devices_last_7d': aparatos7,
+                'devices_last_30d': aparatos30,
                 # El dato que decide si esto es legado o una via abierta.
                 #
                 # OJO: este mira TODAS las filas sin huella, las que salen asi
@@ -4596,6 +4619,66 @@ class AnalysisDB:
             return {}
         finally:
             conn.close()
+
+    @staticmethod
+    def _aparatos_de_lo_reciente(c, sin: str, marcador,
+                                 dias: int) -> Optional[Dict]:
+        """De las filas sin huella de los ultimos [dias] dias, por resultado:
+        de cuantos aparatos vienen y de que plataforma.
+
+        `failed_fallback` y `analyzed_ok` (los dos que importan; `never_tried`
+        es `/recognize` y no entra por `/analyze`). Para cada uno:
+
+          devices              aparatos distintos que tienen esas filas
+          rows_without_device  filas sin ningun aparato apuntado (cliente que
+                               no mando `X-Device-Id`, o anterior al
+                               2026-09-26, cuando `registrar_analista` empezo
+                               a correr en todas las salidas de /analyze)
+          by_platform          filas por plataforma. En el fallback, `unknown`
+                               es lo anterior al 2026-09-29, cuando empezo a
+                               sellarla.
+        """
+        grupos = {
+            'failed_fallback': marcador('failed'),
+            'analyzed_ok': (f"NOT {marcador('failed')}"
+                            f" AND NOT {marcador('recognize_only')}"),
+        }
+        corte = f"date('now','-{int(dias)} days')"
+        base = (f"FROM tracks t WHERE ({sin})"
+                f" AND substr(t.analyzed_at,1,10) >= {corte}")
+        salida = {}
+        try:
+            for nombre, cond in grupos.items():
+                c.execute(
+                    "SELECT COUNT(DISTINCT ta.device_id) AS d FROM tracks t"
+                    " JOIN track_analyzers ta ON ta.fingerprint = t.fingerprint"
+                    f" WHERE ({sin})"
+                    f" AND substr(t.analyzed_at,1,10) >= {corte}"
+                    f" AND {cond}"
+                )
+                aparatos = int(c.fetchone()['d'] or 0)
+                c.execute(
+                    "SELECT COUNT(*) AS n " + base + f" AND {cond}"
+                    " AND NOT EXISTS (SELECT 1 FROM track_analyzers ta"
+                    "                 WHERE ta.fingerprint = t.fingerprint)"
+                )
+                sin_aparato = int(c.fetchone()['n'] or 0)
+                c.execute(
+                    "SELECT COALESCE(t.platform, 'unknown') AS p, COUNT(*) AS n "
+                    + base + f" AND {cond} GROUP BY p ORDER BY n DESC"
+                )
+                por_plataforma = {str(r['p']): int(r['n'] or 0)
+                                  for r in c.fetchall()}
+                salida[nombre] = {
+                    'devices': aparatos,
+                    'rows_without_device': sin_aparato,
+                    'by_platform': por_plataforma,
+                }
+        except sqlite3.OperationalError:
+            # BD sin `track_analyzers` o sin `platform`: mejor «no lo se» que
+            # un cero que parezca una medida.
+            return None
+        return salida
 
     def count_engine_sources(self) -> Dict[str, int]:
         """Counts de tracks por engine_source.
