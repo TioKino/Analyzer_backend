@@ -976,6 +976,36 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def huellas_del_tema(self, fingerprint: Optional[str],
+                         isrc: Optional[str] = None,
+                         limite: int = 500) -> List[str]:
+        """Las huellas (MD5 del contenido) de TODOS los ficheros que se conocen
+        de un tema: su cluster acustico y los analizados con el mismo ISRC.
+
+        Para que Escuchar diga «EN MI BIBLIOTECA» por el FICHERO y no por el
+        nombre: el movil busca estas huellas entre las suyas, y casa aunque
+        los tags de su copia sean basura. Hasta el 2026-09-29 solo casaba por
+        artista y titulo aproximados (el «NOT IN LIBRARY» de siempre).
+
+        Solo analizados (bpm > 0): la deteccion que siembra /recognize lleva
+        de huella un MD5 de «artista|titulo», que no es el de ningun fichero.
+        """
+        huellas = set(self.fingerprints_in_cluster(fingerprint)) if fingerprint else set()
+        if isrc:
+            conn = self._open_conn()
+            try:
+                for fila in conn.execute(
+                    "SELECT fingerprint FROM tracks WHERE isrc = ? "
+                    "AND bpm IS NOT NULL AND bpm > 0 "
+                    "AND instr(COALESCE(analysis_json, ''), 'recognize_only') = 0",
+                    (isrc,),
+                ):
+                    if fila['fingerprint']:
+                        huellas.add(fila['fingerprint'])
+            finally:
+                conn.close()
+        return sorted(h for h in huellas if h)[:limite]
+
     def backfill_track_fingerprint(self, fingerprint, chromaprint_b64, acoustic_id):
         """Backfill LIGERO: escribe chromaprint + acoustic_id en un track YA
         existente (analizado antes de que fpcalc estuviera vivo), SIN re-analizar

@@ -4601,7 +4601,13 @@ def _ficha_para_recognize(artist: str, title: str,
     ficha = buscar_analizado(artist, title, isrc)
     if not ficha:
         return None
-    return _mejorar_ficha_con_la_comunidad(ficha)
+    ficha = _mejorar_ficha_con_la_comunidad(ficha)
+    try:
+        ficha['huellas_del_tema'] = db.huellas_del_tema(
+            ficha.get('fingerprint'), isrc or ficha.get('isrc'))
+    except Exception as e:  # noqa: BLE001 - sin huellas, el móvil casa por nombre
+        logger.warning(f"[Recognize] huellas del tema fallo: {e}")
+    return ficha
 
 
 def _guardar_deteccion(artist: str, title: str, album, label, isrc,

@@ -378,3 +378,45 @@ class TestSearchAnalyzed:
         j = client.get('/search-analyzed', params={
             'artist': artista, 'title': 'Remix'}).json()
         assert j['found'] is False
+
+
+# ── «¿Lo tengo?» por el FICHERO, no por el nombre ───────────────────────
+
+class TestHuellasDelTema:
+    def _db(self, tmp_path):
+        return AnalysisDB(str(tmp_path / 'a.db'))
+
+    def _fila(self, db, fp, **campos):
+        fila = {'id': fp, 'fingerprint': fp, 'filename': f'{fp}.mp3',
+                'energy_dj': 7, 'genre': 'Techno', 'track_type': 'peak_time',
+                'duration': 400, 'bpm': 128.0}
+        fila.update(campos)
+        db.save_track(fila)
+
+    def test_el_cluster_y_el_isrc_sin_la_deteccion(self, tmp_path):
+        db = self._db(tmp_path)
+        self._fila(db, 'a' * 32, acoustic_id='clusterX')
+        self._fila(db, 'b' * 32, acoustic_id='clusterX')   # otra codificación
+        self._fila(db, 'c' * 32, isrc='ESX')               # mismo ISRC, sin huella
+        self._fila(db, 'd' * 32)                           # otro tema
+        # La detección de Escuchar: bpm 0 y una huella que no es de ningún
+        # fichero (MD5 de «artista|titulo»).
+        self._fila(db, 'e' * 32, bpm=0, isrc='ESX',
+                   analysis_status='recognize_only')
+        huellas = db.huellas_del_tema('a' * 32, 'ESX')
+        assert set(huellas) == {'a' * 32, 'b' * 32, 'c' * 32}
+
+    def test_sin_huella_ni_isrc_no_hay_nada(self, tmp_path):
+        assert self._db(tmp_path).huellas_del_tema(None, None) == []
+
+    def test_la_ficha_de_recognize_las_trae(self, client, audd):
+        isrc = f'ES{uuid.uuid4().hex[:10].upper()}'
+        artista, titulo = f'A {uuid.uuid4().hex[:6]}', f'T {uuid.uuid4().hex[:6]}'
+        fp = _guardar_analizado(artist=artista, title=titulo, bpm=126.0,
+                                isrc=isrc)
+        otra = _guardar_analizado(artist='tags basura', title='track 01',
+                                  bpm=126.0, isrc=isrc)
+        audd.respuestas = [(_track_data(isrc=isrc, artist=artista,
+                                        title=titulo), True)]
+        ficha = _post(client, origen='escuchar').json()['backend_analysis']
+        assert {fp, otra} <= set(ficha['huellas_del_tema'])
