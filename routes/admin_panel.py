@@ -2272,6 +2272,13 @@ async def retention(request: Request):
     except Exception as e:  # noqa: BLE001
         logger.debug(f"[Retention] diagnostico de cortos no disponible: {e}")
         stalled = {}
+    # Y si el aviso para los cortos («Trae tu biblioteca») sirve de algo. Su
+    # propio try/except por lo mismo que `stalled`.
+    try:
+        trae = _trae_tu_biblioteca(_por_device)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Retention] trae_tu_biblioteca no disponible: {e}")
+        trae = None
     # La cuenta vieja se conserva bajo otro nombre: mide algo distinto y real
     # (actividad de import del trimestre), solo que no es "cuanta biblioteca
     # tiene la gente".
@@ -2285,6 +2292,9 @@ async def retention(request: Request):
         "tool": tool,
         "investment": investment,
         "stalled": stalled,
+        # `None` = el calculo fallo; ausente = servidor anterior. `embudo.sh`
+        # los distingue (ver «el panel no miente» en CLAUDE.md).
+        "trae_tu_biblioteca": trae,
         "import_activity_90d": imports_90d,
     }
 
@@ -2610,6 +2620,129 @@ def _por_que_se_quedan_cortos(
         'nota_senal': ('la purga de events a los 90 dias es el TECHO de lo que '
                        'se puede ver: sin_eventos mezcla purgado con nunca '
                        'reporto, y no se puede fechar'),
+    }
+
+
+_EVENTOS_TRAE = ('bring_library_shown', 'bring_library_cta',
+                 'bring_library_dismissed')
+
+
+def _trae_tu_biblioteca(
+    por_device: Optional[Dict[str, int]] = None,
+    umbral: int = 10,
+) -> dict:
+    """«Trae tu biblioteca entera», medido: el aviso a los que se quedan cortos.
+
+    Para el grupo `activo_sin_traer_mas` de `_por_que_se_quedan_cortos` (vivos,
+    import OK, menos de `umbral` temas) hay un aviso en la app: el banner de
+    escritorio desde la 2.10.0 y la tarjeta de movil desde el 2026-09-29. Sus
+    eventos —`bring_library_shown`, `_cta` (con `props.puerta`) y
+    `_dismissed`— llevaban una release llegando a `events` y **no los leia
+    nadie**: un aviso que no se mide no se puede quitar ni mejorar.
+
+    Por grupo de plataforma (`desktop` / `mobile`, `otra` si no casa):
+
+      vieron        aparatos que lo vieron alguna vez (en la ventana de events)
+      pulsaron      aparatos que pulsaron alguna puerta
+      por_puerta    {puerta: aparatos}. Escritorio: `carpeta` / `programa`;
+                    movil: `vincular` / `anadir`. `sin_dato` = escritorio
+                    2.10.0-2.10.1, cuando solo existia la carpeta.
+      descartaron   aparatos que le dieron a «no me interesa»
+      crecieron     de los que lo vieron, cuantos tienen HOY >= `umbral` temas.
+                    El aviso solo sale por debajo, asi que esto es haber
+                    traido la biblioteca. Es el numero que dice si sirve.
+      crecieron_tras_pulsar   lo mismo, de los que pulsaron
+      vincularon_tras_pulsar  de los que pulsaron, cuantos tienen un
+                    `device_linked`. En movil es el exito de verdad: vincular
+                    no sube sus temas en `sync.db` (los cuenta el aparato que
+                    los subio), asi que `crecieron` no lo ve.
+
+    ⚠️ `crecieron` cuenta temas POR APARATO (`_tracks_por_device`, por
+    `last_device_id`), igual que el reparto de los cortos. Un movil que
+    vincula y recibe 3.000 temas del ordenador sigue siendo «corto» ahi.
+    """
+    if por_device is None:
+        por_device = _tracks_por_device()
+    vacio = {'umbral': umbral, 'por_plataforma': {}}
+
+    analysis_db_path = os.environ.get("ANALYSIS_DB_PATH", "analysis.db")
+    try:
+        adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
+    except sqlite3.Error as e:  # noqa: BLE001
+        logger.debug(f"[TraeTuBiblioteca] analysis.db no disponible: {e}")
+        return vacio
+
+    grupo_de = {}
+    for grupo, valores in _PLATFORM_GROUPS.items():
+        for v in valores:
+            grupo_de[v] = grupo
+
+    # device -> {'grupo', 'vio', 'pulso', 'puertas', 'descarto'}
+    por_aparato = {}
+    try:
+        marcas = ",".join("?" for _ in _EVENTOS_TRAE)
+        filas = adb.execute(
+            "SELECT device_id, LOWER(COALESCE(platform,'')), event_name, "
+            "       json_extract(props, '$.puerta') "
+            "FROM events WHERE device_id IS NOT NULL "
+            f"AND event_name IN ({marcas})",
+            _EVENTOS_TRAE,
+        )
+        for dev, plat, nombre, puerta in filas:
+            a = por_aparato.setdefault(dev, {
+                'grupo': 'otra', 'vio': False, 'pulso': False,
+                'puertas': set(), 'descarto': False,
+            })
+            a['grupo'] = grupo_de.get(plat, a['grupo'])
+            if nombre == 'bring_library_shown':
+                a['vio'] = True
+            elif nombre == 'bring_library_cta':
+                a['pulso'] = True
+                a['puertas'].add(str(puerta) if puerta else 'sin_dato')
+            else:
+                a['descarto'] = True
+
+        vinculados = set()
+        pulsadores = [d for d, a in por_aparato.items() if a['pulso']]
+        for lote in _en_lotes(pulsadores):
+            marcas = ",".join("?" for _ in lote)
+            for (dev,) in adb.execute(
+                "SELECT DISTINCT device_id FROM events "
+                f"WHERE event_name = 'device_linked' AND device_id IN ({marcas})",
+                lote,
+            ):
+                vinculados.add(dev)
+    finally:
+        adb.close()
+
+    salida = {}
+    for dev, a in por_aparato.items():
+        g = salida.setdefault(a['grupo'], {
+            'vieron': 0, 'pulsaron': 0, 'por_puerta': {}, 'descartaron': 0,
+            'crecieron': 0, 'crecieron_tras_pulsar': 0,
+            'vincularon_tras_pulsar': 0,
+        })
+        crecio = por_device.get(dev, 0) >= umbral
+        if a['vio']:
+            g['vieron'] += 1
+            if crecio:
+                g['crecieron'] += 1
+        if a['pulso']:
+            g['pulsaron'] += 1
+            for p in a['puertas']:
+                g['por_puerta'][p] = g['por_puerta'].get(p, 0) + 1
+            if crecio:
+                g['crecieron_tras_pulsar'] += 1
+            if dev in vinculados:
+                g['vincularon_tras_pulsar'] += 1
+        if a['descarto']:
+            g['descartaron'] += 1
+
+    return {
+        'umbral': umbral,
+        'por_plataforma': salida,
+        'nota': ('crecieron cuenta temas por APARATO: un movil que vincula no '
+                 'crece aqui, por eso esta vincularon_tras_pulsar'),
     }
 
 
