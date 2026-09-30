@@ -1655,8 +1655,8 @@ def _resumen_escuchar():
         return None
 
 
-_EVENTOS_ESCUCHAR = ('listen_result', 'listen_saved', 'listen_link',
-                     'listen_pendiente')
+_EVENTOS_ESCUCHAR = ('listen_result', 'listen_saved', 'listen_wrong',
+                     'listen_link', 'listen_pendiente')
 
 
 def _escuchar_segun_el_movil(dias: int = 30):
@@ -1672,12 +1672,15 @@ def _escuchar_segun_el_movil(dias: int = 30):
       ms_acierto     {n, p50, p90} de `ms` en los aciertos: desde que empieza a
                      escuchar hasta que se ve el tema. EL numero a bajar.
       ms_servidor    {n, p50, p90} de lo que tarda /recognize por dentro
-      guardadas      `listen_saved`: el DJ confirmo que era ese tema. Es lo mas
-                     parecido a medir la precision que hay
+      guardadas      `listen_saved`: el DJ confirmo que era ese tema
+      equivocadas    `listen_wrong`: el DJ pulso «No es este» (desde el
+                     2026-09-29). Con `guardadas`, la precision: en el
+                     servidor una deteccion equivocada cuenta como `matched`
       enlaces        {destino: n} de `listen_link`
       pendientes     {outcome: n} de `listen_pendiente`: capturas sin red que
                      se identificaron despues
-      por_variante   {variante: {pulsaciones, por_desenlace, ms_acierto}}: la
+      por_variante   {variante: {pulsaciones, por_desenlace, ms_acierto,
+                     guardadas, equivocadas}}: la
                      comparacion del interruptor de Escuchar. La variante sale
                      de `clip_s` y `envio` del evento (`8s+directo`); sin ellos
                      es la de siempre, `12s+ffmpeg` (ver
@@ -1698,9 +1701,15 @@ def _escuchar_segun_el_movil(dias: int = 30):
     ms_acierto = []
     ms_servidor = []
     guardadas = 0
+    equivocadas = 0
     enlaces = {}
     pendientes = {}
     por_variante = {}
+
+    def _de_variante(p):
+        return por_variante.setdefault(_variante_del_evento(p), {
+            'pulsaciones': 0, 'por_desenlace': {}, 'ms_acierto': [],
+            'guardadas': 0, 'equivocadas': 0})
 
     def _num(v):
         try:
@@ -1729,8 +1738,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
                     aparatos.add(dev)
                 o = str(p.get('outcome') or 'sin_dato')[:32]
                 por_desenlace[o] = por_desenlace.get(o, 0) + 1
-                pv = por_variante.setdefault(_variante_del_evento(p), {
-                    'pulsaciones': 0, 'por_desenlace': {}, 'ms_acierto': []})
+                pv = _de_variante(p)
                 pv['pulsaciones'] += 1
                 pv['por_desenlace'][o] = pv['por_desenlace'].get(o, 0) + 1
                 if o == 'found':
@@ -1743,6 +1751,10 @@ def _escuchar_segun_el_movil(dias: int = 30):
                     ms_servidor.append(srv)
             elif nombre == 'listen_saved':
                 guardadas += 1
+                _de_variante(p)['guardadas'] += 1
+            elif nombre == 'listen_wrong':
+                equivocadas += 1
+                _de_variante(p)['equivocadas'] += 1
             elif nombre == 'listen_link':
                 d = str(p.get('destino') or 'sin_dato')[:32]
                 enlaces[d] = enlaces.get(d, 0) + 1
@@ -1767,12 +1779,15 @@ def _escuchar_segun_el_movil(dias: int = 30):
         'ms_acierto': _reparto(ms_acierto),
         'ms_servidor': _reparto(ms_servidor),
         'guardadas': guardadas,
+        'equivocadas': equivocadas,
         'enlaces': enlaces,
         'pendientes': pendientes,
         'por_variante': {
             v: {'pulsaciones': d['pulsaciones'],
                 'por_desenlace': d['por_desenlace'],
-                'ms_acierto': _reparto(d['ms_acierto'])}
+                'ms_acierto': _reparto(d['ms_acierto']),
+                'guardadas': d['guardadas'],
+                'equivocadas': d['equivocadas']}
             for v, d in por_variante.items()},
     }
 
