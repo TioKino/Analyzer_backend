@@ -12,7 +12,7 @@ tabla con su `analysis_json` dentro.
 import uuid
 
 import main
-from routes.search import FICHA_DONDE, FICHA_SQL, buscar_analizado
+from routes.search import FICHA_CANDIDATOS, FICHA_EXACTA, buscar_analizado
 
 
 def _plan(sql, args):
@@ -47,19 +47,19 @@ def test_el_indice_existe():
     assert 'NOCASE' in filas[0][0].upper()
 
 
-def test_las_tres_consultas_van_por_el_indice():
+def test_las_consultas_van_por_el_indice():
     # Con el esquema de verdad (hay índices de `analyzed_at` y de `bpm`): sin
-    # forzarlo, la de los dos LIKE usaba uno de esos, que leen la tabla fila a
+    # forzarlo, la de los LIKE usaba uno de esos, que leen la tabla fila a
     # fila.
-    args = (('a', 'b'), ('a', '%b%'), ('%a%', '%b%'))
-    for donde, a in zip(FICHA_DONDE, args):
-        plan = _plan(FICHA_SQL.format(donde=donde), a)
-        assert 'COVERING INDEX idx_tracks_ficha' in plan, (donde, plan)
-        assert 'idx_tracks_analyzed_at' not in plan, (donde, plan)
-        assert 'idx_bpm' not in plan, (donde, plan)
+    for sql, a in ((FICHA_EXACTA, ('a', 'b')),
+                   (FICHA_CANDIDATOS, ('%a%', '%b%'))):
+        plan = _plan(sql, a)
+        assert 'COVERING INDEX idx_tracks_ficha' in plan, (sql, plan)
+        assert 'idx_tracks_analyzed_at' not in plan, (sql, plan)
+        assert 'idx_bpm' not in plan, (sql, plan)
         # De la tabla solo se lee la fila elegida, por su rowid.
-        assert 'SCAN tracks |' not in plan + ' |', (donde, plan)
-    assert 'INDEXED BY idx_tracks_ficha' in FICHA_SQL
+        assert 'SCAN tracks |' not in plan + ' |', (sql, plan)
+        assert 'INDEXED BY idx_tracks_ficha' in sql
 
 
 def test_sin_mayusculas_como_antes():
@@ -69,11 +69,12 @@ def test_sin_mayusculas_como_antes():
     # Exacto: en minúsculas casa igual que con LOWER().
     exacto = _guardar(artista, titulo)
     assert buscar_analizado(artista.lower(), titulo.lower())['id'] == exacto
-    # Artista exacto, título con sufijo de mezcla por aproximación.
+    # Artista exacto, título con «(Original Mix)»: es el original.
     otro = f'Otro Tema {sufijo}'
     fp2 = _guardar(artista, f'{otro} (Original Mix)')
     assert buscar_analizado(artista.lower(), otro.upper())['id'] == fp2
-    # Los dos por aproximación.
+    # Los dos por aproximación (el artista dentro de otro, el tema dentro de
+    # otro) y «(Extended Mix)», que también es el original.
     assert buscar_analizado(f'beyer {sufijo}', f'mind {sufijo} (extended mix)')[
         'id'] in (fp, exacto)
 
