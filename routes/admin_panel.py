@@ -1679,6 +1679,11 @@ def _escuchar_segun_el_movil(dias: int = 30):
       enlaces        {destino: n} de `listen_link`
       pendientes     {outcome: n} de `listen_pendiente`: capturas sin red que
                      se identificaron despues
+      pendientes_resueltas_por
+                     {shazam, audd} de los `listen_pendiente` encontrados
+                     (desde el 2026-09-30): con Shazam delante, una captura
+                     sin red lleva su firma de Shazam y se busca ahi antes
+                     que en AudD. `shazam` = una llamada a AudD ahorrada
       por_entrada    {entrada: n} de `listen_result` (desde el 2026-09-30):
                      `boton` (la pantalla principal), `atajo` (el del icono de
                      la app), `pantalla` (otra pulsacion dentro de Escuchar) y
@@ -1715,6 +1720,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
     equivocadas = 0
     enlaces = {}
     pendientes = {}
+    pendientes_resueltas_por = {'shazam': 0, 'audd': 0}
     por_variante = {}
     por_entrada = {}
     shazam_errores = {}
@@ -1785,6 +1791,10 @@ def _escuchar_segun_el_movil(dias: int = 30):
             else:
                 o = str(p.get('outcome') or 'sin_dato')[:32]
                 pendientes[o] = pendientes.get(o, 0) + 1
+                if o == 'found':
+                    quien = ('shazam' if p.get('resuelto_por') == 'shazam'
+                             else 'audd')
+                    pendientes_resueltas_por[quien] += 1
     except sqlite3.Error as e:
         logger.warning(f"[Admin] Escuchar segun el movil: {e}")
         return None
@@ -1806,6 +1816,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
         'equivocadas': equivocadas,
         'enlaces': enlaces,
         'pendientes': pendientes,
+        'pendientes_resueltas_por': pendientes_resueltas_por,
         'por_entrada': por_entrada,
         'shazam_errores': shazam_errores,
         'por_variante': {
