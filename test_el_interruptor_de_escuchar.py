@@ -291,6 +291,21 @@ class TestPanel:
         assert delta('8s+ffmpeg', 'guardadas') == 1
         assert delta('12s+ffmpeg', 'guardadas') == 1, 'sin variante = la de siempre'
 
+    def test_por_donde_entra_cada_pulsacion(self):
+        # El atajo del icono (2026-09-30): se mide si alguien lo usa.
+        import routes.admin_panel as panel
+        antes = panel._escuchar_segun_el_movil()['por_entrada']
+        dev = f'movil-{uuid.uuid4().hex[:8]}'
+        for props in ({'outcome': 'found', 'entrada': 'atajo'},
+                      {'outcome': 'found', 'entrada': 'boton'},
+                      {'outcome': 'no_match', 'entrada': 'pantalla'},
+                      {'outcome': 'found'}):  # un movil anterior
+            main.db.log_event(device_id=dev, event_name='listen_result',
+                              props=json.dumps(props), platform='ios')
+        pe = panel._escuchar_segun_el_movil()['por_entrada']
+        for k in ('atajo', 'boton', 'pantalla', 'sin_dato'):
+            assert pe.get(k, 0) - antes.get(k, 0) == 1, k
+
     def test_variante_del_evento(self):
         from routes.admin_panel import _variante_del_evento
         assert _variante_del_evento({}) == '12s+ffmpeg'

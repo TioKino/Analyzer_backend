@@ -1679,6 +1679,10 @@ def _escuchar_segun_el_movil(dias: int = 30):
       enlaces        {destino: n} de `listen_link`
       pendientes     {outcome: n} de `listen_pendiente`: capturas sin red que
                      se identificaron despues
+      por_entrada    {entrada: n} de `listen_result` (desde el 2026-09-30):
+                     `boton` (la pantalla principal), `atajo` (el del icono de
+                     la app), `pantalla` (otra pulsacion dentro de Escuchar) y
+                     `sin_dato` (versiones anteriores)
       por_variante   {variante: {pulsaciones, por_desenlace, ms_acierto,
                      guardadas, equivocadas}}: la
                      comparacion del interruptor de Escuchar. La variante sale
@@ -1705,6 +1709,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
     enlaces = {}
     pendientes = {}
     por_variante = {}
+    por_entrada = {}
 
     def _de_variante(p):
         return por_variante.setdefault(_variante_del_evento(p), {
@@ -1740,6 +1745,8 @@ def _escuchar_segun_el_movil(dias: int = 30):
                 por_desenlace[o] = por_desenlace.get(o, 0) + 1
                 pv = _de_variante(p)
                 pv['pulsaciones'] += 1
+                ent = str(p.get('entrada') or 'sin_dato')[:16]
+                por_entrada[ent] = por_entrada.get(ent, 0) + 1
                 pv['por_desenlace'][o] = pv['por_desenlace'].get(o, 0) + 1
                 if o == 'found':
                     ms = _num(p.get('ms'))
@@ -1782,6 +1789,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
         'equivocadas': equivocadas,
         'enlaces': enlaces,
         'pendientes': pendientes,
+        'por_entrada': por_entrada,
         'por_variante': {
             v: {'pulsaciones': d['pulsaciones'],
                 'por_desenlace': d['por_desenlace'],
