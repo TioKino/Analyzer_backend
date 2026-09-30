@@ -4937,6 +4937,21 @@ async def escuchar_ajustes():
     return _ajustes_de_escuchar()
 
 
+@app.get("/shazam/token")
+async def shazam_developer_token():
+    """El token de ShazamKit para Android (2026-09-30, `shazam_token.py`):
+    en Android el SDK pide un JWT firmado con la clave Media Services de la
+    cuenta de Apple Developer, que no puede ir dentro de la app. 503 si
+    Render no tiene `SHAZAM_TEAM_ID`, `SHAZAM_KEY_ID` y `SHAZAM_PRIVATE_KEY`:
+    el movil sigue entonces con AudD solo. Sin auth, como el token de MusicKit
+    de una web: da acceso al catalogo de Shazam, no a nada nuestro."""
+    import shazam_token
+    t = await run_in_threadpool(shazam_token.token_de_shazam)
+    if not t:
+        raise HTTPException(status_code=503, detail="ShazamKit sin configurar")
+    return t
+
+
 @app.post("/recognize")
 async def recognize_audio(
     request: Request,

@@ -10,3 +10,5 @@ soundfile==0.12.1
 discogs_client==2.3.0
 mutagen==1.47.0
 pyacoustid==1.3.0
+# Firma ES256 del token de ShazamKit para Android (shazam_token.py).
+cryptography==44.0.3
