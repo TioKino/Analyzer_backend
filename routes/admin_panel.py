@@ -1688,7 +1688,14 @@ def _escuchar_segun_el_movil(dias: int = 30):
                      comparacion del interruptor de Escuchar. La variante sale
                      de `clip_s` y `envio` del evento (`8s+directo`); sin ellos
                      es la de siempre, `12s+ffmpeg` (ver
-                     `AnalysisDB.VARIANTE_DE_SIEMPRE`)
+                     `AnalysisDB.VARIANTE_DE_SIEMPRE`). Con `motor=shazam`
+                     lleva el prefijo (`shazam+12s+ffmpeg`) y, en los
+                     aciertos, `resueltas_por` {shazam, audd} (`resuelto_por`
+                     del evento)
+      shazam_errores {codigo: n} de `listen_result.shazam_error` (desde el
+                     2026-09-30): ShazamKit fallo en el movil y la pulsacion
+                     siguio solo con AudD. Si crece, algo le pasa a Shazam
+                     (el App ID sin el servicio, la red de Apple)
 
     None si falla (el panel no miente: None es «fallo», no «cero»).
     """
@@ -1710,6 +1717,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
     pendientes = {}
     por_variante = {}
     por_entrada = {}
+    shazam_errores = {}
 
     def _de_variante(p):
         return por_variante.setdefault(_variante_del_evento(p), {
@@ -1753,6 +1761,15 @@ def _escuchar_segun_el_movil(dias: int = 30):
                     if ms is not None:
                         ms_acierto.append(ms)
                         pv['ms_acierto'].append(ms)
+                    if p.get('motor') == 'shazam':
+                        quien = ('shazam' if p.get('resuelto_por') == 'shazam'
+                                 else 'audd')
+                        rp = pv.setdefault('resueltas_por',
+                                           {'shazam': 0, 'audd': 0})
+                        rp[quien] += 1
+                if p.get('shazam_error'):
+                    c = str(p.get('shazam_error'))[:32]
+                    shazam_errores[c] = shazam_errores.get(c, 0) + 1
                 srv = _num(p.get('ms_servidor'))
                 if srv is not None:
                     ms_servidor.append(srv)
@@ -1790,12 +1807,15 @@ def _escuchar_segun_el_movil(dias: int = 30):
         'enlaces': enlaces,
         'pendientes': pendientes,
         'por_entrada': por_entrada,
+        'shazam_errores': shazam_errores,
         'por_variante': {
             v: {'pulsaciones': d['pulsaciones'],
                 'por_desenlace': d['por_desenlace'],
                 'ms_acierto': _reparto(d['ms_acierto']),
                 'guardadas': d['guardadas'],
-                'equivocadas': d['equivocadas']}
+                'equivocadas': d['equivocadas'],
+                **({'resueltas_por': d['resueltas_por']}
+                   if 'resueltas_por' in d else {})}
             for v, d in por_variante.items()},
     }
 
@@ -1804,7 +1824,8 @@ def _variante_del_evento(props: dict) -> str:
     """La variante de una pulsacion segun el movil: `{clip_s}s+{envio}`, con
     la misma forma que `audd_call_log.variante`. Lo que falte es lo de
     siempre (12 s y ffmpeg), que es lo que hacia todo movil antes del
-    interruptor."""
+    interruptor. Con `motor=shazam`, el prefijo `shazam+` (el clip y el envio
+    son los de AudD, que va detras)."""
     try:
         clip = int(float(props.get('clip_s')))
     except (TypeError, ValueError):
@@ -1814,7 +1835,8 @@ def _variante_del_evento(props: dict) -> str:
     envio = str(props.get('envio') or '').strip().lower()
     if envio not in ('ffmpeg', 'directo'):
         envio = 'ffmpeg'
-    return f"{clip}s+{envio}"
+    base = f"{clip}s+{envio}"
+    return f"shazam+{base}" if props.get('motor') == 'shazam' else base
 
 
 def _resumen_lo_importado():

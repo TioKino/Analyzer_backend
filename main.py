@@ -4556,12 +4556,20 @@ def _origen_de_recognize(origen: Optional[str],
 #                           que vale para TODOS los moviles, tambien los
 #                           publicados. Solo Escuchar: el escritorio (portadas,
 #                           Editar) manda ficheros enteros y no espera a nadie.
+#   ESCUCHAR_MOTOR          'shazam' = el movil reconoce con ShazamKit EN EL
+#                           APARATO (en streaming, gratis) y solo si Shazam no
+#                           lo encuentra manda a /recognize el MISMO audio que
+#                           ya grabo (AudD detras). Cualquier otro valor =
+#                           'audd', lo de siempre. Lo obedecen solo los moviles
+#                           que lo tienen (iPhone desde la 2026-09-30); los
+#                           demas siguen con AudD sin enterarse.
 #
 # En Render: Environment → cambiar la variable → «Save and deploy» (reinicia
 # con el mismo codigo). Volver atras es borrar la variable.
 _CLIP_DE_SIEMPRE = 12   # lo que graban todas las versiones publicadas
 _CLIP_MINIMO = 5
 _ENVIOS_ESCUCHAR = ('ffmpeg', 'directo')
+_MOTORES_ESCUCHAR = ('audd', 'shazam')
 
 
 def _ajustes_de_escuchar() -> dict:
@@ -4577,7 +4585,14 @@ def _ajustes_de_escuchar() -> dict:
     envio = (os.getenv('ESCUCHAR_ENVIO') or '').strip().lower()
     if envio not in _ENVIOS_ESCUCHAR:
         envio = 'ffmpeg'
-    return {'primer_clip_s': clip, 'envio': envio}
+    return {'primer_clip_s': clip, 'envio': envio,
+            'motor': _motor_de(os.getenv('ESCUCHAR_MOTOR'))}
+
+
+def _motor_de(valor: Optional[str]) -> str:
+    """'shazam' o 'audd'. Lo que no sea 'shazam' es lo de siempre."""
+    m = (valor or '').strip().lower()
+    return m if m in _MOTORES_ESCUCHAR else 'audd'
 
 
 def _primer_clip_de(valor: Optional[str]) -> int:
@@ -4590,9 +4605,13 @@ def _primer_clip_de(valor: Optional[str]) -> int:
     return s if 1 <= s <= 60 else _CLIP_DE_SIEMPRE
 
 
-def _variante_de_escuchar(primer_clip_s: int, envio: str) -> str:
-    """`12s+ffmpeg`, `8s+directo`… La etiqueta de la pulsacion en el panel."""
-    return f"{primer_clip_s}s+{envio}"
+def _variante_de_escuchar(primer_clip_s: int, envio: str,
+                          motor: str = 'audd') -> str:
+    """`12s+ffmpeg`, `8s+directo`… La etiqueta de la pulsacion en el panel.
+    Con Shazam delante lleva el prefijo (`shazam+12s+ffmpeg`): el clip y el
+    envio son los de AudD, que va detras con el mismo audio."""
+    base = f"{primer_clip_s}s+{envio}"
+    return f"shazam+{base}" if motor == 'shazam' else base
 
 
 def _sesion_de_recognize(sesion_id: Optional[str]) -> Optional[str]:
@@ -4749,11 +4768,167 @@ def _ms(segundos: float) -> int:
     return int(round(segundos * 1000))
 
 
+def _cupo_de_escuchar_agotado(device_id: Optional[str], is_pro: bool,
+                              sesion: Optional[str],
+                              origen: Optional[str]) -> Optional[dict]:
+    """La respuesta `cap_reached` si este aparato ya gasto el cupo de hoy, o
+    None. Cuenta PULSACIONES: el reintento de una pulsacion que ya entro en el
+    cupo no se queda fuera por ese mismo cupo. Sin device_id no se capa. Lo
+    comparten /recognize y /recognize/shazam: el cupo es de pulsaciones, no de
+    lo que cuesta cada una."""
+    if not device_id:
+        return None
+    recognize_cap = RECOGNIZE_PRO_DAILY_CAP if is_pro else RECOGNIZE_FREE_DAILY_CAP
+    try:
+        used_today = db.count_recognition_sessions_today(device_id)
+    except Exception:
+        used_today = 0
+    if used_today < recognize_cap:
+        return None
+    try:
+        if db.sesion_contada_hoy(device_id, sesion):
+            return None
+    except Exception:
+        pass
+    logger.info(
+        f"[Recognize] cap alcanzado device={device_id[:8]} "
+        f"used={used_today} cap={recognize_cap} pro={is_pro} "
+        f"origen={origen}")
+    return {
+        "status": "cap_reached",
+        "is_pro": is_pro,
+        "cap": recognize_cap,
+        "used": used_today,
+        "message": "Límite diario de Escuchar alcanzado. Vuelve mañana."
+        if is_pro else
+        "Has alcanzado el límite diario gratuito de Escuchar.",
+    }
+
+
+class AciertoDeShazam(BaseModel):
+    """Lo que ShazamKit encontro en el movil (`SHMediaItem`). Texto del
+    cliente: se acota antes de guardarlo."""
+    artist: str
+    title: str
+    isrc: Optional[str] = None
+    apple_music_url: Optional[str] = None
+    artwork_url: Optional[str] = None
+    web_url: Optional[str] = None
+    shazam_id: Optional[str] = None
+    device_id: Optional[str] = None
+    is_pro: bool = True
+    origen: Optional[str] = None
+    sesion_id: Optional[str] = None
+    primer_clip_s: Optional[str] = None
+
+
+def _texto_de_shazam(v: Optional[str], largo: int = 300) -> Optional[str]:
+    v = (v or '').strip()
+    return v[:largo] if v else None
+
+
+def _url_de_shazam(v: Optional[str]) -> Optional[str]:
+    """Solo https: es una URL que el movil va a abrir o a pintar."""
+    v = _texto_de_shazam(v, 1000)
+    return v if v and v.startswith('https://') else None
+
+
+@app.post("/recognize/shazam")
+async def recognize_shazam(acierto: AciertoDeShazam, request: Request,
+                           background_tasks: BackgroundTasks):
+    """Un acierto de ShazamKit (2026-09-30, `ESCUCHAR_MOTOR=shazam`).
+
+    Shazam reconoce EN EL MOVIL y en streaming, asi que aqui no llega audio:
+    llega el tema. Lo que hace el servidor es lo mismo que tras un acierto de
+    AudD —la ficha de la memoria colectiva, la portada y el apunte de la
+    deteccion— y el marcador de la pulsacion, para que el cupo y el panel la
+    cuenten como una de Escuchar (`motor='shazam'`, sin llamada a AudD). La
+    respuesta tiene la MISMA forma que la de /recognize.
+    """
+    t_inicio = time.perf_counter()
+    check_rate_limit(get_client_ip(request))
+    artist = _texto_de_shazam(acierto.artist)
+    title = _texto_de_shazam(acierto.title)
+    if not artist or not title:
+        raise HTTPException(400, "artist y title requeridos")
+    isrc = _texto_de_shazam(acierto.isrc, 20)
+    device_id = _texto_de_shazam(acierto.device_id, 100)
+    origen = _origen_de_recognize(acierto.origen, device_id)
+    sesion = _sesion_de_recognize(acierto.sesion_id)
+    ajustes = _ajustes_de_escuchar() if origen == 'escuchar' else None
+    envio = ajustes['envio'] if ajustes else 'ffmpeg'
+    variante = (_variante_de_escuchar(_primer_clip_de(acierto.primer_clip_s),
+                                      envio, 'shazam')
+                if origen == 'escuchar' else None)
+
+    cupo = _cupo_de_escuchar_agotado(device_id, acierto.is_pro, sesion, origen)
+    if cupo:
+        return cupo
+
+    try:
+        db.log_audd_call(
+            fingerprint='recognize_session', success=True, artist=artist,
+            title=title, source='recognize_session', device_id=device_id,
+            reason='matched', origen=origen, sesion=sesion, variante=variante,
+            motor='shazam')
+    except Exception as e:  # noqa: BLE001 - apuntar nunca tumba el acierto
+        logger.warning(f"[Recognize/Shazam] log sesion fallo: {e}")
+
+    t0 = time.perf_counter()
+    try:
+        backend_analysis = await run_in_threadpool(
+            _ficha_para_recognize, artist, title, isrc)
+    except Exception as e:  # noqa: BLE001 - sin ficha, el acierto vale igual
+        logger.warning(f"[Recognize/Shazam] buscar la ficha fallo: {e}")
+        backend_analysis = None
+    ms_ficha = _ms(time.perf_counter() - t0)
+
+    apple_music_url = _url_de_shazam(acierto.apple_music_url)
+    web_url = _url_de_shazam(acierto.web_url)
+    # La portada de Shazam es la de la grabacion EXACTA que sono (como la de
+    # AudD); detras, la de la ficha solo si Render la sirve.
+    portada = (_url_de_shazam(acierto.artwork_url)
+               or _portada_servible(backend_analysis))
+    if backend_analysis:
+        backend_analysis['artwork_url'] = portada
+    else:
+        background_tasks.add_task(
+            _guardar_deteccion, artist, title, None, None, isrc, True)
+
+    logger.info(
+        f"[Recognize/Shazam] origen={origen or 'sin_origen'} "
+        f"variante={variante or '-'} ficha={'si' if backend_analysis else 'no'} "
+        f"ficha_ms={ms_ficha} total={_ms(time.perf_counter() - t_inicio)}ms")
+    return {
+        "status": "found",
+        "motor": "shazam",
+        "artist": artist,
+        "title": title,
+        "album": None,
+        "release_date": None,
+        "label": None,
+        "isrc": isrc,
+        "spotify": None,
+        "deezer": None,
+        # Las guias de ShazamKit piden enlazar el tema en Apple Music.
+        "apple_music": {"url": apple_music_url} if apple_music_url else None,
+        "shazam": {"url": web_url,
+                   "id": _texto_de_shazam(acierto.shazam_id, 40)},
+        "artwork_url": portada,
+        "backend_analysis": backend_analysis,
+        "busco_ficha": True,
+        "envio": envio,
+        "ajustes": ajustes,
+        "ms_servidor": _ms(time.perf_counter() - t_inicio),
+    }
+
+
 @app.get("/escuchar/ajustes")
 async def escuchar_ajustes():
     """Lo que el movil tiene que saber del interruptor antes de grabar: los
-    segundos del primer clip. Va tambien `envio`, para que el movil apunte en
-    su telemetria con que variante se hizo cada pulsacion."""
+    segundos del primer clip y el motor (`audd` / `shazam`). Va tambien
+    `envio`, para que el movil apunte en su telemetria con que variante se
+    hizo cada pulsacion."""
     return _ajustes_de_escuchar()
 
 
@@ -4767,6 +4942,7 @@ async def recognize_audio(
     origen: Optional[str] = Form(None),
     sesion_id: Optional[str] = Form(None),
     primer_clip_s: Optional[str] = Form(None),
+    motor: Optional[str] = Form(None),
 ):
     """
     Reconoce una canción a partir de audio grabado usando AudD API.
@@ -4789,6 +4965,11 @@ async def recognize_audio(
     pulsacion, que el movil saca del interruptor (`_ajustes_de_escuchar`).
     Viaja en todas las peticiones de la pulsacion: es su variante, no el largo
     de esta captura.
+
+    `motor='shazam'` (desde el 2026-09-30): la pulsacion va con ShazamKit
+    delante (`ESCUCHAR_MOTOR`) y esto es AudD detras, con el mismo audio. Solo
+    cambia la variante (`shazam+12s+ffmpeg`); lo que Shazam encuentra llega
+    por `/recognize/shazam`, sin audio.
     """
     t_inicio = time.perf_counter()
     # Rate limiting — endpoint caro (preprocesado + AudD retries).
@@ -4809,38 +4990,14 @@ async def recognize_audio(
     # reiniciando, mala red), se entera aqui para la pulsacion siguiente.
     ajustes = _ajustes_de_escuchar() if origen == 'escuchar' else None
     envio = ajustes['envio'] if ajustes else 'ffmpeg'
-    variante = (_variante_de_escuchar(_primer_clip_de(primer_clip_s), envio)
+    variante = (_variante_de_escuchar(_primer_clip_de(primer_clip_s), envio,
+                                      _motor_de(motor))
                 if origen == 'escuchar' else None)
 
     # Cap por dispositivo/dia ANTES de gastar AudD/CPU. Sin device_id no capamos.
-    # Cuenta PULSACIONES: el reintento de una pulsacion que ya entro en el cupo
-    # no se queda fuera por ese mismo cupo.
-    recognize_cap = RECOGNIZE_PRO_DAILY_CAP if is_pro else RECOGNIZE_FREE_DAILY_CAP
-    if device_id:
-        try:
-            used_today = db.count_recognition_sessions_today(device_id)
-        except Exception:
-            used_today = 0
-        ya_contada = False
-        if used_today >= recognize_cap:
-            try:
-                ya_contada = db.sesion_contada_hoy(device_id, sesion)
-            except Exception:
-                ya_contada = False
-        if used_today >= recognize_cap and not ya_contada:
-            logger.info(
-                f"[Recognize] cap alcanzado device={device_id[:8]} "
-                f"used={used_today} cap={recognize_cap} pro={is_pro} "
-                f"origen={origen}")
-            return {
-                "status": "cap_reached",
-                "is_pro": is_pro,
-                "cap": recognize_cap,
-                "used": used_today,
-                "message": "Límite diario de Escuchar alcanzado. Vuelve mañana."
-                if is_pro else
-                "Has alcanzado el límite diario gratuito de Escuchar.",
-            }
+    cupo = _cupo_de_escuchar_agotado(device_id, is_pro, sesion, origen)
+    if cupo:
+        return cupo
 
     tiempos = {'subida': 0.0, 'ffmpeg': 0.0, 'audd': 0.0, 'ficha': 0.0,
                'portada': 0.0}
@@ -4996,6 +5153,7 @@ async def recognize_audio(
                 reason=session_reason, origen=origen, sesion=sesion,
                 variante=variante,
                 ms=_ms(time.perf_counter() - t_inicio) if variante else None,
+                motor='audd' if variante else None,
             )
         except Exception as _e:
             logger.warning(f"[Recognize] log sesion fallo: {_e}")

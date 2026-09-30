@@ -713,9 +713,13 @@ class AnalysisDB:
         #     tener la respuesta de AudD: subida + ffmpeg + AudD, sin ficha ni
         #     portada. Es la parte que cambia el envio directo, y se mide para
         #     TODOS los clientes, tambien los publicados.
+        # Migracion 2026-09-30 (ShazamKit delante): `motor` en el marcador de
+        #   sesion = quien resolvio esa peticion: 'audd' (/recognize) o
+        #   'shazam' (/recognize/shazam, un acierto hecho en el movil, sin
+        #   llamada a AudD). NULL = anterior, o sea AudD.
         for _col in ('source TEXT', 'device_id TEXT', 'reason TEXT',
                      'origen TEXT', 'sesion TEXT', 'variante TEXT',
-                     'ms INTEGER'):
+                     'ms INTEGER', 'motor TEXT'):
             try:
                 conn.execute(f'ALTER TABLE audd_call_log ADD COLUMN {_col}')
             except sqlite3.OperationalError:
@@ -3300,7 +3304,8 @@ class AnalysisDB:
                       origen: Optional[str] = None,
                       sesion: Optional[str] = None,
                       variante: Optional[str] = None,
-                      ms: Optional[int] = None) -> None:
+                      ms: Optional[int] = None,
+                      motor: Optional[str] = None) -> None:
         """Registra una llamada AudD (incluso fallidas) para honrar cooldown/cap
         y para CONTABILIDAD real del gasto por via. `source`:
           - 'analyze'   → auto-trigger de /analyze (cuenta para AUDD_DAILY_CAP).
@@ -3314,8 +3319,9 @@ class AnalysisDB:
 
         `origen` y `sesion` solo los pone /recognize: quien llamo (Escuchar,
         portada, editar) y a que pulsacion pertenece. `variante` y `ms`, solo
-        Escuchar: como se hizo la pulsacion y lo que tardo hasta AudD. Ver el
-        ALTER."""
+        Escuchar: como se hizo la pulsacion y lo que tardo hasta AudD. `motor`,
+        solo en el marcador de sesion: quien la resolvio ('audd' / 'shazam').
+        Ver el ALTER."""
         if not fingerprint:
             return
         conn = self._open_conn()
@@ -3323,10 +3329,11 @@ class AnalysisDB:
             conn.execute(
                 'INSERT INTO audd_call_log '
                 '(fingerprint, called_at, success, artist, title, source, '
-                'device_id, reason, origen, sesion, variante, ms) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                'device_id, reason, origen, sesion, variante, ms, motor) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (fingerprint, time.time(), 1 if success else 0, artist, title,
-                 source, device_id, reason, origen, sesion, variante, ms),
+                 source, device_id, reason, origen, sesion, variante, ms,
+                 motor),
             )
             conn.commit()
         finally:
@@ -3652,6 +3659,9 @@ class AnalysisDB:
                         y envio directo). `ms_hasta_audd` = {n, p50, p90} por
                         PETICION de lo que tardo el servidor hasta tener la
                         respuesta de AudD. Sin `variante` = VARIANTE_DE_SIEMPRE.
+                        Con ShazamKit delante (`shazam+…`) lleva ademas
+                        `resueltas_por` {shazam, audd}: de los aciertos,
+                        cuantos dio Shazam en el movil y cuantos AudD detras.
 
         Recorre el cursor, no `fetchall()` (la trampa del panel)."""
         conn = self._open_conn()
@@ -3662,10 +3672,11 @@ class AnalysisDB:
             ms_por_variante = {}
             por_origen = {}
             peticiones = 0
+            por_shazam = set()
             cur = conn.execute(
                 "SELECT id, COALESCE(origen, 'sin_origen') AS o, sesion, "
                 "COALESCE(reason, 'unknown') AS r, "
-                "COALESCE(variante, ?) AS v, ms FROM audd_call_log "
+                "COALESCE(variante, ?) AS v, ms, motor FROM audd_call_log "
                 "WHERE called_at >= ? AND source = 'recognize_session'",
                 (self.VARIANTE_DE_SIEMPRE, cutoff),
             )
@@ -3682,6 +3693,8 @@ class AnalysisDB:
                 peticiones += 1
                 clave = fila['sesion'] or f"fila:{fila['id']}"
                 variante_de.setdefault(clave, fila['v'])
+                if fila['motor'] == 'shazam' and r == 'matched':
+                    por_shazam.add(clave)
                 if fila['ms'] is not None:
                     ms_por_variante.setdefault(fila['v'], []).append(fila['ms'])
                 previo = por_pulsacion.get(clave)
@@ -3708,9 +3721,13 @@ class AnalysisDB:
                     'audio_unusable': 0, 'llamadas_audd': 0,
                     'ms_hasta_audd': self._reparto_ms([])})
             for clave, r in por_pulsacion.items():
-                d = _de(variante_de.get(clave, self.VARIANTE_DE_SIEMPRE))
+                v = variante_de.get(clave, self.VARIANTE_DE_SIEMPRE)
+                d = _de(v)
                 d['pulsaciones'] += 1
                 d[r] = d.get(r, 0) + 1
+                if v.startswith('shazam+') and r == 'matched':
+                    rp = d.setdefault('resueltas_por', {'shazam': 0, 'audd': 0})
+                    rp['shazam' if clave in por_shazam else 'audd'] += 1
             for v, lista in ms_por_variante.items():
                 _de(v)['ms_hasta_audd'] = self._reparto_ms(lista)
             for fila in conn.execute(

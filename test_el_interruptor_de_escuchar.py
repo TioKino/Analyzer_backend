@@ -37,6 +37,7 @@ def client():
 def sin_interruptor(monkeypatch):
     monkeypatch.delenv('ESCUCHAR_PRIMER_CLIP_S', raising=False)
     monkeypatch.delenv('ESCUCHAR_ENVIO', raising=False)
+    monkeypatch.delenv('ESCUCHAR_MOTOR', raising=False)
 
 
 @pytest.fixture
@@ -94,13 +95,15 @@ def _td():
 class TestAjustes:
     def test_sin_tocar_nada_es_lo_de_siempre(self):
         assert main._ajustes_de_escuchar() == {'primer_clip_s': 12,
-                                               'envio': 'ffmpeg'}
+                                               'envio': 'ffmpeg',
+                                               'motor': 'audd'}
 
     def test_se_lee_de_las_variables(self, monkeypatch):
         monkeypatch.setenv('ESCUCHAR_PRIMER_CLIP_S', '8')
         monkeypatch.setenv('ESCUCHAR_ENVIO', ' Directo ')
         assert main._ajustes_de_escuchar() == {'primer_clip_s': 8,
-                                               'envio': 'directo'}
+                                               'envio': 'directo',
+                                               'motor': 'audd'}
 
     @pytest.mark.parametrize('valor,esperado', [
         ('3', 5), ('5', 5), ('30', 12), ('abc', 12), ('', 12), (' 7 ', 7)])
@@ -118,7 +121,8 @@ class TestAjustes:
         monkeypatch.setenv('ESCUCHAR_PRIMER_CLIP_S', '8')
         r = client.get('/escuchar/ajustes')
         assert r.status_code == 200
-        assert r.json() == {'primer_clip_s': 8, 'envio': 'ffmpeg'}
+        assert r.json() == {'primer_clip_s': 8, 'envio': 'ffmpeg',
+                            'motor': 'audd'}
 
     def test_primer_clip_de_un_cliente_publicado_es_12(self):
         # Todas las versiones publicadas graban 12 s y no mandan el campo.
@@ -185,7 +189,8 @@ class TestEnvioDirecto:
             r = _post(client, device_id='m-aj', origen='escuchar',
                       sesion_id=uuid.uuid4().hex[:8])
             assert r.json()['ajustes'] == {'primer_clip_s': 8,
-                                           'envio': 'ffmpeg'}
+                                           'envio': 'ffmpeg',
+                                           'motor': 'audd'}
         # El escritorio no lo necesita.
         monkeypatch.setattr(main, 'search_artwork_online', None)
         audd.respuestas = [(None, True)]
