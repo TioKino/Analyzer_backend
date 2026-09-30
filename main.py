@@ -6227,7 +6227,7 @@ async def reset_database(
             community_notes, track_ratings, track_popularity,
             beat_grid_corrections, audd_call_log, imported_values
         sync.db: sync_items, device_seen, users, user_devices,
-            link_codes, detected_tracks_sync
+            link_codes, detected_tracks_sync, listen_sets_sync
 
     Borra SOLO con `?wipe_assets=true`:
         Filesystem: ARTWORK_CACHE_DIR, PREVIEWS_DIR (.mp3 cacheados)
@@ -6297,7 +6297,7 @@ async def reset_database(
         sync_db_path = os.environ.get("SYNC_DB_PATH", "/data/sync.db")
         sync_tables = (
             "sync_items", "device_seen", "users", "user_devices",
-            "link_codes", "detected_tracks_sync",
+            "link_codes", "detected_tracks_sync", "listen_sets_sync",
         )
         cleared_sync = []
         sync_cleared = False

@@ -1656,7 +1656,7 @@ def _resumen_escuchar():
 
 
 _EVENTOS_ESCUCHAR = ('listen_result', 'listen_saved', 'listen_wrong',
-                     'listen_link', 'listen_pendiente')
+                     'listen_link', 'listen_pendiente', 'listen_set_ended')
 
 
 def _escuchar_segun_el_movil(dias: int = 30):
@@ -1697,6 +1697,11 @@ def _escuchar_segun_el_movil(dias: int = 30):
                      lleva el prefijo (`shazam+12s+ffmpeg`) y, en los
                      aciertos, `resueltas_por` {shazam, audd} (`resuelto_por`
                      del evento)
+      modo_set       el modo set (desde el 2026-09-30), de `listen_set_ended`:
+                     {sets, aparatos, minutos, temas, temas_por_hora,
+                     por_motivo {boton, tope, sin_audio, error}, errores}.
+                     Muchos sets con pocos temas por hora = Shazam no
+                     reconoce lo que pinchan (o un set sin musica)
       shazam_errores {codigo: n} de `listen_result.shazam_error` (desde el
                      2026-09-30): ShazamKit fallo en el movil y la pulsacion
                      siguio solo con AudD. Si crece, algo le pasa a Shazam
@@ -1724,6 +1729,8 @@ def _escuchar_segun_el_movil(dias: int = 30):
     por_variante = {}
     por_entrada = {}
     shazam_errores = {}
+    modo_set = {'sets': 0, 'aparatos': set(), 'minutos': 0.0, 'temas': 0,
+                'por_motivo': {}, 'errores': 0}
 
     def _de_variante(p):
         return por_variante.setdefault(_variante_del_evento(p), {
@@ -1788,6 +1795,15 @@ def _escuchar_segun_el_movil(dias: int = 30):
             elif nombre == 'listen_link':
                 d = str(p.get('destino') or 'sin_dato')[:32]
                 enlaces[d] = enlaces.get(d, 0) + 1
+            elif nombre == 'listen_set_ended':
+                modo_set['sets'] += 1
+                if dev:
+                    modo_set['aparatos'].add(dev)
+                modo_set['minutos'] += _num(p.get('minutos')) or 0
+                modo_set['temas'] += int(_num(p.get('temas')) or 0)
+                modo_set['errores'] += int(_num(p.get('errores')) or 0)
+                m = str(p.get('motivo') or 'sin_dato')[:16]
+                modo_set['por_motivo'][m] = modo_set['por_motivo'].get(m, 0) + 1
             else:
                 o = str(p.get('outcome') or 'sin_dato')[:32]
                 pendientes[o] = pendientes.get(o, 0) + 1
@@ -1819,6 +1835,17 @@ def _escuchar_segun_el_movil(dias: int = 30):
         'pendientes_resueltas_por': pendientes_resueltas_por,
         'por_entrada': por_entrada,
         'shazam_errores': shazam_errores,
+        'modo_set': {
+            'sets': modo_set['sets'],
+            'aparatos': len(modo_set['aparatos']),
+            'minutos': round(modo_set['minutos'], 1),
+            'temas': modo_set['temas'],
+            'temas_por_hora': (round(modo_set['temas'] * 60
+                                     / modo_set['minutos'], 1)
+                               if modo_set['minutos'] > 0 else None),
+            'por_motivo': modo_set['por_motivo'],
+            'errores': modo_set['errores'],
+        },
         'por_variante': {
             v: {'pulsaciones': d['pulsaciones'],
                 'por_desenlace': d['por_desenlace'],

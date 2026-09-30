@@ -288,6 +288,23 @@ def _init_tables(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_dts_date
             ON detected_tracks_sync(detected_at);
 
+        -- Los sets del modo set de Escuchar (2026-09-30): el tracklist con
+        -- horas de un set entero, para verlo en el escritorio. Por cuenta,
+        -- como las detecciones.
+        CREATE TABLE IF NOT EXISTS listen_sets_sync (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            set_id TEXT NOT NULL,
+            nombre TEXT NOT NULL DEFAULT '',
+            empezado_en TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            actualizado_en TEXT NOT NULL,
+            user_id TEXT NOT NULL DEFAULT '',
+            UNIQUE(device_id, set_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lss_user
+            ON listen_sets_sync(user_id, empezado_en);
+
         -- Adopcion de la auth por dispositivo + que secreto valida cada
         -- peticion. Agregado por dia, sin device_id ni nada identificable.
         -- Existe para poder tomar DOS decisiones con datos en vez de a ojo:
@@ -743,13 +760,14 @@ def _assign_orphan_data(conn: sqlite3.Connection, device_id: str, user_id: str):
         "UPDATE sync_items SET user_id = ? WHERE last_device_id = ? AND (user_id = '' OR user_id IS NULL)",
         (user_id, device_id),
     )
-    try:
-        conn.execute(
-            "UPDATE detected_tracks_sync SET user_id = ? WHERE device_id = ? AND (user_id = '' OR user_id IS NULL)",
-            (user_id, device_id),
-        )
-    except sqlite3.OperationalError:
-        pass  # Table may not exist yet
+    for tabla in ('detected_tracks_sync', 'listen_sets_sync'):
+        try:
+            conn.execute(
+                f"UPDATE {tabla} SET user_id = ? WHERE device_id = ? AND (user_id = '' OR user_id IS NULL)",
+                (user_id, device_id),
+            )
+        except sqlite3.OperationalError:
+            pass  # Table may not exist yet
 
 
 def _migrate_abandoned_account(conn: sqlite3.Connection, old_user: str, new_user: str):
@@ -783,13 +801,14 @@ def _migrate_abandoned_account(conn: sqlite3.Connection, old_user: str, new_user
         "UPDATE sync_items SET user_id = ? WHERE user_id = ?",
         (new_user, old_user),
     ).rowcount
-    try:
-        conn.execute(
-            "UPDATE detected_tracks_sync SET user_id = ? WHERE user_id = ?",
-            (new_user, old_user),
-        )
-    except sqlite3.OperationalError:
-        pass  # la tabla puede no existir en BDs viejas
+    for tabla in ('detected_tracks_sync', 'listen_sets_sync'):
+        try:
+            conn.execute(
+                f"UPDATE {tabla} SET user_id = ? WHERE user_id = ?",
+                (new_user, old_user),
+            )
+        except sqlite3.OperationalError:
+            pass  # la tabla puede no existir en BDs viejas
     try:
         conn.execute("DELETE FROM users WHERE user_id = ?", (old_user,))
     except sqlite3.OperationalError:
@@ -1826,6 +1845,99 @@ async def sync_clear_detected_tracks(device_id: str):
         }
     except sqlite3.Error as e:
         logger.error(f"Clear detected tracks error: {e}")
+        return {"status": "error", "deleted": 0, "message": str(e)}
+
+
+# ── Sets del modo set de Escuchar (2026-09-30) ──────────────────────────
+
+class ListenSetSync(BaseModel):
+    device_id: str
+    set_id: str
+    nombre: str = ''
+    empezado_en: str
+    payload: Any
+
+
+_MAX_SET_BYTES = 256 * 1024
+"""Un set de 6 h con un tema cada 3 min son ~120 temas, ~40 KB de JSON."""
+
+
+@sync_router.post("/listen-set")
+async def sync_push_listen_set(s: ListenSetSync):
+    """Sube (o sustituye) un set grabado con el modo set: nombre, hora de
+    inicio y el tracklist con horas en `payload`. Por cuenta, como las
+    detecciones: lo ve el escritorio del mismo usuario."""
+    if not s.device_id or not s.set_id or not s.empezado_en:
+        return {"status": "error",
+                "message": "device_id, set_id y empezado_en requeridos"}
+    payload_str = json.dumps(s.payload, ensure_ascii=False)
+    if len(payload_str.encode('utf-8')) > _MAX_SET_BYTES:
+        return {"status": "error", "message": "set demasiado grande"}
+    conn = _get_conn()
+    user_id = _require_user_id(conn, s.device_id)
+    try:
+        conn.execute("""
+            INSERT INTO listen_sets_sync
+                (device_id, set_id, nombre, empezado_en, payload,
+                 actualizado_en, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id, set_id) DO UPDATE SET
+                nombre = excluded.nombre,
+                empezado_en = excluded.empezado_en,
+                payload = excluded.payload,
+                actualizado_en = excluded.actualizado_en,
+                user_id = excluded.user_id
+        """, (s.device_id, s.set_id[:100], (s.nombre or '')[:200],
+              s.empezado_en[:40], payload_str, _now_iso(), user_id))
+        conn.commit()
+        logger.info(f"Set guardado: {s.set_id[:12]} (user: {user_id[:8]})")
+        return {"status": "ok", "user_id": user_id}
+    except (sqlite3.Error, TypeError) as e:
+        logger.error(f"Set error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@sync_router.get("/listen-sets/{device_id}")
+async def sync_pull_listen_sets(device_id: str, limit: int = 50):
+    """Los sets de la cuenta (de todos sus aparatos), el más nuevo primero."""
+    conn = _get_conn()
+    user_id = _require_user_id(conn, device_id)
+    limit = max(1, min(int(limit), 200))
+    try:
+        rows = conn.execute("""
+            SELECT set_id, nombre, empezado_en, payload, device_id
+            FROM listen_sets_sync
+            WHERE user_id = ?
+            ORDER BY empezado_en DESC LIMIT ?
+        """, (user_id, limit)).fetchall()
+        sets = []
+        for set_id, nombre, empezado_en, payload, dev in rows:
+            try:
+                p = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                p = {}
+            sets.append({"set_id": set_id, "nombre": nombre,
+                         "empezado_en": empezado_en, "payload": p,
+                         "from_device": (dev or '')[:8] + "..."})
+        return {"sets": sets, "total": len(sets), "server_time": _now_iso()}
+    except sqlite3.Error as e:
+        logger.error(f"Pull sets error: {e}")
+        return {"sets": [], "total": 0, "error": str(e)}
+
+
+@sync_router.delete("/listen-set/{device_id}/{set_id}")
+async def sync_delete_listen_set(device_id: str, set_id: str):
+    """Borra un set de la cuenta (lo haya subido el aparato que sea)."""
+    conn = _get_conn()
+    user_id = _require_user_id(conn, device_id)
+    try:
+        cur = conn.execute(
+            "DELETE FROM listen_sets_sync WHERE user_id = ? AND set_id = ?",
+            (user_id, set_id))
+        conn.commit()
+        return {"status": "ok", "deleted": cur.rowcount}
+    except sqlite3.Error as e:
+        logger.error(f"Delete set error: {e}")
         return {"status": "error", "deleted": 0, "message": str(e)}
 
 
