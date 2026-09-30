@@ -717,9 +717,12 @@ class AnalysisDB:
         #   sesion = quien resolvio esa peticion: 'audd' (/recognize) o
         #   'shazam' (/recognize/shazam, un acierto hecho en el movil, sin
         #   llamada a AudD). NULL = anterior, o sea AudD.
+        #   `con_ficha` en el marcador de un acierto de Escuchar: 1 si salio
+        #   con la ficha de la comunidad, 0 si no (`apuntar_ficha`). NULL =
+        #   anterior, o no fue un acierto.
         for _col in ('source TEXT', 'device_id TEXT', 'reason TEXT',
                      'origen TEXT', 'sesion TEXT', 'variante TEXT',
-                     'ms INTEGER', 'motor TEXT'):
+                     'ms INTEGER', 'motor TEXT', 'con_ficha INTEGER'):
             try:
                 conn.execute(f'ALTER TABLE audd_call_log ADD COLUMN {_col}')
             except sqlite3.OperationalError:
@@ -3305,7 +3308,7 @@ class AnalysisDB:
                       sesion: Optional[str] = None,
                       variante: Optional[str] = None,
                       ms: Optional[int] = None,
-                      motor: Optional[str] = None) -> None:
+                      motor: Optional[str] = None) -> Optional[int]:
         """Registra una llamada AudD (incluso fallidas) para honrar cooldown/cap
         y para CONTABILIDAD real del gasto por via. `source`:
           - 'analyze'   → auto-trigger de /analyze (cuenta para AUDD_DAILY_CAP).
@@ -3321,12 +3324,12 @@ class AnalysisDB:
         portada, editar) y a que pulsacion pertenece. `variante` y `ms`, solo
         Escuchar: como se hizo la pulsacion y lo que tardo hasta AudD. `motor`,
         solo en el marcador de sesion: quien la resolvio ('audd' / 'shazam').
-        Ver el ALTER."""
+        Ver el ALTER. Devuelve el id de la fila (para `apuntar_ficha`)."""
         if not fingerprint:
-            return
+            return None
         conn = self._open_conn()
         try:
-            conn.execute(
+            cur = conn.execute(
                 'INSERT INTO audd_call_log '
                 '(fingerprint, called_at, success, artist, title, source, '
                 'device_id, reason, origen, sesion, variante, ms, motor) '
@@ -3336,6 +3339,7 @@ class AnalysisDB:
                  motor),
             )
             conn.commit()
+            fila = cur.lastrowid
         finally:
             conn.close()
         if self.al_apuntar_audd is not None:
@@ -3343,6 +3347,21 @@ class AnalysisDB:
                 self.al_apuntar_audd()
             except Exception:  # noqa: BLE001 - avisar nunca tumba el apunte
                 pass
+        return fila
+
+    def apuntar_ficha(self, fila: Optional[int], con_ficha: bool) -> None:
+        """Si el acierto de Escuchar de ese marcador salio con la ficha de la
+        comunidad. Se apunta despues del marcador porque la ficha se busca
+        despues de AudD (el `ms` del marcador es hasta AudD, sin ficha)."""
+        if not fila:
+            return
+        conn = self._open_conn()
+        try:
+            conn.execute('UPDATE audd_call_log SET con_ficha = ? WHERE id = ?',
+                         (1 if con_ficha else 0, fila))
+            conn.commit()
+        finally:
+            conn.close()
 
     # ==================== AudD DE LOS MOTORES LOCALES ====================
 
@@ -3662,6 +3681,8 @@ class AnalysisDB:
                         Con ShazamKit delante (`shazam+…`) lleva ademas
                         `resueltas_por` {shazam, audd}: de los aciertos,
                         cuantos dio Shazam en el movil y cuantos AudD detras.
+                        `con_ficha` (desde el 2026-09-30): de los aciertos,
+                        cuantos salieron con la ficha de la comunidad.
 
         Recorre el cursor, no `fetchall()` (la trampa del panel)."""
         conn = self._open_conn()
@@ -3673,10 +3694,12 @@ class AnalysisDB:
             por_origen = {}
             peticiones = 0
             por_shazam = set()
+            con_ficha = set()
             cur = conn.execute(
                 "SELECT id, COALESCE(origen, 'sin_origen') AS o, sesion, "
                 "COALESCE(reason, 'unknown') AS r, "
-                "COALESCE(variante, ?) AS v, ms, motor FROM audd_call_log "
+                "COALESCE(variante, ?) AS v, ms, motor, con_ficha "
+                "FROM audd_call_log "
                 "WHERE called_at >= ? AND source = 'recognize_session'",
                 (self.VARIANTE_DE_SIEMPRE, cutoff),
             )
@@ -3695,6 +3718,8 @@ class AnalysisDB:
                 variante_de.setdefault(clave, fila['v'])
                 if fila['motor'] == 'shazam' and r == 'matched':
                     por_shazam.add(clave)
+                if fila['con_ficha'] == 1:
+                    con_ficha.add(clave)
                 if fila['ms'] is not None:
                     ms_por_variante.setdefault(fila['v'], []).append(fila['ms'])
                 previo = por_pulsacion.get(clave)
@@ -3718,7 +3743,7 @@ class AnalysisDB:
             def _de(v):
                 return por_variante.setdefault(v, {
                     'pulsaciones': 0, 'matched': 0, 'no_match': 0,
-                    'audio_unusable': 0, 'llamadas_audd': 0,
+                    'audio_unusable': 0, 'llamadas_audd': 0, 'con_ficha': 0,
                     'ms_hasta_audd': self._reparto_ms([])})
             for clave, r in por_pulsacion.items():
                 v = variante_de.get(clave, self.VARIANTE_DE_SIEMPRE)
@@ -3728,6 +3753,8 @@ class AnalysisDB:
                 if v.startswith('shazam+') and r == 'matched':
                     rp = d.setdefault('resueltas_por', {'shazam': 0, 'audd': 0})
                     rp['shazam' if clave in por_shazam else 'audd'] += 1
+                if r == 'matched' and clave in con_ficha:
+                    d['con_ficha'] += 1
             for v, lista in ms_por_variante.items():
                 _de(v)['ms_hasta_audd'] = self._reparto_ms(lista)
             for fila in conn.execute(

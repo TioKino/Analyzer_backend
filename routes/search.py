@@ -21,6 +21,7 @@ duplicacion stale (la causa del doble incidente de /admin/reset-database).
 import json
 import logging
 import re
+import unicodedata
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -168,11 +169,127 @@ async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=2
         "compatible_keys": compatible,
         "tracks": db.search_compatible_keys(camelot, limit)
     }
-# Sufijos de mezcla que no cambian el tema a efectos de «¿alguien lo analizo?».
-_SUFIJOS_DE_MEZCLA = re.compile(
-    r'\s*\(?(Original Mix|Extended Mix|Radio Edit|Remix|Club Mix|Dub Mix)\)?',
-    re.IGNORECASE,
-)
+# ── La ficha por nombre: el mismo TEMA y la misma VERSION ──
+# Cada fuente escribe el titulo a su manera: Shazam «The Age Of Love (Jam &
+# Spoon Watch Out For Stella Mix)», un tag «The Age of Love - Jam and Spoon
+# Watch Out for Stella Mix», Beatport «Rave (Original Mix)». Hasta el
+# 2026-09-30 se buscaba con `LIKE '%titulo%'` sobre el titulo casi entero, y
+# un parentesis frente a un guion bastaba para no encontrar nada (Age of Love
+# salio dos veces sin ficha en el iPhone del owner, con el tema analizado).
+# Y al reves: el titulo sin version casaba con cualquier remix, y la ficha
+# enseñaba el BPM y la tonalidad de OTRA version.
+#
+# Hoy el titulo se parte en TEMA y VERSION, los dos normalizados (sin acentos,
+# `&` = `and`, sin puntuacion), y casa lo que tiene el mismo tema y la misma
+# version. «Original Mix», «Extended Mix», «Radio Edit»… son el original.
+
+# Versiones que son el original: el mismo corte, mas largo o mas corto.
+_VERSIONES_ORIGINALES = frozenset({
+    'original', 'original mix', 'original version', 'extended',
+    'extended mix', 'extended version', 'radio edit', 'radio version',
+    'radio mix', 'edit', 'mix',
+})
+
+# Palabras que no distinguen una version de otra: «X Remix» y «X Mix» son la
+# misma.
+_PALABRAS_DE_RELLENO = frozenset({
+    'remix', 'mix', 'rmx', 'version', 'edit', 'and', 'the',
+})
+
+# Lo que va tras « - » es la version solo si lo parece.
+_PARECE_VERSION = re.compile(
+    r'\b(mix|remix|rmx|edit|version|dub|rework|vip|bootleg|remaster(ed)?)\b',
+    re.IGNORECASE)
+
+_ENTRE_PARENTESIS = re.compile(r'[(\[]([^)\]]*)[)\]]')
+_FEAT = re.compile(r'\s(?:feat|ft|featuring)\.?\s.*$', re.IGNORECASE)
+_SEPARA_ARTISTAS = re.compile(
+    r'\s*(?:,|;|/|&|\bfeat\b\.?|\bft\b\.?|\bfeaturing\b|\bvs\b\.?|'
+    r'\bx\b|\band\b|\bwith\b)\s*', re.IGNORECASE)
+
+
+def _plano(texto: Optional[str]) -> str:
+    """Minusculas, sin acentos, `&` = `and`, sin puntuacion ni espacios de
+    mas."""
+    t = unicodedata.normalize('NFKD', texto or '')
+    t = ''.join(c for c in t if not unicodedata.combining(c)).lower()
+    t = t.replace('&', ' and ')
+    t = re.sub(r'[\W_]+', ' ', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def tema_y_version(titulo: Optional[str]):
+    """(tema, version) de un titulo, normalizados. La version es un conjunto
+    de palabras, vacio si es el original."""
+    t = titulo or ''
+    partes = [m.group(1) for m in _ENTRE_PARENTESIS.finditer(t)]
+    tema = _ENTRE_PARENTESIS.sub(' ', t)
+    guion = re.match(r'^(.*?)\s+[-\u2013\u2014]\s+(.+)$', tema)
+    if guion and _PARECE_VERSION.search(guion.group(2)):
+        tema = guion.group(1)
+        partes.append(guion.group(2))
+    tema = _FEAT.sub('', f' {tema} ').strip()
+
+    version = set()
+    for parte in partes:
+        p = _plano(parte)
+        if not p or re.match(r'^(feat|ft|featuring|with)\b', p):
+            continue  # un «(feat. X)» no es una version
+        if p in _VERSIONES_ORIGINALES:
+            continue
+        palabras = set(p.split()) - _PALABRAS_DE_RELLENO
+        # «(Remix)» a secas sigue siendo una version, no el original.
+        version |= palabras or {f'<{p}>'}
+    return _plano(tema), frozenset(version)
+
+
+def _artistas(artista: Optional[str]) -> frozenset:
+    return frozenset(
+        a for a in (_plano(x) for x in _SEPARA_ARTISTAS.split(artista or ''))
+        if a)
+
+
+def _contiene(largo: str, corto: str) -> bool:
+    """`corto` dentro de `largo` por palabras enteras, y con algo de cuerpo:
+    «dj» no casa con cualquier cosa."""
+    return len(corto) >= 4 and f' {corto} ' in f' {largo} '
+
+
+def _mismo_artista(buscado: str, guardado: str) -> bool:
+    b, g = _plano(buscado), _plano(guardado)
+    if not b or not g:
+        return False
+    if b == g or _contiene(g, b) or _contiene(b, g):
+        return True
+    return bool(_artistas(buscado) & _artistas(guardado))
+
+
+def _parecido_de_titulo(buscado, guardado) -> int:
+    """2 = el mismo tema y version; 1 = el tema dentro del otro (un numero de
+    pista delante, un subtitulo) y la misma version; 0 = no."""
+    tema_b, version_b = buscado
+    tema_g, version_g = tema_y_version(guardado)
+    if not tema_b or not tema_g or version_b != version_g:
+        return 0
+    if tema_b == tema_g:
+        return 2
+    if _contiene(tema_g, tema_b) or _contiene(tema_b, tema_g):
+        return 1
+    return 0
+
+
+def _palabra_para_like(texto: str, dentro_de: Optional[str] = None
+                       ) -> Optional[str]:
+    """La palabra mas larga que se puede pedir con LIKE, tal cual esta en el
+    texto de entrada y sin acentos (LIKE no los pliega: «tiesto» no encuentra
+    «Tiësto», ni «cafe» a «Café»). Con [dentro_de], solo palabras del tema
+    (no de la version)."""
+    del_tema = set(dentro_de.split()) if dentro_de is not None else None
+    candidatas = [
+        w for w in re.split(r'[\W_]+', (texto or '').lower())
+        if len(w) >= 3 and w.isascii() and w not in _PALABRAS_DE_RELLENO
+        and (del_tema is None or w in del_tema)]
+    return max(candidatas, key=len) if candidatas else None
 
 
 def _aplanar(track_dict: Optional[dict]) -> Optional[dict]:
@@ -192,30 +309,30 @@ def _aplanar(track_dict: Optional[dict]) -> Optional[dict]:
     return track_dict
 
 
-# Las tres busquedas de `buscar_analizado`, de la mas exacta a la mas laxa.
-# Sin mayusculas con `COLLATE NOCASE` y `LIKE` (los dos solo ASCII, igual que
-# el `LOWER()` de antes, con los mismos resultados), para que las use el
-# indice `idx_tracks_ficha`: con `LOWER(artist)` las tres recorrian la tabla
-# entera. Y el tema se elige DENTRO del indice (`rowid`) y solo despues se lee
-# su fila: asi hasta la de los dos `LIKE '%…%'` recorre el indice y no la
-# tabla con su `analysis_json`. Ver el comentario del indice en database.py.
+# Las dos busquedas de `buscar_analizado` van por el indice
+# `idx_tracks_ficha` y eligen el tema DENTRO de el (`rowid`), sin leer la
+# tabla con su `analysis_json` salvo la fila elegida. Sin mayusculas con
+# `COLLATE NOCASE` y `LIKE`: con `LOWER(artist)` se recorria la tabla entera
+# (35,5 s en frio, 2026-09-29). Ver el comentario del indice en database.py.
 #
-# El `INDEXED BY` NO sobra: sin el, en la de los dos `LIKE` SQLite prefiere
-# otro indice que tambien sirve —el de `analyzed_at`, para ahorrarse ordenar,
-# o el de `bpm`, por el `bpm > 0`— y cualquiera de los dos lee la tabla fila a
-# fila: medido con 120.000 filas, 200 ms frente a 8 ms, peor que el recorrido
-# completo de antes. Quitarle uno con un `+` le dejaba el otro. El indice lo
-# crea `AnalysisDB` al abrir la base, siempre, y como mucho se recorre entero.
-FICHA_DONDE = (
-    "artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE",
-    "artist = ? COLLATE NOCASE AND title LIKE ?",
-    "artist LIKE ? AND title LIKE ?",
-)
-FICHA_SQL = (
+# El `INDEXED BY` NO sobra: sin el, con los `LIKE` SQLite prefiere otro indice
+# que tambien sirve —el de `analyzed_at`, para ahorrarse ordenar, o el de
+# `bpm`, por el `bpm > 0`— y cualquiera de los dos lee la tabla fila a fila:
+# medido con 120.000 filas, 200 ms frente a 8 ms.
+FICHA_EXACTA = (
     "SELECT * FROM tracks WHERE rowid = ("
-    "SELECT rowid FROM tracks INDEXED BY idx_tracks_ficha WHERE {donde} "
+    "SELECT rowid FROM tracks INDEXED BY idx_tracks_ficha "
+    "WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE "
     "AND bpm IS NOT NULL AND bpm > 0 "
     "ORDER BY analyzed_at DESC LIMIT 1)"
+)
+# Candidatos por una palabra del artista y otra del titulo; el tema y la
+# version se comparan despues, en Python (`_parecido_de_titulo`).
+FICHA_CANDIDATOS = (
+    "SELECT rowid, artist, title FROM tracks INDEXED BY idx_tracks_ficha "
+    "WHERE artist LIKE ? AND title LIKE ? "
+    "AND bpm IS NOT NULL AND bpm > 0 "
+    "ORDER BY analyzed_at DESC LIMIT 500"
 )
 
 
@@ -223,41 +340,62 @@ def buscar_analizado(artist: str, title: str,
                      isrc: Optional[str] = None) -> Optional[dict]:
     """La ficha de un tema que ALGUIEN ya analizo, o None.
 
-    Una sola regla para `/search-analyzed` y `/recognize`. Hasta el 2026-09-29
-    cada uno buscaba a su manera: `/recognize` probaba ISRC y titulo exacto, no
-    miraba si la fila tenia analisis de verdad y podia devolver su propia
-    deteccion (bpm 0 y genero, energia y tipo de relleno); el movil lo tiraba
-    y volvia a preguntar aqui, una peticion mas por cada acierto de Escuchar.
+    Una sola regla para `/search-analyzed` (Escuchar y el relleno de ghosts) y
+    `/recognize` (AudD y Shazam).
 
-    Orden: ISRC (identidad exacta de la grabacion) → artista y titulo exactos →
-    artista exacto y titulo sin sufijo de mezcla → los dos por aproximacion.
-    Solo filas con bpm > 0: una deteccion de Escuchar no es un analisis.
+    Orden: ISRC (identidad exacta de la grabacion) → artista y titulo exactos
+    → el mismo tema y la misma VERSION por nombre (`tema_y_version`), con el
+    artista tolerante a colaboraciones. Nunca otra version: la ficha de un
+    remix no es la del original. Solo filas con bpm > 0: una deteccion de
+    Escuchar no es un analisis. Entre iguales gana el analisis mas reciente.
     """
     if isrc:
         t = db.get_analyzed_track_by_isrc(isrc)
         if t:
             return _aplanar(t)
 
-    artista = (artist or '').lower().strip()
-    titulo = (title or '').lower().strip()
-    titulo_sin_mezcla = _SUFIJOS_DE_MEZCLA.sub('', title or '').lower().strip()
-    # Sin artista o con un titulo que era solo el sufijo («Remix»), el LIKE
-    # '%%' casaria con cualquier tema del artista.
-    if not artista or not titulo_sin_mezcla:
+    if not (artist or '').strip() or not (title or '').strip():
         return None
-
     cursor = db.conn.cursor()
-    args_por_consulta = (
-        (artista, titulo),
-        (artista, f"%{titulo_sin_mezcla}%"),
-        (f"%{artista}%", f"%{titulo_sin_mezcla}%"),
-    )
-    for donde, args in zip(FICHA_DONDE, args_por_consulta):
-        cursor.execute(FICHA_SQL.format(donde=donde), args)
-        row = cursor.fetchone()
-        if row:
-            return _aplanar(db._row_to_dict(row))
-    return None
+    cursor.execute(FICHA_EXACTA, (artist.strip(), title.strip()))
+    row = cursor.fetchone()
+    if row:
+        return _aplanar(db._row_to_dict(row))
+
+    buscado = tema_y_version(title)
+    if not buscado[0]:
+        return None
+    palabra_artista = _palabra_para_like(artist)
+    palabra_tema = _palabra_para_like(title, buscado[0])
+    # Primero por las dos palabras (lo normal, pocos candidatos); si no sale,
+    # por una sola: la otra puede estar guardada con acento («Tiësto» no casa
+    # con `LIKE '%tiesto%'`). Cada pasada recorre el indice, no la tabla.
+    pasadas = []
+    for par in ((palabra_artista, palabra_tema), (None, palabra_tema),
+                (palabra_artista, None)):
+        if any(par) and par not in pasadas:
+            pasadas.append(par)
+    mejor_rowid = None
+    for p_artista, p_tema in pasadas:
+        cursor.execute(FICHA_CANDIDATOS, (
+            f"%{p_artista}%" if p_artista else '%',
+            f"%{p_tema}%" if p_tema else '%'))
+        mejor = 0
+        for rowid, art, tit in cursor.fetchall():
+            if not _mismo_artista(artist, art):
+                continue
+            parecido = _parecido_de_titulo(buscado, tit)
+            if parecido > mejor:  # a igualdad, el mas reciente (en orden)
+                mejor, mejor_rowid = parecido, rowid
+                if parecido == 2:
+                    break
+        if mejor_rowid is not None:
+            break
+    if mejor_rowid is None:
+        return None
+    cursor.execute("SELECT * FROM tracks WHERE rowid = ?", (mejor_rowid,))
+    row = cursor.fetchone()
+    return _aplanar(db._row_to_dict(row)) if row else None
 
 
 @search_router.get("/search-analyzed")

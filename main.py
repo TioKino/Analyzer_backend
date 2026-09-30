@@ -4865,8 +4865,9 @@ async def recognize_shazam(acierto: AciertoDeShazam, request: Request,
     if cupo:
         return cupo
 
+    fila_marcador = None
     try:
-        db.log_audd_call(
+        fila_marcador = db.log_audd_call(
             fingerprint='recognize_session', success=True, artist=artist,
             title=title, source='recognize_session', device_id=device_id,
             reason='matched', origen=origen, sesion=sesion, variante=variante,
@@ -4882,6 +4883,10 @@ async def recognize_shazam(acierto: AciertoDeShazam, request: Request,
         logger.warning(f"[Recognize/Shazam] buscar la ficha fallo: {e}")
         backend_analysis = None
     ms_ficha = _ms(time.perf_counter() - t0)
+    try:
+        db.apuntar_ficha(fila_marcador, bool(backend_analysis))
+    except Exception as e:  # noqa: BLE001 - apuntar nunca tumba el acierto
+        logger.warning(f"[Recognize/Shazam] apuntar la ficha fallo: {e}")
 
     apple_music_url = _url_de_shazam(acierto.apple_music_url)
     web_url = _url_de_shazam(acierto.web_url)
@@ -5144,8 +5149,9 @@ async def recognize_audio(
         # se perdia, asi que no habia forma de saber si los fallos de Escuchar
         # eran por el catalogo de AudD o por audio mal captado.
         session_reason = _recognize_reason(track_data, audio_processed)
+        fila_marcador = None
         try:
-            db.log_audd_call(
+            fila_marcador = db.log_audd_call(
                 fingerprint='recognize_session', success=bool(track_data),
                 artist=(track_data or {}).get('artist'),
                 title=(track_data or {}).get('title'),
@@ -5218,6 +5224,11 @@ async def recognize_audio(
         tiempos['ficha'] = time.perf_counter() - t0
         if backend_analysis:
             logger.info(f"  Ficha de la comunidad: {backend_analysis.get('id')}")
+        try:
+            # Cuantos aciertos salen SIN ficha (panel: `con_ficha`).
+            db.apuntar_ficha(fila_marcador, bool(backend_analysis))
+        except Exception as e:  # noqa: BLE001 - apuntar nunca tumba el acierto
+            logger.warning(f"[Recognize] apuntar la ficha fallo: {e}")
 
         response = {
             "status": "found",
