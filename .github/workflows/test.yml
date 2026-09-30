@@ -14,6 +14,9 @@ jobs:
   test:
     name: pytest backend
     runs-on: ubuntu-latest
+    # Un job sano tarda ~7 min. Sin tope, uno colgado se queda 6 h «in
+    # progress» y el merge espera un check que no va a terminar.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -24,14 +27,27 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      # Un mirror de apt colgado dejó este paso parado sin límite el
+      # 2026-09-30 (run 36733398832), con el mismo commit en verde en el run
+      # del pull_request. Cada intento lleva su tope y se reintenta; si los
+      # tres fallan, el paso falla (no se sigue sin ffmpeg).
       - name: Install system deps (ffmpeg)
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
           # libchromaprint-tools NO existe en el Debian de Render (verificado
           # 2026-07-07), por eso acoustic_fingerprint.py auto-descarga el fpcalc
           # estático de acoustid. En Ubuntu de Actions sí está, y tenerlo aquí
           # permite que los tests que tocan fpcalc corran de verdad.
-          sudo apt-get install -y libchromaprint-tools ffmpeg
+          APT="-o Acquire::Retries=3 -o DPkg::Lock::Timeout=60"
+          ok=0
+          for i in 1 2 3; do
+            if timeout 120 sudo apt-get $APT update \
+               && timeout 240 sudo apt-get $APT install -y libchromaprint-tools ffmpeg; then
+              ok=1; break
+            fi
+            echo "apt: el intento $i no terminó; reintento"; sleep 10
+          done
+          [ "$ok" = 1 ]
 
       - name: Install Python deps
         run: |
