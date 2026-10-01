@@ -284,12 +284,19 @@ def isrc_de_audd(track_data) -> Optional[str]:
             if isinstance(m, dict) and isinstance(m.get('isrcs'), list):
                 candidatos.extend(m['isrcs'])
     for c in candidatos:
-        if not isinstance(c, str):
-            continue
-        v = c.strip().upper().replace('-', '')
-        if _ISRC.match(v):
+        v = isrc_valido(c)
+        if v:
             return v
     return None
+
+
+def isrc_valido(c) -> Optional[str]:
+    """El ISRC normalizado (mayusculas, sin guiones) si tiene el formato
+    CC + 3 + 7 digitos; si no, None."""
+    if not isinstance(c, str):
+        return None
+    v = c.strip().upper().replace('-', '')
+    return v if _ISRC.match(v) else None
 
 
 def enrich_with_audd_if_needed(

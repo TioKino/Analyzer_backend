@@ -5376,6 +5376,26 @@ def _clamp_untrusted_source(data: dict, signed: bool) -> None:
             data[field] = _CLAMPED_SOURCE
 
 
+def _isrc_del_motor_local(data: dict) -> Optional[str]:
+    """El ISRC que manda un motor local en `/cache-analysis`: arriba o dentro
+    del detalle anidado (`analysis_json`, que es donde va hoy)."""
+    from audd_helper import isrc_valido
+    nested = data.get('analysis_json')
+    if isinstance(nested, str):
+        try:
+            nested = json.loads(nested)
+        except (json.JSONDecodeError, TypeError):
+            nested = None
+    candidatos = [data.get('isrc')]
+    if isinstance(nested, dict):
+        candidatos.append(nested.get('isrc'))
+    for c in candidatos:
+        v = isrc_valido(c)
+        if v:
+            return v
+    return None
+
+
 @app.post("/cache-analysis")
 async def cache_analysis(request: Request, signed: bool = Depends(verify_write_auth)):
     """
@@ -5425,6 +5445,12 @@ async def cache_analysis(request: Request, signed: bool = Depends(verify_write_a
                 existing_source = ej.get('bpm_source', '?')
         except (json.JSONDecodeError, TypeError):
             pass
+        # Lo que la fila no tiene se completa aunque no se sustituya: el ISRC
+        # que AudD dio al motor local («Limpiar metadata») es lo que une lo que
+        # Escuchar reconoce con la huella de este fichero.
+        isrc_nuevo = _isrc_del_motor_local(data)
+        if isrc_nuevo and db.completar_isrc(fingerprint, isrc_nuevo):
+            logger.info(f"[Cache] {fingerprint[:12]} gana el ISRC {isrc_nuevo}")
         logger.info(
             f"[Cache] {fingerprint[:12]} skip (existente={existing_source} "
             f"prio={get_source_priority(existing_source)} "

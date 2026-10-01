@@ -120,3 +120,63 @@ def test_con_el_isrc_la_ficha_y_la_huella_salen_aunque_el_titulo_no_diga_la_vers
     assert ficha is not None and abs(ficha['bpm'] - 132.5) < 0.01
     assert fp in main.db.huellas_del_tema(ficha.get('fingerprint'), isrc), \
         'con la huella, el móvil dice «en mi biblioteca por el fichero»'
+
+
+def _cache_analysis(monkeypatch, fp, isrc=None, en_el_detalle=True,
+                    fuente='local_engine'):
+    """Lo que manda el motor local tras analizar: el ISRC va dentro del
+    detalle anidado (`analysis_json`), que es donde lo pone hoy."""
+    import json
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(main, '_WRITE_AUTH_SECRET', 'test-write-secret')
+    detalle = {'bpm': 132.5, 'isrc': isrc} if en_el_detalle else {}
+    payload = {
+        'fingerprint': fp, 'filename': 'x.mp3', 'artist': 'Age Of Love',
+        'title': 'The Age Of Love', 'duration': 420, 'bpm': 132.5,
+        'bpm_source': fuente, 'analysis_json': detalle,
+    }
+    if not en_el_detalle:
+        payload['isrc'] = isrc
+    body = json.dumps(payload).encode('utf-8')
+    headers = {'Content-Type': 'application/json'}
+    headers.update(main._sign_write_payload(body))
+    return TestClient(main.app).post('/cache-analysis', content=body,
+                                     headers=headers)
+
+
+class TestElMotorLocalLoLlevaARender:
+    """«Limpiar metadata» en un ordenador con motor local pasa el fichero por
+    AudD ALLÍ; Render ya tiene la fila y responde «exists». Sin completar el
+    ISRC en ese camino, se quedaba en la BD del motor local."""
+
+    def test_una_fila_que_ya_esta_gana_el_isrc(self, monkeypatch):
+        fp = uuid.uuid4().hex
+        isrc = 'DEA62' + f'{uuid.uuid4().int % 10**7:07d}'
+        # La fila de Render viene de una fuente más fiable que el motor
+        # local: lo que este manda después no la sustituye («exists»).
+        assert _cache_analysis(monkeypatch, fp, fuente='rekordbox'
+                               ).json()['status'] == 'cached'
+        assert not (main.db.get_track_by_fingerprint(fp) or {}).get('isrc')
+        r = _cache_analysis(monkeypatch, fp, isrc=isrc)
+        assert r.json()['status'] == 'exists'
+        assert main.db.get_track_by_fingerprint(fp)['isrc'] == isrc
+        assert fp in main.db.huellas_del_tema(None, isrc)
+
+    def test_no_pisa_uno_que_ya_tiene(self, monkeypatch):
+        fp = uuid.uuid4().hex
+        uno = 'DEA63' + f'{uuid.uuid4().int % 10**7:07d}'
+        otro = 'DEA64' + f'{uuid.uuid4().int % 10**7:07d}'
+        _cache_analysis(monkeypatch, fp, isrc=uno, fuente='rekordbox')
+        assert _cache_analysis(monkeypatch, fp, isrc=otro
+                               ).json()['status'] == 'exists'
+        assert main.db.get_track_by_fingerprint(fp)['isrc'] == uno
+
+    def test_arriba_tambien_vale_y_la_basura_no(self, monkeypatch):
+        fp = uuid.uuid4().hex
+        _cache_analysis(monkeypatch, fp, fuente='rekordbox')
+        _cache_analysis(monkeypatch, fp, isrc='no-es-un-isrc',
+                        en_el_detalle=False)
+        assert not main.db.get_track_by_fingerprint(fp).get('isrc')
+        isrc = 'DEA65' + f'{uuid.uuid4().int % 10**7:07d}'
+        _cache_analysis(monkeypatch, fp, isrc=isrc, en_el_detalle=False)
+        assert main.db.get_track_by_fingerprint(fp)['isrc'] == isrc
