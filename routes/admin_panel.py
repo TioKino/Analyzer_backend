@@ -1706,6 +1706,12 @@ def _escuchar_segun_el_movil(dias: int = 30):
                      2026-09-30): ShazamKit fallo en el movil y la pulsacion
                      siguio solo con AudD. Si crece, algo le pasa a Shazam
                      (el App ID sin el servicio, la red de Apple)
+      rescatadas_por_tempo
+                     {'+4': n, '-2': n…} de `listen_result.tempo_pct` (desde
+                     el 2026-10-01, `ESCUCHAR_SHAZAM_TEMPO`): aciertos que
+                     Shazam solo dio con el audio a otra velocidad, o sea
+                     temas pinchados con el pitch movido que sin esto serian
+                     «no lo conoce»
 
     None si falla (el panel no miente: None es «fallo», no «cero»).
     """
@@ -1726,6 +1732,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
     enlaces = {}
     pendientes = {}
     pendientes_resueltas_por = {'shazam': 0, 'audd': 0}
+    rescatadas_por_tempo = {}
     por_variante = {}
     por_entrada = {}
     shazam_errores = {}
@@ -1780,6 +1787,13 @@ def _escuchar_segun_el_movil(dias: int = 30):
                         rp = pv.setdefault('resueltas_por',
                                            {'shazam': 0, 'audd': 0})
                         rp[quien] += 1
+                    # Un acierto de Shazam con el audio a otra velocidad:
+                    # sin `ESCUCHAR_SHAZAM_TEMPO` seria un «no lo conoce».
+                    t = _num_con_signo(p.get('tempo_pct'))
+                    if t:
+                        k = f"{t:+g}"
+                        rescatadas_por_tempo[k] = (
+                            rescatadas_por_tempo.get(k, 0) + 1)
                 if p.get('shazam_error'):
                     c = str(p.get('shazam_error'))[:32]
                     shazam_errores[c] = shazam_errores.get(c, 0) + 1
@@ -1835,6 +1849,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
         'pendientes_resueltas_por': pendientes_resueltas_por,
         'por_entrada': por_entrada,
         'shazam_errores': shazam_errores,
+        'rescatadas_por_tempo': rescatadas_por_tempo,
         'modo_set': {
             'sets': modo_set['sets'],
             'aparatos': len(modo_set['aparatos']),
@@ -1858,13 +1873,24 @@ def _escuchar_segun_el_movil(dias: int = 30):
     }
 
 
+def _num_con_signo(v):
+    """Un numero con signo (el tempo de un rescate), o None."""
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    return n if -50 <= n <= 50 else None
+
+
 def _variante_del_evento(props: dict) -> str:
     """La variante de una pulsacion segun el movil: `{clip_s}s+{envio}`, con
     la misma forma que `audd_call_log.variante`. Lo que falte es lo de
     siempre (12 s y ffmpeg), que es lo que hacia todo movil antes del
     interruptor. Con `motor=shazam`, el prefijo `shazam+` (el clip y el envio
-    son los de AudD, que va detras), y `+auddNs` si AudD espero N segundos
-    (`ESCUCHAR_AUDD_TRAS_S`). Espejo de `_variante_de_escuchar` (main)."""
+    son los de AudD, que va detras), `+auddNs` si AudD espero N segundos
+    (`ESCUCHAR_AUDD_TRAS_S`) y `+tempo` si se probo Shazam a otras
+    velocidades (`ESCUCHAR_SHAZAM_TEMPO`). Espejo de `_variante_de_escuchar`
+    (main)."""
     try:
         clip = int(float(props.get('clip_s')))
     except (TypeError, ValueError):
@@ -1883,6 +1909,8 @@ def _variante_del_evento(props: dict) -> str:
     except (TypeError, ValueError):
         tras = 0
     sufijo = f"+audd{tras}s" if clip < tras <= 60 else ''
+    if props.get('shazam_tempo') in (True, 1, '1', 'true'):
+        sufijo += '+tempo'
     return f"shazam+{base}{sufijo}"
 
 
