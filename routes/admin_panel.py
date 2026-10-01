@@ -1863,7 +1863,8 @@ def _variante_del_evento(props: dict) -> str:
     la misma forma que `audd_call_log.variante`. Lo que falte es lo de
     siempre (12 s y ffmpeg), que es lo que hacia todo movil antes del
     interruptor. Con `motor=shazam`, el prefijo `shazam+` (el clip y el envio
-    son los de AudD, que va detras)."""
+    son los de AudD, que va detras), y `+auddNs` si AudD espero N segundos
+    (`ESCUCHAR_AUDD_TRAS_S`). Espejo de `_variante_de_escuchar` (main)."""
     try:
         clip = int(float(props.get('clip_s')))
     except (TypeError, ValueError):
@@ -1874,7 +1875,15 @@ def _variante_del_evento(props: dict) -> str:
     if envio not in ('ffmpeg', 'directo'):
         envio = 'ffmpeg'
     base = f"{clip}s+{envio}"
-    return f"shazam+{base}" if props.get('motor') == 'shazam' else base
+    if props.get('motor') != 'shazam':
+        return base
+    # AudD esperó más que el clip (`ESCUCHAR_AUDD_TRAS_S`): `+audd15s`.
+    try:
+        tras = int(float(props.get('audd_tras_s')))
+    except (TypeError, ValueError):
+        tras = 0
+    sufijo = f"+audd{tras}s" if clip < tras <= 60 else ''
+    return f"shazam+{base}{sufijo}"
 
 
 def _resumen_lo_importado():
