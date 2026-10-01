@@ -965,6 +965,32 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def completar_isrc(self, fingerprint: str, isrc: Optional[str]) -> bool:
+        """Pone el ISRC a la fila de ese fichero si no lo tiene. Nunca pisa uno
+        que ya este.
+
+        Para `/cache-analysis` cuando responde «exists»: el motor local que
+        vuelve a pasar un fichero por AudD («Limpiar metadata») trae el ISRC de
+        la grabacion, y sin esto se quedaba en su BD — Render ya tenia la fila
+        y no la tocaba. Es lo que une lo que Escuchar reconoce con la huella
+        del fichero (`huellas_del_tema`). Dos UPDATE, por huella y por id, en
+        vez de un `OR` entre columnas (ver `_tracks_por_huella_o_id`)."""
+        if not fingerprint or not isrc:
+            return False
+        conn = self._open_conn()
+        try:
+            n = 0
+            for columna in ('fingerprint', 'id'):
+                n += conn.execute(
+                    f"UPDATE tracks SET isrc = ? WHERE {columna} = ? "
+                    "AND (isrc IS NULL OR isrc = '')",
+                    (isrc, fingerprint),
+                ).rowcount
+            conn.commit()
+            return n > 0
+        finally:
+            conn.close()
+
     def get_track_by_isrc(self, isrc: str) -> Optional[Dict]:
         """Busca un track por su ISRC (codigo unico de grabacion de AudD).
         Identidad exacta, sin fuzzy artist/title. Devuelve el analizado mas

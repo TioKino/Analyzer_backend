@@ -201,6 +201,13 @@ _PARECE_VERSION = re.compile(
     r'\b(mix|remix|rmx|edit|version|dub|rework|vip|bootleg|remaster(ed)?)\b',
     re.IGNORECASE)
 
+# Palabras que dicen QUE CLASE de version es, no DE QUIEN: «(Dub)» no puede
+# hacerse pasar por «(Adam Beyer Dub)» por estar dentro (`misma_version`).
+_TIPOS_DE_VERSION = frozenset({
+    'dub', 'vip', 'rework', 'bootleg', 'remaster', 'remastered', 'club',
+    'vocal', 'instrumental', 'acapella', 'extended', 'original', 'radio',
+})
+
 _ENTRE_PARENTESIS = re.compile(r'[(\[]([^)\]]*)[)\]]')
 _FEAT = re.compile(r'\s(?:feat|ft|featuring)\.?\s.*$', re.IGNORECASE)
 _SEPARA_ARTISTAS = re.compile(
@@ -222,7 +229,11 @@ def tema_y_version(titulo: Optional[str]):
     """(tema, version) de un titulo, normalizados. La version es un conjunto
     de palabras, vacio si es el original."""
     t = titulo or ''
-    partes = [m.group(1) for m in _ENTRE_PARENTESIS.finditer(t)]
+    # Entre parentesis siempre es la version («(base)» tambien). Entre
+    # corchetes solo si lo parece: ahi van el sello («[Drumcode]») y la
+    # basura de las webs de descarga («[www.x.tk]»), que no son una version.
+    partes = [m.group(1) for m in _ENTRE_PARENTESIS.finditer(t)
+              if m.group(0).startswith('(') or _PARECE_VERSION.search(m.group(1))]
     tema = _ENTRE_PARENTESIS.sub(' ', t)
     guion = re.match(r'^(.*?)\s+[-\u2013\u2014]\s+(.+)$', tema)
     if guion and _PARECE_VERSION.search(guion.group(2)):
@@ -264,12 +275,29 @@ def _mismo_artista(buscado: str, guardado: str) -> bool:
     return bool(_artistas(buscado) & _artistas(guardado))
 
 
+def misma_version(a: frozenset, b: frozenset) -> bool:
+    """La misma version, aunque una lleve el nombre mas completo que la otra:
+    «(Jam & Spoon Mix)» y «(Jam & Spoon Watch Out For Stella Mix)» son la
+    misma; «(Charlotte de Witte Remix)» y la que añade a Enrico Sangiuliano,
+    tambien. El original (vacio) solo es el original, y la corta tiene que
+    llevar un nombre, no solo la clase de version. Espejo de
+    `mismaVersion` en el movil (`track_match.dart`)."""
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+    corta, larga = (a, b) if len(a) <= len(b) else (b, a)
+    # La corta tiene que nombrar a alguien: «(Dub)» dentro de «(Adam Beyer
+    # Dub)» no dice que sea la de Adam Beyer.
+    return corta <= larga and bool(corta - _TIPOS_DE_VERSION)
+
+
 def _parecido_de_titulo(buscado, guardado) -> int:
     """2 = el mismo tema y version; 1 = el tema dentro del otro (un numero de
     pista delante, un subtitulo) y la misma version; 0 = no."""
     tema_b, version_b = buscado
     tema_g, version_g = tema_y_version(guardado)
-    if not tema_b or not tema_g or version_b != version_g:
+    if not tema_b or not tema_g or not misma_version(version_b, version_g):
         return 0
     if tema_b == tema_g:
         return 2

@@ -2451,9 +2451,11 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                     f"{artist_name} - {title_name}")
 
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
+    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
-            from audd_helper import enrich_with_audd_if_needed, download_artwork_from_audd
+            from audd_helper import (enrich_with_audd_if_needed,
+                                     download_artwork_from_audd, isrc_de_audd)
             audd_track = enrich_with_audd_if_needed(
                 file_path=file_path,
                 fingerprint=fingerprint,
@@ -2470,6 +2472,7 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                 device_id=device_id,
             )
             if audd_track:
+                audd_isrc = isrc_de_audd(audd_track)
                 if audd_track.get('artist'):
                     artist_name = audd_track['artist']
                 if audd_track.get('title'):
@@ -2670,7 +2673,9 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         album=id3_data.get('album'),
         label=label,
         year=year,
-        isrc=id3_data.get('isrc'),
+        # El de las etiquetas, y si no trae, el que dio AudD al identificar el
+        # audio: con el, Escuchar encuentra la ficha y la huella del fichero.
+        isrc=id3_data.get('isrc') or audd_isrc,
         duration=duration,
         bpm=bpm,
         bpm_confidence=bpm_confidence,
@@ -2833,9 +2838,11 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
                     f"{artist_name} - {title_name}")
 
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
+    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
-            from audd_helper import enrich_with_audd_if_needed, download_artwork_from_audd
+            from audd_helper import (enrich_with_audd_if_needed,
+                                     download_artwork_from_audd, isrc_de_audd)
             audd_track = enrich_with_audd_if_needed(
                 file_path=file_path,
                 fingerprint=fingerprint,
@@ -2852,6 +2859,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
                 device_id=device_id,
             )
             if audd_track:
+                audd_isrc = isrc_de_audd(audd_track)
                 if audd_track.get('artist'):
                     artist_name = audd_track['artist']
                 if audd_track.get('title'):
@@ -2979,7 +2987,9 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         album=id3_data.get('album'),
         label=label,
         year=year,
-        isrc=id3_data.get('isrc'),
+        # El de las etiquetas, y si no trae, el que dio AudD al identificar el
+        # audio: con el, Escuchar encuentra la ficha y la huella del fichero.
+        isrc=id3_data.get('isrc') or audd_isrc,
         duration=duration,
         bpm=bpm,
         bpm_confidence=result['bpm_confidence'],
@@ -4009,7 +4019,7 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         label = track_data.get('label')
         release_date = track_data.get('release_date')
         year = release_date[:4] if release_date and len(release_date) >= 4 else None
-        isrc = track_data.get('isrc')
+        isrc = _isrc_de_audd(track_data)
 
         logger.info(f"  AudD identifico: {artist} - {title}")
         
@@ -4686,6 +4696,13 @@ def _mejorar_ficha_con_la_comunidad(ficha: dict) -> dict:
     return ficha
 
 
+def _isrc_de_audd(track_data) -> Optional[str]:
+    """El ISRC de un resultado de AudD, venga arriba o dentro de
+    apple_music/spotify/deezer/musicbrainz (`audd_helper.isrc_de_audd`)."""
+    from audd_helper import isrc_de_audd
+    return isrc_de_audd(track_data)
+
+
 def _ficha_para_recognize(artist: str, title: str,
                           isrc: Optional[str]) -> Optional[dict]:
     """La ficha del tema reconocido si alguien lo analizo: la MISMA busqueda
@@ -4935,6 +4952,21 @@ async def escuchar_ajustes():
     `envio`, para que el movil apunte en su telemetria con que variante se
     hizo cada pulsacion."""
     return _ajustes_de_escuchar()
+
+
+@app.get("/shazam/token")
+async def shazam_developer_token():
+    """El token de ShazamKit para Android (2026-09-30, `shazam_token.py`):
+    en Android el SDK pide un JWT firmado con la clave Media Services de la
+    cuenta de Apple Developer, que no puede ir dentro de la app. 503 si
+    Render no tiene `SHAZAM_TEAM_ID`, `SHAZAM_KEY_ID` y `SHAZAM_PRIVATE_KEY`:
+    el movil sigue entonces con AudD solo. Sin auth, como el token de MusicKit
+    de una web: da acceso al catalogo de Shazam, no a nada nuestro."""
+    import shazam_token
+    t = await run_in_threadpool(shazam_token.token_de_shazam)
+    if not t:
+        raise HTTPException(status_code=503, detail="ShazamKit sin configurar")
+    return t
 
 
 @app.post("/recognize")
@@ -5202,7 +5234,7 @@ async def recognize_audio(
         album = track_data.get('album')
         release_date = track_data.get('release_date')
         label = track_data.get('label')
-        isrc = track_data.get('isrc')
+        isrc = _isrc_de_audd(track_data)
 
         spotify_data = track_data.get('spotify')
         deezer_data = track_data.get('deezer')
@@ -5344,6 +5376,26 @@ def _clamp_untrusted_source(data: dict, signed: bool) -> None:
             data[field] = _CLAMPED_SOURCE
 
 
+def _isrc_del_motor_local(data: dict) -> Optional[str]:
+    """El ISRC que manda un motor local en `/cache-analysis`: arriba o dentro
+    del detalle anidado (`analysis_json`, que es donde va hoy)."""
+    from audd_helper import isrc_valido
+    nested = data.get('analysis_json')
+    if isinstance(nested, str):
+        try:
+            nested = json.loads(nested)
+        except (json.JSONDecodeError, TypeError):
+            nested = None
+    candidatos = [data.get('isrc')]
+    if isinstance(nested, dict):
+        candidatos.append(nested.get('isrc'))
+    for c in candidatos:
+        v = isrc_valido(c)
+        if v:
+            return v
+    return None
+
+
 @app.post("/cache-analysis")
 async def cache_analysis(request: Request, signed: bool = Depends(verify_write_auth)):
     """
@@ -5393,6 +5445,12 @@ async def cache_analysis(request: Request, signed: bool = Depends(verify_write_a
                 existing_source = ej.get('bpm_source', '?')
         except (json.JSONDecodeError, TypeError):
             pass
+        # Lo que la fila no tiene se completa aunque no se sustituya: el ISRC
+        # que AudD dio al motor local («Limpiar metadata») es lo que une lo que
+        # Escuchar reconoce con la huella de este fichero.
+        isrc_nuevo = _isrc_del_motor_local(data)
+        if isrc_nuevo and db.completar_isrc(fingerprint, isrc_nuevo):
+            logger.info(f"[Cache] {fingerprint[:12]} gana el ISRC {isrc_nuevo}")
         logger.info(
             f"[Cache] {fingerprint[:12]} skip (existente={existing_source} "
             f"prio={get_source_priority(existing_source)} "
@@ -6212,7 +6270,7 @@ async def reset_database(
             community_notes, track_ratings, track_popularity,
             beat_grid_corrections, audd_call_log, imported_values
         sync.db: sync_items, device_seen, users, user_devices,
-            link_codes, detected_tracks_sync
+            link_codes, detected_tracks_sync, listen_sets_sync
 
     Borra SOLO con `?wipe_assets=true`:
         Filesystem: ARTWORK_CACHE_DIR, PREVIEWS_DIR (.mp3 cacheados)
@@ -6282,7 +6340,7 @@ async def reset_database(
         sync_db_path = os.environ.get("SYNC_DB_PATH", "/data/sync.db")
         sync_tables = (
             "sync_items", "device_seen", "users", "user_devices",
-            "link_codes", "detected_tracks_sync",
+            "link_codes", "detected_tracks_sync", "listen_sets_sync",
         )
         cleared_sync = []
         sync_cleared = False

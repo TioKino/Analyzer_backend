@@ -260,6 +260,44 @@ class TestResumenEscuchar:
         assert r['enlaces'].get('beatport', 0) >= 1
         assert r['pendientes'].get('found', 0) >= 1
 
+    def test_el_modo_set_se_lee(self):
+        # El modo set (2026-09-30): cuántos sets, cuántos minutos y cuántos
+        # temas por hora apunta Shazam.
+        import routes.admin_panel as panel
+        antes = panel._escuchar_segun_el_movil()['modo_set']
+        dev = f'movil-{uuid.uuid4().hex[:8]}'
+        for props in ({'minutos': 60, 'temas': 18, 'errores': 2,
+                       'motivo': 'boton'},
+                      {'minutos': 30, 'temas': 9, 'motivo': 'sin_audio'}):
+            main.db.log_event(device_id=dev, event_name='listen_set_ended',
+                              props=json.dumps(props), platform='ios')
+        r = panel._escuchar_segun_el_movil()['modo_set']
+        assert r['sets'] - antes['sets'] == 2
+        assert r['temas'] - antes['temas'] == 27
+        assert r['minutos'] - antes['minutos'] == 90
+        assert r['errores'] - antes['errores'] == 2
+        assert r['por_motivo'].get('sin_audio', 0) >= 1
+        assert r['temas_por_hora'] is not None
+
+    def test_una_pendiente_resuelta_por_la_firma_de_shazam(self):
+        # Sin red, con Shazam delante, la captura lleva su firma y se busca en
+        # Shazam antes que en AudD: el panel cuenta cuántas se ahorró AudD.
+        import routes.admin_panel as panel
+        antes = panel._escuchar_segun_el_movil()['pendientes_resueltas_por']
+        dev = f'movil-{uuid.uuid4().hex[:8]}'
+        for quien in ('shazam', 'shazam', 'audd'):
+            main.db.log_event(device_id=dev, event_name='listen_pendiente',
+                              props=json.dumps({'outcome': 'found',
+                                                'resuelto_por': quien}),
+                              platform='ios')
+        main.db.log_event(device_id=dev, event_name='listen_pendiente',
+                          props=json.dumps({'outcome': 'no_match',
+                                            'resuelto_por': None}),
+                          platform='ios')
+        r = panel._escuchar_segun_el_movil()['pendientes_resueltas_por']
+        assert r['shazam'] - antes['shazam'] == 2
+        assert r['audd'] - antes['audd'] == 1
+
     def test_la_clave_esta_en_la_respuesta_del_panel(self):
         ruta = os.path.join(os.path.dirname(__file__), 'routes',
                             'admin_panel.py')

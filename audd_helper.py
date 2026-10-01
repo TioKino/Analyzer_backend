@@ -253,6 +253,52 @@ def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dic
                 pass
 
 
+_ISRC = re.compile(r'^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$')
+
+
+def isrc_de_audd(track_data) -> Optional[str]:
+    """El ISRC de la grabacion que AudD identifico, o None.
+
+    AudD no siempre lo da arriba: viene dentro de los bloques que se le piden
+    (`apple_music.isrc`, `spotify.external_ids.isrc`, `deezer.isrc`,
+    `musicbrainz[].isrcs`). Hasta el 2026-10-01 /analyze lo tiraba y solo
+    guardaba el de las etiquetas del fichero, que casi nunca lo trae: el
+    servidor no podia unir lo que Escuchar reconoce (Shazam siempre da el
+    ISRC) con la HUELLA del fichero, y un fichero etiquetado sin la version
+    («The Age Of Love» a secas, siendo el Jam & Spoon) se quedaba sin ficha y
+    sin «en mi biblioteca por el fichero». Se normaliza (mayusculas, sin
+    guiones) y se valida el formato: CC + 3 + 7 digitos."""
+    if not isinstance(track_data, dict):
+        return None
+    candidatos = [track_data.get('isrc')]
+    for bloque in ('apple_music', 'deezer'):
+        b = track_data.get(bloque)
+        if isinstance(b, dict):
+            candidatos.append(b.get('isrc'))
+    sp = track_data.get('spotify')
+    if isinstance(sp, dict) and isinstance(sp.get('external_ids'), dict):
+        candidatos.append(sp['external_ids'].get('isrc'))
+    mb = track_data.get('musicbrainz')
+    if isinstance(mb, list):
+        for m in mb:
+            if isinstance(m, dict) and isinstance(m.get('isrcs'), list):
+                candidatos.extend(m['isrcs'])
+    for c in candidatos:
+        v = isrc_valido(c)
+        if v:
+            return v
+    return None
+
+
+def isrc_valido(c) -> Optional[str]:
+    """El ISRC normalizado (mayusculas, sin guiones) si tiene el formato
+    CC + 3 + 7 digitos; si no, None."""
+    if not isinstance(c, str):
+        return None
+    v = c.strip().upper().replace('-', '')
+    return v if _ISRC.match(v) else None
+
+
 def enrich_with_audd_if_needed(
     file_path: str,
     fingerprint: Optional[str],
