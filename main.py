@@ -4584,6 +4584,15 @@ def _origen_de_recognize(origen: Optional[str],
 #                           los 12 s y Shazam lo caso a los 13,5 (y AudD dio
 #                           otro tema). Se decide con `resueltas_por` y las
 #                           llamadas a AudD por pulsacion de cada variante.
+#   ESCUCHAR_SHAZAM_TEMPO   '1' = con Shazam delante, si la pulsacion acaba
+#                           sin acierto, el movil prueba Shazam con el audio
+#                           a otras velocidades (±2/4/6/8 %): un DJ que pincha
+#                           con el pitch movido deja el tema irreconocible
+#                           para una huella hecha a su velocidad. Firma y
+#                           busqueda en el aparato, gratis (no toca AudD).
+#                           Experimento: el panel cuenta los rescates en
+#                           `movil_30d.rescatadas_por_tempo` y la variante
+#                           lleva `+tempo`.
 #
 # En Render: Environment → cambiar la variable → «Save and deploy» (reinicia
 # con el mismo codigo). Volver atras es borrar la variable.
@@ -4614,7 +4623,16 @@ def _ajustes_de_escuchar() -> dict:
                          _AUDD_TRAS_MAXIMO)
     if tras:
         ajustes['audd_tras_s'] = tras
+    # Solo si esta encendido: sin el, la respuesta es la de siempre.
+    if _si(os.getenv('ESCUCHAR_SHAZAM_TEMPO')):
+        ajustes['shazam_tempo'] = True
     return ajustes
+
+
+def _si(valor) -> bool:
+    """'1', 'si', 'true', 'on'… Lo que no sea un si claro es no."""
+    return str(valor or '').strip().lower() in ('1', 'si', 'sí', 'true', 'on',
+                                                'yes')
 
 
 def _audd_tras_de(valor: Optional[str], clip: int,
@@ -4649,18 +4667,22 @@ def _primer_clip_de(valor: Optional[str]) -> int:
 
 def _variante_de_escuchar(primer_clip_s: int, envio: str,
                           motor: str = 'audd',
-                          audd_tras_s: Optional[int] = None) -> str:
+                          audd_tras_s: Optional[int] = None,
+                          tempo: bool = False) -> str:
     """`12s+ffmpeg`, `8s+directo`… La etiqueta de la pulsacion en el panel.
     Con Shazam delante lleva el prefijo (`shazam+12s+ffmpeg`): el clip y el
     envio son los de AudD, que va detras con el mismo audio. Y si AudD esperó
     mas que el clip (`ESCUCHAR_AUDD_TRAS_S`), el sufijo:
-    `shazam+12s+ffmpeg+audd15s`. Espejo de `_variante_del_evento` (panel) y
-    de `AjustesDeEscuchar.variante` (movil)."""
+    `shazam+12s+ffmpeg+audd15s`; y `+tempo` si se prueba Shazam a otras
+    velocidades (`ESCUCHAR_SHAZAM_TEMPO`). Espejo de `_variante_del_evento`
+    (panel) y de `AjustesDeEscuchar.variante` (movil)."""
     base = f"{primer_clip_s}s+{envio}"
     if motor != 'shazam':
         return base
     sufijo = (f"+audd{audd_tras_s}s"
               if audd_tras_s and audd_tras_s > primer_clip_s else '')
+    if tempo:
+        sufijo += '+tempo'
     return f"shazam+{base}{sufijo}"
 
 
@@ -4878,6 +4900,7 @@ class AciertoDeShazam(BaseModel):
     sesion_id: Optional[str] = None
     primer_clip_s: Optional[str] = None
     audd_tras_s: Optional[str] = None
+    shazam_tempo: Optional[str] = None
 
 
 def _texto_de_shazam(v: Optional[str], largo: int = 300) -> Optional[str]:
@@ -4917,7 +4940,8 @@ async def recognize_shazam(acierto: AciertoDeShazam, request: Request,
     envio = ajustes['envio'] if ajustes else 'ffmpeg'
     clip = _primer_clip_de(acierto.primer_clip_s)
     variante = (_variante_de_escuchar(clip, envio, 'shazam',
-                                      _audd_tras_de(acierto.audd_tras_s, clip))
+                                      _audd_tras_de(acierto.audd_tras_s, clip),
+                                      _si(acierto.shazam_tempo))
                 if origen == 'escuchar' else None)
 
     cupo = _cupo_de_escuchar_agotado(device_id, acierto.is_pro, sesion, origen)
@@ -5023,6 +5047,7 @@ async def recognize_audio(
     primer_clip_s: Optional[str] = Form(None),
     motor: Optional[str] = Form(None),
     audd_tras_s: Optional[str] = Form(None),
+    shazam_tempo: Optional[str] = Form(None),
 ):
     """
     Reconoce una canción a partir de audio grabado usando AudD API.
@@ -5051,7 +5076,9 @@ async def recognize_audio(
     cambia la variante (`shazam+12s+ffmpeg`); lo que Shazam encuentra llega
     por `/recognize/shazam`, sin audio. `audd_tras_s` (desde el 2026-10-01):
     los segundos que espero el movil antes de este primer envio a AudD
-    (`ESCUCHAR_AUDD_TRAS_S`), solo para la variante (`+audd15s`).
+    (`ESCUCHAR_AUDD_TRAS_S`), solo para la variante (`+audd15s`). Y
+    `shazam_tempo` (desde el 2026-10-01), si la pulsacion prueba Shazam a
+    otras velocidades (`ESCUCHAR_SHAZAM_TEMPO`): `+tempo`.
     """
     t_inicio = time.perf_counter()
     # Rate limiting — endpoint caro (preprocesado + AudD retries).
@@ -5074,7 +5101,8 @@ async def recognize_audio(
     envio = ajustes['envio'] if ajustes else 'ffmpeg'
     clip = _primer_clip_de(primer_clip_s)
     variante = (_variante_de_escuchar(clip, envio, _motor_de(motor),
-                                      _audd_tras_de(audd_tras_s, clip))
+                                      _audd_tras_de(audd_tras_s, clip),
+                                      _si(shazam_tempo))
                 if origen == 'escuchar' else None)
 
     # Cap por dispositivo/dia ANTES de gastar AudD/CPU. Sin device_id no capamos.
