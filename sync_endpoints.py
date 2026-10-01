@@ -364,6 +364,7 @@ def _init_tables(conn: sqlite3.Connection):
 
     # Migración: añadir user_id a sync_items si no existe
     _migrate_add_user_id(conn)
+    _migrate_detecciones_borradas(conn)
 
     conn.commit()
 
@@ -386,6 +387,22 @@ def _migrate_add_user_id(conn: sqlite3.Connection):
             logger.info("Migrated detected_tracks_sync: added user_id column")
     except sqlite3.OperationalError:
         pass  # Table doesn't exist yet
+
+
+def _migrate_detecciones_borradas(conn: sqlite3.Connection):
+    """`borrado_at` en `detected_tracks_sync` (2026-10-01): una deteccion
+    quitada se MARCA, no se borra, para que el pull pueda decirle a los otros
+    aparatos de la cuenta que la quiten. Va en la misma fila, asi que vincular
+    y la cuenta abandonada se la llevan con lo demas."""
+    try:
+        cols = [row[1] for row in conn.execute(
+            "PRAGMA table_info(detected_tracks_sync)").fetchall()]
+        if cols and "borrado_at" not in cols:
+            conn.execute(
+                "ALTER TABLE detected_tracks_sync ADD COLUMN borrado_at TEXT")
+            logger.info("Migrated detected_tracks_sync: added borrado_at")
+    except sqlite3.OperationalError:
+        pass  # la tabla aun no existe
 
 
 # ── Data types compartidos (Memoria Colectiva) ──────────────
@@ -1713,6 +1730,7 @@ def _init_detected_table(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_dts_date
             ON detected_tracks_sync(detected_at);
     """)
+    _migrate_detecciones_borradas(conn)
     conn.commit()
 
 
@@ -1736,7 +1754,8 @@ async def sync_push_detected_track(track: DetectedTrackSync):
             DO UPDATE SET
                 payload = excluded.payload,
                 detected_at = excluded.detected_at,
-                user_id = excluded.user_id
+                user_id = excluded.user_id,
+                borrado_at = NULL
         """, (
             track.device_id,
             track.artist,
@@ -1765,6 +1784,12 @@ async def sync_pull_detected_tracks(
     Descarga tracks detectados SOLO del mismo usuario.
     Útil para ver en el PC lo que escaneaste con el móvil.
     Solo muestra tracks de dispositivos vinculados al mismo user_id.
+
+    `borrados` (desde el 2026-10-01): lo quitado en cualquier aparato de la
+    cuenta, con cuándo. El cliente quita lo suyo que sea de ANTES de esa hora:
+    sin esto, el pull volvía a bajar lo que el usuario acababa de quitar (el
+    escritorio pide el historial al abrir *DETECCIONES*), y lo que se volvió a
+    detectar después sí se queda.
     """
     conn = _get_conn()
     user_id = _require_user_id(conn, device_id)
@@ -1774,16 +1799,26 @@ async def sync_pull_detected_tracks(
             rows = conn.execute("""
                 SELECT artist, title, payload, detected_at, device_id
                 FROM detected_tracks_sync
-                WHERE user_id = ? AND detected_at > ?
+                WHERE user_id = ? AND detected_at > ? AND borrado_at IS NULL
                 ORDER BY detected_at DESC LIMIT ?
             """, (user_id, since, limit)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT artist, title, payload, detected_at, device_id
                 FROM detected_tracks_sync
-                WHERE user_id = ?
+                WHERE user_id = ? AND borrado_at IS NULL
                 ORDER BY detected_at DESC LIMIT ?
             """, (user_id, limit)).fetchall()
+        borrados = [
+            {"artist": a, "title": t, "borrado_at": b}
+            for a, t, b in conn.execute("""
+                SELECT MIN(artist), MIN(title), MAX(borrado_at)
+                FROM detected_tracks_sync
+                WHERE user_id = ? AND borrado_at IS NOT NULL
+                GROUP BY LOWER(artist), LOWER(title)
+                ORDER BY MAX(borrado_at) DESC LIMIT 1000
+            """, (user_id,))
+        ]
 
         tracks = []
         for row in rows:
@@ -1803,6 +1838,7 @@ async def sync_pull_detected_tracks(
         return {
             "tracks": tracks,
             "total": len(tracks),
+            "borrados": borrados,
             "server_time": _now_iso(),
             "user_id": user_id,
         }
@@ -1810,6 +1846,47 @@ async def sync_pull_detected_tracks(
     except (sqlite3.Error, json.JSONDecodeError, TypeError) as e:
         logger.error(f"Pull detected tracks error: {e}")
         return {"tracks": [], "total": 0, "error": str(e)}
+
+
+class DeteccionBorrada(BaseModel):
+    device_id: str
+    artist: str = ''
+    title: str = ''
+    todas: bool = False
+
+
+@sync_router.post("/detected-track/borrar")
+async def sync_borrar_deteccion(b: DeteccionBorrada):
+    """Quita una deteccion (o todas, `todas=true`) para TODA la cuenta
+    (2026-10-01). Se marca con `borrado_at`, no se borra: el pull se lo dice
+    a los demas aparatos (`borrados`). Volver a subirla (DESHACER, o volver a
+    detectarla) la recupera.
+
+    Hasta ese dia quitar una deteccion solo la quitaba de la lista local, y el
+    escritorio la volvia a bajar en cuanto abria *DETECCIONES*: no habia forma
+    de quitar una. Con las detecciones guardandose solas, «No es este» la
+    quita de aqui."""
+    if not b.device_id or (not b.todas and (not b.artist or not b.title)):
+        raise HTTPException(400, "device_id y artist+title (o todas) requeridos")
+    conn = _get_conn()
+    user_id = _require_user_id(conn, b.device_id)
+    ahora = _now_iso()
+    try:
+        if b.todas:
+            cur = conn.execute(
+                "UPDATE detected_tracks_sync SET borrado_at = ? "
+                "WHERE user_id = ? AND borrado_at IS NULL", (ahora, user_id))
+        else:
+            cur = conn.execute(
+                "UPDATE detected_tracks_sync SET borrado_at = ? "
+                "WHERE user_id = ? AND LOWER(artist) = LOWER(?) "
+                "AND LOWER(title) = LOWER(?)",
+                (ahora, user_id, b.artist.strip(), b.title.strip()))
+        conn.commit()
+        return {"status": "ok", "borradas": cur.rowcount, "borrado_at": ahora}
+    except sqlite3.Error as e:
+        logger.error(f"Borrar deteccion error: {e}")
+        return {"status": "error", "borradas": 0, "message": str(e)}
 
 
 @sync_router.delete("/detected-tracks/{device_id}")

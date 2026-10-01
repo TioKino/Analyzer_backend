@@ -1672,10 +1672,16 @@ def _escuchar_segun_el_movil(dias: int = 30):
       ms_acierto     {n, p50, p90} de `ms` en los aciertos: desde que empieza a
                      escuchar hasta que se ve el tema. EL numero a bajar.
       ms_servidor    {n, p50, p90} de lo que tarda /recognize por dentro
-      guardadas      `listen_saved`: el DJ confirmo que era ese tema
+      guardadas      `listen_saved`: el DJ pulso GUARDAR. Solo versiones
+                     anteriores al 2026-10-01: desde ese dia el acierto se
+                     guarda solo y no hay boton, asi que deja de crecer
       equivocadas    `listen_wrong`: el DJ pulso «No es este» (desde el
-                     2026-09-29). Con `guardadas`, la precision: en el
-                     servidor una deteccion equivocada cuenta como `matched`
+                     2026-09-29) y no lo deshizo
+      precision      1 - equivocadas / aciertos (`found`), o None sin
+                     aciertos (desde el 2026-10-01). En el servidor una
+                     deteccion equivocada cuenta como `matched`: esto es lo
+                     unico que la ve. Vale para versiones viejas y nuevas
+                     (todas mandan un `listen_result` por acierto)
       enlaces        {destino: n} de `listen_link`
       pendientes     {outcome: n} de `listen_pendiente`: capturas sin red que
                      se identificaron despues
@@ -1712,6 +1718,15 @@ def _escuchar_segun_el_movil(dias: int = 30):
                      Shazam solo dio con el audio a otra velocidad, o sea
                      temas pinchados con el pitch movido que sin esto serian
                      «no lo conoce»
+      shazam_senal   como caso Shazam (desde el 2026-10-01, iOS):
+                     {aciertos, equivocados}, cada uno {n, skew_abs_p50,
+                     skew_abs_p90, offset_s_p50, varios_candidatos}, de
+                     `shazam_skew`, `shazam_offset_s` y `shazam_candidatos`
+                     de `listen_result` (todos los aciertos de Shazam) y de
+                     `listen_wrong` (los que el DJ rechazo). Existe por *Pure
+                     NRG*: Shazam no lo tiene y devolvio cinco temas de trance
+                     parecidos. Si los equivocados se separan de los aciertos
+                     en alguna de estas, ahi esta el filtro
 
     None si falla (el panel no miente: None es «fallo», no «cero»).
     """
@@ -1738,6 +1753,19 @@ def _escuchar_segun_el_movil(dias: int = 30):
     shazam_errores = {}
     modo_set = {'sets': 0, 'aparatos': set(), 'minutos': 0.0, 'temas': 0,
                 'por_motivo': {}, 'errores': 0}
+    senal = {'aciertos': [], 'equivocados': []}
+
+    def _senal_de(p):
+        """(|skew|, offset, candidatos) de un evento con la senal de
+        Shazam, o None."""
+        if p.get('resuelto_por') != 'shazam':
+            return None
+        skew = _num_con_signo(p.get('shazam_skew'))
+        if skew is None:
+            return None
+        cand = _num(p.get('shazam_candidatos'))
+        return (abs(skew), _num(p.get('shazam_offset_s')),
+                int(cand) if cand is not None else None)
 
     def _de_variante(p):
         return por_variante.setdefault(_variante_del_evento(p), {
@@ -1787,6 +1815,10 @@ def _escuchar_segun_el_movil(dias: int = 30):
                         rp = pv.setdefault('resueltas_por',
                                            {'shazam': 0, 'audd': 0})
                         rp[quien] += 1
+                    # Como caso Shazam: se compara con los «No es este».
+                    sn = _senal_de(p)
+                    if sn:
+                        senal['aciertos'].append(sn)
                     # Un acierto de Shazam con el audio a otra velocidad:
                     # sin `ESCUCHAR_SHAZAM_TEMPO` seria un «no lo conoce».
                     t = _num_con_signo(p.get('tempo_pct'))
@@ -1806,6 +1838,9 @@ def _escuchar_segun_el_movil(dias: int = 30):
             elif nombre == 'listen_wrong':
                 equivocadas += 1
                 _de_variante(p)['equivocadas'] += 1
+                sn = _senal_de(p)
+                if sn:
+                    senal['equivocados'].append(sn)
             elif nombre == 'listen_link':
                 d = str(p.get('destino') or 'sin_dato')[:32]
                 enlaces[d] = enlaces.get(d, 0) + 1
@@ -1836,6 +1871,23 @@ def _escuchar_segun_el_movil(dias: int = 30):
         return {'n': len(orden), 'p50': int(_percentil(orden, 50)),
                 'p90': int(_percentil(orden, 90))}
 
+    def _precision(desenlaces, mal):
+        bien = desenlaces.get('found', 0)
+        return round(1 - min(mal, bien) / bien, 3) if bien else None
+
+    def _resumen_senal(filas):
+        skews = sorted(f[0] for f in filas)
+        offsets = sorted(f[1] for f in filas if f[1] is not None)
+        return {
+            'n': len(filas),
+            'skew_abs_p50': round(_percentil(skews, 50), 4) if skews else None,
+            'skew_abs_p90': round(_percentil(skews, 90), 4) if skews else None,
+            'offset_s_p50': (round(_percentil(offsets, 50), 1)
+                             if offsets else None),
+            'varios_candidatos': sum(1 for f in filas
+                                     if f[2] is not None and f[2] > 1),
+        }
+
     return {
         'pulsaciones': pulsaciones,
         'aparatos': len(aparatos),
@@ -1844,6 +1896,8 @@ def _escuchar_segun_el_movil(dias: int = 30):
         'ms_servidor': _reparto(ms_servidor),
         'guardadas': guardadas,
         'equivocadas': equivocadas,
+        'precision': _precision(por_desenlace, equivocadas),
+        'shazam_senal': {k: _resumen_senal(v) for k, v in senal.items()},
         'enlaces': enlaces,
         'pendientes': pendientes,
         'pendientes_resueltas_por': pendientes_resueltas_por,
@@ -1867,6 +1921,7 @@ def _escuchar_segun_el_movil(dias: int = 30):
                 'ms_acierto': _reparto(d['ms_acierto']),
                 'guardadas': d['guardadas'],
                 'equivocadas': d['equivocadas'],
+                'precision': _precision(d['por_desenlace'], d['equivocadas']),
                 **({'resueltas_por': d['resueltas_por']}
                    if 'resueltas_por' in d else {})}
             for v, d in por_variante.items()},
