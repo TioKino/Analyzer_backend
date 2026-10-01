@@ -41,6 +41,24 @@ def _s():
     return uuid.uuid4().hex[:6]
 
 
+class TestMismaVersion:
+    @pytest.mark.parametrize('a,b,igual', [
+        ('The Age Of Love (Jam & Spoon Mix)',
+         'The Age Of Love (Jam & Spoon Watch Out For Stella Mix)', True),
+        ('The Age of Love (Charlotte de Witte Remix)',
+         'The Age of Love (Charlotte de Witte & Enrico Sangiuliano Remix)',
+         True),
+        ('The Age Of Love', 'The Age Of Love (Jam & Spoon Mix)', False),
+        ('Rave (Remix)', 'Rave (Adam Beyer Remix)', False),
+        ('The Age Of Love (base)', 'The Age Of Love (Jam & Spoon Mix)', False),
+        ('Rave (Dub)', 'Rave (Adam Beyer Dub)', False),
+        ('Rave (Beyer Dub)', 'Rave (Adam Beyer Dub)', True),
+    ])
+    def test_el_nombre_abreviado_es_la_misma(self, a, b, igual):
+        from routes.search import misma_version
+        assert misma_version(tema_y_version(a)[1], tema_y_version(b)[1]) is igual
+
+
 class TestTemaYVersion:
     @pytest.mark.parametrize('a,b', [
         ('The Age Of Love (Jam & Spoon Watch Out For Stella Mix)',

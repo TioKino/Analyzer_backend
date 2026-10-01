@@ -2451,9 +2451,11 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                     f"{artist_name} - {title_name}")
 
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
+    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
-            from audd_helper import enrich_with_audd_if_needed, download_artwork_from_audd
+            from audd_helper import (enrich_with_audd_if_needed,
+                                     download_artwork_from_audd, isrc_de_audd)
             audd_track = enrich_with_audd_if_needed(
                 file_path=file_path,
                 fingerprint=fingerprint,
@@ -2470,6 +2472,7 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                 device_id=device_id,
             )
             if audd_track:
+                audd_isrc = isrc_de_audd(audd_track)
                 if audd_track.get('artist'):
                     artist_name = audd_track['artist']
                 if audd_track.get('title'):
@@ -2670,7 +2673,9 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         album=id3_data.get('album'),
         label=label,
         year=year,
-        isrc=id3_data.get('isrc'),
+        # El de las etiquetas, y si no trae, el que dio AudD al identificar el
+        # audio: con el, Escuchar encuentra la ficha y la huella del fichero.
+        isrc=id3_data.get('isrc') or audd_isrc,
         duration=duration,
         bpm=bpm,
         bpm_confidence=bpm_confidence,
@@ -2833,9 +2838,11 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
                     f"{artist_name} - {title_name}")
 
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
+    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
     if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
-            from audd_helper import enrich_with_audd_if_needed, download_artwork_from_audd
+            from audd_helper import (enrich_with_audd_if_needed,
+                                     download_artwork_from_audd, isrc_de_audd)
             audd_track = enrich_with_audd_if_needed(
                 file_path=file_path,
                 fingerprint=fingerprint,
@@ -2852,6 +2859,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
                 device_id=device_id,
             )
             if audd_track:
+                audd_isrc = isrc_de_audd(audd_track)
                 if audd_track.get('artist'):
                     artist_name = audd_track['artist']
                 if audd_track.get('title'):
@@ -2979,7 +2987,9 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         album=id3_data.get('album'),
         label=label,
         year=year,
-        isrc=id3_data.get('isrc'),
+        # El de las etiquetas, y si no trae, el que dio AudD al identificar el
+        # audio: con el, Escuchar encuentra la ficha y la huella del fichero.
+        isrc=id3_data.get('isrc') or audd_isrc,
         duration=duration,
         bpm=bpm,
         bpm_confidence=result['bpm_confidence'],
@@ -4009,7 +4019,7 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         label = track_data.get('label')
         release_date = track_data.get('release_date')
         year = release_date[:4] if release_date and len(release_date) >= 4 else None
-        isrc = track_data.get('isrc')
+        isrc = _isrc_de_audd(track_data)
 
         logger.info(f"  AudD identifico: {artist} - {title}")
         
@@ -4686,6 +4696,13 @@ def _mejorar_ficha_con_la_comunidad(ficha: dict) -> dict:
     return ficha
 
 
+def _isrc_de_audd(track_data) -> Optional[str]:
+    """El ISRC de un resultado de AudD, venga arriba o dentro de
+    apple_music/spotify/deezer/musicbrainz (`audd_helper.isrc_de_audd`)."""
+    from audd_helper import isrc_de_audd
+    return isrc_de_audd(track_data)
+
+
 def _ficha_para_recognize(artist: str, title: str,
                           isrc: Optional[str]) -> Optional[dict]:
     """La ficha del tema reconocido si alguien lo analizo: la MISMA busqueda
@@ -5217,7 +5234,7 @@ async def recognize_audio(
         album = track_data.get('album')
         release_date = track_data.get('release_date')
         label = track_data.get('label')
-        isrc = track_data.get('isrc')
+        isrc = _isrc_de_audd(track_data)
 
         spotify_data = track_data.get('spotify')
         deezer_data = track_data.get('deezer')
