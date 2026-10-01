@@ -103,15 +103,17 @@ def test_con_el_isrc_la_ficha_y_la_huella_salen_aunque_el_titulo_no_diga_la_vers
     # El fichero del owner: guardado con el título sin versión, pero con el
     # ISRC que dio AudD al identificar su audio.
     fp = uuid.uuid4().hex
+    s = uuid.uuid4().hex[:6]  # la BD es compartida con otros ficheros de test
     isrc = 'DEA61910' + f'{uuid.uuid4().int % 10000:04d}'
     main.db.save_track({
         'id': fp, 'fingerprint': fp, 'filename': f'{fp}.mp3',
-        'artist': 'Age Of Love', 'title': 'The Age Of Love', 'bpm': 132.5,
-        'duration': 420, 'key': 'Am', 'camelot': '8A', 'energy_dj': 7,
-        'genre': 'Trance', 'track_type': 'peak_time', 'isrc': isrc,
+        'artist': f'Age Of Love {s}', 'title': f'The Age Of Love {s}',
+        'bpm': 132.5, 'duration': 420, 'key': 'Am', 'camelot': '8A',
+        'energy_dj': 7, 'genre': 'Trance', 'track_type': 'peak_time',
+        'isrc': isrc,
     })
-    detectado = ('Age of Love',
-                 'The Age Of Love (Jam & Spoon Watch Out For Stella Mix)')
+    detectado = (f'Age of Love {s}',
+                 f'The Age Of Love {s} (Jam & Spoon Watch Out For Stella Mix)')
     assert buscar_analizado(*detectado) is None, \
         'por nombre sigue sin casar: el título guardado no dice la versión'
     ficha = buscar_analizado(*detectado, isrc=isrc)

@@ -229,7 +229,11 @@ def tema_y_version(titulo: Optional[str]):
     """(tema, version) de un titulo, normalizados. La version es un conjunto
     de palabras, vacio si es el original."""
     t = titulo or ''
-    partes = [m.group(1) for m in _ENTRE_PARENTESIS.finditer(t)]
+    # Entre parentesis siempre es la version («(base)» tambien). Entre
+    # corchetes solo si lo parece: ahi van el sello («[Drumcode]») y la
+    # basura de las webs de descarga («[www.x.tk]»), que no son una version.
+    partes = [m.group(1) for m in _ENTRE_PARENTESIS.finditer(t)
+              if m.group(0).startswith('(') or _PARECE_VERSION.search(m.group(1))]
     tema = _ENTRE_PARENTESIS.sub(' ', t)
     guion = re.match(r'^(.*?)\s+[-\u2013\u2014]\s+(.+)$', tema)
     if guion and _PARECE_VERSION.search(guion.group(2)):

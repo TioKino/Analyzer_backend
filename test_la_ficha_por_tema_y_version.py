@@ -87,6 +87,17 @@ class TestTemaYVersion:
     def test_un_guion_que_no_es_version_es_parte_del_titulo(self):
         assert tema_y_version('Love - Tomorrow')[1] == frozenset()
 
+    def test_el_sello_entre_corchetes_no_es_una_version(self):
+        # Ni el sello ni la basura de las webs de descarga; un «[Extended
+        # Mix]» si lo es (y es el original).
+        assert tema_y_version('Rave [Drumcode]') == tema_y_version('Rave')
+        assert tema_y_version('Rave [www.djsite.tk]') == tema_y_version('Rave')
+        assert tema_y_version('Rave [Extended Mix]') == tema_y_version('Rave')
+        assert tema_y_version('Rave [Adam Beyer Remix]')[1] == frozenset(
+            {'adam', 'beyer'})
+        # Entre parentesis cuenta siempre: «(base)» es otra version.
+        assert tema_y_version('The Age Of Love (base)')[1] == frozenset({'base'})
+
 
 class TestBuscar:
     def test_el_caso_de_age_of_love(self):
