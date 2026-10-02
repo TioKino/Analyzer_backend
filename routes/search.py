@@ -188,6 +188,10 @@ _VERSIONES_ORIGINALES = frozenset({
     'original', 'original mix', 'original version', 'extended',
     'extended mix', 'extended version', 'radio edit', 'radio version',
     'radio mix', 'edit', 'mix',
+    # Lo que Shazam y las tiendas ponen al tema de un recopilatorio mezclado
+    # o a su corte corto: la misma grabacion. Con «(Mixed)» como version,
+    # «Knights of the Jaguar (Mixed)» no casaba con el del DJ (2026-10-02).
+    'mixed', 'mixed version', 'mix cut', 'radio cut',
 })
 
 # Palabras que no distinguen una version de otra: «X Remix» y «X Mix» son la

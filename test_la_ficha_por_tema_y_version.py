@@ -70,6 +70,12 @@ class TestTemaYVersion:
         ('Rave (Radio Edit)', 'Rave'),
         ('Adagio for Strings (feat. X)', 'Adagio For Strings'),
         ('Café del Mar', 'Cafe Del Mar'),
+        # Shazam: el tema tal como sale en un recopilatorio mezclado, o su
+        # corte corto (2026-10-02).
+        ('Knights of the Jaguar (Mixed)', 'Knights Of The Jaguar (Original Mix)'),
+        ('Loneliness (Radio Cut)', 'Loneliness'),
+        ('Rave (Mix Cut)', 'Rave'),
+        ('Rave (Mixed Version)', 'Rave (Extended Mix)'),
     ])
     def test_lo_mismo_escrito_distinto(self, a, b):
         assert tema_y_version(a) == tema_y_version(b)
