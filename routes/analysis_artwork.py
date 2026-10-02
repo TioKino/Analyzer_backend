@@ -4,10 +4,10 @@ Cache-lookup + artwork endpoints for DJ Analyzer Pro API.
 PASO 5 del troceo de main.py (review 2026-06-29). Bloque movido VERBATIM
 desde main.py (mismo comportamiento, sin cambio de logica):
 
-  - POST /check-analyzed                       que filenames ya estan analizados
-  - POST /check-analyzed-by-fingerprint        idem por fingerprint (dedup multi-device)
+  - POST /check-analyzed                       por NOMBRE: todo «no analizado» (2026-10-02)
+  - POST /check-analyzed-by-fingerprint        que huellas ya estan analizadas (dedup)
   - GET  /analysis/by-fingerprint/{fingerprint}  hidrata cache local sin re-subir
-  - GET  /analysis/{filename:path}             analisis cacheado por filename
+  - GET  /analysis/{filename:path}             por NOMBRE: 410 (2026-10-02)
   - HEAD /artwork/{track_id}                   pre-check de existencia (sin fallback online)
   - GET  /artwork/{track_id}                   sirve artwork (cache -> fallback online)
   - POST /artwork/upload/{fingerprint}         sube artwork desde el motor local
@@ -130,23 +130,25 @@ def _merge_cluster_best_into(result, fingerprint, fila):
 
 @router.post("/check-analyzed")
 async def check_analyzed(filenames: list[str]):
-    """Verificar cules tracks ya estn analizados"""
-    analyzed = []
-    not_analyzed = []
+    """POR NOMBRE NO SE CONTESTA: todo sale como «no analizado».
 
-    for filename in filenames:
-        existing = db.get_track_by_filename(filename)
-        if existing:
-            analyzed.append(filename)
-        else:
-            not_analyzed.append(filename)
+    Lo usaba el import del móvil hasta la auditoría del 2026-10-02, y con lo
+    que contestaba pedía `/analysis/{nombre}` y se quedaba con el análisis de
+    cualquier usuario cuyo fichero se llamara igual — BPM, tonalidad, nombre y
+    la huella de otro audio. Es lo que SEC-01 cerró en `/analyze`, por otra
+    puerta. Los móviles de antes siguen llamándolo: así suben el fichero y
+    `/analyze` lo resuelve por huella, que es la identidad de verdad. El
+    cliente nuevo pregunta por `/check-analyzed-by-fingerprint`.
 
+    Y de paso deja de recorrer la tabla: `filename` no tenía índice y eran
+    las ~122.000 filas UNA vez POR FICHERO, en el único proceso de Render.
+    """
     return {
-        "analyzed": analyzed,
-        "not_analyzed": not_analyzed,
+        "analyzed": [],
+        "not_analyzed": list(filenames),
         "total": len(filenames),
-        "analyzed_count": len(analyzed),
-        "not_analyzed_count": len(not_analyzed)
+        "analyzed_count": 0,
+        "not_analyzed_count": len(filenames),
     }
 
 
@@ -356,42 +358,19 @@ async def get_analysis_by_fingerprint(fingerprint: str):
 
 @router.get("/analysis/{filename:path}")
 async def get_analysis(filename: str):
-    """Obtener anlisis guardado de un track por filename"""
-    # Decodificar filename si viene con URL encoding
-    from urllib.parse import unquote
-    import json
-    filename = unquote(filename)
-    
-    existing = db.get_track_by_filename(filename)
-    if existing:
-        # existing es una tupla, convertir a diccionario
-        # Columnas: id, filename, artist, title, duration, bpm, key, camelot, 
-        #           energy_dj, genre, track_type, analysis_json, analyzed_at, fingerprint
-        try:
-            # Si hay analysis_json guardado, usarlo directamente
-            analysis_json = existing[11]  # ndice de analysis_json
-            if analysis_json:
-                return json.loads(analysis_json)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning("analysis_json cacheado corrupto, fallback a respuesta basica: %s", e)
-        
-        # Fallback: construir respuesta bsica
-        return {
-            "id": existing[0],
-            "filename": existing[1],
-            "artist": existing[2],
-            "title": existing[3],
-            "duration": existing[4],
-            "bpm": existing[5],
-            "key": existing[6],
-            "camelot": existing[7],
-            "energy_dj": existing[8],
-            "genre": existing[9],
-            "track_type": existing[10],
-            "fingerprint": existing[13] if len(existing) > 13 else None,
-        }
-    
-    raise HTTPException(404, f"Anlisis no encontrado para: {filename}")
+    """Ya no se da un análisis por NOMBRE de fichero: 410.
+
+    La tabla es la de todos los usuarios, y por nombre salía el de cualquiera
+    que se llamara igual (ver `/check-analyzed`). Lo de este audio se pide por
+    su huella: `/analysis/by-fingerprint/{huella}`. Un móvil de antes, con el
+    410, analiza el fichero (`AudioAnalysisApi.getAnalysis` devolvía null en
+    cualquier respuesta que no fuera 200).
+    """
+    raise HTTPException(
+        410,
+        "Por nombre de fichero no: pídelo por su huella "
+        "(/analysis/by-fingerprint/{huella})",
+    )
 
 # Ids que se aceptan en /artwork: huellas (hex) y los `imp_…`/detecciones que
 # usa el propio backend. Nada con puntos ni barras llega a `os.path.join`.

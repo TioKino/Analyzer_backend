@@ -3090,7 +3090,17 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                     force_audd: bool):
     """El cuerpo de /analyze. Tiene cinco salidas (acierto por nombre, por
     huella, fallback a Render, análisis nuevo y el de emergencia), y por eso
-    lo común a todas va en `analyze_track`, que lo envuelve."""
+    lo común a todas va en `analyze_track`, que lo envuelve.
+
+    EL EVENT LOOP NO SE TOCA. Render corre UN proceso de uvicorn (`Procfile`),
+    así que lo que bloquea aquí bloquea a todos: el sync, la comunidad y
+    Escuchar esperan detrás. Hasta la auditoría del 2026-10-02 solo el DSP iba
+    al threadpool; el MD5 del fichero (hasta 100 MB), `fpcalc` sobre el audio
+    entero (`_attach_acoustic`), el preview con ffmpeg y la consulta a Render
+    del motor local corrían aquí mismo, segundos por análisis y también en los
+    aciertos de caché que curan la huella. Todo lo que lee el fichero, lanza
+    un subproceso o sale a la red va por `run_in_threadpool`; lo vigila
+    `test_analyze_no_bloquea_el_worker.py`."""
     # force_audd implica force=true: el usuario pidio explicitamente AudD y el
     # registro cacheado debe sobreescribirse con el resultado nuevo.
     if force_audd:
@@ -3201,7 +3211,9 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
     # upload streaming termino arriba), asi que no cuesta una lectura extra
     # respecto al flujo anterior — solo se adelanta.
     try:
-        fingerprint = calculate_fingerprint(tmp_path)
+        # En el threadpool, como todo lo que lee el fichero o lanza un
+        # subproceso: ver «EL EVENT LOOP NO SE TOCA» en `_analizar`.
+        fingerprint = await run_in_threadpool(calculate_fingerprint, tmp_path)
     except (OSError, IOError) as e:
         try:
             os.unlink(tmp_path)
@@ -3258,7 +3270,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                     if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
                         logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
                         try:
-                            regen_path = generate_preview_snippet(
+                            regen_path = await run_in_threadpool(
+                                generate_preview_snippet,
                                 file_path=original_path,
                                 fingerprint=fp,
                                 drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
@@ -3290,13 +3303,15 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                 # extra — ni subida (ya esta hecha) ni AudD ni reanalisis.
                 _fila = db._row_to_dict(existing) or {}
                 if not _fila.get('chromaprint'):
-                    _attach_acoustic(_fila, tmp_path)
-                    if _fila.get('chromaprint'):
-                        db.backfill_track_fingerprint(
-                            fingerprint,
-                            _fila['chromaprint'],
-                            _fila.get('acoustic_id'),
-                        )
+                    def _curar_fila():
+                        _attach_acoustic(_fila, tmp_path)
+                        if _fila.get('chromaprint'):
+                            db.backfill_track_fingerprint(
+                                fingerprint,
+                                _fila['chromaprint'],
+                                _fila.get('acoustic_id'),
+                            )
+                    await run_in_threadpool(_curar_fila)
 
                 # Limpiar el tmp_path creado durante el upload streaming: este
                 # cache-hit no necesita el archivo subido. (No reventamos si ya
@@ -3347,9 +3362,11 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                 # No cuesta ni una subida ni una llamada a AudD: el fichero ya
                 # esta en disco. Y es best-effort, como en el camino normal: si
                 # fpcalc falla, se guarda igual.
-                if not existing_by_fp.get('chromaprint'):
-                    _attach_acoustic(existing_by_fp, tmp_path)
-                db.save_track(existing_by_fp)
+                def _curar_y_guardar():
+                    if not existing_by_fp.get('chromaprint'):
+                        _attach_acoustic(existing_by_fp, tmp_path)
+                    db.save_track(existing_by_fp)
+                await run_in_threadpool(_curar_y_guardar)
                 
                 # Intentar construir respuesta desde analysis_json
                 if existing_by_fp.get('analysis_json'):
@@ -3421,7 +3438,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                 # cero CPU. Acelera reanalisis post-wipe / Mac nuevo / HDD
                 # nuevo donde Render ya tiene los analisis de otros equipos
                 # del mismo usuario.
-                render_cached = _fetch_render_cache(fingerprint)
+                render_cached = await run_in_threadpool(
+                    _fetch_render_cache, fingerprint)
                 if render_cached:
                     logger.info(
                         f"[Render fallback] Hit {fingerprint[:8]}... — "
@@ -3450,9 +3468,12 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                             # (es un blob que no viaja en la respuesta). El
                             # audio sigue en `tmp_path`, asi que la huella se
                             # saca aqui en vez de nacer sin ella.
-                            if not to_save.get('chromaprint'):
-                                _attach_acoustic(to_save, tmp_path)
-                            db.save_track(to_save)
+                            def _curar_y_guardar_lo_de_render():
+                                if not to_save.get('chromaprint'):
+                                    _attach_acoustic(to_save, tmp_path)
+                                db.save_track(to_save)
+                            await run_in_threadpool(
+                                _curar_y_guardar_lo_de_render)
                     except Exception as e:
                         logger.warning(f"[Render fallback] save_track fallo: {e}")
                     if os.path.exists(tmp_path):
@@ -3645,8 +3666,10 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # La cabecera la manda el cliente desde hace versiones y nadie la leia.
         track_data['platform'] = client_platform(request)
         # Huella acustica + cluster para la memoria colectiva por sonido.
-        _attach_acoustic(track_data, tmp_path)
-        db.save_track(track_data)
+        def _huella_y_guardar():
+            _attach_acoustic(track_data, tmp_path)
+            db.save_track(track_data)
+        await run_in_threadpool(_huella_y_guardar)
         # Lo mejor del cluster acustico (otra version del mismo audio con
         # fuente superior) y lo que los programas de DJ de otros dicen de el
         # lo aplica `_mejorar_con_la_comunidad` al salir de /analyze, para
@@ -3654,7 +3677,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # analisis nuevo, que ya tarda segundos: en los aciertos de cache seria
         # un viaje a Render por tema (ver `_lo_mejor_para`).
         if IS_LOCAL_ENGINE:
-            _mejorar_con_la_comunidad(result, fingerprint, a_render=True)
+            await run_in_threadpool(
+                _mejorar_con_la_comunidad, result, fingerprint, a_render=True)
 
         # Incrementar contador de popularidad. El device_id va AHORA (BUG-01):
         # la cabecera ya se leia unas lineas mas arriba para la contabilidad de
@@ -3671,7 +3695,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # Logueamos fallos en analysis_errors con endpoint='preview' para
         # que el panel admin pueda contar la tasa de fallo del generador.
         try:
-            preview_path = generate_preview_snippet(
+            preview_path = await run_in_threadpool(
+                generate_preview_snippet,
                 file_path=tmp_path,
                 fingerprint=fingerprint,
                 drop_timestamp=result.drop_timestamp,
@@ -3776,7 +3801,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         try:
             # Intentar fingerprint del contenido primero
             try:
-                fingerprint = calculate_fingerprint(tmp_path)
+                fingerprint = await run_in_threadpool(
+                    calculate_fingerprint, tmp_path)
             except Exception:
                 # Si falla (archivo muy corrupto), usar md5 del nombre
                 fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
@@ -3785,7 +3811,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
             id3_data = {}
             if ARTWORK_ENABLED:
                 try:
-                    id3_data = extract_id3_metadata(tmp_path)
+                    id3_data = await run_in_threadpool(
+                        extract_id3_metadata, tmp_path)
                 except Exception as e:
                     logger.warning("ID3 extract fallo en %s: %s", file.filename, e)
             

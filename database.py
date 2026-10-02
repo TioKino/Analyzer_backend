@@ -392,6 +392,16 @@ class AnalysisDB:
         # 0,02 ms la exacta y 142 ms → ~10 ms la aproximada.
         c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_ficha ON tracks('
                   'artist COLLATE NOCASE, title COLLATE NOCASE, bpm, analyzed_at)')
+        # `filename` y `duration` tampoco tenian, y los dos se buscan en el
+        # camino de CADA analisis (auditoria del flujo de analisis,
+        # 2026-10-02). `/analyze` mira por nombre antes que por huella (el
+        # atajo que exige las dos), y `find_acoustic_cluster` filtra el cluster
+        # por duracion ±2,5 s: dos recorridos de las ~122.000 filas por tema
+        # —83 ms cada uno con 120.000 filas en caliente, en local; en Render la
+        # misma clase de recorrido fue 1 s en caliente y 35 s en frio— y en un
+        # servidor de UN proceso.
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_filename ON tracks(filename)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_duration ON tracks(duration)')
 
         # Lo que dice un programa de DJ (Rekordbox, Traktor, VirtualDJ) de una
         # huella, tal como llega del XML que importó alguien. Un voto por
@@ -1114,11 +1124,15 @@ class AnalysisDB:
         try:
             c = conn.cursor()
             if duration is not None and duration > 0:
+                # `BETWEEN` y no `ABS(duration - ?) <= 2.5`: con la expresion
+                # ningun indice sirve y era un recorrido de la tabla entera
+                # en cada analisis nuevo y cada backfill. Es el mismo
+                # intervalo cerrado.
                 c.execute(
                     'SELECT chromaprint, acoustic_id FROM tracks '
-                    'WHERE chromaprint IS NOT NULL AND acoustic_id IS NOT NULL '
-                    'AND duration IS NOT NULL AND ABS(duration - ?) <= 2.5',
-                    (duration,),
+                    'WHERE duration BETWEEN ? AND ? '
+                    'AND chromaprint IS NOT NULL AND acoustic_id IS NOT NULL',
+                    (duration - 2.5, duration + 2.5),
                 )
             else:
                 c.execute(
