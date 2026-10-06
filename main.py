@@ -33,7 +33,8 @@ import numpy as np
 # Rejilla de beats (intervalo + fase + downbeat). Modulo propio y compartido
 # con el analizador por chunks; el cliente lleva el mismo algoritmo en
 # lib/services/beat_grid_detector.dart.
-from beat_grid import fit_beat_grid, onset_envelope as beat_grid_onset_envelope
+from beat_grid import (fit_beat_grid, bpm_de_la_rejilla,
+                       onset_envelope as beat_grid_onset_envelope)
 import sys
 import tempfile
 import os
@@ -2622,6 +2623,14 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
                 f"iv={beat_interval:.5f}s downbeat={_fit['downbeat_index']} "
                 f"conf={_fit['confidence']:.2f}"
             )
+            # El BPM que se guarda es el del intervalo AFINADO, no el bin del
+            # tempograma de librosa (129,20 para un 128). Solo si lo midio el
+            # DSP: el de las etiquetas manda su numero. Ver `bpm_de_la_rejilla`.
+            if bpm_source == "analysis":
+                _bpm_librosa = bpm
+                bpm = bpm_de_la_rejilla(bpm, beat_interval)
+                if bpm != _bpm_librosa:
+                    logger.info(f"  [BPM] de la rejilla: {_bpm_librosa:.2f} -> {bpm:.2f}")
         else:
             logger.info("  [BeatGrid] sin pulso claro; rejilla sin fase")
     except Exception as e:
@@ -2812,7 +2821,13 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         id3_data = extract_id3_metadata(file_path)
     
     # Sobrescribir con ID3 si existe y es vlido
-    bpm = result['bpm']
+    #
+    # El BPM del DSP es el del intervalo AFINADO de la rejilla, no la media de
+    # los bins de librosa de cada trozo (ver `bpm_de_la_rejilla`). La rejilla
+    # sale de la envolvente del tema entero, cosida trozo a trozo.
+    bpm = bpm_de_la_rejilla(result['bpm'], result.get('beat_interval'))
+    if bpm != result['bpm']:
+        logger.info(f"  [BPM] de la rejilla: {result['bpm']:.2f} -> {bpm:.2f}")
     bpm_source = result['bpm_source']
     if id3_data.get('bpm') and 60 < id3_data['bpm'] < 200:
         bpm = id3_data['bpm']
