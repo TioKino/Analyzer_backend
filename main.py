@@ -1667,6 +1667,165 @@ def _cluster_clean_identity(audio_path, duration):
         return None
 
 
+def _resolver_identidad(id3_data: dict, file_path: str,
+                        original_filename: Optional[str]):
+    """(artista, título) con los que se va a buscar todo lo demás.
+
+    Las ETIQUETAS mandan si son utilizables. Si les falta un campo, se rellena
+    con el NOMBRE del fichero (como siempre). Y si lo que sale de las dos
+    juntas es basura —«Unknown Artist», «Track 01»— pero el nombre del fichero
+    no, manda el nombre: hasta el 2026-10-06 una etiqueta basura tapaba un
+    nombre bueno, y el tema iba a AudD (que cuesta) o se quedaba sin buscar.
+
+    El nombre REAL del fichero (`original_filename`), no el del temporal: el
+    basename de `/tmp/tmpXXXX.mp3` daba títulos «tmpXXXX» (bug 2026-06).
+    """
+    from audd_helper import is_garbage_metadata
+    a, t = id3_data.get('artist'), id3_data.get('title')
+    if a and t and not is_garbage_metadata(a, t):
+        return a, t
+    parsed = parse_filename(original_filename or os.path.basename(file_path))
+    pa, pt = parsed.get('artist'), parsed.get('title')
+    mezcla = (a or pa, t or pt)
+    if is_garbage_metadata(*mezcla) and not is_garbage_metadata(pa, pt):
+        return pa, pt
+    return mezcla
+
+
+def _genero_por_identidad(artist: Optional[str], title: Optional[str]) -> Optional[dict]:
+    """Discogs y, si no, MusicBrainz, con la identidad YA RESUELTA.
+
+    Hasta el 2026-10-06 se consultaban con el artista y el título de las
+    ETIQUETAS y antes de nada más: un tema identificado por el nombre del
+    fichero o heredando la identidad de su cluster no los consultaba nunca, y
+    uno con etiquetas basura los consultaba CON la basura. Solo AudD volvía a
+    lanzarlos, y ni eso si el fichero traía género en la etiqueta. Ahora corren
+    una vez, al final de la identidad (etiquetas → nombre del fichero →
+    cluster → AudD), y nunca con una identidad basura.
+
+    Devuelve {'genre', 'source', 'label', 'year'} o None.
+    """
+    if not (GENRE_DETECTOR_ENABLED and genre_detector):
+        return None
+    from audd_helper import is_garbage_metadata
+    if is_garbage_metadata(artist, title):
+        return None
+    logger.info(f"  [Genero] buscando: {artist} - {title}")
+    try:
+        d = genre_detector.get_discogs_genre(artist, title)
+        if d and d.get('genre'):
+            logger.info(f"  [Genero] Discogs: {d['genre']} | {d.get('label')} ({d.get('year')})")
+            return {'genre': d['genre'], 'source': 'discogs',
+                    'label': d.get('label'), 'year': d.get('year')}
+    except Exception as e:  # noqa: BLE001 - servicio externo, hay fallback
+        logger.warning(f"  [Genero] Discogs no disponible ({type(e).__name__}): {e}")
+    try:
+        m = genre_detector.get_musicbrainz_info(artist, title)
+        if m and m.get('genre'):
+            logger.info(f"  [Genero] MusicBrainz: {m['genre']}")
+            return {'genre': m['genre'], 'source': 'musicbrainz'}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"  [Genero] MusicBrainz no disponible ({type(e).__name__}): {e}")
+    logger.info("  [Genero] ni Discogs ni MusicBrainz lo conocen")
+    return None
+
+
+def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
+                        duration: float, id3_data: dict,
+                        original_filename: Optional[str],
+                        force_audd: bool = False,
+                        device_id: Optional[str] = None) -> dict:
+    """Quién es el tema y de qué género: lo mismo para los dos caminos de
+    /analyze (el corto y el chunked repetían el bloque entero).
+
+    Orden: etiquetas -> nombre del fichero (`_resolver_identidad`) ->
+    identidad del cluster (solo con basura: ahorra AudD) -> AudD (solo con
+    basura, con presupuesto) -> Discogs / MusicBrainz con lo que haya salido
+    (`_genero_por_identidad`) -> género de la etiqueta. `genre` None = el que
+    midió el DSP.
+    """
+    label = id3_data.get('label')
+    year = id3_data.get('year')
+    artist_name, title_name = _resolver_identidad(id3_data, file_path, original_filename)
+
+    # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
+    # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
+    # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
+    # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
+    # siendo basura y no es una peticion force del usuario.
+    if AUDD_AUTO_ENABLED and not force_audd:
+        from audd_helper import is_garbage_metadata
+        if is_garbage_metadata(artist_name, title_name):
+            _inherited = _cluster_clean_identity(file_path, duration)
+            if _inherited:
+                artist_name, title_name = _inherited
+                logger.info(
+                    f"[AudD-skip] identidad heredada del cluster: "
+                    f"{artist_name} - {title_name}")
+
+    # AudD como ultimo recurso si la identidad sigue siendo basura (con
+    # presupuesto y cooldown; con `force_audd`, siempre: «Limpiar con AudD»).
+    # Beatport iba por aqui y se elimino (WAF de Cloudflare).
+    audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
+    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
+    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+        try:
+            from audd_helper import (enrich_with_audd_if_needed,
+                                     download_artwork_from_audd, isrc_de_audd)
+            audd_track = enrich_with_audd_if_needed(
+                file_path=file_path,
+                fingerprint=fingerprint,
+                duration=duration,
+                artist=artist_name,
+                title=title_name,
+                api_token=AUDD_API_TOKEN,
+                db=db,
+                min_duration=AUDD_MIN_DURATION,
+                max_duration=AUDD_MAX_DURATION,
+                daily_cap=AUDD_DAILY_CAP,
+                cooldown_days=AUDD_COOLDOWN_DAYS,
+                force=force_audd,
+                device_id=device_id,
+            )
+            if audd_track:
+                audd_isrc = isrc_de_audd(audd_track)
+                if audd_track.get('artist'):
+                    artist_name = audd_track['artist']
+                if audd_track.get('title'):
+                    title_name = audd_track['title']
+                if not label and audd_track.get('label'):
+                    label = audd_track['label']
+                if not year and audd_track.get('release_date'):
+                    year = audd_track['release_date'][:4]
+                # Portada exacta del match AudD (Apple Music/Deezer/Spotify):
+                # AudD ya identifico el track preciso, asi que su caratula es la
+                # oficial del release — mejor que re-buscar por texto. Gratis
+                # (la respuesta ya venia con esos campos). Se usa como candidata
+                # preferente en el bloque de ARTWORK de abajo.
+                audd_artwork = download_artwork_from_audd(audd_track)
+        except Exception as e:
+            logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
+
+    genre = genre_source = None
+    _g = _genero_por_identidad(artist_name, title_name)
+    if _g:
+        genre, genre_source = _g['genre'], _g['source']
+        if not label and _g.get('label'):
+            label = _g['label']
+        if not year and _g.get('year'):
+            year = str(_g['year'])
+    elif id3_data.get('genre'):
+        genre, genre_source = id3_data['genre'], 'id3'
+        logger.info(f"  [Genero] ID3 (fallback): {genre}")
+
+    return {
+        'artist': artist_name, 'title': title_name,
+        'label': label, 'year': year,
+        'genre': genre, 'genre_source': genre_source,
+        'audd_artwork': audd_artwork, 'audd_isrc': audd_isrc,
+    }
+
+
 def parse_filename(filename: str) -> dict:
     name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
     name = re.sub(r'^\d+[\s\-_.]+', '', name)
@@ -2427,166 +2586,17 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         spectral_centroid, rolloff
     )
     genre_source = "spectral_analysis"
-    label = id3_data.get('label')
-    year = id3_data.get('year')
-    
-    # Guardar g(c)nero ID3 como fallback (suele ser gen(c)rico: "House", "Techno")
-    id3_genre = id3_data.get('genre')
-    
-    # ==================== PRIORIDAD DE GENEROS ====================
-    # Discogs > MusicBrainz > ID3 > Anlisis espectral
-    # Discogs/MusicBrainz dan g(c)neros especficos (ej: "Minimal Techno" vs "Techno")
-    
-    artist_name = id3_data.get('artist')
-    title_name = id3_data.get('title')
-    
-    if GENRE_DETECTOR_ENABLED and genre_detector and artist_name and title_name:
-        logger.info(f" Buscando g(c)nero: {artist_name} - {title_name}")
-        # 1. Intentar Discogs primero (mejor para electrnica)
-        try:
-            discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
-            if discogs_result and discogs_result.get('genre'):
-                genre = discogs_result.get('genre')
-                genre_source = "discogs"
-                # Tambi(c)n obtener label y year si no los tenemos
-                if not label and discogs_result.get('label'):
-                    label = discogs_result['label']
-                if not year and discogs_result.get('year'):
-                    year = str(discogs_result['year'])
-                logger.info(f" Discogs: {genre} | {label} ({year})")
-            else:
-                logger.info(f" Discogs: No encontrado")
-        except Exception as e:
-            # 404/JSON-empty/timeout son respuestas esperadas de un servicio
-            # externo, no bugs nuestros. Tenemos fallback a MusicBrainz/ID3.
-            # Warning evita disparar alertas de error en el panel admin.
-            logger.warning(f" Discogs no disponible ({type(e).__name__}): {e}")
 
-        # 2. Si no hay Discogs, intentar MusicBrainz
-        if genre_source not in ["discogs"]:
-            try:
-                mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
-                if mb_result and mb_result.get('genre'):
-                    genre = mb_result.get('genre')
-                    genre_source = "musicbrainz"
-                    logger.info(f"   MusicBrainz: {genre}")
-            except Exception as e:
-                logger.warning(f" MusicBrainz no disponible ({type(e).__name__}): {e}")
-    
-    # 3. Si no hay Discogs ni MusicBrainz, usar ID3 (gen(c)rico pero mejor que nada)
-    if genre_source == "spectral_analysis" and id3_genre:
-        genre = id3_genre
-        genre_source = "id3"
-        logger.info(f" ID3 (fallback): {genre}")
-
-    # ==================== RESOLVER ARTIST / TITLE ====================
-    # Beatport solia ir aqui pero se elimino (WAF de Cloudflare bloquea el
-    # scraping desde datacenter e IP residencial sin browser real; los 84
-    # tracks de produccion tienen 0 con bpm_source='beatport'). El boton de
-    # Flutter "Buscar en Beatport" sigue funcionando porque solo abre URL.
-
-    if not artist_name:
-        artist_name = id3_data.get('artist')
-    if not title_name:
-        title_name = id3_data.get('title')
-
-    # Si no hay metadata ID3, intentar con filename parseado.
-    # IMPORTANTE: usar el filename REAL (original_filename) y NO el basename
-    # del file_path, que en /analyze es el tmp_path (/tmp/tmpXXXXXX.mp3). Si
-    # parseabamos el basename del temp, el "title" salia "tmpXXXXXX" (basura)
-    # y como no quedaba vacio, el fallback del endpoint con file.filename
-    # nunca disparaba -> la limpieza proponia nombres tmpXXXX. Bug 2026-06.
-    if not artist_name or not title_name:
-        parsed = parse_filename(original_filename or os.path.basename(file_path))
-        if not artist_name:
-            artist_name = parsed.get('artist')
-        if not title_name:
-            title_name = parsed.get('title')
-
-    # ==================== AUDD AUTO-TRIGGER ====================
-    # Si tras ID3 + filename seguimos sin artist/title utilizable, AudD como
-    # ultimo recurso (con presupuesto y cooldown). Discogs/iTunes/MusicBrainz
-    # requieren artist+title para arrancar, asi que recuperar la identidad
-    # aqui desbloquea el resto.
-    # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
-    # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
-    # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
-    # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
-    # siendo basura y no es una peticion force del usuario.
-    if AUDD_AUTO_ENABLED and not force_audd:
-        from audd_helper import is_garbage_metadata
-        if is_garbage_metadata(artist_name, title_name):
-            _inherited = _cluster_clean_identity(file_path, duration)
-            if _inherited:
-                artist_name, title_name = _inherited
-                logger.info(
-                    f"[AudD-skip] identidad heredada del cluster: "
-                    f"{artist_name} - {title_name}")
-
-    audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
-    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
-    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
-        try:
-            from audd_helper import (enrich_with_audd_if_needed,
-                                     download_artwork_from_audd, isrc_de_audd)
-            audd_track = enrich_with_audd_if_needed(
-                file_path=file_path,
-                fingerprint=fingerprint,
-                duration=duration,
-                artist=artist_name,
-                title=title_name,
-                api_token=AUDD_API_TOKEN,
-                db=db,
-                min_duration=AUDD_MIN_DURATION,
-                max_duration=AUDD_MAX_DURATION,
-                daily_cap=AUDD_DAILY_CAP,
-                cooldown_days=AUDD_COOLDOWN_DAYS,
-                force=force_audd,
-                device_id=device_id,
-            )
-            if audd_track:
-                audd_isrc = isrc_de_audd(audd_track)
-                if audd_track.get('artist'):
-                    artist_name = audd_track['artist']
-                if audd_track.get('title'):
-                    title_name = audd_track['title']
-                if not label and audd_track.get('label'):
-                    label = audd_track['label']
-                if not year and audd_track.get('release_date'):
-                    year = audd_track['release_date'][:4]
-                # Portada exacta del match AudD (Apple Music/Deezer/Spotify):
-                # AudD ya identifico el track preciso, asi que su caratula es la
-                # oficial del release — mejor que re-buscar por texto. Gratis
-                # (la respuesta ya venia con esos campos). Se usa como candidata
-                # preferente en el bloque de ARTWORK de abajo.
-                audd_artwork = download_artwork_from_audd(audd_track)
-                # Re-correr Discogs/MusicBrainz si la cascada anterior no aporto
-                # genero (sigue siendo el default analitico).
-                if (genre_source in ('spectral_analysis', 'chunked_analysis')
-                        and GENRE_DETECTOR_ENABLED and genre_detector):
-                    try:
-                        discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
-                        if discogs_result and discogs_result.get('genre'):
-                            genre = discogs_result['genre']
-                            genre_source = 'discogs'
-                            if not label and discogs_result.get('label'):
-                                label = discogs_result['label']
-                            if not year and discogs_result.get('year'):
-                                year = str(discogs_result['year'])
-                    except Exception as e:
-                        # Mismo criterio que la cascada principal: fallo de
-                        # servicio externo es warning, no error.
-                        logger.warning(f"  [AudD-auto] re-run Discogs ({type(e).__name__}): {e}")
-                    if genre_source in ('spectral_analysis', 'chunked_analysis'):
-                        try:
-                            mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
-                            if mb_result and mb_result.get('genre'):
-                                genre = mb_result['genre']
-                                genre_source = 'musicbrainz'
-                        except Exception as e:
-                            logger.warning(f"  [AudD-auto] re-run MusicBrainz ({type(e).__name__}): {e}")
-        except Exception as e:
-            logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
+    # ==================== IDENTIDAD Y GENERO ====================
+    # Etiquetas -> nombre del fichero -> cluster -> AudD, y con eso Discogs /
+    # MusicBrainz. Los dos caminos de /analyze pasan por el mismo sitio.
+    _ident = _identidad_y_genero(file_path, fingerprint, duration, id3_data,
+                                 original_filename, force_audd, device_id)
+    artist_name, title_name = _ident['artist'], _ident['title']
+    label, year = _ident['label'], _ident['year']
+    audd_artwork, audd_isrc = _ident['audd_artwork'], _ident['audd_isrc']
+    if _ident['genre']:
+        genre, genre_source = _ident['genre'], _ident['genre_source']
 
     drop_time = find_drop_timestamp(y, sr, segments)
     
@@ -2842,146 +2852,17 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         key, camelot = id3_norm
         key_source = "id3"
     
-    # ==================== GNERO ====================
+    # ==================== IDENTIDAD Y GENERO ====================
+    # La misma cascada que el camino corto (`_identidad_y_genero`).
     genre = "Electronic"
     genre_source = "chunked_analysis"
-    label = id3_data.get('label')
-    year = id3_data.get('year')
-    id3_genre = id3_data.get('genre')
-    
-    artist_name = id3_data.get('artist')
-    title_name = id3_data.get('title')
-    
-    # Intentar obtener g(c)nero de Discogs/MusicBrainz
-    if GENRE_DETECTOR_ENABLED and genre_detector and artist_name and title_name:
-        logger.info(f"   Buscando g(c)nero: {artist_name} - {title_name}")
-        try:
-            discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
-            if discogs_result and discogs_result.get('genre'):
-                genre = discogs_result.get('genre')
-                genre_source = "discogs"
-                if not label and discogs_result.get('label'):
-                    label = discogs_result['label']
-                if not year and discogs_result.get('year'):
-                    year = str(discogs_result['year'])
-                logger.info(f"   Discogs: {genre}")
-        except Exception as e:
-            logger.error(f"   Error Discogs: {e}")
-        
-        if genre_source not in ["discogs"]:
-            try:
-                mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
-                if mb_result and mb_result.get('genre'):
-                    genre = mb_result.get('genre')
-                    genre_source = "musicbrainz"
-                    logger.info(f"   MusicBrainz: {genre}")
-            except Exception as e:
-                logger.error(f"   Error MusicBrainz: {e}")
-    
-    if genre_source == "chunked_analysis" and id3_genre:
-        genre = id3_genre
-        genre_source = "id3"
-
-    # ==================== RESOLVER ARTIST / TITLE ====================
-    # Beatport solia ir aqui pero se elimino (WAF de Cloudflare bloquea el
-    # scraping desde datacenter e IP residencial sin browser real; los 84
-    # tracks de produccion tienen 0 con bpm_source='beatport'). El boton de
-    # Flutter "Buscar en Beatport" sigue funcionando porque solo abre URL.
-
-    if not artist_name:
-        artist_name = id3_data.get('artist')
-    if not title_name:
-        title_name = id3_data.get('title')
-
-    # Si no hay metadata ID3, intentar con filename parseado.
-    # IMPORTANTE: usar el filename REAL (original_filename) y NO el basename
-    # del file_path, que en /analyze es el tmp_path (/tmp/tmpXXXXXX.mp3). Si
-    # parseabamos el basename del temp, el "title" salia "tmpXXXXXX" (basura)
-    # y como no quedaba vacio, el fallback del endpoint con file.filename
-    # nunca disparaba -> la limpieza proponia nombres tmpXXXX. Bug 2026-06.
-    if not artist_name or not title_name:
-        parsed = parse_filename(original_filename or os.path.basename(file_path))
-        if not artist_name:
-            artist_name = parsed.get('artist')
-        if not title_name:
-            title_name = parsed.get('title')
-
-    # ==================== AUDD AUTO-TRIGGER ====================
-    # Mismo trigger que en analyze_audio: si tras ID3+filename seguimos sin
-    # artist/title utilizable, AudD como ultimo recurso.
-    # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
-    # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
-    # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
-    # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
-    # siendo basura y no es una peticion force del usuario.
-    if AUDD_AUTO_ENABLED and not force_audd:
-        from audd_helper import is_garbage_metadata
-        if is_garbage_metadata(artist_name, title_name):
-            _inherited = _cluster_clean_identity(file_path, duration)
-            if _inherited:
-                artist_name, title_name = _inherited
-                logger.info(
-                    f"[AudD-skip] identidad heredada del cluster: "
-                    f"{artist_name} - {title_name}")
-
-    audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
-    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
-    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
-        try:
-            from audd_helper import (enrich_with_audd_if_needed,
-                                     download_artwork_from_audd, isrc_de_audd)
-            audd_track = enrich_with_audd_if_needed(
-                file_path=file_path,
-                fingerprint=fingerprint,
-                duration=duration,
-                artist=artist_name,
-                title=title_name,
-                api_token=AUDD_API_TOKEN,
-                db=db,
-                min_duration=AUDD_MIN_DURATION,
-                max_duration=AUDD_MAX_DURATION,
-                daily_cap=AUDD_DAILY_CAP,
-                cooldown_days=AUDD_COOLDOWN_DAYS,
-                force=force_audd,
-                device_id=device_id,
-            )
-            if audd_track:
-                audd_isrc = isrc_de_audd(audd_track)
-                if audd_track.get('artist'):
-                    artist_name = audd_track['artist']
-                if audd_track.get('title'):
-                    title_name = audd_track['title']
-                if not label and audd_track.get('label'):
-                    label = audd_track['label']
-                if not year and audd_track.get('release_date'):
-                    year = audd_track['release_date'][:4]
-                # Portada exacta del match AudD (ver path no-chunked arriba).
-                audd_artwork = download_artwork_from_audd(audd_track)
-                if (genre_source in ('spectral_analysis', 'chunked_analysis')
-                        and GENRE_DETECTOR_ENABLED and genre_detector):
-                    try:
-                        discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
-                        if discogs_result and discogs_result.get('genre'):
-                            genre = discogs_result['genre']
-                            genre_source = 'discogs'
-                            if not label and discogs_result.get('label'):
-                                label = discogs_result['label']
-                            if not year and discogs_result.get('year'):
-                                year = str(discogs_result['year'])
-                    except Exception as e:
-                        # Mismo criterio que la cascada principal: fallo de
-                        # servicio externo es warning, no error.
-                        logger.warning(f"  [AudD-auto] re-run Discogs ({type(e).__name__}): {e}")
-                    if genre_source in ('spectral_analysis', 'chunked_analysis'):
-                        try:
-                            mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
-                            if mb_result and mb_result.get('genre'):
-                                genre = mb_result['genre']
-                                genre_source = 'musicbrainz'
-                        except Exception as e:
-                            logger.warning(f"  [AudD-auto] re-run MusicBrainz ({type(e).__name__}): {e}")
-        except Exception as e:
-            logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
+    _ident = _identidad_y_genero(file_path, fingerprint, duration, id3_data,
+                                 original_filename, force_audd, device_id)
+    artist_name, title_name = _ident['artist'], _ident['title']
+    label, year = _ident['label'], _ident['year']
+    audd_artwork, audd_isrc = _ident['audd_artwork'], _ident['audd_isrc']
+    if _ident['genre']:
+        genre, genre_source = _ident['genre'], _ident['genre_source']
 
     # ==================== ARTWORK ====================
     # Misma decision que en el flow no-chunked: `elegir_portada`.
