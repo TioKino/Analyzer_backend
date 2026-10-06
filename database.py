@@ -1247,6 +1247,38 @@ class AnalysisDB:
                 salida.append(r)
         return salida
 
+    def filas_por_huella(self, fingerprints, columnas: str) -> Dict[str, Dict]:
+        """{huella -> fila} para un lote, en DOS consultas (ver
+        `_tracks_por_huella_o_id`). Una fila casa con la huella por su
+        `fingerprint` o por su `id` (en los registros antiguos el id ES el MD5).
+
+        Lo usa el pre-check (`/check-analyzed-by-fingerprint`), que hasta el
+        2026-10-06 hacía una consulta y una conexión por huella: 500 seguidas
+        en el event loop del único worker por cada lote del móvil."""
+        fps = [f for f in (fingerprints or []) if f]
+        if not fps:
+            return {}
+        if 'fingerprint' not in columnas:
+            columnas = f'{columnas}, fingerprint'
+        if not re.search(r'\bid\b', columnas):
+            columnas = f'id, {columnas}'
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            salida: Dict[str, Dict] = {}
+            # Por trozos: SQLite tiene tope de variables por sentencia.
+            for i in range(0, len(fps), 400):
+                trozo = fps[i:i + 400]
+                pedidas = set(trozo)
+                for r in self._tracks_por_huella_o_id(c, columnas, trozo):
+                    fila = dict(r)
+                    for clave in (fila.get('fingerprint'), fila.get('id')):
+                        if clave in pedidas and clave not in salida:
+                            salida[clave] = fila
+            return salida
+        finally:
+            conn.close()
+
     def canonical_community_keys(self, fingerprints):
         """Version batch de canonical_community_key: mapa {fingerprint ->
         clave del cluster} para una lista, en UNA query. Los que no matchean un
@@ -2670,6 +2702,48 @@ class AnalysisDB:
                 (fingerprint, djs, now))
             conn.commit()
             return True
+        finally:
+            conn.close()
+
+    def registrar_analistas(self, fingerprints, device_id: str) -> int:
+        """`registrar_analista` para un LOTE: el pre-check por huella.
+
+        Quien pregunta por la huella de un fichero lo tiene (la saca del
+        contenido), y si el servidor ya lo tenía analizado el cliente se salta
+        /analyze — o sea que tampoco pasaba por el `registrar_analista` del
+        envoltorio. Hasta el 2026-10-06 la popularidad no contaba a nadie que
+        entrara por ese atajo: el móvil, que va por el pre-check desde el
+        2026-10-02, y el escritorio al reimportar. Una conexión para el lote.
+        Devuelve cuántos DJs nuevos ha sumado."""
+        from datetime import datetime
+        device_id = (device_id or '').strip()
+        fps = [f for f in dict.fromkeys(fingerprints or []) if f]
+        if not fps or not device_id:
+            return 0
+        claves = list(dict.fromkeys(self.canonical_community_keys(fps).values()))
+        now = datetime.utcnow().isoformat()
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            nuevas = []
+            for clave in claves:
+                c.execute('INSERT OR IGNORE INTO track_analyzers '
+                          '(fingerprint, device_id, first_seen) VALUES (?, ?, ?)',
+                          (clave, device_id, now))
+                if c.rowcount:
+                    nuevas.append(clave)
+            for clave in nuevas:
+                c.execute('SELECT COUNT(*) FROM track_analyzers '
+                          'WHERE fingerprint = ?', (clave,))
+                djs = max(1, int((c.fetchone() or [0])[0] or 0))
+                c.execute(
+                    'INSERT INTO track_popularity (fingerprint, analysis_count, '
+                    'dj_count, last_analyzed) VALUES (?, 1, ?, ?) '
+                    'ON CONFLICT(fingerprint) DO UPDATE SET '
+                    'dj_count = excluded.dj_count',
+                    (clave, djs, now))
+            conn.commit()
+            return len(nuevas)
         finally:
             conn.close()
 

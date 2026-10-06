@@ -33,7 +33,7 @@ inline se BORRAN -> sin duplicacion stale.
 import logging
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile
@@ -57,15 +57,25 @@ buscar_portada = None
 # Solo en el motor local: consulta a Render el analisis de un fingerprint.
 # None en Render (no se consulta a si mismo).
 fetch_render_cache = None
+# Solo en el motor local: de un LOTE de huellas, cuales tiene Render con un
+# analisis que sirva (`main._precheck_en_render`). None en Render.
+precheck_en_render = None
+# Solo en Render: apunta al aparato como un DJ más que tiene esos temas
+# (`db.registrar_analistas`). None en el motor local: su BD no es la de la
+# comunidad, y lo que él sabe llega a Render reenviando el pre-check.
+registrar_analistas = None
 
 
 def init(database, is_analysis_current, artwork_cache_dir,
          search_online=None, save_to_cache=None, render_cache_lookup=None,
-         buscar=None, lo_mejor=None):
+         buscar=None, lo_mejor=None, render_precheck=None,
+         registrar=None):
     """Inyecta deps desde main.py. Llamar ANTES de include_router(router)."""
     global db, _is_analysis_current, ARTWORK_CACHE_DIR, buscar_portada
     global search_artwork_online, save_artwork_to_cache, fetch_render_cache
-    global lo_mejor_para
+    global lo_mejor_para, precheck_en_render, registrar_analistas
+    precheck_en_render = render_precheck
+    registrar_analistas = registrar
     buscar_portada = buscar
     lo_mejor_para = lo_mejor
     db = database
@@ -242,10 +252,35 @@ async def acoustic_pending(request: AcousticPendingRequest):
 
 class CheckAnalyzedByFingerprintRequest(BaseModel):
     fingerprints: List[str]
+    # Los dos los manda SOLO el motor local cuando pregunta a Render por lo que
+    # el no tiene (`main._precheck_en_render`). Para el, «analizado» es que
+    # Render le pueda dar un analisis que valga AQUI: de SU version de
+    # analisis (no la de Render) y con BPM y tonalidad. Una fila del fallback
+    # (`analysis_status='failed'`, bpm 0) no le sirve: el motor local tiene
+    # librosa y lo hace mejor. Es la misma vara que `_fetch_render_cache`.
+    version: Optional[str] = None
+    con_datos: bool = False
+
+
+def _vale(fila: dict, version: Optional[str], con_datos: bool) -> bool:
+    if version is not None:
+        if (fila.get('analysis_version') or '1') != version:
+            return False
+    elif not _is_analysis_current(fila):
+        return False
+    if con_datos:
+        try:
+            bpm = float(fila.get('bpm') or 0)
+        except (TypeError, ValueError):
+            bpm = 0
+        if bpm <= 0 or not (fila.get('key') or '').strip():
+            return False
+    return True
 
 
 @router.post("/check-analyzed-by-fingerprint")
-async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintRequest):
+async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintRequest,
+                                        peticion: Request):
     """
     Dedup multi-dispositivo: dado un lote de fingerprints (MD5 del contenido
     del archivo) devuelve cuáles ya están analizados en Render. Esto
@@ -254,35 +289,59 @@ async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintReque
     del fichero sea distinto.
 
     Máximo 500 IDs por petición.
+
+    El lote se resuelve en DOS consultas (`filas_por_huella`) y fuera del
+    event loop. Hasta el 2026-10-06 era una consulta por huella —500 seguidas
+    en el único worker por cada lote del móvil— y, en el motor local, un GET
+    a Render POR HUELLA que no tenía, bloqueando y con 5 s de timeout cada
+    uno: con Render dormido, una ventana de 25 temas eran dos minutos sin
+    atender nada. Ahora lo que falta va a Render en UNA petición.
+
+    Y cuenta en la popularidad: con el `X-Device-Token` de un aparato
+    registrado, ese aparato queda como un DJ más que tiene los temas que se
+    contestan como analizados (`registrar_analistas`). Sin token no se cuenta:
+    la huella basta para preguntar, y sin aparato de verdad cualquiera
+    inflaría los DJs. El motor local reenvía el token con lo que pregunta a
+    Render.
     """
     fps = request.fingerprints or []
     if len(fps) > 500:
         raise HTTPException(400, "Máximo 500 fingerprints por petición")
+    validas = [fp for fp in fps if fp]
 
-    analyzed: list[str] = []
-    not_analyzed: list[str] = []
-    for fp in fps:
-        if not fp:
-            continue
-        # `get_track_by_fingerprint` ya cubre el caso `id == fingerprint`
-        # para registros antiguos donde el id legacy es el propio MD5.
-        existing = db.get_track_by_fingerprint(fp)
-        if existing and _is_analysis_current(existing):
-            analyzed.append(fp)
-            continue
-        # Motor local: su BD es local a ESTA maquina, asi que tras un formateo
-        # (o en un Mac nuevo) esta vacia y el pre-check del cliente fallaba
-        # SIEMPRE -> subida + analisis completo de toda la biblioteca aunque
-        # Render ya tuviera cada track. Preguntamos a Render antes de decir
-        # "no analizado": es un SELECT, y el cliente se ahorra subir el fichero.
-        if fetch_render_cache is not None:
-            try:
-                if fetch_render_cache(fp):
-                    analyzed.append(fp)
-                    continue
-            except Exception as e:  # nunca romper el pre-check por esto
-                logger.debug("[Dedup] fallback Render fallo para %s: %s", fp[:8], e)
-        not_analyzed.append(fp)
+    def _de_esta_bd():
+        filas = db.filas_por_huella(
+            validas, 'id, fingerprint, analysis_version, bpm, key')
+        return {fp for fp, fila in filas.items()
+                if _vale(fila, request.version, request.con_datos)}
+
+    ya = await run_in_threadpool(_de_esta_bd)
+
+    # Motor local: su BD es local a ESTA maquina, asi que tras un formateo
+    # (o en un Mac nuevo) esta vacia y el pre-check del cliente fallaba
+    # SIEMPRE -> subida + analisis completo de toda la biblioteca aunque
+    # Render ya tuviera cada track. Preguntamos a Render antes de decir
+    # "no analizado": es un SELECT, y el cliente se ahorra subir el fichero.
+    token = (peticion.headers.get('X-Device-Token') or '').strip()
+    faltan = [fp for fp in dict.fromkeys(validas) if fp not in ya]
+    if faltan and precheck_en_render is not None:
+        try:
+            ya |= set(await run_in_threadpool(precheck_en_render, faltan,
+                                              token or None))
+        except Exception as e:  # nunca romper el pre-check por esto
+            logger.info("[Dedup] Render no contesto al pre-check (%d huellas): %s",
+                        len(faltan), e)
+
+    analyzed = [fp for fp in validas if fp in ya]
+    not_analyzed = [fp for fp in validas if fp not in ya]
+
+    if analyzed and token and registrar_analistas is not None:
+        try:
+            aparato = await run_in_threadpool(dispositivo_del_token, token)
+            if aparato:
+                await run_in_threadpool(registrar_analistas, analyzed, aparato)
+        except Exception as e:  # contar nunca tumba el pre-check
+            logger.warning("[Popularidad] pre-check: %s", e)
 
     return {
         "analyzed": analyzed,
@@ -310,7 +369,7 @@ async def get_analysis_by_fingerprint(fingerprint: str):
         # respondia 404, asi que el cliente acababa subiendo el fichero igual.
         if fetch_render_cache is not None:
             try:
-                remote = fetch_render_cache(safe_fp)
+                remote = await run_in_threadpool(fetch_render_cache, safe_fp)
             except Exception:
                 remote = None
             if remote:

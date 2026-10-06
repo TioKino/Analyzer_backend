@@ -545,6 +545,43 @@ def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
     return data
 
 
+def _precheck_en_render(fingerprints, token: Optional[str] = None) -> set:
+    """De un lote de huellas que el motor local NO tiene, cuales tiene Render
+    con un analisis que valga aqui: de la version de analisis de ESTE motor y
+    con BPM y tonalidad (la misma vara que `_fetch_render_cache`).
+
+    UNA peticion por lote de 500, no una por huella: hasta el 2026-10-06 el
+    pre-check del motor local llamaba a `_fetch_render_cache` huella a huella,
+    bloqueando y con 5 s de timeout cada una. Con Render dormido, una ventana
+    de 25 temas del import eran dos minutos sin que el motor atendiera nada.
+
+    Si Render no contesta, lanza: el endpoint lo trata como «Render no sabe»
+    y el cliente sube y analiza, que es la direccion segura. Un Render
+    anterior a los campos `version`/`con_datos` los ignora y contesta con su
+    propia vara; lo que no valga aqui lo filtra despues `_fetch_render_cache`
+    al pedir la ficha (404, y el cliente analiza), como antes.
+
+    Con el `X-Device-Token` del cliente, Render cuenta a ese aparato en la
+    popularidad de lo que tiene (ver `registrar_analistas`): lo que el motor
+    local analizó aquí ya se contó al empujarlo por `/cache-analysis`."""
+    fps = [f for f in (fingerprints or []) if f and len(f) >= 16]
+    salida: set = set()
+    cabeceras = {'X-Device-Token': token} if token else {}
+    for i in range(0, len(fps), 500):
+        resp = requests.post(
+            f"{RENDER_BACKEND_URL}/check-analyzed-by-fingerprint",
+            json={'fingerprints': fps[i:i + 500],
+                  'version': ANALYSIS_VERSION, 'con_datos': True},
+            headers=cabeceras,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        salida.update(str(x) for x in (resp.json().get('analyzed') or []))
+    logger.info(f"[Dedup] Render tiene {len(salida)} de {len(fps)} huellas "
+                f"que este motor no tenia")
+    return salida
+
+
 # ==================== IMPORTS LOCALES ====================
 from database import AnalysisDB, MIN_CUENTAS_CAMBIO_MANUAL
 
@@ -1084,6 +1121,11 @@ init_lookup(
     # mismo. Hace que el pre-check de dedup del cliente funcione en una maquina
     # recien formateada, donde la BD local esta vacia pero Render lo tiene todo.
     render_cache_lookup=(_fetch_render_cache if IS_LOCAL_ENGINE else None),
+    # El pre-check por lotes: lo que el motor local no tiene, a Render en UNA
+    # peticion (antes, un GET por huella).
+    render_precheck=(_precheck_en_render if IS_LOCAL_ENGINE else None),
+    # La popularidad cuenta a quien entra por el pre-check (solo Render).
+    registrar=(None if IS_LOCAL_ENGINE else db.registrar_analistas),
     # Lambda y no la función: `_lo_mejor_para` se define más abajo.
     # Sin ir a Render desde el motor local: es la lectura por huella del
     # pre-check del import, una por tema (ver `_lo_mejor_para`).
@@ -6295,6 +6337,10 @@ async def health():
         # cuanto lleva; para cruzarlo con la hora de un merge hace falta esto.
         "started_at": datetime.fromtimestamp(_startup_time, timezone.utc)
                               .isoformat(),
+        # Qué SQLite trae el Python de Render. El plan de una consulta (si un
+        # `OR` entre columnas usa índice o recorre la tabla) depende de la
+        # versión, y sin esto solo se podía medir en otra máquina.
+        "sqlite": sqlite3.sqlite_version,
         "checks": {
             "database": db_status,
             "ffmpeg": ffmpeg_status,

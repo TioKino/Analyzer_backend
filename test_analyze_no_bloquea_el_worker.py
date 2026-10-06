@@ -180,3 +180,21 @@ def test_check_analyzed_ya_no_toca_la_bd():
     i = src.index('async def check_analyzed(filenames')
     cuerpo = src[i:src.index('\n\n\n', i)]
     assert 'db.' not in cuerpo
+
+
+def test_la_busqueda_por_huella_entra_por_indice():
+    """`get_track_by_fingerprint` y `canonical_community_key` buscan con
+    `fingerprint = ? OR id = ?`. Medido el 2026-10-06 (SQLite 3.45): SQLite lo
+    resuelve con MULTI-INDEX OR, por los dos índices. Lo que recorría la tabla
+    en septiembre era la falta del índice de `fingerprint`, no el `OR`. Si
+    alguien quita ese índice, esto lo dice."""
+    plan = _plan('SELECT * FROM tracks WHERE fingerprint = ? OR id = ?',
+                 ('a', 'a'))
+    assert 'idx_tracks_fingerprint' in plan, plan
+    assert 'SCAN tracks |' not in plan + ' |', plan
+
+
+def test_health_dice_que_sqlite_corre(client):
+    """El plan depende de la versión: `/health` la da para mirarla en Render."""
+    import sqlite3
+    assert client.get('/health').json()['sqlite'] == sqlite3.sqlite_version
