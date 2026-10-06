@@ -521,19 +521,24 @@ def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
         data = resp.json()
     except (requests.Timeout, requests.RequestException, ValueError):
         return None
+    return data if _ficha_de_render_vale(data) else None
 
-    # Validar que NO es un fallback "failed" (bpm=0, key=null,
-    # analysis_status='failed'). Si lo es, mejor analizar local
-    # de cero — el motor local ya tiene librosa OK aquí.
+
+def _ficha_de_render_vale(data) -> bool:
+    """¿Le sirve al motor local esta ficha de Render? No si es un fallback
+    fallido (bpm 0, sin tonalidad, `analysis_status='failed'`): el motor local
+    tiene librosa y lo hace mejor. Ni si es de otra versión de análisis."""
+    if not isinstance(data, dict):
+        return False
     try:
         bpm_val = float(data.get('bpm') or 0)
     except (TypeError, ValueError):
         bpm_val = 0
     key_val = (data.get('key') or '').strip() if data.get('key') else ''
     if bpm_val <= 0 or not key_val:
-        return None
+        return False
     if data.get('analysis_status') == 'failed':
-        return None
+        return False
     # Si Render tiene una versión antigua del análisis, mejor re-analizar local
     if (data.get('analysis_version') or '1') != ANALYSIS_VERSION:
         logger.info(
@@ -541,8 +546,30 @@ def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
             f"({data.get('analysis_version') or 'NULL'} != {ANALYSIS_VERSION}), "
             f"re-analizando local"
         )
-        return None
-    return data
+        return False
+    return True
+
+
+def _fichas_en_render(fingerprints) -> dict:
+    """Las fichas que Render tiene de un lote de huellas que el motor local
+    no tiene, y que valen aquí (`_ficha_de_render_vale`). UNA petición por
+    cada 100, no un GET por huella. Si Render no contesta, lanza: el endpoint
+    lo trata como «Render no sabe» y el cliente pide la ficha de una en una o
+    analiza, que es la dirección segura."""
+    fps = [f for f in (fingerprints or []) if f and len(f) >= 16]
+    salida: dict = {}
+    for i in range(0, len(fps), 100):
+        resp = requests.post(
+            f"{RENDER_BACKEND_URL}/analysis/by-fingerprint/batch",
+            json={'fingerprints': fps[i:i + 100]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        fichas = (resp.json() or {}).get('fichas') or {}
+        for fp, ficha in fichas.items():
+            if _ficha_de_render_vale(ficha):
+                salida[str(fp)] = ficha
+    return salida
 
 
 def _precheck_en_render(fingerprints, token: Optional[str] = None) -> set:
@@ -1126,6 +1153,9 @@ init_lookup(
     render_precheck=(_precheck_en_render if IS_LOCAL_ENGINE else None),
     # La popularidad cuenta a quien entra por el pre-check (solo Render).
     registrar=(None if IS_LOCAL_ENGINE else db.registrar_analistas),
+    # Las fichas de un lote: lo que el motor local no tiene, a Render en una
+    # petición (antes, un GET por huella).
+    render_fichas=(_fichas_en_render if IS_LOCAL_ENGINE else None),
     # Lambda y no la función: `_lo_mejor_para` se define más abajo.
     # Sin ir a Render desde el motor local: es la lectura por huella del
     # pre-check del import, una por tema (ver `_lo_mejor_para`).

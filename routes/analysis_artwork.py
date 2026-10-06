@@ -30,6 +30,7 @@ Como pasos 2-4: el router SI se monta (init + include_router) y los endpoints
 inline se BORRAN -> sin duplicacion stale.
 """
 
+import json
 import logging
 import os
 import re
@@ -60,6 +61,9 @@ fetch_render_cache = None
 # Solo en el motor local: de un LOTE de huellas, cuales tiene Render con un
 # analisis que sirva (`main._precheck_en_render`). None en Render.
 precheck_en_render = None
+# Solo en el motor local: las fichas de un LOTE de huellas que tiene Render y
+# valen aquí (`main._fichas_en_render`). None en Render.
+fichas_en_render = None
 # Solo en Render: apunta al aparato como un DJ más que tiene esos temas
 # (`db.registrar_analistas`). None en el motor local: su BD no es la de la
 # comunidad, y lo que él sabe llega a Render reenviando el pre-check.
@@ -69,12 +73,14 @@ registrar_analistas = None
 def init(database, is_analysis_current, artwork_cache_dir,
          search_online=None, save_to_cache=None, render_cache_lookup=None,
          buscar=None, lo_mejor=None, render_precheck=None,
-         registrar=None):
+         registrar=None, render_fichas=None):
     """Inyecta deps desde main.py. Llamar ANTES de include_router(router)."""
     global db, _is_analysis_current, ARTWORK_CACHE_DIR, buscar_portada
     global search_artwork_online, save_artwork_to_cache, fetch_render_cache
     global lo_mejor_para, precheck_en_render, registrar_analistas
+    global fichas_en_render
     precheck_en_render = render_precheck
+    fichas_en_render = render_fichas
     registrar_analistas = registrar
     buscar_portada = buscar
     lo_mejor_para = lo_mejor
@@ -352,34 +358,15 @@ async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintReque
     }
 
 
-@router.get("/analysis/by-fingerprint/{fingerprint}")
-async def get_analysis_by_fingerprint(fingerprint: str):
-    """Devuelve el análisis cacheado de un track por su fingerprint
-    (MD5 del contenido). El cliente puede usar este endpoint tras
-    `/check-analyzed-by-fingerprint` para hidratar su cache local sin
-    subir el archivo otra vez."""
-    safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
-    if not safe_fp:
-        raise HTTPException(400, "fingerprint inválido")
-    existing = db.get_track_by_fingerprint(safe_fp)
-    if not existing:
-        # Motor local sin el track en su BD: si Render lo tiene, se lo damos al
-        # cliente tal cual. Sin esto el pre-check de dedup decia "ya analizado"
-        # (gracias al mismo fallback en /check-analyzed-by-fingerprint) y aqui
-        # respondia 404, asi que el cliente acababa subiendo el fichero igual.
-        if fetch_render_cache is not None:
-            try:
-                remote = await run_in_threadpool(fetch_render_cache, safe_fp)
-            except Exception:
-                remote = None
-            if remote:
-                return remote
-        raise HTTPException(404, "fingerprint no encontrado")
+def _ficha_desde_fila(safe_fp, existing):
+    """La ficha que se le da al cliente a partir de la fila de `tracks` de esa
+    huella: su `analysis_json` (o las columnas, si no lo hay) con lo mejor que
+    sabe la memoria colectiva encima. La comparten el GET de una huella y el
+    lote (`/analysis/by-fingerprint/batch`)."""
     raw = existing.get('analysis_json')
     result = None
     if raw:
         try:
-            import json
             result = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             result = None
@@ -411,6 +398,73 @@ async def get_analysis_by_fingerprint(fingerprint: str):
     # de que este track se analizara, el cliente la recibe al re-consultar.
     _merge_cluster_best_into(result, safe_fp, existing)
     return result
+
+
+@router.get("/analysis/by-fingerprint/{fingerprint}")
+async def get_analysis_by_fingerprint(fingerprint: str):
+    """Devuelve el análisis cacheado de un track por su fingerprint
+    (MD5 del contenido). El cliente puede usar este endpoint tras
+    `/check-analyzed-by-fingerprint` para hidratar su cache local sin
+    subir el archivo otra vez."""
+    safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
+    if not safe_fp:
+        raise HTTPException(400, "fingerprint inválido")
+    existing = db.get_track_by_fingerprint(safe_fp)
+    if not existing:
+        # Motor local sin el track en su BD: si Render lo tiene, se lo damos al
+        # cliente tal cual. Sin esto el pre-check de dedup decia "ya analizado"
+        # (gracias al mismo fallback en /check-analyzed-by-fingerprint) y aqui
+        # respondia 404, asi que el cliente acababa subiendo el fichero igual.
+        if fetch_render_cache is not None:
+            try:
+                remote = await run_in_threadpool(fetch_render_cache, safe_fp)
+            except Exception:
+                remote = None
+            if remote:
+                return remote
+        raise HTTPException(404, "fingerprint no encontrado")
+    return _ficha_desde_fila(safe_fp, existing)
+
+
+class FichasPorHuellaRequest(BaseModel):
+    fingerprints: List[str]
+
+
+# Una ficha son unos KB (el `analysis_json` entero): 100 por petición.
+MAX_FICHAS_POR_PETICION = 100
+
+
+@router.post("/analysis/by-fingerprint/batch")
+async def fichas_por_huella(req: FichasPorHuellaRequest):
+    """Las fichas de varias huellas en UNA petición: `{"fichas": {huella:
+    ficha}}`, la misma ficha que da el GET de una (`_ficha_desde_fila`). Las
+    que no hay no salen.
+
+    Tras el pre-check, el import pedía la ficha de cada acierto con un GET:
+    en un Mac recién formateado con 5.000 temas que Render ya tiene, 5.000
+    viajes seguidos, y con motor local, cada uno pasando por él (2026-10-06).
+    El motor local completa con Render lo que no tiene, en otra sola petición
+    y con la misma vara que el GET (`_fetch_render_cache`).
+    """
+    fps = [re.sub(r'[^a-fA-F0-9]', '', f or '') for f in (req.fingerprints or [])]
+    fps = [f for f in dict.fromkeys(fps) if f]
+    if len(fps) > MAX_FICHAS_POR_PETICION:
+        raise HTTPException(
+            400, f"Máximo {MAX_FICHAS_POR_PETICION} fingerprints por petición")
+
+    def _de_esta_bd():
+        filas = db.fichas_por_huella(fps)
+        return {fp: _ficha_desde_fila(fp, fila) for fp, fila in filas.items()}
+
+    fichas = await run_in_threadpool(_de_esta_bd)
+    faltan = [fp for fp in fps if fp not in fichas]
+    if faltan and fichas_en_render is not None:
+        try:
+            fichas.update(await run_in_threadpool(fichas_en_render, faltan))
+        except Exception as e:  # nunca romper el lote por esto
+            logger.info("[Fichas] Render no contesto (%d huellas): %s",
+                        len(faltan), e)
+    return {"fichas": fichas}
 
 
 # ==================== ENDPOINTS DE ARTWORK ====================

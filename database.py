@@ -1279,6 +1279,30 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def fichas_por_huella(self, fingerprints) -> Dict[str, Dict]:
+        """{huella -> fila de `tracks`} como `get_track_by_fingerprint`, pero
+        para un lote y en dos consultas (por `fingerprint` y por `id`, ver
+        `_tracks_por_huella_o_id`). Si una huella casa con dos filas, gana la
+        que la tiene en `fingerprint`."""
+        fps = [f for f in dict.fromkeys(fingerprints or []) if f]
+        if not fps:
+            return {}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            salida: Dict[str, Dict] = {}
+            for i in range(0, len(fps), 400):
+                trozo = fps[i:i + 400]
+                pedidas = set(trozo)
+                for r in self._tracks_por_huella_o_id(c, '*', trozo):
+                    fila = self._row_to_dict(r)
+                    for clave in (fila.get('fingerprint'), fila.get('id')):
+                        if clave in pedidas and clave not in salida:
+                            salida[clave] = fila
+            return salida
+        finally:
+            conn.close()
+
     def canonical_community_keys(self, fingerprints):
         """Version batch de canonical_community_key: mapa {fingerprint ->
         clave del cluster} para una lista, en UNA query. Los que no matchean un
