@@ -2,7 +2,7 @@ import sqlite3
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import re
 import statistics
@@ -2953,6 +2953,134 @@ class AnalysisDB:
             'aparatos': total['aparatos'],
             'por_fuente': por_fuente,
         }
+
+    # Las fuentes de `tracks` que son lo MEDIDO sobre el audio (el DSP del
+    # servidor o del motor local), no un tag ni un programa de DJ.
+    FUENTES_DEL_DSP = ('analysis', 'local_engine')
+
+    @staticmethod
+    def _clase_de_bpm(dsp: float, programa: float) -> Optional[str]:
+        """Cómo se parece el BPM medido al del programa de DJ. `igual` es lo
+        que un DJ no distingue (±0,5); `doble_o_mitad` es el error típico de
+        un detector de tempo, y se cuenta aparte porque pide otro arreglo."""
+        if not dsp or not programa or dsp <= 0 or programa <= 0:
+            return None
+        d = abs(dsp - programa)
+        if d <= 0.5:
+            return 'igual'
+        if d <= 2.0:
+            return 'cerca'
+        r = dsp / programa
+        if abs(r / 2 - 1) <= 0.03 or abs(r * 2 - 1) <= 0.03:
+            return 'doble_o_mitad'
+        return 'otro'
+
+    @staticmethod
+    def _clase_de_tonalidad(dsp: Optional[str], programa: Optional[str]) -> Optional[str]:
+        """Cómo se parece la tonalidad medida a la del programa, en Camelot.
+        `relativa` (8A↔8B) y `quinta` (8A↔7A/9A) son los errores típicos de un
+        detector de tonalidad, y mezclan bien: se cuentan aparte de `otra`."""
+        def partir(c):
+            m = re.match(r'^\s*(\d{1,2})\s*([ABab])\s*$', c or '')
+            return (int(m.group(1)), m.group(2).upper()) if m else None
+        a, b = partir(dsp), partir(programa)
+        if not a or not b:
+            return None
+        if a == b:
+            return 'igual'
+        if a[0] == b[0]:
+            return 'relativa'
+        if a[1] == b[1] and (a[0] - b[0]) % 12 in (1, 11):
+            return 'quinta'
+        return 'otra'
+
+    def dsp_frente_a_lo_importado(self, dias_recientes: int = 30) -> Dict:
+        """El DSP medido contra lo que dicen Rekordbox, Traktor y VirtualDJ de
+        la MISMA huella (auditoría del flujo de análisis, 2026-10-06).
+
+        Hasta ese día no había forma de saber cuánto acierta el análisis: lo
+        importado se usaba para sustituirlo, nunca para medirlo. Es la única
+        verdad de referencia que hay a mano —el BPM y la tonalidad que el DJ
+        tenía ya en su programa— y está en el mismo audio, no en otra versión.
+
+        Solo cuentan las filas de `tracks` cuya fuente es el DSP
+        (`FUENTES_DEL_DSP`): si la fila ya dice `rekordbox` o `id3`, el DSP no
+        está ahí para medirlo. Un valor por huella y campo (el voto más
+        reciente). Se reparte por programa, porque las tonalidades de Traktor
+        anteriores al 2026-09-26 salieron con una tabla mala, y aparte lo
+        analizado en los últimos `dias_recientes` (`analyzed_at`): el DSP ha
+        cambiado sin subir `ANALYSIS_VERSION` (la rejilla, el afinado del
+        intervalo), y lo viejo no dice nada del de hoy. Recorre
+        `imported_values` con el cursor y busca las filas de `tracks` por
+        lotes, por índice.
+        """
+        def vacio():
+            return {'comparados': 0, 'igual': 0}
+
+        salida = {campo: {'total': vacio(), 'por_programa': {}, 'recientes': vacio()}
+                  for campo in ('bpm', 'tonalidad')}
+        salida['dias_recientes'] = dias_recientes
+        desde = (datetime.utcnow() - timedelta(days=dias_recientes)).isoformat()
+
+        def apuntar(campo, programa, clase, reciente):
+            bloque = salida[campo]
+            for d in (bloque['total'],
+                      bloque['por_programa'].setdefault(programa, vacio()),
+                      bloque['recientes'] if reciente else None):
+                if d is None:
+                    continue
+                d['comparados'] += 1
+                d[clase] = d.get(clase, 0) + 1
+
+        conn = self._open_conn()
+        try:
+            try:
+                cur = conn.execute(
+                    "SELECT fingerprint, field, value, camelot, source, "
+                    "MAX(updated_at) AS cuando FROM imported_values "
+                    "WHERE field IN ('bpm', 'key') GROUP BY fingerprint, field")
+            except sqlite3.OperationalError:
+                return salida
+            c = conn.cursor()
+            while True:
+                lote = cur.fetchmany(400)
+                if not lote:
+                    break
+                fps = list({r['fingerprint'] for r in lote})
+                filas = {}
+                # Las fuentes no son columnas: viven en `analysis_json`.
+                for t in self._tracks_por_huella_o_id(
+                        c, "id, fingerprint, bpm, camelot, analyzed_at, "
+                           "json_extract(analysis_json, '$.bpm_source') AS bpm_source, "
+                           "json_extract(analysis_json, '$.key_source') AS key_source",
+                        fps):
+                    for clave in (t['fingerprint'], t['id']):
+                        if clave and clave not in filas:
+                            filas[clave] = t
+                for r in lote:
+                    t = filas.get(r['fingerprint'])
+                    if t is None:
+                        continue
+                    reciente = (t['analyzed_at'] or '') >= desde
+                    if r['field'] == 'bpm':
+                        if t['bpm_source'] not in self.FUENTES_DEL_DSP:
+                            continue
+                        try:
+                            clase = self._clase_de_bpm(float(t['bpm'] or 0),
+                                                       float(r['value']))
+                        except (TypeError, ValueError):
+                            clase = None
+                        if clase:
+                            apuntar('bpm', r['source'], clase, reciente)
+                    else:
+                        if t['key_source'] not in self.FUENTES_DEL_DSP:
+                            continue
+                        clase = self._clase_de_tonalidad(t['camelot'], r['camelot'])
+                        if clase:
+                            apuntar('tonalidad', r['source'], clase, reciente)
+        finally:
+            conn.close()
+        return salida
 
     def lo_importado_de(self, fingerprints, exacta: Optional[str] = None) -> Dict:
         """Lo que los programas de DJ dicen de estas huellas (las versiones de
