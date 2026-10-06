@@ -3240,6 +3240,43 @@ class AnalysisDB:
             'validated': False,
         }
 
+    def get_community_beat_grids(self, fingerprints) -> Dict[str, Dict]:
+        """`get_community_beat_grid` para un LOTE, y solo lo VALIDADO: {huella
+        -> rejilla} de las que tres cuentas comparten. Lo pide el import de
+        escritorio, que hasta el 2026-10-06 hacía un GET por tema nuevo — con
+        el pre-check acertando, cientos seguidos y sin esperar a ninguno.
+
+        Casi ninguna huella tiene correcciones: una consulta (por el índice de
+        `fingerprint, device_id`) dice cuáles, y el cálculo por cuenta solo se
+        hace para esas."""
+        fps = [f for f in dict.fromkeys(fingerprints or []) if f]
+        if not fps:
+            return {}
+        canon = self.canonical_community_keys(fps)
+        claves = list(dict.fromkeys(canon.values()))
+        conn = self._open_conn()
+        try:
+            con_algo = set()
+            for i in range(0, len(claves), 400):
+                trozo = claves[i:i + 400]
+                con_algo.update(r[0] for r in conn.execute(
+                    'SELECT DISTINCT fingerprint FROM beat_grid_corrections '
+                    f'WHERE fingerprint IN ({",".join("?" * len(trozo))})', trozo))
+        finally:
+            conn.close()
+        salida = {}
+        calculadas = {}
+        for fp in fps:
+            clave = canon.get(fp, fp)
+            if clave not in con_algo:
+                continue
+            if clave not in calculadas:
+                calculadas[clave] = self.get_community_beat_grid(clave)
+            rejilla = calculadas[clave]
+            if rejilla.get('validated'):
+                salida[fp] = rejilla
+        return salida
+
     # ==================== COMMUNITY OVERRIDES GENERICOS (Fase 4) ====================
     # Sistema unificado para CUALQUIER campo categorico: track_type, key,
     # camelot, genre, subgenre. Mismas reglas de consensus (>=3 votos al
