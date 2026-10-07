@@ -1638,6 +1638,19 @@ def _resolver_identidad(id3_data: dict, file_path: str,
     return mezcla
 
 
+def _titulo_sin_el_artista(artist: Optional[str], title: Optional[str]) -> Optional[str]:
+    """El título sin el artista repetido delante («Wannabe Djs - Whoops» de
+    Wannabe Djs → «Whoops»), que es como lo dejan muchas etiquetas y nombres
+    de fichero. Con él delante, Discogs y MusicBrainz no encuentran el tema y
+    la verificación (`mismo_titulo`) tampoco casaría la pista (log de Render,
+    2026-10-07). Solo para BUSCAR: el título que ve el DJ no se toca."""
+    if not artist or not title:
+        return title
+    m = re.match(r'^\s*' + re.escape(artist.strip()) + r'\s*[-–—:]\s*(.+)$',
+                 title, flags=re.IGNORECASE)
+    return m.group(1).strip() if m and m.group(1).strip() else title
+
+
 def _genero_por_identidad(artist: Optional[str], title: Optional[str]) -> Optional[dict]:
     """Discogs y, si no, MusicBrainz, con la identidad YA RESUELTA.
 
@@ -1656,6 +1669,7 @@ def _genero_por_identidad(artist: Optional[str], title: Optional[str]) -> Option
     from audd_helper import is_garbage_metadata
     if is_garbage_metadata(artist, title):
         return None
+    title = _titulo_sin_el_artista(artist, title)
     logger.info(f"  [Genero] buscando: {artist} - {title}")
     try:
         d = genre_detector.get_discogs_genre(artist, title)
@@ -4085,6 +4099,17 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
 
 # ==================== RECONOCIMIENTO DE AUDIO (SHAZAM-LIKE) ====================
 
+# Cuánto audio preprocesa /recognize, como mucho. AudD reconoce con un trozo:
+# `_audd_clip_if_large` le manda 0:30→0:50 de lo que salga de aquí, y un
+# minuto en WAV (5,3 MB) sigue pasando de su umbral, así que AudD recibe la
+# MISMA ventana que antes. Lo que cambia es el coste: el backfill de portadas
+# del escritorio sube 6 MB de cada tema (origen=portada), y normalizar el tema
+# entero con `loudnorm` eran 10-15 s de CPU por petición, muchas veces pasando
+# del tope de 15 s (log de Render, 2026-10-07: «ffmpeg normalize timeout»).
+# Un clip de Escuchar dura 12 s: el tope no le toca.
+SEGUNDOS_PARA_RECONOCER = 60
+
+
 def _preprocess_audio_for_recognition(input_path: str, output_path: str, strategy: str = "normalize") -> bool:
     """
     Preprocesa audio para mejorar la detección por AudD.
@@ -4103,7 +4128,7 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
             # Normalizar volumen + filtro high-pass a 80Hz (elimina ruido de ambiente/aire acondicionado)
             # + limitar frecuencias altas innecesarias para fingerprinting
             cmd = [
-                ffmpeg_bin, '-y', '-i', input_path,
+                ffmpeg_bin, '-y', '-t', str(SEGUNDOS_PARA_RECONOCER), '-i', input_path,
                 '-af', 'highpass=f=80,lowpass=f=16000,loudnorm=I=-16:TP=-1.5:LRA=11,silenceremove=start_periods=1:start_silence=0.5:start_threshold=-40dB:stop_periods=-1:stop_silence=0.3:stop_threshold=-40dB',
                 '-ar', '44100', '-ac', '1',
                 '-acodec', 'pcm_s16le',
@@ -4113,7 +4138,7 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
             # Filtrado más agresivo: banda 200-8000Hz (rango vocal/melódico principal),
             # compresión dinámica fuerte para igualar volúmenes, normalización
             cmd = [
-                ffmpeg_bin, '-y', '-i', input_path,
+                ffmpeg_bin, '-y', '-t', str(SEGUNDOS_PARA_RECONOCER), '-i', input_path,
                 '-af', 'highpass=f=200,lowpass=f=8000,acompressor=threshold=-20dB:ratio=6:attack=5:release=50,loudnorm=I=-14:TP=-1:LRA=7,silenceremove=start_periods=1:start_silence=0.3:start_threshold=-35dB:stop_periods=-1:stop_silence=0.2:stop_threshold=-35dB',
                 '-ar', '44100', '-ac', '1',
                 '-acodec', 'pcm_s16le',
@@ -4122,7 +4147,7 @@ def _preprocess_audio_for_recognition(input_path: str, output_path: str, strateg
         else:  # raw_wav
             # Solo convertir a WAV sin procesamiento
             cmd = [
-                ffmpeg_bin, '-y', '-i', input_path,
+                ffmpeg_bin, '-y', '-t', str(SEGUNDOS_PARA_RECONOCER), '-i', input_path,
                 '-ar', '44100', '-ac', '1',
                 '-acodec', 'pcm_s16le',
                 output_path

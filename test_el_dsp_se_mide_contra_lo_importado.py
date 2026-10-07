@@ -164,3 +164,47 @@ def test_el_camino_por_trozos_tambien_se_mide_y_se_parte_por_camino(db):
     assert caminos['motor_local']['recientes'] == {'comparados': 0, 'igual': 0}
     assert m['bpm']['por_camino']['trozos']['total'] == {'comparados': 1,
                                                          'igual': 1}
+
+
+def test_lo_del_motor_local_va_a_su_camino_aunque_su_fuente_diga_analysis(db):
+    """El motor local manda a Render su análisis por `/cache-analysis` con SU
+    fuente (`analysis`), y solo `engine_source` dice que no lo hizo Render.
+    Hasta el 2026-10-07 caía en `corto` y la línea «corto (Render)» de
+    `embudo.sh` mezclaba los dos motores."""
+    fp = uuid.uuid4().hex
+    db.save_track({
+        'id': fp, 'fingerprint': fp, 'filename': f'{fp}.mp3', 'bpm': 128.0,
+        'bpm_source': 'analysis', 'key': 'Am', 'camelot': '8A',
+        'key_source': 'analysis', 'duration': 420, 'energy_dj': 6,
+        'genre': 'Techno', 'track_type': 'peak_time',
+        'engine_source': 'local_engine', 'platform': 'windows',
+        'analyzed_at': (datetime.utcnow() - timedelta(days=2)).isoformat(),
+    })
+    _importado(db, fp, bpm=128.0, key='Am', camelot='8A')
+    render = _tema(db, camelot='3A')
+    _importado(db, render, bpm=128.0, key='Am', camelot='8A')
+
+    caminos = db.dsp_frente_a_lo_importado()['tonalidad']['por_camino']
+    assert caminos['motor_local']['total'] == {'comparados': 1, 'igual': 1}
+    assert caminos['corto']['total'] == {'comparados': 1, 'igual': 0, 'otra': 1}
+
+
+def test_lo_reciente_se_parte_por_plataforma(db):
+    """Una ráfaga de un Mac de pruebas pesa más que el resto junto: sin
+    reparto por plataforma, lo reciente no dice si es el DSP o ese aparato."""
+    for camelot, plataforma in (('8A', 'macos-mas'), ('3A', 'macos-mas'),
+                                ('8A', 'windows')):
+        fp = _tema(db, camelot=camelot)
+        with db._open_conn() as conn:
+            conn.execute('UPDATE tracks SET platform = ? WHERE fingerprint = ?',
+                         (plataforma, fp))
+        _importado(db, fp, key='Am', camelot='8A')
+    viejo = _tema(db, camelot='8A', hace_dias=90)
+    _importado(db, viejo, key='Am', camelot='8A')
+
+    m = db.dsp_frente_a_lo_importado()['tonalidad']
+    assert m['recientes_por_plataforma'] == {
+        'macos-mas': {'comparados': 2, 'igual': 1, 'otra': 1},
+        'windows': {'comparados': 1, 'igual': 1},
+    }
+    assert m['total']['comparados'] == 4
