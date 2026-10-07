@@ -110,11 +110,16 @@ def classify_track_type(energy: float, segments: dict, duration: float) -> dict:
     # honestidad sobre tracks ambiguos en lugar de mentir con un tipo forzado.
     # Plan completo en Analyzer/PENDING_NEXT_SESSION_TRACKTYPE_V2.md.
     #
-    # Mismas señales que la cascada original (has_intro/has_drop/has_outro +
-    # energy + duration), pero acumulamos en lugar de decidir inmediato.
-    # Ej. Oxia - Domino (energy=0.7, has_outro=True, duration=433): closing
-    # acumula 1.0 + 0.3 = 1.3, peak_time solo 0.2 (energy>0.6 soft signal),
-    # warmup 0. Margin grande -> confidence ~0.85.
+    # Mismas señales que la cascada original (has_intro/has_drop + energy),
+    # pero acumulamos en lugar de decidir inmediato.
+    #
+    # *Closing* es el tema con el que se CIERRA una sesión (owner,
+    # 2026-10-07), y la heurística no tiene con qué verlo: hasta ese día
+    # sumaba 1,0 a closing con un outro y más de 5 minutos, o sea a cualquier
+    # extended mix con su outro de batería para mezclar (8 de 13 temas largos
+    # en un log de Render, con confianza 1,0 y el espectral descartado). Un
+    # outro para mezclar no dice que el tema cierre nada. Closing se queda en
+    # el reparto con 0 y lo decide el espectral (energía baja que va bajando).
     scores = {'warmup': 0.0, 'peak_time': 0.0, 'closing': 0.0}
 
     if energy < 0.5 and segments['has_intro']:
@@ -125,10 +130,6 @@ def classify_track_type(energy: float, segments: dict, duration: float) -> dict:
         scores['peak_time'] += 1.0
     if energy > 0.8 and segments['has_drop']:
         scores['peak_time'] += 0.5
-    if segments['has_outro'] and duration > 300:
-        scores['closing'] += 1.0
-    if segments['has_outro'] and duration > 420:
-        scores['closing'] += 0.3
     # Soft signals para desempates: cualquier track con energia alta
     # tira hacia peak_time, cualquiera con energia baja hacia warmup.
     if energy > 0.6:

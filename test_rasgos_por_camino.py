@@ -5,8 +5,9 @@ Dos preguntas que no se podían contestar con datos:
 - ¿Los temas largos de Render salían de verdad un nivel de energía arriba?
   El motor local analiza los largos por el camino corto, así que sus «más de
   5 min» son la comparación justa con los de trozos.
-- ¿Cuánto *closing* sale, y dónde? (`classify_track_type` suma 1,0 a
-  *closing* con un outro y más de 5 minutos).
+- ¿Cuánto *closing* sale, y dónde? Hasta el 2026-10-07 `classify_track_type`
+  sumaba 1,0 a *closing* con un outro y más de 5 minutos; desde ese día el
+  outro no cuenta, y lo ya analizado conserva lo que tenía.
 
     pytest test_rasgos_por_camino.py -v
 """
