@@ -36,7 +36,9 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
@@ -399,7 +401,46 @@ def _transcodificar_a_wav(file_path, timeout):
         return None
 
 
+# La ultima huella de cada fichero, por (ruta, tamaño, fecha). Un análisis con
+# nombre basura pasaba DOS veces por fpcalc sobre el mismo temporal: una en
+# `_cluster_clean_identity` (heredar la identidad del cluster antes de AudD) y
+# otra en `_attach_acoustic` (guardar la huella). Segundos de CPU tirados por
+# tema. Solo se recuerda lo que SALE BIEN: memoizar el fallo es lo que apagó
+# la huella para todos hasta el siguiente deploy (`Analyzer_backend#79`).
+_HUELLAS_RECIENTES = OrderedDict()
+_HUELLAS_LOCK = threading.Lock()
+_HUELLAS_MAX = 8
+
+
+def _clave_de_fichero(file_path):
+    try:
+        st = os.stat(file_path)
+    except (OSError, TypeError, ValueError):
+        return None
+    return (os.path.abspath(file_path), st.st_size, st.st_mtime_ns)
+
+
 def compute_raw_chromaprint(file_path, timeout=30, etiqueta=None):
+    """`_calcular_raw_chromaprint`, recordando la última huella de cada fichero
+    (ver `_HUELLAS_RECIENTES`). Mismo contrato: lista de int o None."""
+    clave = _clave_de_fichero(file_path)
+    if clave is not None:
+        with _HUELLAS_LOCK:
+            hecha = _HUELLAS_RECIENTES.get(clave)
+            if hecha is not None:
+                _HUELLAS_RECIENTES.move_to_end(clave)
+                return list(hecha)
+    ints = _calcular_raw_chromaprint(file_path, timeout=timeout,
+                                     etiqueta=etiqueta)
+    if ints and clave is not None:
+        with _HUELLAS_LOCK:
+            _HUELLAS_RECIENTES[clave] = tuple(ints)
+            while len(_HUELLAS_RECIENTES) > _HUELLAS_MAX:
+                _HUELLAS_RECIENTES.popitem(last=False)
+    return ints
+
+
+def _calcular_raw_chromaprint(file_path, timeout=30, etiqueta=None):
     """Extrae el fingerprint Chromaprint crudo con `fpcalc -raw -json`.
 
     Devuelve una lista de int (subfingerprints uint32) o None si fpcalc no esta

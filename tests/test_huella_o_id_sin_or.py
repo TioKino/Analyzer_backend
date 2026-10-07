@@ -84,4 +84,6 @@ def test_las_columnas_pedidas_incluyen_id():
     """El ayudante deduplica por `id`; sin el en el SELECT daria KeyError."""
     texto = FUENTE.read_text(encoding='utf-8')
     for m in re.finditer(r"_tracks_por_huella_o_id\(\s*c,\s*'([^']+)'", texto):
-        assert 'id' in [x.strip() for x in m.group(1).split(',')], m.group(1)
+        columnas = [x.strip() for x in m.group(1).split(',')]
+        # `*` las trae todas, `id` incluida (`fichas_por_huella`).
+        assert 'id' in columnas or columnas == ['*'], m.group(1)

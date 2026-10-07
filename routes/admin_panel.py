@@ -1632,6 +1632,10 @@ async def telemetry(request: Request):
         # bibliotecas PERSONALES, y por eso enseñaba `rekordbox` mientras al
         # servidor no llegaba ni uno. Esto es lo que de verdad comparten.
         "lo_importado": _resumen_lo_importado(),
+        # Cuánto acierta el DSP: el BPM y la tonalidad MEDIDOS contra lo que
+        # dicen Rekordbox/Traktor/VirtualDJ de la misma huella (desde el
+        # 2026-10-06). La única verdad de referencia que hay a mano.
+        "dsp_frente_a_lo_importado": _dsp_frente_a_lo_importado(),
     }
 
 
@@ -1967,6 +1971,14 @@ def _variante_del_evento(props: dict) -> str:
     if props.get('shazam_tempo') in (True, 1, '1', 'true'):
         sufijo += '+tempo'
     return f"shazam+{base}{sufijo}"
+
+
+def _dsp_frente_a_lo_importado():
+    try:
+        return _get_db().dsp_frente_a_lo_importado(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] DSP frente a lo importado fallo: {e}")
+        return None
 
 
 def _resumen_lo_importado():

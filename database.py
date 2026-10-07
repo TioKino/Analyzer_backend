@@ -2,7 +2,7 @@ import sqlite3
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import re
 import statistics
@@ -392,6 +392,16 @@ class AnalysisDB:
         # 0,02 ms la exacta y 142 ms → ~10 ms la aproximada.
         c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_ficha ON tracks('
                   'artist COLLATE NOCASE, title COLLATE NOCASE, bpm, analyzed_at)')
+        # `filename` y `duration` tampoco tenian, y los dos se buscan en el
+        # camino de CADA analisis (auditoria del flujo de analisis,
+        # 2026-10-02). `/analyze` mira por nombre antes que por huella (el
+        # atajo que exige las dos), y `find_acoustic_cluster` filtra el cluster
+        # por duracion ±2,5 s: dos recorridos de las ~122.000 filas por tema
+        # —83 ms cada uno con 120.000 filas en caliente, en local; en Render la
+        # misma clase de recorrido fue 1 s en caliente y 35 s en frio— y en un
+        # servidor de UN proceso.
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_filename ON tracks(filename)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tracks_duration ON tracks(duration)')
 
         # Lo que dice un programa de DJ (Rekordbox, Traktor, VirtualDJ) de una
         # huella, tal como llega del XML que importó alguien. Un voto por
@@ -1114,11 +1124,15 @@ class AnalysisDB:
         try:
             c = conn.cursor()
             if duration is not None and duration > 0:
+                # `BETWEEN` y no `ABS(duration - ?) <= 2.5`: con la expresion
+                # ningun indice sirve y era un recorrido de la tabla entera
+                # en cada analisis nuevo y cada backfill. Es el mismo
+                # intervalo cerrado.
                 c.execute(
                     'SELECT chromaprint, acoustic_id FROM tracks '
-                    'WHERE chromaprint IS NOT NULL AND acoustic_id IS NOT NULL '
-                    'AND duration IS NOT NULL AND ABS(duration - ?) <= 2.5',
-                    (duration,),
+                    'WHERE duration BETWEEN ? AND ? '
+                    'AND chromaprint IS NOT NULL AND acoustic_id IS NOT NULL',
+                    (duration - 2.5, duration + 2.5),
                 )
             else:
                 c.execute(
@@ -1232,6 +1246,62 @@ class AnalysisDB:
                 vistas.add(r['id'])
                 salida.append(r)
         return salida
+
+    def filas_por_huella(self, fingerprints, columnas: str) -> Dict[str, Dict]:
+        """{huella -> fila} para un lote, en DOS consultas (ver
+        `_tracks_por_huella_o_id`). Una fila casa con la huella por su
+        `fingerprint` o por su `id` (en los registros antiguos el id ES el MD5).
+
+        Lo usa el pre-check (`/check-analyzed-by-fingerprint`), que hasta el
+        2026-10-06 hacía una consulta y una conexión por huella: 500 seguidas
+        en el event loop del único worker por cada lote del móvil."""
+        fps = [f for f in (fingerprints or []) if f]
+        if not fps:
+            return {}
+        if 'fingerprint' not in columnas:
+            columnas = f'{columnas}, fingerprint'
+        if not re.search(r'\bid\b', columnas):
+            columnas = f'id, {columnas}'
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            salida: Dict[str, Dict] = {}
+            # Por trozos: SQLite tiene tope de variables por sentencia.
+            for i in range(0, len(fps), 400):
+                trozo = fps[i:i + 400]
+                pedidas = set(trozo)
+                for r in self._tracks_por_huella_o_id(c, columnas, trozo):
+                    fila = dict(r)
+                    for clave in (fila.get('fingerprint'), fila.get('id')):
+                        if clave in pedidas and clave not in salida:
+                            salida[clave] = fila
+            return salida
+        finally:
+            conn.close()
+
+    def fichas_por_huella(self, fingerprints) -> Dict[str, Dict]:
+        """{huella -> fila de `tracks`} como `get_track_by_fingerprint`, pero
+        para un lote y en dos consultas (por `fingerprint` y por `id`, ver
+        `_tracks_por_huella_o_id`). Si una huella casa con dos filas, gana la
+        que la tiene en `fingerprint`."""
+        fps = [f for f in dict.fromkeys(fingerprints or []) if f]
+        if not fps:
+            return {}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            salida: Dict[str, Dict] = {}
+            for i in range(0, len(fps), 400):
+                trozo = fps[i:i + 400]
+                pedidas = set(trozo)
+                for r in self._tracks_por_huella_o_id(c, '*', trozo):
+                    fila = self._row_to_dict(r)
+                    for clave in (fila.get('fingerprint'), fila.get('id')):
+                        if clave in pedidas and clave not in salida:
+                            salida[clave] = fila
+            return salida
+        finally:
+            conn.close()
 
     def canonical_community_keys(self, fingerprints):
         """Version batch de canonical_community_key: mapa {fingerprint ->
@@ -2659,6 +2729,48 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def registrar_analistas(self, fingerprints, device_id: str) -> int:
+        """`registrar_analista` para un LOTE: el pre-check por huella.
+
+        Quien pregunta por la huella de un fichero lo tiene (la saca del
+        contenido), y si el servidor ya lo tenía analizado el cliente se salta
+        /analyze — o sea que tampoco pasaba por el `registrar_analista` del
+        envoltorio. Hasta el 2026-10-06 la popularidad no contaba a nadie que
+        entrara por ese atajo: el móvil, que va por el pre-check desde el
+        2026-10-02, y el escritorio al reimportar. Una conexión para el lote.
+        Devuelve cuántos DJs nuevos ha sumado."""
+        from datetime import datetime
+        device_id = (device_id or '').strip()
+        fps = [f for f in dict.fromkeys(fingerprints or []) if f]
+        if not fps or not device_id:
+            return 0
+        claves = list(dict.fromkeys(self.canonical_community_keys(fps).values()))
+        now = datetime.utcnow().isoformat()
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            nuevas = []
+            for clave in claves:
+                c.execute('INSERT OR IGNORE INTO track_analyzers '
+                          '(fingerprint, device_id, first_seen) VALUES (?, ?, ?)',
+                          (clave, device_id, now))
+                if c.rowcount:
+                    nuevas.append(clave)
+            for clave in nuevas:
+                c.execute('SELECT COUNT(*) FROM track_analyzers '
+                          'WHERE fingerprint = ?', (clave,))
+                djs = max(1, int((c.fetchone() or [0])[0] or 0))
+                c.execute(
+                    'INSERT INTO track_popularity (fingerprint, analysis_count, '
+                    'dj_count, last_analyzed) VALUES (?, 1, ?, ?) '
+                    'ON CONFLICT(fingerprint) DO UPDATE SET '
+                    'dj_count = excluded.dj_count',
+                    (clave, djs, now))
+            conn.commit()
+            return len(nuevas)
+        finally:
+            conn.close()
+
     def rate_track(self, fingerprint: str, device_id: str, rating: int) -> Dict:
         """La valoración de un DJ: UNA por cuenta. Valorar desde otro aparato
         de la misma cuenta sustituye la anterior, y quitarla la quita de todos.
@@ -2866,6 +2978,155 @@ class AnalysisDB:
             'por_fuente': por_fuente,
         }
 
+    # Las fuentes de `tracks` que son lo MEDIDO sobre el audio (el DSP del
+    # servidor o del motor local), no un tag ni un programa de DJ.
+    FUENTES_DEL_DSP = ('analysis', 'chunked_analysis', 'local_engine')
+
+    # El CAMINO de cada fuente del DSP. En Render un tema de más de 4 minutos
+    # —casi cualquier tema de club— va por trozos y escribe `chunked_analysis`;
+    # los cortos, `analysis`; el motor local lo analiza todo entero. Hasta el
+    # 2026-10-07 la medida solo miraba `analysis`/`local_engine`, o sea que
+    # dejaba fuera justo el camino de la mayoría de los temas.
+    CAMINO_DEL_DSP = {
+        'analysis': 'corto',
+        'chunked_analysis': 'trozos',
+        'local_engine': 'motor_local',
+    }
+
+    @staticmethod
+    def _clase_de_bpm(dsp: float, programa: float) -> Optional[str]:
+        """Cómo se parece el BPM medido al del programa de DJ. `igual` es lo
+        que un DJ no distingue (±0,5); `doble_o_mitad` es el error típico de
+        un detector de tempo, y se cuenta aparte porque pide otro arreglo."""
+        if not dsp or not programa or dsp <= 0 or programa <= 0:
+            return None
+        d = abs(dsp - programa)
+        if d <= 0.5:
+            return 'igual'
+        if d <= 2.0:
+            return 'cerca'
+        r = dsp / programa
+        if abs(r / 2 - 1) <= 0.03 or abs(r * 2 - 1) <= 0.03:
+            return 'doble_o_mitad'
+        return 'otro'
+
+    @staticmethod
+    def _clase_de_tonalidad(dsp: Optional[str], programa: Optional[str]) -> Optional[str]:
+        """Cómo se parece la tonalidad medida a la del programa, en Camelot.
+        `relativa` (8A↔8B) y `quinta` (8A↔7A/9A) son los errores típicos de un
+        detector de tonalidad, y mezclan bien: se cuentan aparte de `otra`."""
+        def partir(c):
+            m = re.match(r'^\s*(\d{1,2})\s*([ABab])\s*$', c or '')
+            return (int(m.group(1)), m.group(2).upper()) if m else None
+        a, b = partir(dsp), partir(programa)
+        if not a or not b:
+            return None
+        if a == b:
+            return 'igual'
+        if a[0] == b[0]:
+            return 'relativa'
+        if a[1] == b[1] and (a[0] - b[0]) % 12 in (1, 11):
+            return 'quinta'
+        return 'otra'
+
+    def dsp_frente_a_lo_importado(self, dias_recientes: int = 30) -> Dict:
+        """El DSP medido contra lo que dicen Rekordbox, Traktor y VirtualDJ de
+        la MISMA huella (auditoría del flujo de análisis, 2026-10-06).
+
+        Hasta ese día no había forma de saber cuánto acierta el análisis: lo
+        importado se usaba para sustituirlo, nunca para medirlo. Es la única
+        verdad de referencia que hay a mano —el BPM y la tonalidad que el DJ
+        tenía ya en su programa— y está en el mismo audio, no en otra versión.
+
+        Solo cuentan las filas de `tracks` cuya fuente es el DSP
+        (`FUENTES_DEL_DSP`): si la fila ya dice `rekordbox` o `id3`, el DSP no
+        está ahí para medirlo. Un valor por huella y campo (el voto más
+        reciente). Se reparte por CAMINO (`por_camino`: corto, trozos, motor
+        local; el #4 de `PENDING.md` es justo comparar el corto con el de
+        trozos, que sacan la tonalidad con algoritmos distintos), por programa, porque las tonalidades de Traktor
+        anteriores al 2026-09-26 salieron con una tabla mala, y aparte lo
+        analizado en los últimos `dias_recientes` (`analyzed_at`): el DSP ha
+        cambiado sin subir `ANALYSIS_VERSION` (la rejilla, el afinado del
+        intervalo), y lo viejo no dice nada del de hoy. Recorre
+        `imported_values` con el cursor y busca las filas de `tracks` por
+        lotes, por índice.
+        """
+        def vacio():
+            return {'comparados': 0, 'igual': 0}
+
+        salida = {campo: {'total': vacio(), 'por_programa': {}, 'recientes': vacio(),
+                          'por_camino': {}}
+                  for campo in ('bpm', 'tonalidad')}
+        salida['dias_recientes'] = dias_recientes
+        desde = (datetime.utcnow() - timedelta(days=dias_recientes)).isoformat()
+
+        def apuntar(campo, programa, clase, reciente, fuente):
+            bloque = salida[campo]
+            camino = bloque['por_camino'].setdefault(
+                self.CAMINO_DEL_DSP.get(fuente, fuente),
+                {'total': vacio(), 'recientes': vacio()})
+            for d in (bloque['total'],
+                      bloque['por_programa'].setdefault(programa, vacio()),
+                      bloque['recientes'] if reciente else None,
+                      camino['total'],
+                      camino['recientes'] if reciente else None):
+                if d is None:
+                    continue
+                d['comparados'] += 1
+                d[clase] = d.get(clase, 0) + 1
+
+        conn = self._open_conn()
+        try:
+            try:
+                cur = conn.execute(
+                    "SELECT fingerprint, field, value, camelot, source, "
+                    "MAX(updated_at) AS cuando FROM imported_values "
+                    "WHERE field IN ('bpm', 'key') GROUP BY fingerprint, field")
+            except sqlite3.OperationalError:
+                return salida
+            c = conn.cursor()
+            while True:
+                lote = cur.fetchmany(400)
+                if not lote:
+                    break
+                fps = list({r['fingerprint'] for r in lote})
+                filas = {}
+                # Las fuentes no son columnas: viven en `analysis_json`.
+                for t in self._tracks_por_huella_o_id(
+                        c, "id, fingerprint, bpm, camelot, analyzed_at, "
+                           "json_extract(analysis_json, '$.bpm_source') AS bpm_source, "
+                           "json_extract(analysis_json, '$.key_source') AS key_source",
+                        fps):
+                    for clave in (t['fingerprint'], t['id']):
+                        if clave and clave not in filas:
+                            filas[clave] = t
+                for r in lote:
+                    t = filas.get(r['fingerprint'])
+                    if t is None:
+                        continue
+                    reciente = (t['analyzed_at'] or '') >= desde
+                    if r['field'] == 'bpm':
+                        if t['bpm_source'] not in self.FUENTES_DEL_DSP:
+                            continue
+                        try:
+                            clase = self._clase_de_bpm(float(t['bpm'] or 0),
+                                                       float(r['value']))
+                        except (TypeError, ValueError):
+                            clase = None
+                        if clase:
+                            apuntar('bpm', r['source'], clase, reciente,
+                                    t['bpm_source'])
+                    else:
+                        if t['key_source'] not in self.FUENTES_DEL_DSP:
+                            continue
+                        clase = self._clase_de_tonalidad(t['camelot'], r['camelot'])
+                        if clase:
+                            apuntar('tonalidad', r['source'], clase, reciente,
+                                    t['key_source'])
+        finally:
+            conn.close()
+        return salida
+
     def lo_importado_de(self, fingerprints, exacta: Optional[str] = None) -> Dict:
         """Lo que los programas de DJ dicen de estas huellas (las versiones de
         un mismo sonido), listo para competir en el ranking.
@@ -3023,6 +3284,43 @@ class AnalysisDB:
             'contributors': len(grupo),
             'validated': False,
         }
+
+    def get_community_beat_grids(self, fingerprints) -> Dict[str, Dict]:
+        """`get_community_beat_grid` para un LOTE, y solo lo VALIDADO: {huella
+        -> rejilla} de las que tres cuentas comparten. Lo pide el import de
+        escritorio, que hasta el 2026-10-06 hacía un GET por tema nuevo — con
+        el pre-check acertando, cientos seguidos y sin esperar a ninguno.
+
+        Casi ninguna huella tiene correcciones: una consulta (por el índice de
+        `fingerprint, device_id`) dice cuáles, y el cálculo por cuenta solo se
+        hace para esas."""
+        fps = [f for f in dict.fromkeys(fingerprints or []) if f]
+        if not fps:
+            return {}
+        canon = self.canonical_community_keys(fps)
+        claves = list(dict.fromkeys(canon.values()))
+        conn = self._open_conn()
+        try:
+            con_algo = set()
+            for i in range(0, len(claves), 400):
+                trozo = claves[i:i + 400]
+                con_algo.update(r[0] for r in conn.execute(
+                    'SELECT DISTINCT fingerprint FROM beat_grid_corrections '
+                    f'WHERE fingerprint IN ({",".join("?" * len(trozo))})', trozo))
+        finally:
+            conn.close()
+        salida = {}
+        calculadas = {}
+        for fp in fps:
+            clave = canon.get(fp, fp)
+            if clave not in con_algo:
+                continue
+            if clave not in calculadas:
+                calculadas[clave] = self.get_community_beat_grid(clave)
+            rejilla = calculadas[clave]
+            if rejilla.get('validated'):
+                salida[fp] = rejilla
+        return salida
 
     # ==================== COMMUNITY OVERRIDES GENERICOS (Fase 4) ====================
     # Sistema unificado para CUALQUIER campo categorico: track_type, key,

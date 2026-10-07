@@ -25,7 +25,13 @@ from typing import Dict, List, Optional, Tuple
 # La rejilla (fase + downbeat) vive aparte y la comparten los dos caminos de
 # analisis. El cliente lleva el MISMO algoritmo en beat_grid_detector.dart: si
 # tocas uno, toca el otro.
-from beat_grid import fit_beat_grid, onset_envelope as beat_grid_onset_envelope
+from beat_grid import onset_envelope as beat_grid_onset_envelope
+# Lo que este camino tiene que calcular IGUAL que el corto (`main.analyze_audio`):
+# el BPM y su doble/mitad, la rejilla, el groove, el tipo de track, los graves,
+# los pads, la percusion y el genero espectral. Ver el docstring del modulo.
+from rasgos_del_tema import (HOP, pulso_de_beats, rasgos_espectrales,
+                             rejilla_y_bpm, tempo_y_beats, tempograma,
+                             try_bpm_double_half)
 import warnings
 import gc
 
@@ -37,16 +43,6 @@ try:
 except ImportError:
     LIBROSA_AVAILABLE = False
     logger.warning("Librosa no disponible")
-
-try:
-    # Normalizador de octava canonico compartido ([60,180], colapsa
-    # halftime/doubletime). Mismo helper que usa el consenso comunitario
-    # (main.py), para que el BPM del analisis y el del consenso usen UNA
-    # sola politica de octava. Guardado por si bpm_utils arrastra librosa
-    # en un entorno sin libreria (degradacion, no crash de import).
-    from bpm_utils import normalize_bpm_to_canonical
-except Exception:  # pragma: no cover - solo si falta librosa
-    normalize_bpm_to_canonical = None
 
 try:
     from audio_helpers import silence_native_stderr, beat_track_seguro
@@ -62,34 +58,6 @@ except ImportError:
         # Sin `audio_helpers` no hay guarda, pero tampoco se cambia el
         # comportamiento: el `except` del llamador sigue siendo la red.
         return librosa.beat.beat_track(y=y, sr=sr, **kwargs)
-
-
-def _normalize_bpm_octave(bpm) -> Optional[float]:
-    """Colapsa un BPM al rango canonico [60, 180] (octava).
-
-    Delega en `bpm_utils.normalize_bpm_to_canonical` cuando esta disponible
-    (fuente unica de verdad, compartida con el consenso comunitario). Si el
-    helper no se pudo importar, replica su semantica con un fallback puro.
-    Devuelve None para valores no normalizables (<= 0, NaN, Inf), para que el
-    chunk no contamine la votacion ponderada.
-    """
-    if normalize_bpm_to_canonical is not None:
-        try:
-            return normalize_bpm_to_canonical(bpm)
-        except (ValueError, TypeError):
-            return None
-    # Fallback puro (mismo rango [60,180] que bpm_utils).
-    try:
-        value = float(bpm)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(value) or math.isinf(value) or value <= 0:
-        return None
-    while value < 60:
-        value *= 2
-    while value > 180:
-        value /= 2
-    return round(value, 1)
 
 
 # ==================== CONFIGURACIÓN ====================
@@ -229,37 +197,6 @@ class ChunkedAudioAnalyzer:
                     except OSError:
                         pass
     
-    def analyze_chunk_bpm(self, y: np.ndarray, sr: int) -> Dict:
-        """Analiza BPM de un chunk."""
-        try:
-            # `beat_track_seguro`, no `librosa.beat.beat_track` a pelo. Aqui el
-            # fallo de `trim` caia en el `except` de abajo y devolvia **120 BPM
-            # de default**: un chunk sin percusion —una intro ambiental, un
-            # breakdown largo— metia un numero inventado en el BPM agregado del
-            # track, y no quedaba ni un error en ningun sitio.
-            tempo, beats = beat_track_seguro(y, sr)
-            tempo = float(tempo) if not isinstance(tempo, np.ndarray) else float(tempo[0])
-            
-            # Calcular confianza basada en regularidad de beats
-            if len(beats) > 1:
-                beat_times = librosa.frames_to_time(beats, sr=sr)
-                intervals = np.diff(beat_times)
-                confidence = max(0, min(1, 1.0 - np.std(intervals) * 2))
-            else:
-                confidence = 0.3
-            
-            return {
-                'bpm': tempo,
-                'confidence': confidence,
-                'beat_count': len(beats)
-            }
-        except Exception as e:
-            # Generico (como analyze_chunk_key): librosa levanta ParameterError,
-            # subclase de Exception pero NO de ValueError/TypeError/RuntimeError.
-            # Un chunk malo devuelve default, no tumba el analisis del track.
-            logger.warning(f"Error BPM chunk: {type(e).__name__}: {e}")
-            return {'bpm': 120.0, 'confidence': 0.0, 'beat_count': 0}
-    
     def analyze_chunk_key(self, y: np.ndarray, sr: int) -> Dict:
         """Analiza key/tonalidad de un chunk."""
         # Guard contra chunks vacios o demasiado cortos. chroma_cqt necesita
@@ -351,77 +288,6 @@ class ChunkedAudioAnalyzer:
         except Exception as e:  # generico: ver analyze_chunk_key (ParameterError)
             logger.warning(f"Error Energy chunk: {type(e).__name__}: {e}")
             return {'energy_mean': 0.1, 'energy_curve': []}
-    
-    def analyze_chunk_spectral(self, y: np.ndarray, sr: int) -> Dict:
-        """Analiza características espectrales de un chunk."""
-        try:
-            centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-            rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
-            
-            # Onset strength para densidad de percusión
-            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-            
-            return {
-                'centroid_mean': float(np.mean(centroid)),
-                'centroid_std': float(np.std(centroid)),
-                'rolloff_mean': float(np.mean(rolloff)),
-                'rolloff_std': float(np.std(rolloff)),
-                'onset_strength_mean': float(np.mean(onset_env)),
-                'has_heavy_bass': float(np.mean(centroid)) < 2500,
-                'has_pads': float(np.std(rolloff)) < 1500
-            }
-        except Exception as e:  # generico: ver analyze_chunk_key (ParameterError)
-            logger.warning(f"Error Spectral chunk: {type(e).__name__}: {e}")
-            return {'centroid_mean': 3000, 'has_heavy_bass': False, 'has_pads': False}
-    
-    def fuse_bpm_results(self, chunk_results: List[Dict]) -> Dict:
-        """
-        Fusiona resultados de BPM de múltiples chunks usando votación ponderada.
-        """
-        if not chunk_results:
-            return {'bpm': 120.0, 'confidence': 0.0}
-        
-        # Filtrar BPMs en rango válido para electrónica
-        valid_results = [r for r in chunk_results if 60 <= r['bpm'] <= 200 and r['confidence'] > 0.1]
-        
-        if not valid_results:
-            valid_results = chunk_results
-        
-        # Normalizar armonicos al rango canonico [60, 180] colapsando
-        # octavas (halftime/doubletime) ANTES de promediar, para que
-        # chunks que leyeron el mismo track a distinta octava voten juntos.
-        #
-        # ANTES habia un umbral inline `bpm > 170: bpm /= 2` que partia el
-        # Drum & Bass: 174 BPM -> 87 BPM. Ademas divergia del normalizador
-        # del consenso comunitario (que ya usa [60,180]). Ahora ambos caminos
-        # comparten `normalize_bpm_to_canonical`, que preserva DnB (170-180).
-        normalized = []
-        for r in valid_results:
-            raw = r['bpm']
-            bpm = _normalize_bpm_octave(raw)
-            if bpm is None:
-                # bpm <= 0 / NaN / Inf en este chunk: no vota.
-                continue
-            normalized.append({'bpm': bpm, 'confidence': r['confidence']})
-
-        if not normalized:
-            return {'bpm': 120.0, 'confidence': 0.0, 'source': 'chunked_analysis'}
-
-        # Votación ponderada por confianza
-        total_weight = sum(r['confidence'] for r in normalized)
-        if total_weight > 0:
-            weighted_bpm = sum(r['bpm'] * r['confidence'] for r in normalized) / total_weight
-        else:
-            weighted_bpm = np.median([r['bpm'] for r in normalized])
-        
-        # Confianza final = promedio de confianzas
-        avg_confidence = np.mean([r['confidence'] for r in normalized])
-        
-        return {
-            'bpm': round(weighted_bpm, 1),
-            'confidence': round(avg_confidence, 3),
-            'source': 'chunked_analysis'
-        }
     
     def fuse_key_results(self, chunk_results: List[Dict], energy_weights: List[float] = None) -> Dict:
         """
@@ -876,51 +742,43 @@ class ChunkedAudioAnalyzer:
         
         return cleaned
     
-    def calculate_beat_grid(self, bpm: float, onset=None, onset_fps=None) -> Dict:
-        """Rejilla de beats: intervalo, FASE y DOWNBEAT.
+    def _rasgos_del_trozo(self, y: np.ndarray, sr: int) -> Dict:
+        """Lo de este trozo que hace falta para el tema entero, frame a frame
+        (hop 512): las MISMAS llamadas que hace el camino corto con el tema
+        entero, para coserlas y sacar las mismas cuentas.
 
-        Con `onset` se busca donde cae de verdad el primer beat. Sin el se
-        devuelve lo unico que se puede decir sin mirar el audio —el intervalo—
-        y `first_beat` queda a 0, que es lo que hacia SIEMPRE esta funcion
-        hasta el 2026-09-18: nadie le pasaba nunca el offset y el parametro
-        existia solo de adorno.
-
-        `fit_beat_grid` devuelve None cuando no hay pulso que medir (ambient,
-        una grabacion de voz). Ahi tambien se cae al 0: una fase inventada
-        mueve la rejilla a un sitio que no es y el usuario deja de fiarse.
+        - `onset`: la envolvente de siempre (media), para la rejilla, el
+          doble/mitad y la percusion.
+        - `onset_med` y `tg`: la envolvente con mediana y su tempograma, que
+          es con lo que `librosa.beat.beat_track` decide el tempo.
+        - `centroid`, `rolloff`: genero y pads.
+        - `bass`, `mid`, `treble`: las bandas del clasificador espectral.
         """
-        beat_interval = 60.0 / bpm if bpm > 0 else 0.5
-        first_beat = 0.0
-        confidence = 0.0
-
-        if onset is not None and onset_fps and bpm > 0:
-            try:
-                fit = fit_beat_grid(onset, onset_fps, bpm)
-                if fit:
-                    first_beat = fit['first_beat']
-                    beat_interval = fit['beat_interval']
-                    confidence = fit['confidence']
-                    logger.info(
-                        f"[BeatGrid] first_beat={first_beat:.3f}s "
-                        f"iv={beat_interval:.5f}s downbeat={fit['downbeat_index']} "
-                        f"conf={confidence:.2f}"
-                    )
-                else:
-                    logger.info("[BeatGrid] sin pulso claro; rejilla sin fase")
-            except Exception as e:
-                logger.warning(f"[BeatGrid] fallo la fase ({type(e).__name__}): {e}")
-
+        from spectral_classifier import bandas_de_audio
+        onset = librosa.onset.onset_strength(y=y, sr=sr)
+        onset_med = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
+        bandas = bandas_de_audio(y, sr)
+        vacio = np.zeros(0, dtype=np.float32)
         return {
-            'first_beat': first_beat,
-            'beat_interval': round(beat_interval, 6),
-            'beat_confidence': confidence,
-            'bpm': bpm
+            'onset': onset,
+            'onset_med': onset_med,
+            'tg': tempograma(onset_med, sr),
+            'centroid': librosa.feature.spectral_centroid(y=y, sr=sr)[0],
+            'rolloff': librosa.feature.spectral_rolloff(y=y, sr=sr)[0],
+            'bass': bandas[0] if bandas else vacio,
+            'mid': bandas[1] if bandas else vacio,
+            'treble': bandas[2] if bandas else vacio,
         }
-    
-    def full_analysis(self, file_path: str) -> Dict:
+
+    def full_analysis(self, file_path: str,
+                      bpm_etiqueta: Optional[float] = None) -> Dict:
         """
         Análisis completo por chunks.
-        
+
+        `bpm_etiqueta`: el BPM de las etiquetas del fichero. Manda como en el
+        camino corto (si está entre 60 y 200): sin doble/mitad y sin afinarlo
+        con la rejilla.
+
         Returns:
             Dict con todos los resultados del análisis
         """
@@ -930,24 +788,39 @@ class ChunkedAudioAnalyzer:
         duration = self.get_audio_duration(file_path)
         logger.info(f"Duracion: {duration:.1f}s ({duration/60:.1f} min)")
         
-        # Calcular chunks necesarios
+        # Trozos que empiezan en un frame EXACTO (multiplo de 512 muestras).
+        #
+        # Con 55 s de paso, cada trozo empezaba en 4737,3 frames: al coser las
+        # envolventes por frames enteros se perdian 3,4 ms por trozo, que se
+        # ACUMULABAN — ~20 ms a lo largo de un tema de 6 minutos, una
+        # compresion del eje de tiempo que la rejilla leia como otro tempo
+        # (128,01 en vez de 128,00) y que movia su fase. Con el paso en frames
+        # enteros, el frame j de cada trozo es exactamente el frame
+        # `inicio/512 + j` del tema.
+        paso_muestras = int(round(
+            (self.chunk_duration - self.chunk_overlap) * self.sr / HOP)) * HOP
+        paso_frames = paso_muestras // HOP
+        paso_s = paso_muestras / self.sr
+        # Cada trozo aporta desde la MITAD de su solape con el anterior hasta
+        # la mitad del solape con el siguiente: sus bordes (donde librosa
+        # rellena y la envolvente se inventa un golpe) se quedan fuera.
+        medio_solape = int(round(self.chunk_overlap * self.sr / HOP)) // 2
+
         chunk_starts = []
-        current_start = 0
-        
-        while current_start < duration:
-            chunk_starts.append(current_start)
-            current_start += self.chunk_duration - self.chunk_overlap
-        
+        while len(chunk_starts) * paso_s < duration:
+            chunk_starts.append(len(chunk_starts) * paso_s)
+
         num_chunks = len(chunk_starts)
         logger.info(f"Procesando {num_chunks} chunks de {self.chunk_duration}s")
         
         # Resultados por chunk
-        bpm_results = []
         key_results = []
         energy_results = []
-        spectral_results = []
-        onset_partes = []
-        onset_fps = None
+        cosido = {k: [] for k in ('onset', 'onset_med', 'centroid', 'rolloff',
+                                  'bass', 'mid', 'treble')}
+        suma_tg = None
+        frames_tg = 0
+        sr = self.sr
         
         # Procesar cada chunk
         for i, start_time in enumerate(chunk_starts):
@@ -969,33 +842,22 @@ class ChunkedAudioAnalyzer:
                 continue
 
             # Analizar chunk
-            bpm_result = self.analyze_chunk_bpm(y, sr)
-            key_result = self.analyze_chunk_key(y, sr)
-            energy_result = self.analyze_chunk_energy(y, sr, start_time)
-            spectral_result = self.analyze_chunk_spectral(y, sr)
-            
-            bpm_results.append(bpm_result)
-            key_results.append(key_result)
-            energy_results.append(energy_result)
-            spectral_results.append(spectral_result)
+            key_results.append(self.analyze_chunk_key(y, sr))
+            energy_results.append(self.analyze_chunk_energy(y, sr, start_time))
 
-            # Envolvente de onset del track ENTERO, cosida chunk a chunk. Sale
-            # gratis: el audio ya esta cargado aqui y se tira a la linea
-            # siguiente. Es lo que necesita la fase de la rejilla, y sin esto
-            # habria que volver a leer el fichero.
-            #
-            # Se recorta el solape para no coser dos veces el mismo trozo: un
-            # tramo repetido desplazaria el histograma de fase hacia ese trozo.
+            # Lo que se cose: frame a frame, sin el solape repetido.
             try:
-                env, env_fps = beat_grid_onset_envelope(y, sr)
-                if onset_fps is None:
-                    onset_fps = env_fps
-                if i < num_chunks - 1:
-                    utiles = int(round((self.chunk_duration - self.chunk_overlap) * env_fps))
-                    env = env[:max(0, utiles)]
-                onset_partes.append(env)
-            except Exception as e:
-                logger.debug(f"[BeatGrid] onset del chunk {i+1} descartado: {e}")
+                r = self._rasgos_del_trozo(y, sr)
+                desde = 0 if i == 0 else medio_solape
+                hasta = None if i == num_chunks - 1 else paso_frames + medio_solape
+                for k in cosido:
+                    cosido[k].append(np.asarray(r[k])[desde:hasta])
+                tg = r['tg'][:, desde:hasta]
+                suma_tg = tg.sum(axis=1) if suma_tg is None else suma_tg + tg.sum(axis=1)
+                frames_tg += tg.shape[1]
+                del r, tg
+            except Exception as e:  # noqa: BLE001 - un trozo malo no tumba el tema
+                logger.warning(f"[Chunk {i+1}] rasgos descartados: {type(e).__name__}: {e}")
             
             # ⚡ CRÍTICO: Liberar memoria del chunk
             del y
@@ -1004,9 +866,27 @@ class ChunkedAudioAnalyzer:
         # ==================== FUSIÓN DE RESULTADOS ====================
         
         logger.info("Fusionando resultados...")
-        
-        # BPM final
-        bpm_final = self.fuse_bpm_results(bpm_results)
+        f = {k: (np.concatenate(v) if v else np.zeros(0, dtype=np.float32))
+             for k, v in cosido.items()}
+        fps = sr / HOP
+
+        # BPM: como el camino corto. El tempo del tema entero (la media del
+        # tempograma de todos los trozos), los beats sobre la envolvente cosida,
+        # la confianza y el groove con ellos, el doble/mitad si la confianza es
+        # baja, y despues la rejilla. Hasta el 2026-10-06 era la media de los
+        # BPM de cada trozo, sin doble/mitad y con groove y swing fijos a 0,5.
+        tempo, beats = tempo_y_beats(f['onset_med'], suma_tg if suma_tg is not None
+                                     else np.zeros(1), frames_tg, sr)
+        bpm_confidence, groove_score, swing_factor = pulso_de_beats(beats, sr)
+        bpm = float(tempo)
+        bpm_source = 'chunked_analysis' if bpm > 0 else ''
+        if bpm_etiqueta and 60 < bpm_etiqueta < 200:
+            bpm = float(bpm_etiqueta)
+            bpm_source = 'id3'
+        if bpm_source == 'chunked_analysis':
+            bpm = try_bpm_double_half(None, sr, bpm, bpm_confidence, onset_env=f['onset'])
+        first_beat, beat_interval, bpm = rejilla_y_bpm(
+            f['onset'], fps, bpm, bpm_del_dsp=(bpm_source == 'chunked_analysis'))
         
         # Key final (ponderado por energía de cada chunk)
         energy_weights = [r.get('energy_mean', 0.5) for r in energy_results]
@@ -1021,26 +901,9 @@ class ChunkedAudioAnalyzer:
         # Cue points automaticos deshabilitados - el usuario los pone a mano
         cue_points = []
         
-        # Beat grid: fase + downbeat REALES sobre la envolvente cosida.
-        #
-        # Hasta el 2026-09-18 esto era `calculate_beat_grid(bpm)`, que devolvia
-        # `first_beat: 0.0` sin mirar el audio — o sea que TODO lo que pasa de
-        # 4 minutos (casi cualquier tema de club) salia con la rejilla anclada
-        # al segundo 0 del fichero. El usuario tenia que dar al tap siempre.
-        beat_grid = self.calculate_beat_grid(
-            bpm_final['bpm'],
-            onset=np.concatenate(onset_partes) if onset_partes else None,
-            onset_fps=onset_fps,
-        )
-        
         # Energía DJ (1-10)
-        energy_mean = np.mean([r.get('energy_mean', 0.1) for r in energy_results])
+        energy_mean = np.mean([r.get('energy_mean', 0.1) for r in energy_results]) if energy_results else 0.1
         energy_dj = self._calculate_energy_dj(energy_mean)
-        
-        # Características espectrales agregadas
-        has_heavy_bass = sum(1 for r in spectral_results if r.get('has_heavy_bass')) > len(spectral_results) / 2
-        has_pads = sum(1 for r in spectral_results if r.get('has_pads')) > len(spectral_results) / 2
-        percussion_density = np.mean([r.get('onset_strength_mean', 0.5) for r in spectral_results]) / 10
         
         # Energía inicio/fin para mix
         if energy_results:
@@ -1048,22 +911,23 @@ class ChunkedAudioAnalyzer:
             mix_energy_end = energy_results[-1].get('energy_mean', 0.5)
         else:
             mix_energy_start = mix_energy_end = 0.5
-        
-        # Track type — Fase 1 v2: el classifier devuelve dict con confidence
-        # + alternativas. Mantenemos compatibilidad: aún exportamos `track_type`
-        # como string (igual que antes) y añadimos los campos nuevos.
-        classification = self._classify_track_type(energy_dj / 10, structure, duration)
-        track_type = classification['type']
-        track_type_confidence = classification['confidence']
-        track_type_alternatives = classification['alternatives']
 
-        logger.info(f"BPM: {bpm_final['bpm']} | Key: {key_final['key']}/{key_final['camelot']} | Energy: {energy_dj}/10")
+        # Tipo, graves, pads, percusion y genero: las cuentas del camino corto
+        # sobre lo cosido (`rasgos_espectrales`).
+        rasgos = rasgos_espectrales(
+            bpm=bpm, energy_normalized=energy_dj / 10, segments=structure,
+            duration=duration, onset_env=f['onset'] if len(f['onset']) else np.zeros(1),
+            spectral_centroid=f['centroid'] if len(f['centroid']) else np.zeros(1),
+            rolloff=f['rolloff'] if len(f['rolloff']) else np.zeros(1),
+            bandas=(f['bass'], f['mid'], f['treble']) if len(f['bass']) else None)
+
+        logger.info(f"BPM: {bpm} | Key: {key_final['key']}/{key_final['camelot']} | Energy: {energy_dj}/10")
         
         return {
             'duration': duration,
-            'bpm': bpm_final['bpm'],
-            'bpm_confidence': bpm_final['confidence'],
-            'bpm_source': 'chunked_analysis',
+            'bpm': bpm,
+            'bpm_confidence': bpm_confidence,
+            'bpm_source': bpm_source,
             'key': key_final['key'],
             'camelot': key_final['camelot'],
             'key_confidence': key_final['confidence'],
@@ -1073,8 +937,8 @@ class ChunkedAudioAnalyzer:
             'energy_dj': energy_dj,
             'mix_energy_start': mix_energy_start,
             'mix_energy_end': mix_energy_end,
-            'groove_score': 0.5,  # TODO: Calcular desde beat intervals
-            'swing_factor': 0.5,
+            'groove_score': groove_score,
+            'swing_factor': swing_factor,
             'has_intro': structure['has_intro'],
             'has_buildup': structure['has_buildup'],
             'has_drop': structure['has_drop'],
@@ -1082,16 +946,19 @@ class ChunkedAudioAnalyzer:
             'has_outro': structure['has_outro'],
             'structure_sections': structure['sections'],
             'drop_timestamp': structure['drop_timestamp'],
-            'track_type': track_type,
-            'track_type_confidence': track_type_confidence,
-            'track_type_alternatives': track_type_alternatives,
-            'has_vocals': False,  # Desactivado (muchos falsos positivos)
-            'has_heavy_bass': has_heavy_bass,
-            'has_pads': has_pads,
-            'percussion_density': min(percussion_density, 1.0),
+            'track_type': rasgos['track_type'],
+            'track_type_confidence': rasgos['track_type_confidence'],
+            'track_type_alternatives': rasgos['track_type_alternatives'],
+            'genre': rasgos['genre'],
+            # Las voces no se miden en ningun camino: el detector que habia
+            # decia que si a casi cualquier tema con agudos (ver `main`).
+            'has_vocals': False,
+            'has_heavy_bass': rasgos['has_heavy_bass'],
+            'has_pads': rasgos['has_pads'],
+            'percussion_density': rasgos['percussion_density'],
             'cue_points': cue_points,
-            'first_beat': beat_grid['first_beat'],
-            'beat_interval': beat_grid['beat_interval'],
+            'first_beat': first_beat,
+            'beat_interval': round(beat_interval, 6),
             'analyzer': 'chunked_librosa'
         }
     
@@ -1115,62 +982,6 @@ class ChunkedAudioAnalyzer:
         energy_dj = int(round(1 + powered * 9))
         return max(1, min(10, energy_dj))
     
-    def _classify_track_type(self, energy_normalized: float, structure: Dict, duration: float) -> dict:
-        """Clasifica el tipo de track devolviendo dict con confidence + alternativas.
-
-        Mismo shape y semantica que `main.classify_track_type` (Fase 1 v2):
-        scoring acumulado -> margin top-1/top-2 -> confidence (0..1). Mantener
-        en sync con la version del flujo no-chunked si se modifica una.
-
-        Cambio cosmetico vs. la version anterior: usamos 'peak_time' en lugar
-        de 'peak' para alinearnos con el resto del backend (Beatport hints,
-        history_screen ya acepta ambos via fall-through).
-        """
-        scores = {'warmup': 0.0, 'peak_time': 0.0, 'closing': 0.0}
-
-        if energy_normalized < 0.5 and structure['has_intro']:
-            scores['warmup'] += 1.0
-        if energy_normalized < 0.4 and structure['has_intro']:
-            scores['warmup'] += 0.5
-        if energy_normalized > 0.7 and structure['has_drop']:
-            scores['peak_time'] += 1.0
-        if energy_normalized > 0.8 and structure['has_drop']:
-            scores['peak_time'] += 0.5
-        if structure['has_outro'] and duration > 300:
-            scores['closing'] += 1.0
-        if structure['has_outro'] and duration > 420:
-            scores['closing'] += 0.3
-        if energy_normalized > 0.6:
-            scores['peak_time'] += 0.2
-        elif energy_normalized < 0.5:
-            scores['warmup'] += 0.2
-
-        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-        winner_type, winner_score = sorted_scores[0]
-        second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
-
-        if winner_score == 0.0:
-            winner_type = 'peak_time' if energy_normalized > 0.6 else 'warmup'
-            confidence = 0.0
-        else:
-            margin = winner_score - second_score
-            confidence = min(1.0, margin / max(winner_score, 0.5))
-
-        return {
-            'type': winner_type,
-            'confidence': round(confidence, 2),
-            'alternatives': [
-                {'type': t, 'score': round(s, 2)} for t, s in sorted_scores
-            ],
-            'reason': (
-                f"energy={energy_normalized:.2f} duration={duration:.0f} "
-                f"intro={structure['has_intro']} drop={structure['has_drop']} "
-                f"outro={structure['has_outro']}"
-            ),
-            'source': 'waveform',
-        }
-
-
 def get_chunked_analyzer(chunk_duration: int = 60) -> ChunkedAudioAnalyzer:
     """Factory function para obtener el analizador."""
     return ChunkedAudioAnalyzer(chunk_duration=chunk_duration)

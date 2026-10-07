@@ -44,6 +44,9 @@ QUÉ HACE DISTINTO
   Todo sobre señal sintética, ver `tests/test_beat_grid.py`.
 * **Downbeat**: se suma la fuerza del onset en los beats de cada residuo mod 4
   y gana el más fuerte.
+* **El BPM que se guarda sale del intervalo afinado** (`bpm_de_la_rejilla`,
+  desde el 2026-10-06) cuando lo midió el DSP: el de librosa es el bin de su
+  tempograma, que en la zona de club se va más de un BPM (129,20 para un 128).
 
 El cliente lleva el MISMO algoritmo en `lib/services/beat_grid_detector.dart`,
 sobre las bandas del espectro que ya tiene cacheadas. Es a propósito: así un
@@ -286,6 +289,37 @@ def fit_beat_grid(onset: Sequence[float], fps: float, bpm: float,
         "confidence": round(float(confianza), 3),
         "downbeat_index": downbeat,
     }
+
+
+def bpm_de_la_rejilla(bpm: float, beat_interval: Optional[float]) -> float:
+    """El BPM que dice el intervalo AFINADO, a centésimas. Si no hay intervalo
+    que creer, el mismo `bpm` de entrada.
+
+    librosa no mide el tempo: lo elige de una rejilla de candidatos (los bins
+    del tempograma), y con `sr=44100` y `hop=512` esos bins van separados más
+    de un BPM en la zona de club. Un tema a 128 sale 129,20; uno a 127, 126,05;
+    uno a 150, 152,00 (medido sobre señal sintética, `test_bpm_de_la_rejilla`).
+    `fit_beat_grid` ya afinaba el intervalo con esa misma señal y lo recuperaba
+    —128,001 · 126,999 · 149,999—, pero solo se usaba para dibujar la rejilla:
+    el BPM que se guarda, se enseña, se compara para mezclar y se exporta al
+    XML de Rekordbox seguía siendo el de librosa. Hasta el 2026-10-06.
+
+    Solo se acepta un intervalo dentro de lo que el afinado puede mover
+    (`TOL_INTERVALO` alrededor de 60/BPM): fuera de eso no es el mismo tempo
+    afinado, es otra cosa, y manda el de entrada. Cuando el afinado no se fía
+    (`MIN_PICO_INTERVALO`) el intervalo vuelve sin tocar, así que esto devuelve
+    el mismo BPM.
+
+    **Solo para un BPM que midió el DSP.** Uno de las etiquetas, de un
+    programa de DJ o del consenso lo fijó alguien, y manda su número.
+    """
+    if not bpm or bpm <= 0 or not beat_interval or beat_interval <= 0:
+        return bpm
+    medido = 60.0 / float(beat_interval)
+    # El intervalo llega redondeado a micro-segundos: un pelo de margen.
+    if abs(medido - bpm) / bpm > TOL_INTERVALO * 1.001:
+        return bpm
+    return round(medido, 2)
 
 
 def onset_envelope(y, sr, hop_length: int = 512):

@@ -20,6 +20,7 @@ import os
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,26 @@ async def get_community_beat_grid(fingerprint: str):
     except Exception as e:
         logger.error(f"[Community] Error fetching beat grid: {e}")
         return {"bpm_adjust": 0.0, "beat_offset": 0.0, "contributors": 0, "validated": False}
+
+class BeatGridBatchRequest(BaseModel):
+    fingerprints: List[str]
+
+
+@community_router.post("/community/beat-grid/batch")
+async def get_community_beat_grids(req: BeatGridBatchRequest):
+    """Las rejillas de la comunidad de varios temas en UNA llamada, solo las
+    VALIDADAS (tres cuentas que coinciden): {huella: {bpm_adjust,
+    beat_offset, contributors, validated, original_bpm}}. Lo usa el import de
+    escritorio, que pedía una por tema nuevo. Máximo 500."""
+    fps = req.fingerprints or []
+    if len(fps) > 500:
+        raise HTTPException(400, "Máximo 500 fingerprints por petición")
+    try:
+        return {"rejillas": await run_in_threadpool(
+            db.get_community_beat_grids, fps)}
+    except Exception as e:
+        logger.error(f"[Community] Error beat grid batch: {e}")
+        return {"rejillas": {}}
 
 # ==================== COMMUNITY OVERRIDES (Fase 4 - generico) ====================
 # Sistema unificado de votos comunitarios para CUALQUIER campo categorico:

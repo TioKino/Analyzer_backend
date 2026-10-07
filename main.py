@@ -33,7 +33,12 @@ import numpy as np
 # Rejilla de beats (intervalo + fase + downbeat). Modulo propio y compartido
 # con el analizador por chunks; el cliente lleva el mismo algoritmo en
 # lib/services/beat_grid_detector.dart.
-from beat_grid import fit_beat_grid, onset_envelope as beat_grid_onset_envelope
+# Lo que los dos caminos de /analyze calculan con las mismas cuentas (el corto
+# aqui, el de trozos en `chunked_analyzer`). Se importan con su nombre de
+# siempre: hay tests y llamadas que los piden a `main`.
+from rasgos_del_tema import (try_bpm_double_half, classify_track_type,
+                             pulso_de_beats, rasgos_espectrales,
+                             rejilla_y_bpm, HOP as HOP_RASGOS)
 import sys
 import tempfile
 import os
@@ -132,7 +137,7 @@ if _os_log.getenv('QUIET_ASSET_LOGS', '1') not in ('0', 'false', 'False'):
 
 from pydantic import BaseModel
 from audio_helpers import silence_native_stderr, beat_track_seguro
-from spectral_genre_classifier import classify_genre_advanced
+from spectral_genre_classifier import classify_genre_advanced  # noqa: F401 (compat)
 from config import (
     AUDD_API_TOKEN,
     AUDD_AUTO_ENABLED,
@@ -521,19 +526,24 @@ def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
         data = resp.json()
     except (requests.Timeout, requests.RequestException, ValueError):
         return None
+    return data if _ficha_de_render_vale(data) else None
 
-    # Validar que NO es un fallback "failed" (bpm=0, key=null,
-    # analysis_status='failed'). Si lo es, mejor analizar local
-    # de cero — el motor local ya tiene librosa OK aquí.
+
+def _ficha_de_render_vale(data) -> bool:
+    """¿Le sirve al motor local esta ficha de Render? No si es un fallback
+    fallido (bpm 0, sin tonalidad, `analysis_status='failed'`): el motor local
+    tiene librosa y lo hace mejor. Ni si es de otra versión de análisis."""
+    if not isinstance(data, dict):
+        return False
     try:
         bpm_val = float(data.get('bpm') or 0)
     except (TypeError, ValueError):
         bpm_val = 0
     key_val = (data.get('key') or '').strip() if data.get('key') else ''
     if bpm_val <= 0 or not key_val:
-        return None
+        return False
     if data.get('analysis_status') == 'failed':
-        return None
+        return False
     # Si Render tiene una versión antigua del análisis, mejor re-analizar local
     if (data.get('analysis_version') or '1') != ANALYSIS_VERSION:
         logger.info(
@@ -541,8 +551,67 @@ def _fetch_render_cache(fingerprint: str) -> Optional[dict]:
             f"({data.get('analysis_version') or 'NULL'} != {ANALYSIS_VERSION}), "
             f"re-analizando local"
         )
-        return None
-    return data
+        return False
+    return True
+
+
+def _fichas_en_render(fingerprints) -> dict:
+    """Las fichas que Render tiene de un lote de huellas que el motor local
+    no tiene, y que valen aquí (`_ficha_de_render_vale`). UNA petición por
+    cada 100, no un GET por huella. Si Render no contesta, lanza: el endpoint
+    lo trata como «Render no sabe» y el cliente pide la ficha de una en una o
+    analiza, que es la dirección segura."""
+    fps = [f for f in (fingerprints or []) if f and len(f) >= 16]
+    salida: dict = {}
+    for i in range(0, len(fps), 100):
+        resp = requests.post(
+            f"{RENDER_BACKEND_URL}/analysis/by-fingerprint/batch",
+            json={'fingerprints': fps[i:i + 100]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        fichas = (resp.json() or {}).get('fichas') or {}
+        for fp, ficha in fichas.items():
+            if _ficha_de_render_vale(ficha):
+                salida[str(fp)] = ficha
+    return salida
+
+
+def _precheck_en_render(fingerprints, token: Optional[str] = None) -> set:
+    """De un lote de huellas que el motor local NO tiene, cuales tiene Render
+    con un analisis que valga aqui: de la version de analisis de ESTE motor y
+    con BPM y tonalidad (la misma vara que `_fetch_render_cache`).
+
+    UNA peticion por lote de 500, no una por huella: hasta el 2026-10-06 el
+    pre-check del motor local llamaba a `_fetch_render_cache` huella a huella,
+    bloqueando y con 5 s de timeout cada una. Con Render dormido, una ventana
+    de 25 temas del import eran dos minutos sin que el motor atendiera nada.
+
+    Si Render no contesta, lanza: el endpoint lo trata como «Render no sabe»
+    y el cliente sube y analiza, que es la direccion segura. Un Render
+    anterior a los campos `version`/`con_datos` los ignora y contesta con su
+    propia vara; lo que no valga aqui lo filtra despues `_fetch_render_cache`
+    al pedir la ficha (404, y el cliente analiza), como antes.
+
+    Con el `X-Device-Token` del cliente, Render cuenta a ese aparato en la
+    popularidad de lo que tiene (ver `registrar_analistas`): lo que el motor
+    local analizó aquí ya se contó al empujarlo por `/cache-analysis`."""
+    fps = [f for f in (fingerprints or []) if f and len(f) >= 16]
+    salida: set = set()
+    cabeceras = {'X-Device-Token': token} if token else {}
+    for i in range(0, len(fps), 500):
+        resp = requests.post(
+            f"{RENDER_BACKEND_URL}/check-analyzed-by-fingerprint",
+            json={'fingerprints': fps[i:i + 500],
+                  'version': ANALYSIS_VERSION, 'con_datos': True},
+            headers=cabeceras,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        salida.update(str(x) for x in (resp.json().get('analyzed') or []))
+    logger.info(f"[Dedup] Render tiene {len(salida)} de {len(fps)} huellas "
+                f"que este motor no tenia")
+    return salida
 
 
 # ==================== IMPORTS LOCALES ====================
@@ -624,64 +693,6 @@ class SafeJSONResponse(JSONResponse):
             allow_nan=False,
         ).encode("utf-8")
 
-
-def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset_env=None) -> float:
-    """
-    Si la confianza del BPM es baja, probar con doble y mitad.
-    
-    Logica: si librosa dice 131 con confianza 0.4, probar 262 y 65.5.
-    Si alguno de esos tiene sentido musical (60-200 BPM range) Y tiene
-    mejor alineacion con los beats, usarlo.
-    
-    Args:
-        onset_env: Si ya se calculó onset_strength, pasarlo para no duplicar CPU.
-    """
-    if bpm_confidence >= 0.7:
-        return original_bpm  # Alta confianza, no tocar
-    
-    candidates = [original_bpm]
-    
-    # Probar doble
-    double = original_bpm * 2
-    if 60 <= double <= 200:
-        candidates.append(double)
-    
-    # Probar mitad
-    half = original_bpm / 2
-    if 60 <= half <= 200:
-        candidates.append(half)
-    
-    if len(candidates) == 1:
-        return original_bpm
-    
-    # Evaluar cual se alinea mejor con onset strength
-    try:
-        if onset_env is None:
-            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        best_bpm = original_bpm
-        best_score = 0
-        
-        for candidate in candidates:
-            # Crear pulso teorico para este BPM
-            beat_interval = 60.0 / candidate
-            sr_onset = sr / 512  # hop_length default
-            
-            # Autocorrelacion con el BPM candidato
-            period = int(round(sr_onset * beat_interval))
-            if period > 0 and period < len(onset_env) // 2:
-                corr = np.correlate(onset_env[:len(onset_env)//2], 
-                                     onset_env[period:period + len(onset_env)//2])
-                score = float(np.max(corr)) if len(corr) > 0 else 0
-                if score > best_score:
-                    best_score = score
-                    best_bpm = candidate
-        
-        if best_bpm != original_bpm:
-            logger.info(f"   BPM auto-corregido: {original_bpm:.1f} -> {best_bpm:.1f} (confianza baja: {bpm_confidence:.2f})")
-        
-        return best_bpm
-    except Exception:
-        return original_bpm
 
 # ==================== APP ====================
 
@@ -1084,6 +1095,14 @@ init_lookup(
     # mismo. Hace que el pre-check de dedup del cliente funcione en una maquina
     # recien formateada, donde la BD local esta vacia pero Render lo tiene todo.
     render_cache_lookup=(_fetch_render_cache if IS_LOCAL_ENGINE else None),
+    # El pre-check por lotes: lo que el motor local no tiene, a Render en UNA
+    # peticion (antes, un GET por huella).
+    render_precheck=(_precheck_en_render if IS_LOCAL_ENGINE else None),
+    # La popularidad cuenta a quien entra por el pre-check (solo Render).
+    registrar=(None if IS_LOCAL_ENGINE else db.registrar_analistas),
+    # Las fichas de un lote: lo que el motor local no tiene, a Render en una
+    # petición (antes, un GET por huella).
+    render_fichas=(_fichas_en_render if IS_LOCAL_ENGINE else None),
     # Lambda y no la función: `_lo_mejor_para` se define más abajo.
     # Sin ir a Render desde el motor local: es la lectura por huella del
     # pre-check del import, una por tema (ver `_lo_mejor_para`).
@@ -1594,6 +1613,165 @@ def _cluster_clean_identity(audio_path, duration):
         return None
 
 
+def _resolver_identidad(id3_data: dict, file_path: str,
+                        original_filename: Optional[str]):
+    """(artista, título) con los que se va a buscar todo lo demás.
+
+    Las ETIQUETAS mandan si son utilizables. Si les falta un campo, se rellena
+    con el NOMBRE del fichero (como siempre). Y si lo que sale de las dos
+    juntas es basura —«Unknown Artist», «Track 01»— pero el nombre del fichero
+    no, manda el nombre: hasta el 2026-10-06 una etiqueta basura tapaba un
+    nombre bueno, y el tema iba a AudD (que cuesta) o se quedaba sin buscar.
+
+    El nombre REAL del fichero (`original_filename`), no el del temporal: el
+    basename de `/tmp/tmpXXXX.mp3` daba títulos «tmpXXXX» (bug 2026-06).
+    """
+    from audd_helper import is_garbage_metadata
+    a, t = id3_data.get('artist'), id3_data.get('title')
+    if a and t and not is_garbage_metadata(a, t):
+        return a, t
+    parsed = parse_filename(original_filename or os.path.basename(file_path))
+    pa, pt = parsed.get('artist'), parsed.get('title')
+    mezcla = (a or pa, t or pt)
+    if is_garbage_metadata(*mezcla) and not is_garbage_metadata(pa, pt):
+        return pa, pt
+    return mezcla
+
+
+def _genero_por_identidad(artist: Optional[str], title: Optional[str]) -> Optional[dict]:
+    """Discogs y, si no, MusicBrainz, con la identidad YA RESUELTA.
+
+    Hasta el 2026-10-06 se consultaban con el artista y el título de las
+    ETIQUETAS y antes de nada más: un tema identificado por el nombre del
+    fichero o heredando la identidad de su cluster no los consultaba nunca, y
+    uno con etiquetas basura los consultaba CON la basura. Solo AudD volvía a
+    lanzarlos, y ni eso si el fichero traía género en la etiqueta. Ahora corren
+    una vez, al final de la identidad (etiquetas → nombre del fichero →
+    cluster → AudD), y nunca con una identidad basura.
+
+    Devuelve {'genre', 'source', 'label', 'year'} o None.
+    """
+    if not (GENRE_DETECTOR_ENABLED and genre_detector):
+        return None
+    from audd_helper import is_garbage_metadata
+    if is_garbage_metadata(artist, title):
+        return None
+    logger.info(f"  [Genero] buscando: {artist} - {title}")
+    try:
+        d = genre_detector.get_discogs_genre(artist, title)
+        if d and d.get('genre'):
+            logger.info(f"  [Genero] Discogs: {d['genre']} | {d.get('label')} ({d.get('year')})")
+            return {'genre': d['genre'], 'source': 'discogs',
+                    'label': d.get('label'), 'year': d.get('year')}
+    except Exception as e:  # noqa: BLE001 - servicio externo, hay fallback
+        logger.warning(f"  [Genero] Discogs no disponible ({type(e).__name__}): {e}")
+    try:
+        m = genre_detector.get_musicbrainz_info(artist, title)
+        if m and m.get('genre'):
+            logger.info(f"  [Genero] MusicBrainz: {m['genre']}")
+            return {'genre': m['genre'], 'source': 'musicbrainz'}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"  [Genero] MusicBrainz no disponible ({type(e).__name__}): {e}")
+    logger.info("  [Genero] ni Discogs ni MusicBrainz lo conocen")
+    return None
+
+
+def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
+                        duration: float, id3_data: dict,
+                        original_filename: Optional[str],
+                        force_audd: bool = False,
+                        device_id: Optional[str] = None) -> dict:
+    """Quién es el tema y de qué género: lo mismo para los dos caminos de
+    /analyze (el corto y el chunked repetían el bloque entero).
+
+    Orden: etiquetas -> nombre del fichero (`_resolver_identidad`) ->
+    identidad del cluster (solo con basura: ahorra AudD) -> AudD (solo con
+    basura, con presupuesto) -> Discogs / MusicBrainz con lo que haya salido
+    (`_genero_por_identidad`) -> género de la etiqueta. `genre` None = el que
+    midió el DSP.
+    """
+    label = id3_data.get('label')
+    year = id3_data.get('year')
+    artist_name, title_name = _resolver_identidad(id3_data, file_path, original_filename)
+
+    # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
+    # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
+    # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
+    # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
+    # siendo basura y no es una peticion force del usuario.
+    if AUDD_AUTO_ENABLED and not force_audd:
+        from audd_helper import is_garbage_metadata
+        if is_garbage_metadata(artist_name, title_name):
+            _inherited = _cluster_clean_identity(file_path, duration)
+            if _inherited:
+                artist_name, title_name = _inherited
+                logger.info(
+                    f"[AudD-skip] identidad heredada del cluster: "
+                    f"{artist_name} - {title_name}")
+
+    # AudD como ultimo recurso si la identidad sigue siendo basura (con
+    # presupuesto y cooldown; con `force_audd`, siempre: «Limpiar con AudD»).
+    # Beatport iba por aqui y se elimino (WAF de Cloudflare).
+    audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
+    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
+    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+        try:
+            from audd_helper import (enrich_with_audd_if_needed,
+                                     download_artwork_from_audd, isrc_de_audd)
+            audd_track = enrich_with_audd_if_needed(
+                file_path=file_path,
+                fingerprint=fingerprint,
+                duration=duration,
+                artist=artist_name,
+                title=title_name,
+                api_token=AUDD_API_TOKEN,
+                db=db,
+                min_duration=AUDD_MIN_DURATION,
+                max_duration=AUDD_MAX_DURATION,
+                daily_cap=AUDD_DAILY_CAP,
+                cooldown_days=AUDD_COOLDOWN_DAYS,
+                force=force_audd,
+                device_id=device_id,
+            )
+            if audd_track:
+                audd_isrc = isrc_de_audd(audd_track)
+                if audd_track.get('artist'):
+                    artist_name = audd_track['artist']
+                if audd_track.get('title'):
+                    title_name = audd_track['title']
+                if not label and audd_track.get('label'):
+                    label = audd_track['label']
+                if not year and audd_track.get('release_date'):
+                    year = audd_track['release_date'][:4]
+                # Portada exacta del match AudD (Apple Music/Deezer/Spotify):
+                # AudD ya identifico el track preciso, asi que su caratula es la
+                # oficial del release — mejor que re-buscar por texto. Gratis
+                # (la respuesta ya venia con esos campos). Se usa como candidata
+                # preferente en el bloque de ARTWORK de abajo.
+                audd_artwork = download_artwork_from_audd(audd_track)
+        except Exception as e:
+            logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
+
+    genre = genre_source = None
+    _g = _genero_por_identidad(artist_name, title_name)
+    if _g:
+        genre, genre_source = _g['genre'], _g['source']
+        if not label and _g.get('label'):
+            label = _g['label']
+        if not year and _g.get('year'):
+            year = str(_g['year'])
+    elif id3_data.get('genre'):
+        genre, genre_source = id3_data['genre'], 'id3'
+        logger.info(f"  [Genero] ID3 (fallback): {genre}")
+
+    return {
+        'artist': artist_name, 'title': title_name,
+        'label': label, 'year': year,
+        'genre': genre, 'genre_source': genre_source,
+        'audd_artwork': audd_artwork, 'audd_isrc': audd_isrc,
+    }
+
+
 def parse_filename(filename: str) -> dict:
     name = re.sub(r'\.(mp3|wav|flac|m4a)$', '', filename, flags=re.IGNORECASE)
     name = re.sub(r'^\d+[\s\-_.]+', '', name)
@@ -1685,89 +1863,6 @@ def find_drop_timestamp(y, sr, segments: dict) -> float:
     
     duration = segments['sections'][-1]['end'] if segments['sections'] else 180
     return duration / 3
-
-def classify_track_type(energy: float, segments: dict, duration: float) -> dict:
-    # Fase 1 Track Type v2: pasamos de cascada de returns simples a scoring
-    # con margin top-1 vs top-2 -> confidence (0..1). Permite a la UI mostrar
-    # honestidad sobre tracks ambiguos en lugar de mentir con un tipo forzado.
-    # Plan completo en Analyzer/PENDING_NEXT_SESSION_TRACKTYPE_V2.md.
-    #
-    # Mismas señales que la cascada original (has_intro/has_drop/has_outro +
-    # energy + duration), pero acumulamos en lugar de decidir inmediato.
-    # Ej. Oxia - Domino (energy=0.7, has_outro=True, duration=433): closing
-    # acumula 1.0 + 0.3 = 1.3, peak_time solo 0.2 (energy>0.6 soft signal),
-    # warmup 0. Margin grande -> confidence ~0.85.
-    scores = {'warmup': 0.0, 'peak_time': 0.0, 'closing': 0.0}
-
-    if energy < 0.5 and segments['has_intro']:
-        scores['warmup'] += 1.0
-    if energy < 0.4 and segments['has_intro']:
-        scores['warmup'] += 0.5
-    if energy > 0.7 and segments['has_drop']:
-        scores['peak_time'] += 1.0
-    if energy > 0.8 and segments['has_drop']:
-        scores['peak_time'] += 0.5
-    if segments['has_outro'] and duration > 300:
-        scores['closing'] += 1.0
-    if segments['has_outro'] and duration > 420:
-        scores['closing'] += 0.3
-    # Soft signals para desempates: cualquier track con energia alta
-    # tira hacia peak_time, cualquiera con energia baja hacia warmup.
-    if energy > 0.6:
-        scores['peak_time'] += 0.2
-    elif energy < 0.5:
-        scores['warmup'] += 0.2
-
-    sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-    winner_type, winner_score = sorted_scores[0]
-    second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
-
-    if winner_score == 0.0:
-        # Track sin señales claras: caer al fallback de la cascada original
-        # (energy>0.6 -> peak_time, sino warmup) y reportar confidence 0
-        # para que la UI muestre el badge como "incierto".
-        winner_type = 'peak_time' if energy > 0.6 else 'warmup'
-        confidence = 0.0
-    else:
-        margin = winner_score - second_score
-        confidence = min(1.0, margin / max(winner_score, 0.5))
-
-    return {
-        'type': winner_type,
-        'confidence': round(confidence, 2),
-        'alternatives': [
-            {'type': t, 'score': round(s, 2)} for t, s in sorted_scores
-        ],
-        'reason': (
-            f"energy={energy:.2f} duration={duration:.0f} "
-            f"intro={segments['has_intro']} drop={segments['has_drop']} "
-            f"outro={segments['has_outro']}"
-        ),
-        'source': 'waveform',
-    }
-
-def detect_vocals_improved(y, sr, spectral_centroid):
-    try:
-        centroid_mean = float(np.mean(spectral_centroid))
-        has_high_centroid = centroid_mean > 3500
-        
-        flatness = librosa.feature.spectral_flatness(y=y)
-        flatness_mean = float(np.mean(flatness))
-        is_tonal = flatness_mean < 0.15
-        
-        centroid_std = float(np.std(spectral_centroid))
-        has_variation = centroid_std > 500
-        
-        zcr = librosa.feature.zero_crossing_rate(y)
-        zcr_mean = float(np.mean(zcr))
-        zcr_in_voice_range = 0.05 < zcr_mean < 0.15
-        
-        criteria_met = sum([has_high_centroid, is_tonal, has_variation, zcr_in_voice_range])
-        return criteria_met >= 3
-        
-    except Exception as e:
-        logger.error(f"Error detectando vocals: {e}")
-        return False
 
 def get_acousticbrainz_genre(fingerprint=None, artist=None, title=None):
     """AcousticBrainz cerró en 2022. Stub que retorna None para no romper llamadas."""
@@ -2161,8 +2256,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         bpm = id3_data['bpm']
         bpm_source = "id3"
     
-    beat_intervals = np.diff(librosa.frames_to_time(beats, sr=sr))
-    bpm_confidence = 1.0 - min(np.std(beat_intervals) * 2, 0.5) if len(beat_intervals) > 0 else 0.5
+    # Confianza, groove y swing: las mismas cuentas en los dos caminos.
+    bpm_confidence, groove_score, swing_factor = pulso_de_beats(beats, sr)
     
     # Calcular onset_env una sola vez (se reusa en BPM correction + percussion_density)
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
@@ -2170,14 +2265,14 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # MEJORA 3: Auto-correccion half/double tempo si confianza baja
     if bpm_source == "analysis":
         bpm = try_bpm_double_half(y, sr, bpm, bpm_confidence, onset_env=onset_env)
-    
-    if len(beat_intervals) > 1:
-        groove_score = min(np.std(beat_intervals) * 10, 1.0)
-        swing_factor = float(np.mean(beat_intervals[::2]) / np.mean(beat_intervals[1::2]) 
-                           if len(beat_intervals) > 2 else 0.5)
-    else:
-        groove_score = 0.0
-        swing_factor = 0.5
+
+    # ==================== BEAT GRID ====================
+    # Fase, downbeat e intervalo afinado, y con el el BPM si lo midio el DSP
+    # (`rejilla_y_bpm`, lo mismo en los dos caminos). La envolvente es la de
+    # arriba: `beat_grid.onset_envelope` es `onset_strength` con hop 512, o
+    # sea la misma.
+    first_beat, beat_interval, bpm = rejilla_y_bpm(
+        onset_env, sr / HOP_RASGOS, bpm, bpm_del_dsp=(bpm_source == "analysis"))
     
     # Key - Krumhansl-Kessler profiles (academicamente validados)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12, n_octaves=7)
@@ -2298,263 +2393,53 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     
     # Spectral features
     spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
-    has_vocals = detect_vocals_improved(y, sr, spectral_centroid)
-    
+    # Las voces NO se miden: `detect_vocals_improved` decia que si a cualquier
+    # tema con agudos (dos de cinco instrumentales sinteticos, sin una sola
+    # voz, salian «con voces»: sus cuatro criterios —centroide, planitud,
+    # variacion y cruces por cero— los cumple casi cualquier musica). El
+    # camino por trozos ya la tenia apagada por eso; ahora ninguno la usa
+    # (2026-10-06).
+    has_vocals = False
+
     low_freq_energy = np.mean(np.abs(y[:int(sr*10)]))
-    has_heavy_bass = low_freq_energy > energy_raw * 0.8
-    
     rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
-    has_pads = float(np.std(rolloff)) < 1000
-    
-    # onset_env ya calculado arriba (antes de BPM correction) - reusar
-    percussion_density = min(float(np.mean(onset_env)) / 10, 1.0)
-    
-    # Classification (heuristic, Fase 1 v2)
-    track_type = 'peak_time'  # default seguro
-    track_type_confidence = 0.5  # neutral si la clasificacion falla
-    track_type_alternatives: List[Dict[str, Any]] = []
-    try:
-        classification = classify_track_type(energy_normalized, segments, duration)
-        track_type = classification['type']
-        track_type_confidence = classification['confidence']
-        track_type_alternatives = classification['alternatives']
-    except Exception as e:
-        logger.error(f"  [TrackType] Error clasificando: {e}")
-        classification = None
 
-    # Spectral + ensemble (Fase 3 v2): metrics FFT + scoring 7 tipos
-    # (vs 3 del heuristic). El spectral pesa β=1.5 vs α=1.0 del heuristic.
-    # Refina tambien has_heavy_bass con bassRatio normalizado per-band.
-    try:
-        from spectral_classifier import (
-            compute_spectral_metrics,
-            classify_track_type_spectral,
-            detect_heavy_bass as _spectral_detect_heavy_bass,
-            ensemble_classify,
-        )
-        spectral_metrics = compute_spectral_metrics(y, sr)
-        spectral_classification = classify_track_type_spectral(
-            spectral_metrics, bpm, duration
-        )
-        ensemble = ensemble_classify(classification, spectral_classification)
-        track_type = ensemble['type']
-        track_type_confidence = ensemble['confidence']
-        track_type_alternatives = ensemble['alternatives']
-        # Heavy bass refinado (per-band ratio > heuristic crudo de low_freq_energy)
-        has_heavy_bass = _spectral_detect_heavy_bass(spectral_metrics)
-        logger.info(
-            f"  [Spectral+Ensemble] {ensemble['type']} "
-            f"conf={ensemble['confidence']:.2f} | {ensemble['reason']}"
-        )
-    except Exception as e:
-        logger.warning(f"  [Spectral] Failed, usando solo heuristic: {e}")
-    genre = classify_genre_advanced(
-        bpm, energy_normalized, has_heavy_bass,
-        y, sr, percussion_density,
-        spectral_centroid, rolloff
-    )
+    # Tipo, graves, pads, percusion y genero: las mismas cuentas que el camino
+    # por trozos (`rasgos_espectrales`), con el tema entero.
+    from spectral_classifier import bandas_de_audio
+    _rasgos = rasgos_espectrales(
+        bpm=bpm, energy_normalized=energy_normalized, segments=segments,
+        duration=duration, onset_env=onset_env,
+        spectral_centroid=spectral_centroid, rolloff=rolloff,
+        bandas=bandas_de_audio(y, sr),
+        graves_si_falla=low_freq_energy > energy_raw * 0.8)
+    track_type = _rasgos['track_type']
+    track_type_confidence = _rasgos['track_type_confidence']
+    track_type_alternatives = _rasgos['track_type_alternatives']
+    has_heavy_bass = _rasgos['has_heavy_bass']
+    has_pads = _rasgos['has_pads']
+    percussion_density = _rasgos['percussion_density']
+    genre = _rasgos['genre']
     genre_source = "spectral_analysis"
-    label = id3_data.get('label')
-    year = id3_data.get('year')
-    
-    # Guardar g(c)nero ID3 como fallback (suele ser gen(c)rico: "House", "Techno")
-    id3_genre = id3_data.get('genre')
-    
-    # ==================== PRIORIDAD DE GENEROS ====================
-    # Discogs > MusicBrainz > ID3 > Anlisis espectral
-    # Discogs/MusicBrainz dan g(c)neros especficos (ej: "Minimal Techno" vs "Techno")
-    
-    artist_name = id3_data.get('artist')
-    title_name = id3_data.get('title')
-    
-    if GENRE_DETECTOR_ENABLED and genre_detector and artist_name and title_name:
-        logger.info(f" Buscando g(c)nero: {artist_name} - {title_name}")
-        # 1. Intentar Discogs primero (mejor para electrnica)
-        try:
-            discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
-            if discogs_result and discogs_result.get('genre'):
-                genre = discogs_result.get('genre')
-                genre_source = "discogs"
-                # Tambi(c)n obtener label y year si no los tenemos
-                if not label and discogs_result.get('label'):
-                    label = discogs_result['label']
-                if not year and discogs_result.get('year'):
-                    year = str(discogs_result['year'])
-                logger.info(f" Discogs: {genre} | {label} ({year})")
-            else:
-                logger.info(f" Discogs: No encontrado")
-        except Exception as e:
-            # 404/JSON-empty/timeout son respuestas esperadas de un servicio
-            # externo, no bugs nuestros. Tenemos fallback a MusicBrainz/ID3.
-            # Warning evita disparar alertas de error en el panel admin.
-            logger.warning(f" Discogs no disponible ({type(e).__name__}): {e}")
 
-        # 2. Si no hay Discogs, intentar MusicBrainz
-        if genre_source not in ["discogs"]:
-            try:
-                mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
-                if mb_result and mb_result.get('genre'):
-                    genre = mb_result.get('genre')
-                    genre_source = "musicbrainz"
-                    logger.info(f"   MusicBrainz: {genre}")
-            except Exception as e:
-                logger.warning(f" MusicBrainz no disponible ({type(e).__name__}): {e}")
-    
-    # 3. Si no hay Discogs ni MusicBrainz, usar ID3 (gen(c)rico pero mejor que nada)
-    if genre_source == "spectral_analysis" and id3_genre:
-        genre = id3_genre
-        genre_source = "id3"
-        logger.info(f" ID3 (fallback): {genre}")
-
-    # ==================== RESOLVER ARTIST / TITLE ====================
-    # Beatport solia ir aqui pero se elimino (WAF de Cloudflare bloquea el
-    # scraping desde datacenter e IP residencial sin browser real; los 84
-    # tracks de produccion tienen 0 con bpm_source='beatport'). El boton de
-    # Flutter "Buscar en Beatport" sigue funcionando porque solo abre URL.
-
-    if not artist_name:
-        artist_name = id3_data.get('artist')
-    if not title_name:
-        title_name = id3_data.get('title')
-
-    # Si no hay metadata ID3, intentar con filename parseado.
-    # IMPORTANTE: usar el filename REAL (original_filename) y NO el basename
-    # del file_path, que en /analyze es el tmp_path (/tmp/tmpXXXXXX.mp3). Si
-    # parseabamos el basename del temp, el "title" salia "tmpXXXXXX" (basura)
-    # y como no quedaba vacio, el fallback del endpoint con file.filename
-    # nunca disparaba -> la limpieza proponia nombres tmpXXXX. Bug 2026-06.
-    if not artist_name or not title_name:
-        parsed = parse_filename(original_filename or os.path.basename(file_path))
-        if not artist_name:
-            artist_name = parsed.get('artist')
-        if not title_name:
-            title_name = parsed.get('title')
-
-    # ==================== AUDD AUTO-TRIGGER ====================
-    # Si tras ID3 + filename seguimos sin artist/title utilizable, AudD como
-    # ultimo recurso (con presupuesto y cooldown). Discogs/iTunes/MusicBrainz
-    # requieren artist+title para arrancar, asi que recuperar la identidad
-    # aqui desbloquea el resto.
-    # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
-    # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
-    # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
-    # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
-    # siendo basura y no es una peticion force del usuario.
-    if AUDD_AUTO_ENABLED and not force_audd:
-        from audd_helper import is_garbage_metadata
-        if is_garbage_metadata(artist_name, title_name):
-            _inherited = _cluster_clean_identity(file_path, duration)
-            if _inherited:
-                artist_name, title_name = _inherited
-                logger.info(
-                    f"[AudD-skip] identidad heredada del cluster: "
-                    f"{artist_name} - {title_name}")
-
-    audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
-    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
-    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
-        try:
-            from audd_helper import (enrich_with_audd_if_needed,
-                                     download_artwork_from_audd, isrc_de_audd)
-            audd_track = enrich_with_audd_if_needed(
-                file_path=file_path,
-                fingerprint=fingerprint,
-                duration=duration,
-                artist=artist_name,
-                title=title_name,
-                api_token=AUDD_API_TOKEN,
-                db=db,
-                min_duration=AUDD_MIN_DURATION,
-                max_duration=AUDD_MAX_DURATION,
-                daily_cap=AUDD_DAILY_CAP,
-                cooldown_days=AUDD_COOLDOWN_DAYS,
-                force=force_audd,
-                device_id=device_id,
-            )
-            if audd_track:
-                audd_isrc = isrc_de_audd(audd_track)
-                if audd_track.get('artist'):
-                    artist_name = audd_track['artist']
-                if audd_track.get('title'):
-                    title_name = audd_track['title']
-                if not label and audd_track.get('label'):
-                    label = audd_track['label']
-                if not year and audd_track.get('release_date'):
-                    year = audd_track['release_date'][:4]
-                # Portada exacta del match AudD (Apple Music/Deezer/Spotify):
-                # AudD ya identifico el track preciso, asi que su caratula es la
-                # oficial del release — mejor que re-buscar por texto. Gratis
-                # (la respuesta ya venia con esos campos). Se usa como candidata
-                # preferente en el bloque de ARTWORK de abajo.
-                audd_artwork = download_artwork_from_audd(audd_track)
-                # Re-correr Discogs/MusicBrainz si la cascada anterior no aporto
-                # genero (sigue siendo el default analitico).
-                if (genre_source in ('spectral_analysis', 'chunked_analysis')
-                        and GENRE_DETECTOR_ENABLED and genre_detector):
-                    try:
-                        discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
-                        if discogs_result and discogs_result.get('genre'):
-                            genre = discogs_result['genre']
-                            genre_source = 'discogs'
-                            if not label and discogs_result.get('label'):
-                                label = discogs_result['label']
-                            if not year and discogs_result.get('year'):
-                                year = str(discogs_result['year'])
-                    except Exception as e:
-                        # Mismo criterio que la cascada principal: fallo de
-                        # servicio externo es warning, no error.
-                        logger.warning(f"  [AudD-auto] re-run Discogs ({type(e).__name__}): {e}")
-                    if genre_source in ('spectral_analysis', 'chunked_analysis'):
-                        try:
-                            mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
-                            if mb_result and mb_result.get('genre'):
-                                genre = mb_result['genre']
-                                genre_source = 'musicbrainz'
-                        except Exception as e:
-                            logger.warning(f"  [AudD-auto] re-run MusicBrainz ({type(e).__name__}): {e}")
-        except Exception as e:
-            logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
+    # ==================== IDENTIDAD Y GENERO ====================
+    # Etiquetas -> nombre del fichero -> cluster -> AudD, y con eso Discogs /
+    # MusicBrainz. Los dos caminos de /analyze pasan por el mismo sitio.
+    _ident = _identidad_y_genero(file_path, fingerprint, duration, id3_data,
+                                 original_filename, force_audd, device_id)
+    artist_name, title_name = _ident['artist'], _ident['title']
+    label, year = _ident['label'], _ident['year']
+    audd_artwork, audd_isrc = _ident['audd_artwork'], _ident['audd_isrc']
+    if _ident['genre']:
+        genre, genre_source = _ident['genre'], _ident['genre_source']
 
     drop_time = find_drop_timestamp(y, sr, segments)
     
     # ==================== CUE POINTS ====================
     cue_points = []
-    first_beat = 0.0
-    # Lo peor que puede salir es 60/bpm, no 0.5: ese 0.5 son 120 BPM clavados,
-    # un intervalo que no tiene nada que ver con el track y que ademas se
-    # exporta tal cual al XML de Rekordbox.
-    beat_interval = 60.0 / bpm if bpm > 0 else 0.5
-
     if ARTWORK_ENABLED:
         cue_points = detect_cue_points(y, sr, duration, segments)
 
-    # ==================== BEAT GRID ====================
-    # La rejilla NO depende del modulo de artwork. Que estuviera dentro de su
-    # `if` era un accidente de donde vivia la funcion, y tenia consecuencia: si
-    # ese modulo no cargaba, el track salia con la rejilla anclada al 0 y a 120
-    # BPM sin un solo error.
-    #
-    # `fit_beat_grid` da fase Y downbeat, que es lo que le faltaba a la version
-    # anterior: con el BPM y la fase perfectos, la linea de compas podia caer
-    # igualmente en el 3. Devuelve None cuando no hay pulso que medir, y
-    # entonces se deja el 0 — una fase inventada mueve la rejilla a un sitio que
-    # no es y el usuario deja de fiarse.
-    try:
-        _env, _env_fps = beat_grid_onset_envelope(y, sr)
-        _fit = fit_beat_grid(_env, _env_fps, bpm)
-        if _fit:
-            first_beat = _fit['first_beat']
-            beat_interval = _fit['beat_interval']
-            logger.info(
-                f"  [BeatGrid] first_beat={first_beat:.3f}s "
-                f"iv={beat_interval:.5f}s downbeat={_fit['downbeat_index']} "
-                f"conf={_fit['confidence']:.2f}"
-            )
-        else:
-            logger.info("  [BeatGrid] sin pulso claro; rejilla sin fase")
-    except Exception as e:
-        logger.warning(f"  [BeatGrid] fallo la fase ({type(e).__name__}): {e}")
-    
     # ==================== ARTWORK ====================
     artwork_embedded = False
     artwork_url = None
@@ -2724,27 +2609,27 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
     """
     import gc
     
+    # ==================== ID3 METADATA ====================
+    # Antes del analisis: el BPM de las etiquetas manda como en el camino corto
+    # (sin doble/mitad, sin afinarlo con la rejilla), y el tipo de track y el
+    # genero espectral se calculan con el.
+    id3_data = {}
+    if ARTWORK_ENABLED:
+        id3_data = extract_id3_metadata(file_path)
+
     # Crear analizador por chunks
     analyzer = get_chunked_analyzer(chunk_duration=60)
     
-    # Ejecutar anlisis chunked
-    result = analyzer.full_analysis(file_path)
+    # Ejecutar anlisis chunked: BPM, rejilla, groove, tipo, graves, pads y
+    # genero con las mismas cuentas que el camino corto (`rasgos_del_tema`).
+    result = analyzer.full_analysis(file_path, bpm_etiqueta=id3_data.get('bpm'))
     
     # Limpiar memoria
     del analyzer
     gc.collect()
-    
-    # ==================== ID3 METADATA ====================
-    id3_data = {}
-    if ARTWORK_ENABLED:
-        id3_data = extract_id3_metadata(file_path)
-    
-    # Sobrescribir con ID3 si existe y es vlido
+
     bpm = result['bpm']
     bpm_source = result['bpm_source']
-    if id3_data.get('bpm') and 60 < id3_data['bpm'] < 200:
-        bpm = id3_data['bpm']
-        bpm_source = "id3"
     
     key = result['key']
     camelot = result['camelot']
@@ -2755,146 +2640,19 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         key, camelot = id3_norm
         key_source = "id3"
     
-    # ==================== GNERO ====================
-    genre = "Electronic"
-    genre_source = "chunked_analysis"
-    label = id3_data.get('label')
-    year = id3_data.get('year')
-    id3_genre = id3_data.get('genre')
-    
-    artist_name = id3_data.get('artist')
-    title_name = id3_data.get('title')
-    
-    # Intentar obtener g(c)nero de Discogs/MusicBrainz
-    if GENRE_DETECTOR_ENABLED and genre_detector and artist_name and title_name:
-        logger.info(f"   Buscando g(c)nero: {artist_name} - {title_name}")
-        try:
-            discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
-            if discogs_result and discogs_result.get('genre'):
-                genre = discogs_result.get('genre')
-                genre_source = "discogs"
-                if not label and discogs_result.get('label'):
-                    label = discogs_result['label']
-                if not year and discogs_result.get('year'):
-                    year = str(discogs_result['year'])
-                logger.info(f"   Discogs: {genre}")
-        except Exception as e:
-            logger.error(f"   Error Discogs: {e}")
-        
-        if genre_source not in ["discogs"]:
-            try:
-                mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
-                if mb_result and mb_result.get('genre'):
-                    genre = mb_result.get('genre')
-                    genre_source = "musicbrainz"
-                    logger.info(f"   MusicBrainz: {genre}")
-            except Exception as e:
-                logger.error(f"   Error MusicBrainz: {e}")
-    
-    if genre_source == "chunked_analysis" and id3_genre:
-        genre = id3_genre
-        genre_source = "id3"
-
-    # ==================== RESOLVER ARTIST / TITLE ====================
-    # Beatport solia ir aqui pero se elimino (WAF de Cloudflare bloquea el
-    # scraping desde datacenter e IP residencial sin browser real; los 84
-    # tracks de produccion tienen 0 con bpm_source='beatport'). El boton de
-    # Flutter "Buscar en Beatport" sigue funcionando porque solo abre URL.
-
-    if not artist_name:
-        artist_name = id3_data.get('artist')
-    if not title_name:
-        title_name = id3_data.get('title')
-
-    # Si no hay metadata ID3, intentar con filename parseado.
-    # IMPORTANTE: usar el filename REAL (original_filename) y NO el basename
-    # del file_path, que en /analyze es el tmp_path (/tmp/tmpXXXXXX.mp3). Si
-    # parseabamos el basename del temp, el "title" salia "tmpXXXXXX" (basura)
-    # y como no quedaba vacio, el fallback del endpoint con file.filename
-    # nunca disparaba -> la limpieza proponia nombres tmpXXXX. Bug 2026-06.
-    if not artist_name or not title_name:
-        parsed = parse_filename(original_filename or os.path.basename(file_path))
-        if not artist_name:
-            artist_name = parsed.get('artist')
-        if not title_name:
-            title_name = parsed.get('title')
-
-    # ==================== AUDD AUTO-TRIGGER ====================
-    # Mismo trigger que en analyze_audio: si tras ID3+filename seguimos sin
-    # artist/title utilizable, AudD como ultimo recurso.
-    # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
-    # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
-    # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
-    # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
-    # siendo basura y no es una peticion force del usuario.
-    if AUDD_AUTO_ENABLED and not force_audd:
-        from audd_helper import is_garbage_metadata
-        if is_garbage_metadata(artist_name, title_name):
-            _inherited = _cluster_clean_identity(file_path, duration)
-            if _inherited:
-                artist_name, title_name = _inherited
-                logger.info(
-                    f"[AudD-skip] identidad heredada del cluster: "
-                    f"{artist_name} - {title_name}")
-
-    audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
-    audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
-    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
-        try:
-            from audd_helper import (enrich_with_audd_if_needed,
-                                     download_artwork_from_audd, isrc_de_audd)
-            audd_track = enrich_with_audd_if_needed(
-                file_path=file_path,
-                fingerprint=fingerprint,
-                duration=duration,
-                artist=artist_name,
-                title=title_name,
-                api_token=AUDD_API_TOKEN,
-                db=db,
-                min_duration=AUDD_MIN_DURATION,
-                max_duration=AUDD_MAX_DURATION,
-                daily_cap=AUDD_DAILY_CAP,
-                cooldown_days=AUDD_COOLDOWN_DAYS,
-                force=force_audd,
-                device_id=device_id,
-            )
-            if audd_track:
-                audd_isrc = isrc_de_audd(audd_track)
-                if audd_track.get('artist'):
-                    artist_name = audd_track['artist']
-                if audd_track.get('title'):
-                    title_name = audd_track['title']
-                if not label and audd_track.get('label'):
-                    label = audd_track['label']
-                if not year and audd_track.get('release_date'):
-                    year = audd_track['release_date'][:4]
-                # Portada exacta del match AudD (ver path no-chunked arriba).
-                audd_artwork = download_artwork_from_audd(audd_track)
-                if (genre_source in ('spectral_analysis', 'chunked_analysis')
-                        and GENRE_DETECTOR_ENABLED and genre_detector):
-                    try:
-                        discogs_result = genre_detector.get_discogs_genre(artist_name, title_name)
-                        if discogs_result and discogs_result.get('genre'):
-                            genre = discogs_result['genre']
-                            genre_source = 'discogs'
-                            if not label and discogs_result.get('label'):
-                                label = discogs_result['label']
-                            if not year and discogs_result.get('year'):
-                                year = str(discogs_result['year'])
-                    except Exception as e:
-                        # Mismo criterio que la cascada principal: fallo de
-                        # servicio externo es warning, no error.
-                        logger.warning(f"  [AudD-auto] re-run Discogs ({type(e).__name__}): {e}")
-                    if genre_source in ('spectral_analysis', 'chunked_analysis'):
-                        try:
-                            mb_result = genre_detector.get_musicbrainz_info(artist_name, title_name)
-                            if mb_result and mb_result.get('genre'):
-                                genre = mb_result['genre']
-                                genre_source = 'musicbrainz'
-                        except Exception as e:
-                            logger.warning(f"  [AudD-auto] re-run MusicBrainz ({type(e).__name__}): {e}")
-        except Exception as e:
-            logger.warning(f"  [AudD-auto] error ({type(e).__name__}): {e}")
+    # ==================== IDENTIDAD Y GENERO ====================
+    # La misma cascada que el camino corto (`_identidad_y_genero`). Sin
+    # Discogs/MusicBrainz/etiqueta, el genero espectral del analisis, como en
+    # el corto (hasta el 2026-10-06 era «Electronic» fijo).
+    genre = result.get('genre') or "Electronic"
+    genre_source = "spectral_analysis"
+    _ident = _identidad_y_genero(file_path, fingerprint, duration, id3_data,
+                                 original_filename, force_audd, device_id)
+    artist_name, title_name = _ident['artist'], _ident['title']
+    label, year = _ident['label'], _ident['year']
+    audd_artwork, audd_isrc = _ident['audd_artwork'], _ident['audd_isrc']
+    if _ident['genre']:
+        genre, genre_source = _ident['genre'], _ident['genre_source']
 
     # ==================== ARTWORK ====================
     # Misma decision que en el flow no-chunked: `elegir_portada`.
@@ -3090,7 +2848,17 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                     force_audd: bool):
     """El cuerpo de /analyze. Tiene cinco salidas (acierto por nombre, por
     huella, fallback a Render, análisis nuevo y el de emergencia), y por eso
-    lo común a todas va en `analyze_track`, que lo envuelve."""
+    lo común a todas va en `analyze_track`, que lo envuelve.
+
+    EL EVENT LOOP NO SE TOCA. Render corre UN proceso de uvicorn (`Procfile`),
+    así que lo que bloquea aquí bloquea a todos: el sync, la comunidad y
+    Escuchar esperan detrás. Hasta la auditoría del 2026-10-02 solo el DSP iba
+    al threadpool; el MD5 del fichero (hasta 100 MB), `fpcalc` sobre el audio
+    entero (`_attach_acoustic`), el preview con ffmpeg y la consulta a Render
+    del motor local corrían aquí mismo, segundos por análisis y también en los
+    aciertos de caché que curan la huella. Todo lo que lee el fichero, lanza
+    un subproceso o sale a la red va por `run_in_threadpool`; lo vigila
+    `test_analyze_no_bloquea_el_worker.py`."""
     # force_audd implica force=true: el usuario pidio explicitamente AudD y el
     # registro cacheado debe sobreescribirse con el resultado nuevo.
     if force_audd:
@@ -3201,7 +2969,9 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
     # upload streaming termino arriba), asi que no cuesta una lectura extra
     # respecto al flujo anterior — solo se adelanta.
     try:
-        fingerprint = calculate_fingerprint(tmp_path)
+        # En el threadpool, como todo lo que lee el fichero o lanza un
+        # subproceso: ver «EL EVENT LOOP NO SE TOCA» en `_analizar`.
+        fingerprint = await run_in_threadpool(calculate_fingerprint, tmp_path)
     except (OSError, IOError) as e:
         try:
             os.unlink(tmp_path)
@@ -3258,7 +3028,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                     if not os.path.exists(preview_file) and original_path and os.path.exists(original_path):
                         logger.debug(f"[Preview] Cache hit pero sin snippet, generando para {fp[:8]}...")
                         try:
-                            regen_path = generate_preview_snippet(
+                            regen_path = await run_in_threadpool(
+                                generate_preview_snippet,
                                 file_path=original_path,
                                 fingerprint=fp,
                                 drop_timestamp=analysis_json.get('drop_timestamp', 30.0),
@@ -3290,13 +3061,15 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                 # extra — ni subida (ya esta hecha) ni AudD ni reanalisis.
                 _fila = db._row_to_dict(existing) or {}
                 if not _fila.get('chromaprint'):
-                    _attach_acoustic(_fila, tmp_path)
-                    if _fila.get('chromaprint'):
-                        db.backfill_track_fingerprint(
-                            fingerprint,
-                            _fila['chromaprint'],
-                            _fila.get('acoustic_id'),
-                        )
+                    def _curar_fila():
+                        _attach_acoustic(_fila, tmp_path)
+                        if _fila.get('chromaprint'):
+                            db.backfill_track_fingerprint(
+                                fingerprint,
+                                _fila['chromaprint'],
+                                _fila.get('acoustic_id'),
+                            )
+                    await run_in_threadpool(_curar_fila)
 
                 # Limpiar el tmp_path creado durante el upload streaming: este
                 # cache-hit no necesita el archivo subido. (No reventamos si ya
@@ -3347,9 +3120,11 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                 # No cuesta ni una subida ni una llamada a AudD: el fichero ya
                 # esta en disco. Y es best-effort, como en el camino normal: si
                 # fpcalc falla, se guarda igual.
-                if not existing_by_fp.get('chromaprint'):
-                    _attach_acoustic(existing_by_fp, tmp_path)
-                db.save_track(existing_by_fp)
+                def _curar_y_guardar():
+                    if not existing_by_fp.get('chromaprint'):
+                        _attach_acoustic(existing_by_fp, tmp_path)
+                    db.save_track(existing_by_fp)
+                await run_in_threadpool(_curar_y_guardar)
                 
                 # Intentar construir respuesta desde analysis_json
                 if existing_by_fp.get('analysis_json'):
@@ -3421,7 +3196,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                 # cero CPU. Acelera reanalisis post-wipe / Mac nuevo / HDD
                 # nuevo donde Render ya tiene los analisis de otros equipos
                 # del mismo usuario.
-                render_cached = _fetch_render_cache(fingerprint)
+                render_cached = await run_in_threadpool(
+                    _fetch_render_cache, fingerprint)
                 if render_cached:
                     logger.info(
                         f"[Render fallback] Hit {fingerprint[:8]}... — "
@@ -3450,9 +3226,12 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                             # (es un blob que no viaja en la respuesta). El
                             # audio sigue en `tmp_path`, asi que la huella se
                             # saca aqui en vez de nacer sin ella.
-                            if not to_save.get('chromaprint'):
-                                _attach_acoustic(to_save, tmp_path)
-                            db.save_track(to_save)
+                            def _curar_y_guardar_lo_de_render():
+                                if not to_save.get('chromaprint'):
+                                    _attach_acoustic(to_save, tmp_path)
+                                db.save_track(to_save)
+                            await run_in_threadpool(
+                                _curar_y_guardar_lo_de_render)
                     except Exception as e:
                         logger.warning(f"[Render fallback] save_track fallo: {e}")
                     if os.path.exists(tmp_path):
@@ -3645,8 +3424,10 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # La cabecera la manda el cliente desde hace versiones y nadie la leia.
         track_data['platform'] = client_platform(request)
         # Huella acustica + cluster para la memoria colectiva por sonido.
-        _attach_acoustic(track_data, tmp_path)
-        db.save_track(track_data)
+        def _huella_y_guardar():
+            _attach_acoustic(track_data, tmp_path)
+            db.save_track(track_data)
+        await run_in_threadpool(_huella_y_guardar)
         # Lo mejor del cluster acustico (otra version del mismo audio con
         # fuente superior) y lo que los programas de DJ de otros dicen de el
         # lo aplica `_mejorar_con_la_comunidad` al salir de /analyze, para
@@ -3654,7 +3435,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # analisis nuevo, que ya tarda segundos: en los aciertos de cache seria
         # un viaje a Render por tema (ver `_lo_mejor_para`).
         if IS_LOCAL_ENGINE:
-            _mejorar_con_la_comunidad(result, fingerprint, a_render=True)
+            await run_in_threadpool(
+                _mejorar_con_la_comunidad, result, fingerprint, a_render=True)
 
         # Incrementar contador de popularidad. El device_id va AHORA (BUG-01):
         # la cabecera ya se leia unas lineas mas arriba para la contabilidad de
@@ -3671,7 +3453,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # Logueamos fallos en analysis_errors con endpoint='preview' para
         # que el panel admin pueda contar la tasa de fallo del generador.
         try:
-            preview_path = generate_preview_snippet(
+            preview_path = await run_in_threadpool(
+                generate_preview_snippet,
                 file_path=tmp_path,
                 fingerprint=fingerprint,
                 drop_timestamp=result.drop_timestamp,
@@ -3776,7 +3559,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         try:
             # Intentar fingerprint del contenido primero
             try:
-                fingerprint = calculate_fingerprint(tmp_path)
+                fingerprint = await run_in_threadpool(
+                    calculate_fingerprint, tmp_path)
             except Exception:
                 # Si falla (archivo muy corrupto), usar md5 del nombre
                 fingerprint = hashlib.md5(file.filename.encode()).hexdigest()
@@ -3785,7 +3569,8 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
             id3_data = {}
             if ARTWORK_ENABLED:
                 try:
-                    id3_data = extract_id3_metadata(tmp_path)
+                    id3_data = await run_in_threadpool(
+                        extract_id3_metadata, tmp_path)
                 except Exception as e:
                     logger.warning("ID3 extract fallo en %s: %s", file.filename, e)
             
@@ -4069,6 +3854,8 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         duration = 0.0
         bpm_source = 'pending'
         key_source = 'pending'
+        first_beat_re = 0.0
+        beat_interval_re = 0.0
         logger.info(f"Re-analizando audio...")
         try:
             # Local: sr=44100 para maxima precision. Render: sr=22050 para ahorrar RAM.
@@ -4095,6 +3882,11 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             # MEJORA 3: Auto-correccion half/double
             onset_env_re = librosa.onset.onset_strength(y=y_full, sr=sr_full)
             bpm = try_bpm_double_half(y_full, sr_full, bpm, bpm_confidence, onset_env=onset_env_re)
+            # La rejilla, como en /analyze (`rejilla_y_bpm`): hasta el
+            # 2026-10-06 este reanalisis guardaba `first_beat` 0 y el BPM del
+            # bin de librosa a una cifra.
+            first_beat_re, beat_interval_re, bpm = rejilla_y_bpm(
+                onset_env_re, sr_full / HOP_RASGOS, bpm, bpm_del_dsp=True)
             logger.info(f"BPM: {bpm} (confianza: {bpm_confidence:.2f})")
             
             # MEJORA 1: Key con Krumhansl-Kessler (mismo codigo que analisis principal)
@@ -4230,8 +4022,8 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             'mix_energy_end': 0,
             'drop_timestamp': 0,
             'cue_points': [],
-            'first_beat': 0,
-            'beat_interval': 0,
+            'first_beat': first_beat_re,
+            'beat_interval': beat_interval_re,
         }
 
         # Huella acustica + cluster para la memoria colectiva por sonido.
@@ -6268,6 +6060,10 @@ async def health():
         # cuanto lleva; para cruzarlo con la hora de un merge hace falta esto.
         "started_at": datetime.fromtimestamp(_startup_time, timezone.utc)
                               .isoformat(),
+        # Qué SQLite trae el Python de Render. El plan de una consulta (si un
+        # `OR` entre columnas usa índice o recorre la tabla) depende de la
+        # versión, y sin esto solo se podía medir en otra máquina.
+        "sqlite": sqlite3.sqlite_version,
         "checks": {
             "database": db_status,
             "ffmpeg": ffmpeg_status,

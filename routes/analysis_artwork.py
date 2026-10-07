@@ -4,10 +4,10 @@ Cache-lookup + artwork endpoints for DJ Analyzer Pro API.
 PASO 5 del troceo de main.py (review 2026-06-29). Bloque movido VERBATIM
 desde main.py (mismo comportamiento, sin cambio de logica):
 
-  - POST /check-analyzed                       que filenames ya estan analizados
-  - POST /check-analyzed-by-fingerprint        idem por fingerprint (dedup multi-device)
+  - POST /check-analyzed                       por NOMBRE: todo «no analizado» (2026-10-02)
+  - POST /check-analyzed-by-fingerprint        que huellas ya estan analizadas (dedup)
   - GET  /analysis/by-fingerprint/{fingerprint}  hidrata cache local sin re-subir
-  - GET  /analysis/{filename:path}             analisis cacheado por filename
+  - GET  /analysis/{filename:path}             por NOMBRE: 410 (2026-10-02)
   - HEAD /artwork/{track_id}                   pre-check de existencia (sin fallback online)
   - GET  /artwork/{track_id}                   sirve artwork (cache -> fallback online)
   - POST /artwork/upload/{fingerprint}         sube artwork desde el motor local
@@ -30,10 +30,11 @@ Como pasos 2-4: el router SI se monta (init + include_router) y los endpoints
 inline se BORRAN -> sin duplicacion stale.
 """
 
+import json
 import logging
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile
@@ -57,15 +58,30 @@ buscar_portada = None
 # Solo en el motor local: consulta a Render el analisis de un fingerprint.
 # None en Render (no se consulta a si mismo).
 fetch_render_cache = None
+# Solo en el motor local: de un LOTE de huellas, cuales tiene Render con un
+# analisis que sirva (`main._precheck_en_render`). None en Render.
+precheck_en_render = None
+# Solo en el motor local: las fichas de un LOTE de huellas que tiene Render y
+# valen aquí (`main._fichas_en_render`). None en Render.
+fichas_en_render = None
+# Solo en Render: apunta al aparato como un DJ más que tiene esos temas
+# (`db.registrar_analistas`). None en el motor local: su BD no es la de la
+# comunidad, y lo que él sabe llega a Render reenviando el pre-check.
+registrar_analistas = None
 
 
 def init(database, is_analysis_current, artwork_cache_dir,
          search_online=None, save_to_cache=None, render_cache_lookup=None,
-         buscar=None, lo_mejor=None):
+         buscar=None, lo_mejor=None, render_precheck=None,
+         registrar=None, render_fichas=None):
     """Inyecta deps desde main.py. Llamar ANTES de include_router(router)."""
     global db, _is_analysis_current, ARTWORK_CACHE_DIR, buscar_portada
     global search_artwork_online, save_artwork_to_cache, fetch_render_cache
-    global lo_mejor_para
+    global lo_mejor_para, precheck_en_render, registrar_analistas
+    global fichas_en_render
+    precheck_en_render = render_precheck
+    fichas_en_render = render_fichas
+    registrar_analistas = registrar
     buscar_portada = buscar
     lo_mejor_para = lo_mejor
     db = database
@@ -130,23 +146,25 @@ def _merge_cluster_best_into(result, fingerprint, fila):
 
 @router.post("/check-analyzed")
 async def check_analyzed(filenames: list[str]):
-    """Verificar cules tracks ya estn analizados"""
-    analyzed = []
-    not_analyzed = []
+    """POR NOMBRE NO SE CONTESTA: todo sale como «no analizado».
 
-    for filename in filenames:
-        existing = db.get_track_by_filename(filename)
-        if existing:
-            analyzed.append(filename)
-        else:
-            not_analyzed.append(filename)
+    Lo usaba el import del móvil hasta la auditoría del 2026-10-02, y con lo
+    que contestaba pedía `/analysis/{nombre}` y se quedaba con el análisis de
+    cualquier usuario cuyo fichero se llamara igual — BPM, tonalidad, nombre y
+    la huella de otro audio. Es lo que SEC-01 cerró en `/analyze`, por otra
+    puerta. Los móviles de antes siguen llamándolo: así suben el fichero y
+    `/analyze` lo resuelve por huella, que es la identidad de verdad. El
+    cliente nuevo pregunta por `/check-analyzed-by-fingerprint`.
 
+    Y de paso deja de recorrer la tabla: `filename` no tenía índice y eran
+    las ~122.000 filas UNA vez POR FICHERO, en el único proceso de Render.
+    """
     return {
-        "analyzed": analyzed,
-        "not_analyzed": not_analyzed,
+        "analyzed": [],
+        "not_analyzed": list(filenames),
         "total": len(filenames),
-        "analyzed_count": len(analyzed),
-        "not_analyzed_count": len(not_analyzed)
+        "analyzed_count": 0,
+        "not_analyzed_count": len(filenames),
     }
 
 
@@ -240,10 +258,35 @@ async def acoustic_pending(request: AcousticPendingRequest):
 
 class CheckAnalyzedByFingerprintRequest(BaseModel):
     fingerprints: List[str]
+    # Los dos los manda SOLO el motor local cuando pregunta a Render por lo que
+    # el no tiene (`main._precheck_en_render`). Para el, «analizado» es que
+    # Render le pueda dar un analisis que valga AQUI: de SU version de
+    # analisis (no la de Render) y con BPM y tonalidad. Una fila del fallback
+    # (`analysis_status='failed'`, bpm 0) no le sirve: el motor local tiene
+    # librosa y lo hace mejor. Es la misma vara que `_fetch_render_cache`.
+    version: Optional[str] = None
+    con_datos: bool = False
+
+
+def _vale(fila: dict, version: Optional[str], con_datos: bool) -> bool:
+    if version is not None:
+        if (fila.get('analysis_version') or '1') != version:
+            return False
+    elif not _is_analysis_current(fila):
+        return False
+    if con_datos:
+        try:
+            bpm = float(fila.get('bpm') or 0)
+        except (TypeError, ValueError):
+            bpm = 0
+        if bpm <= 0 or not (fila.get('key') or '').strip():
+            return False
+    return True
 
 
 @router.post("/check-analyzed-by-fingerprint")
-async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintRequest):
+async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintRequest,
+                                        peticion: Request):
     """
     Dedup multi-dispositivo: dado un lote de fingerprints (MD5 del contenido
     del archivo) devuelve cuáles ya están analizados en Render. Esto
@@ -252,35 +295,59 @@ async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintReque
     del fichero sea distinto.
 
     Máximo 500 IDs por petición.
+
+    El lote se resuelve en DOS consultas (`filas_por_huella`) y fuera del
+    event loop. Hasta el 2026-10-06 era una consulta por huella —500 seguidas
+    en el único worker por cada lote del móvil— y, en el motor local, un GET
+    a Render POR HUELLA que no tenía, bloqueando y con 5 s de timeout cada
+    uno: con Render dormido, una ventana de 25 temas eran dos minutos sin
+    atender nada. Ahora lo que falta va a Render en UNA petición.
+
+    Y cuenta en la popularidad: con el `X-Device-Token` de un aparato
+    registrado, ese aparato queda como un DJ más que tiene los temas que se
+    contestan como analizados (`registrar_analistas`). Sin token no se cuenta:
+    la huella basta para preguntar, y sin aparato de verdad cualquiera
+    inflaría los DJs. El motor local reenvía el token con lo que pregunta a
+    Render.
     """
     fps = request.fingerprints or []
     if len(fps) > 500:
         raise HTTPException(400, "Máximo 500 fingerprints por petición")
+    validas = [fp for fp in fps if fp]
 
-    analyzed: list[str] = []
-    not_analyzed: list[str] = []
-    for fp in fps:
-        if not fp:
-            continue
-        # `get_track_by_fingerprint` ya cubre el caso `id == fingerprint`
-        # para registros antiguos donde el id legacy es el propio MD5.
-        existing = db.get_track_by_fingerprint(fp)
-        if existing and _is_analysis_current(existing):
-            analyzed.append(fp)
-            continue
-        # Motor local: su BD es local a ESTA maquina, asi que tras un formateo
-        # (o en un Mac nuevo) esta vacia y el pre-check del cliente fallaba
-        # SIEMPRE -> subida + analisis completo de toda la biblioteca aunque
-        # Render ya tuviera cada track. Preguntamos a Render antes de decir
-        # "no analizado": es un SELECT, y el cliente se ahorra subir el fichero.
-        if fetch_render_cache is not None:
-            try:
-                if fetch_render_cache(fp):
-                    analyzed.append(fp)
-                    continue
-            except Exception as e:  # nunca romper el pre-check por esto
-                logger.debug("[Dedup] fallback Render fallo para %s: %s", fp[:8], e)
-        not_analyzed.append(fp)
+    def _de_esta_bd():
+        filas = db.filas_por_huella(
+            validas, 'id, fingerprint, analysis_version, bpm, key')
+        return {fp for fp, fila in filas.items()
+                if _vale(fila, request.version, request.con_datos)}
+
+    ya = await run_in_threadpool(_de_esta_bd)
+
+    # Motor local: su BD es local a ESTA maquina, asi que tras un formateo
+    # (o en un Mac nuevo) esta vacia y el pre-check del cliente fallaba
+    # SIEMPRE -> subida + analisis completo de toda la biblioteca aunque
+    # Render ya tuviera cada track. Preguntamos a Render antes de decir
+    # "no analizado": es un SELECT, y el cliente se ahorra subir el fichero.
+    token = (peticion.headers.get('X-Device-Token') or '').strip()
+    faltan = [fp for fp in dict.fromkeys(validas) if fp not in ya]
+    if faltan and precheck_en_render is not None:
+        try:
+            ya |= set(await run_in_threadpool(precheck_en_render, faltan,
+                                              token or None))
+        except Exception as e:  # nunca romper el pre-check por esto
+            logger.info("[Dedup] Render no contesto al pre-check (%d huellas): %s",
+                        len(faltan), e)
+
+    analyzed = [fp for fp in validas if fp in ya]
+    not_analyzed = [fp for fp in validas if fp not in ya]
+
+    if analyzed and token and registrar_analistas is not None:
+        try:
+            aparato = await run_in_threadpool(dispositivo_del_token, token)
+            if aparato:
+                await run_in_threadpool(registrar_analistas, analyzed, aparato)
+        except Exception as e:  # contar nunca tumba el pre-check
+            logger.warning("[Popularidad] pre-check: %s", e)
 
     return {
         "analyzed": analyzed,
@@ -291,34 +358,15 @@ async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintReque
     }
 
 
-@router.get("/analysis/by-fingerprint/{fingerprint}")
-async def get_analysis_by_fingerprint(fingerprint: str):
-    """Devuelve el análisis cacheado de un track por su fingerprint
-    (MD5 del contenido). El cliente puede usar este endpoint tras
-    `/check-analyzed-by-fingerprint` para hidratar su cache local sin
-    subir el archivo otra vez."""
-    safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
-    if not safe_fp:
-        raise HTTPException(400, "fingerprint inválido")
-    existing = db.get_track_by_fingerprint(safe_fp)
-    if not existing:
-        # Motor local sin el track en su BD: si Render lo tiene, se lo damos al
-        # cliente tal cual. Sin esto el pre-check de dedup decia "ya analizado"
-        # (gracias al mismo fallback en /check-analyzed-by-fingerprint) y aqui
-        # respondia 404, asi que el cliente acababa subiendo el fichero igual.
-        if fetch_render_cache is not None:
-            try:
-                remote = fetch_render_cache(safe_fp)
-            except Exception:
-                remote = None
-            if remote:
-                return remote
-        raise HTTPException(404, "fingerprint no encontrado")
+def _ficha_desde_fila(safe_fp, existing):
+    """La ficha que se le da al cliente a partir de la fila de `tracks` de esa
+    huella: su `analysis_json` (o las columnas, si no lo hay) con lo mejor que
+    sabe la memoria colectiva encima. La comparten el GET de una huella y el
+    lote (`/analysis/by-fingerprint/batch`)."""
     raw = existing.get('analysis_json')
     result = None
     if raw:
         try:
-            import json
             result = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             result = None
@@ -352,46 +400,90 @@ async def get_analysis_by_fingerprint(fingerprint: str):
     return result
 
 
+@router.get("/analysis/by-fingerprint/{fingerprint}")
+async def get_analysis_by_fingerprint(fingerprint: str):
+    """Devuelve el análisis cacheado de un track por su fingerprint
+    (MD5 del contenido). El cliente puede usar este endpoint tras
+    `/check-analyzed-by-fingerprint` para hidratar su cache local sin
+    subir el archivo otra vez."""
+    safe_fp = re.sub(r'[^a-fA-F0-9]', '', fingerprint or '')
+    if not safe_fp:
+        raise HTTPException(400, "fingerprint inválido")
+    existing = db.get_track_by_fingerprint(safe_fp)
+    if not existing:
+        # Motor local sin el track en su BD: si Render lo tiene, se lo damos al
+        # cliente tal cual. Sin esto el pre-check de dedup decia "ya analizado"
+        # (gracias al mismo fallback en /check-analyzed-by-fingerprint) y aqui
+        # respondia 404, asi que el cliente acababa subiendo el fichero igual.
+        if fetch_render_cache is not None:
+            try:
+                remote = await run_in_threadpool(fetch_render_cache, safe_fp)
+            except Exception:
+                remote = None
+            if remote:
+                return remote
+        raise HTTPException(404, "fingerprint no encontrado")
+    return _ficha_desde_fila(safe_fp, existing)
+
+
+class FichasPorHuellaRequest(BaseModel):
+    fingerprints: List[str]
+
+
+# Una ficha son unos KB (el `analysis_json` entero): 100 por petición.
+MAX_FICHAS_POR_PETICION = 100
+
+
+@router.post("/analysis/by-fingerprint/batch")
+async def fichas_por_huella(req: FichasPorHuellaRequest):
+    """Las fichas de varias huellas en UNA petición: `{"fichas": {huella:
+    ficha}}`, la misma ficha que da el GET de una (`_ficha_desde_fila`). Las
+    que no hay no salen.
+
+    Tras el pre-check, el import pedía la ficha de cada acierto con un GET:
+    en un Mac recién formateado con 5.000 temas que Render ya tiene, 5.000
+    viajes seguidos, y con motor local, cada uno pasando por él (2026-10-06).
+    El motor local completa con Render lo que no tiene, en otra sola petición
+    y con la misma vara que el GET (`_fetch_render_cache`).
+    """
+    fps = [re.sub(r'[^a-fA-F0-9]', '', f or '') for f in (req.fingerprints or [])]
+    fps = [f for f in dict.fromkeys(fps) if f]
+    if len(fps) > MAX_FICHAS_POR_PETICION:
+        raise HTTPException(
+            400, f"Máximo {MAX_FICHAS_POR_PETICION} fingerprints por petición")
+
+    def _de_esta_bd():
+        filas = db.fichas_por_huella(fps)
+        return {fp: _ficha_desde_fila(fp, fila) for fp, fila in filas.items()}
+
+    fichas = await run_in_threadpool(_de_esta_bd)
+    faltan = [fp for fp in fps if fp not in fichas]
+    if faltan and fichas_en_render is not None:
+        try:
+            fichas.update(await run_in_threadpool(fichas_en_render, faltan))
+        except Exception as e:  # nunca romper el lote por esto
+            logger.info("[Fichas] Render no contesto (%d huellas): %s",
+                        len(faltan), e)
+    return {"fichas": fichas}
+
+
 # ==================== ENDPOINTS DE ARTWORK ====================
 
 @router.get("/analysis/{filename:path}")
 async def get_analysis(filename: str):
-    """Obtener anlisis guardado de un track por filename"""
-    # Decodificar filename si viene con URL encoding
-    from urllib.parse import unquote
-    import json
-    filename = unquote(filename)
-    
-    existing = db.get_track_by_filename(filename)
-    if existing:
-        # existing es una tupla, convertir a diccionario
-        # Columnas: id, filename, artist, title, duration, bpm, key, camelot, 
-        #           energy_dj, genre, track_type, analysis_json, analyzed_at, fingerprint
-        try:
-            # Si hay analysis_json guardado, usarlo directamente
-            analysis_json = existing[11]  # ndice de analysis_json
-            if analysis_json:
-                return json.loads(analysis_json)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning("analysis_json cacheado corrupto, fallback a respuesta basica: %s", e)
-        
-        # Fallback: construir respuesta bsica
-        return {
-            "id": existing[0],
-            "filename": existing[1],
-            "artist": existing[2],
-            "title": existing[3],
-            "duration": existing[4],
-            "bpm": existing[5],
-            "key": existing[6],
-            "camelot": existing[7],
-            "energy_dj": existing[8],
-            "genre": existing[9],
-            "track_type": existing[10],
-            "fingerprint": existing[13] if len(existing) > 13 else None,
-        }
-    
-    raise HTTPException(404, f"Anlisis no encontrado para: {filename}")
+    """Ya no se da un análisis por NOMBRE de fichero: 410.
+
+    La tabla es la de todos los usuarios, y por nombre salía el de cualquiera
+    que se llamara igual (ver `/check-analyzed`). Lo de este audio se pide por
+    su huella: `/analysis/by-fingerprint/{huella}`. Un móvil de antes, con el
+    410, analiza el fichero (`AudioAnalysisApi.getAnalysis` devolvía null en
+    cualquier respuesta que no fuera 200).
+    """
+    raise HTTPException(
+        410,
+        "Por nombre de fichero no: pídelo por su huella "
+        "(/analysis/by-fingerprint/{huella})",
+    )
 
 # Ids que se aceptan en /artwork: huellas (hex) y los `imp_…`/detecciones que
 # usa el propio backend. Nada con puntos ni barras llega a `os.path.join`.

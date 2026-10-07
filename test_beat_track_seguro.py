@@ -102,7 +102,8 @@ def test_acepta_los_kwargs_de_librosa():
 # EL CABLEADO: QUE NO SE QUEDE OTRA VEZ EN UN SOLO SITIO
 # ============================================================================
 
-@pytest.mark.parametrize('fichero', ['main.py', 'chunked_analyzer.py'])
+@pytest.mark.parametrize('fichero', ['main.py', 'chunked_analyzer.py',
+                                     'rasgos_del_tema.py'])
 def test_nadie_llama_a_beat_track_a_pelo(fichero):
     src = _src(fichero)
     # El fallback de `chunked_analyzer` para cuando no hay `audio_helpers` SI
@@ -118,16 +119,19 @@ def test_nadie_llama_a_beat_track_a_pelo(fichero):
         f'{fichero} llama a beat_track sin la guarda: {sospechosas}')
 
 
-def test_los_tres_sitios_usan_el_helper():
+def test_los_sitios_usan_el_helper():
     assert 'beat_track_seguro(y, sr)' in _src('main.py')
     assert 'beat_track_seguro(y_full, sr_full)' in _src('main.py')
-    assert 'beat_track_seguro(y, sr)' in _src('chunked_analyzer.py')
+    # Los temas largos: desde el 2026-10-06 ya no hay un `beat_track` por
+    # trozo (cada uno con su BPM y un 120 de defecto si fallaba) sino uno
+    # sobre la envolvente del tema entero, cosida (`rasgos_del_tema`).
+    assert 'beat_track_seguro(None, sr, onset_envelope=' in _src('rasgos_del_tema.py')
+    assert 'tempo_y_beats(' in _src('chunked_analyzer.py')
 
 
-def test_el_default_de_120_del_chunk_sigue_documentado_como_ultimo_recurso():
-    """El 120 no se quita —un chunk puede fallar por otras razones— pero deja
-    de ser lo que pasa cuando el audio simplemente no tiene percusion."""
+def test_el_120_de_defecto_del_trozo_ya_no_existe():
+    """Un tema sin pulso sale con BPM 0 y sin fuente, como en el camino
+    corto, en vez de con un 120 inventado."""
     src = _src('chunked_analyzer.py')
-    assert "'bpm': 120.0" in src
-    i = src.index('beat_track_seguro(y, sr)')
-    assert '120 BPM' in src[max(0, i - 600):i]
+    assert "'bpm': 120.0" not in src
+    assert "bpm_source = 'chunked_analysis' if bpm > 0 else ''" in src
