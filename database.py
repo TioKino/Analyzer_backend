@@ -3212,6 +3212,77 @@ class AnalysisDB:
             return cls.CAMINO_DEL_DSP.get(fuente, fuente)
         return 'etiquetas'
 
+    def resumen_puesta_al_dia(self, dias: int = 30) -> Dict:
+        """Lo que la PUESTA AL DÍA (`puesta_al_dia.py`) ha rehecho en los
+        ordenadores, desde los eventos `puesta_al_dia` que manda el cliente
+        (uno por tanda). Para leer dos cosas: que corre (aparatos, temas,
+        fallos, por motor) y qué cambió — sobre todo los *closing* que dejan
+        de serlo (#7) y la energía que baja en los largos de Render (#5).
+
+          aparatos, tandas, hechos, errores, ilegibles
+          por_motor   {local | render: {hechos, errores, ilegibles}}
+          cambios     {energia, tipo, genero, bpm, graves: temas}
+          energia     {baja, sube}: temas cuyo nivel bajó o subió
+          closing     {siguen, pasan_a: {tipo: temas}}
+
+        Recorre el cursor (la trampa del panel)."""
+        conn = self._open_conn()
+        try:
+            aparatos = set()
+            salida = {
+                'aparatos': 0, 'tandas': 0,
+                'hechos': 0, 'errores': 0, 'ilegibles': 0,
+                'por_motor': {},
+                'cambios': {},
+                'energia': {'baja': 0, 'sube': 0},
+                'closing': {'siguen': 0, 'pasan_a': {}},
+            }
+
+            def _n(v):
+                try:
+                    return max(0, int(v))
+                except (TypeError, ValueError):
+                    return 0
+
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'puesta_al_dia' AND day >= date('now', ?)",
+                (f"-{int(dias)} days",))
+            for dev, props in cur:
+                try:
+                    p = json.loads(props) if props else {}
+                except (TypeError, ValueError):
+                    p = {}
+                if not isinstance(p, dict):
+                    continue
+                salida['tandas'] += 1
+                if dev:
+                    aparatos.add(dev)
+                motor = 'local' if p.get('motor') == 'local' else 'render'
+                pm = salida['por_motor'].setdefault(
+                    motor, {'hechos': 0, 'errores': 0, 'ilegibles': 0})
+                for k in ('hechos', 'errores', 'ilegibles'):
+                    salida[k] += _n(p.get(k))
+                    pm[k] += _n(p.get(k))
+                cambios = p.get('cambios')
+                if isinstance(cambios, dict):
+                    for k, v in cambios.items():
+                        k = str(k)[:16]
+                        salida['cambios'][k] = salida['cambios'].get(k, 0) + _n(v)
+                salida['energia']['baja'] += _n(p.get('energia_baja'))
+                salida['energia']['sube'] += _n(p.get('energia_sube'))
+                salida['closing']['siguen'] += _n(p.get('closing_sigue'))
+                pasan = p.get('closing_a')
+                if isinstance(pasan, dict):
+                    for k, v in pasan.items():
+                        k = str(k)[:24]
+                        salida['closing']['pasan_a'][k] = (
+                            salida['closing']['pasan_a'].get(k, 0) + _n(v))
+            salida['aparatos'] = len(aparatos)
+            return salida
+        finally:
+            conn.close()
+
     # Lo que decide en Render el camino por trozos (`CHUNK_ANALYSIS_THRESHOLD`).
     UMBRAL_DEL_CAMINO_POR_TROZOS = 240
 

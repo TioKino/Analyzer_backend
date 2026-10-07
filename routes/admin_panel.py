@@ -1638,6 +1638,9 @@ async def telemetry(request: Request):
         "dsp_frente_a_lo_importado": _dsp_frente_a_lo_importado(),
         "tonalidad_en_sombra": _tonalidad_en_sombra(),
         "rasgos_por_camino": _rasgos_por_camino(),
+        # Lo que la puesta al día ha rehecho en los ordenadores (desde el
+        # 2026-10-07, apagada hasta que se pone `PUESTA_AL_DIA` en Render).
+        "puesta_al_dia": _puesta_al_dia(),
     }
 
 
@@ -1996,6 +1999,14 @@ def _rasgos_por_camino():
         return _get_db().rasgos_por_camino(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] rasgos por camino fallo: {e}")
+        return None
+
+
+def _puesta_al_dia():
+    try:
+        return _get_db().resumen_puesta_al_dia(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] puesta al día fallo: {e}")
         return None
 
 
