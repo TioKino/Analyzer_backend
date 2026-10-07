@@ -3069,8 +3069,15 @@ class AnalysisDB:
             bloque = salida[campo]
             camino = bloque['por_camino'].setdefault(
                 self._camino_del_dsp(fuente, fila['engine_source']),
-                {'total': vacio(), 'recientes': vacio()})
+                {'total': vacio(), 'recientes': vacio(), 'por_duracion': {}})
+            # Por duración: los temas de 4 minutos o menos de Render van por
+            # el corto y los del motor local también, así que «hasta_4min»
+            # compara el mismo tipo de tema en los dos motores (el 19 % del
+            # corto de Render frente al 48 % del motor local, lectura 55).
+            tramo = ('hasta_4min' if (fila['duration'] or 0) <= self.UMBRAL_DEL_CAMINO_POR_TROZOS
+                     else 'mas_de_4min')
             for d in (bloque['total'],
+                      camino['por_duracion'].setdefault(tramo, vacio()),
                       bloque['por_programa'].setdefault(programa, vacio()),
                       bloque['recientes'] if reciente else None,
                       camino['total'],
@@ -3102,7 +3109,7 @@ class AnalysisDB:
                 # Las fuentes no son columnas: viven en `analysis_json`.
                 for t in self._tracks_por_huella_o_id(
                         c, "id, fingerprint, bpm, camelot, analyzed_at, "
-                           "engine_source, platform, "
+                           "engine_source, platform, duration, "
                            "json_extract(analysis_json, '$.bpm_source') AS bpm_source, "
                            "json_extract(analysis_json, '$.key_source') AS key_source",
                         fps):
@@ -3149,8 +3156,9 @@ class AnalysisDB:
         perfil usa /analyze. Solo cuentan los temas analizados desde que
         `/analyze` guarda el croma (`croma` en `analysis_json`), así que al
         principio son los que alguien haya reanalizado."""
-        from tonalidad import evaluar_perfiles
+        from tonalidad import evaluar_perfiles, guardada_frente_a_kk
         temas = []
+        por_camino = []
         marcas = ','.join('?' * len(self.PROGRAMAS_DE_REFERENCIA_TONALIDAD))
         conn = self._open_conn()
         try:
@@ -3170,7 +3178,8 @@ class AnalysisDB:
                 verdad = {r['fingerprint']: r['camelot'] for r in lote if r['camelot']}
                 vistos = set()
                 for t in self._tracks_por_huella_o_id(
-                        c, "id, fingerprint, "
+                        c, "id, fingerprint, camelot, engine_source, "
+                           "json_extract(analysis_json, '$.key_source') AS key_source, "
                            "json_extract(analysis_json, '$.croma') AS croma",
                         list(verdad)):
                     clave = t['fingerprint'] if t['fingerprint'] in verdad else t['id']
@@ -3183,9 +3192,28 @@ class AnalysisDB:
                     if isinstance(croma, list) and len(croma) == 12:
                         vistos.add(clave)
                         temas.append((clave, croma, verdad[clave]))
+                        por_camino.append((croma, verdad[clave],
+                                           self._camino_de_la_tonalidad(t),
+                                           t['camelot']))
         finally:
             conn.close()
-        return evaluar_perfiles(temas)
+        salida = evaluar_perfiles(temas)
+        salida['por_camino'] = guardada_frente_a_kk(por_camino)
+        return salida
+
+    @classmethod
+    def _camino_de_la_tonalidad(cls, fila) -> str:
+        """Quién puso la tonalidad guardada: el motor local (por
+        `engine_source`), el de trozos, el corto o las etiquetas."""
+        if fila['engine_source'] == 'local_engine':
+            return 'motor_local'
+        fuente = fila['key_source']
+        if fuente in cls.FUENTES_DEL_DSP:
+            return cls.CAMINO_DEL_DSP.get(fuente, fuente)
+        return 'etiquetas'
+
+    # Lo que decide en Render el camino por trozos (`CHUNK_ANALYSIS_THRESHOLD`).
+    UMBRAL_DEL_CAMINO_POR_TROZOS = 240
 
     # Los tramos de duración del reparto de rasgos. 4 minutos es donde Render
     # pasa al camino por trozos (`CHUNK_ANALYSIS_THRESHOLD`); 5, donde

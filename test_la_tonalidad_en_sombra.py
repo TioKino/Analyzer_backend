@@ -188,3 +188,23 @@ def test_analyze_devuelve_el_croma():
     import models
     assert 'croma' in main.AnalysisResult.model_fields
     assert 'croma' in models.AnalysisResult.model_fields
+
+
+def test_por_camino_lo_guardado_frente_a_krumhansl(db):
+    """En el corto la tonalidad guardada y Krumhansl sobre el croma son el
+    mismo cálculo y tienen que coincidir; en los trozos son dos algoritmos
+    sobre los mismos temas (lectura 55)."""
+    corto = _tema(db, croma=_la_menor(), camelot='8A')
+    db.guardar_lo_importado('devA', [{'fingerprint': corto, 'source': 'rekordbox',
+                                      'key': 'Am', 'camelot': '8A'}])
+    trozos = _tema(db, croma=_la_menor(), key_source='chunked_analysis',
+                   camelot='9A')
+    db.guardar_lo_importado('devA', [{'fingerprint': trozos, 'source': 'rekordbox',
+                                      'key': 'Am', 'camelot': '8A'}])
+    r = db.tonalidad_en_sombra()['por_camino']
+    assert r['corto'] == {'temas': 1, 'guardada': {'comparados': 1, 'igual': 1},
+                          'kk': {'comparados': 1, 'igual': 1},
+                          'kk_igual_que_guardada': 1}
+    assert r['trozos']['guardada'] == {'comparados': 1, 'igual': 0, 'quinta': 1}
+    assert r['trozos']['kk'] == {'comparados': 1, 'igual': 1}
+    assert r['trozos']['kk_igual_que_guardada'] == 0

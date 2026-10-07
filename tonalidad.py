@@ -226,3 +226,27 @@ def evaluar_perfiles(temas: Sequence[Tuple[str, Sequence[float], str]]) -> Dict:
     if todos:
         salida['perfil_aprendido'] = {'mayor': todos[0], 'menor': todos[1]}
     return salida
+
+
+def guardada_frente_a_kk(temas: Sequence[Tuple[Sequence[float], str, str, Optional[str]]]
+                         ) -> Dict[str, Dict]:
+    """Por camino, la tonalidad GUARDADA y la que da Krumhansl sobre el croma
+    del mismo tema, las dos contra el programa, y en cuántos coinciden.
+    `temas` = [(croma, Camelot del programa, camino, Camelot guardado)].
+
+    Para dos cosas (lectura 55). En el corto las dos son el mismo cálculo y
+    tienen que coincidir siempre: si no, algo cambia la tonalidad entre que
+    se mide y se guarda. En los trozos son dos algoritmos (el voto de cada
+    trozo frente al croma del tema entero) sobre los mismos temas: dice cuál
+    acierta más sin cambiar nada."""
+    salida: Dict[str, Dict] = {}
+    for croma, verdad, camino, guardada in temas:
+        d = salida.setdefault(camino, {'temas': 0, 'guardada': _vacio(),
+                                       'kk': _vacio(), 'kk_igual_que_guardada': 0})
+        d['temas'] += 1
+        kk = tonalidad_desde_croma(croma, *PERFILES['kk'])
+        _apuntar(d['guardada'], clase_de_tonalidad(guardada, verdad))
+        _apuntar(d['kk'], clase_de_tonalidad(kk, verdad))
+        if kk and partir_camelot(kk) == partir_camelot(guardada):
+            d['kk_igual_que_guardada'] += 1
+    return salida

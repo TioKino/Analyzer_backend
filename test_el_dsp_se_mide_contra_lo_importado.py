@@ -208,3 +208,31 @@ def test_lo_reciente_se_parte_por_plataforma(db):
         'windows': {'comparados': 1, 'igual': 1},
     }
     assert m['total']['comparados'] == 4
+
+
+def test_cada_camino_se_parte_por_duracion(db):
+    """Lectura 55: el corto de Render acierta la tonalidad un 19 % y el motor
+    local un 48 %, con el MISMO código. El motor local analiza también los
+    temas largos, así que sus «hasta_4min» son los únicos comparables con el
+    corto de Render: si también dan ~19 %, es la población; si dan ~48 %, es
+    el camino."""
+    def motor_local(duracion, camelot):
+        fp = uuid.uuid4().hex
+        db.save_track({
+            'id': fp, 'fingerprint': fp, 'filename': f'{fp}.mp3', 'bpm': 128.0,
+            'bpm_source': 'analysis', 'key': 'Am', 'camelot': camelot,
+            'key_source': 'analysis', 'duration': duracion, 'energy_dj': 6,
+            'genre': 'Techno', 'track_type': 'peak_time',
+            'engine_source': 'local_engine', 'platform': 'windows',
+            'analyzed_at': (datetime.utcnow() - timedelta(days=2)).isoformat(),
+        })
+        _importado(db, fp, bpm=128.0, key='Am', camelot='8A')
+
+    motor_local(200, '8A')
+    motor_local(230, '5A')
+    motor_local(420, '8A')
+    caminos = db.dsp_frente_a_lo_importado()['tonalidad']['por_camino']
+    tramos = caminos['motor_local']['por_duracion']
+    assert tramos['hasta_4min'] == {'comparados': 2, 'igual': 1, 'otra': 1}
+    assert tramos['mas_de_4min'] == {'comparados': 1, 'igual': 1}
+    assert caminos['motor_local']['total']['comparados'] == 3
