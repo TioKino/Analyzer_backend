@@ -1636,6 +1636,7 @@ async def telemetry(request: Request):
         # dicen Rekordbox/Traktor/VirtualDJ de la misma huella (desde el
         # 2026-10-06). La única verdad de referencia que hay a mano.
         "dsp_frente_a_lo_importado": _dsp_frente_a_lo_importado(),
+        "tonalidad_en_sombra": _tonalidad_en_sombra(),
     }
 
 
@@ -1978,6 +1979,14 @@ def _dsp_frente_a_lo_importado():
         return _get_db().dsp_frente_a_lo_importado(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] DSP frente a lo importado fallo: {e}")
+        return None
+
+
+def _tonalidad_en_sombra():
+    try:
+        return _get_db().tonalidad_en_sombra()
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] tonalidad en sombra fallo: {e}")
         return None
 
 

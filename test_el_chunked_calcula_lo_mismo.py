@@ -149,3 +149,16 @@ def test_los_trozos_empiezan_en_un_frame_exacto():
                   'def analyze_chunk_spectral', 'def _classify_track_type',
                   'def calculate_beat_grid'):
         assert fuera not in src, f'{fuera}: los dos caminos usan rasgos_del_tema'
+
+
+def test_el_croma_se_guarda_en_los_dos_y_es_el_mismo(los_dos):
+    """El croma medio del tema va en el análisis por los dos caminos, para
+    medir otros perfiles de tonalidad sin el audio (`tonalidad.py`). El tema
+    sintético lleva La de bajo y La-Do# de acorde: el pico, en La."""
+    corto, trozos = los_dos
+    for croma in (corto.croma, trozos['croma']):
+        assert len(croma) == 12
+        assert abs(sum(croma) - 1) < 1e-3
+        assert int(np.argmax(croma)) == 9, croma
+    a, b = np.array(corto.croma), np.array(trozos['croma'])
+    assert a @ b / (np.linalg.norm(a) * np.linalg.norm(b)) > 0.95

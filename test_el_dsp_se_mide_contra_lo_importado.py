@@ -52,7 +52,7 @@ def test_EL_CASO_el_bpm_y_la_tonalidad_medidos_frente_al_programa(db):
     _importado(db, bien, bpm=127.99, key='Am', camelot='8A')
     doble = _tema(db, bpm=170.0, camelot='8B')
     _importado(db, doble, bpm=85.0, key='Am', camelot='8A')
-    otro = _tema(db, bpm=122.0, camelot='3A')
+    otro = _tema(db, bpm=122.0, camelot='5A')
     _importado(db, otro, programa='traktor', bpm=126.0, key='Fm', camelot='4A')
 
     m = db.dsp_frente_a_lo_importado()
@@ -149,7 +149,7 @@ def test_el_camino_por_trozos_tambien_se_mide_y_se_parte_por_camino(db):
     largo = _tema(db, camelot='8B', bpm_source='chunked_analysis',
                   key_source='chunked_analysis')
     _importado(db, largo, bpm=128.0, key='Am', camelot='8A')
-    local = _tema(db, camelot='3A', bpm_source='local_engine',
+    local = _tema(db, camelot='5A', bpm_source='local_engine',
                   key_source='local_engine', hace_dias=60)
     _importado(db, local, bpm=128.0, key='Am', camelot='8A')
 
@@ -181,7 +181,7 @@ def test_lo_del_motor_local_va_a_su_camino_aunque_su_fuente_diga_analysis(db):
         'analyzed_at': (datetime.utcnow() - timedelta(days=2)).isoformat(),
     })
     _importado(db, fp, bpm=128.0, key='Am', camelot='8A')
-    render = _tema(db, camelot='3A')
+    render = _tema(db, camelot='5A')
     _importado(db, render, bpm=128.0, key='Am', camelot='8A')
 
     caminos = db.dsp_frente_a_lo_importado()['tonalidad']['por_camino']
@@ -192,7 +192,7 @@ def test_lo_del_motor_local_va_a_su_camino_aunque_su_fuente_diga_analysis(db):
 def test_lo_reciente_se_parte_por_plataforma(db):
     """Una ráfaga de un Mac de pruebas pesa más que el resto junto: sin
     reparto por plataforma, lo reciente no dice si es el DSP o ese aparato."""
-    for camelot, plataforma in (('8A', 'macos-mas'), ('3A', 'macos-mas'),
+    for camelot, plataforma in (('8A', 'macos-mas'), ('5A', 'macos-mas'),
                                 ('8A', 'windows')):
         fp = _tema(db, camelot=camelot)
         with db._open_conn() as conn:

@@ -31,6 +31,10 @@ class AnalysisResult(BaseModel):
     camelot: Optional[str] = None
     key_confidence: float
     key_source: str = "analysis"
+    # El croma medio del tema (12 números que suman 1, de Do a Si): lo que la
+    # tonalidad mira. Se guarda para medir otros perfiles contra lo importado
+    # sin volver a tener el audio (`tonalidad.py`, #4 de PENDING, 2026-10-07).
+    croma: Optional[List[float]] = None
     energy_raw: float
     energy_normalized: float
     energy_dj: int

@@ -3025,21 +3025,11 @@ class AnalysisDB:
     @staticmethod
     def _clase_de_tonalidad(dsp: Optional[str], programa: Optional[str]) -> Optional[str]:
         """Cómo se parece la tonalidad medida a la del programa, en Camelot.
-        `relativa` (8A↔8B) y `quinta` (8A↔7A/9A) son los errores típicos de un
-        detector de tonalidad, y mezclan bien: se cuentan aparte de `otra`."""
-        def partir(c):
-            m = re.match(r'^\s*(\d{1,2})\s*([ABab])\s*$', c or '')
-            return (int(m.group(1)), m.group(2).upper()) if m else None
-        a, b = partir(dsp), partir(programa)
-        if not a or not b:
-            return None
-        if a == b:
-            return 'igual'
-        if a[0] == b[0]:
-            return 'relativa'
-        if a[1] == b[1] and (a[0] - b[0]) % 12 in (1, 11):
-            return 'quinta'
-        return 'otra'
+        La regla vive en `tonalidad.clase_de_tonalidad` (igual, relativa,
+        quinta, paralela, semitono, otra): la usan esta medida y la de los
+        perfiles en sombra, y tienen que contar igual."""
+        from tonalidad import clase_de_tonalidad
+        return clase_de_tonalidad(dsp, programa)
 
     def dsp_frente_a_lo_importado(self, dias_recientes: int = 30) -> Dict:
         """El DSP medido contra lo que dicen Rekordbox, Traktor y VirtualDJ de
@@ -3145,6 +3135,57 @@ class AnalysisDB:
         finally:
             conn.close()
         return salida
+
+    # Los programas cuya tonalidad sirve de verdad de referencia para los
+    # perfiles en sombra. Traktor no: su tabla estuvo mal hasta el 2026-09-26
+    # y no hay forma de distinguir una buena (lectura 54: 12,5 % de acierto).
+    PROGRAMAS_DE_REFERENCIA_TONALIDAD = ('rekordbox', 'virtualdj')
+
+    def tonalidad_en_sombra(self) -> Dict:
+        """Cada perfil de tonalidad (`tonalidad.PERFILES` y uno aprendido de
+        esta misma música), medido sobre el croma guardado de los temas
+        contra la tonalidad que dice su programa de DJ (#4 de PENDING,
+        2026-10-07). Nadie ve nada distinto: es para decidir con números qué
+        perfil usa /analyze. Solo cuentan los temas analizados desde que
+        `/analyze` guarda el croma (`croma` en `analysis_json`), así que al
+        principio son los que alguien haya reanalizado."""
+        from tonalidad import evaluar_perfiles
+        temas = []
+        marcas = ','.join('?' * len(self.PROGRAMAS_DE_REFERENCIA_TONALIDAD))
+        conn = self._open_conn()
+        try:
+            try:
+                cur = conn.execute(
+                    "SELECT fingerprint, camelot, MAX(updated_at) AS cuando "
+                    "FROM imported_values WHERE field = 'key' "
+                    f"AND source IN ({marcas}) GROUP BY fingerprint",
+                    self.PROGRAMAS_DE_REFERENCIA_TONALIDAD)
+            except sqlite3.OperationalError:
+                return evaluar_perfiles([])
+            c = conn.cursor()
+            while True:
+                lote = cur.fetchmany(400)
+                if not lote:
+                    break
+                verdad = {r['fingerprint']: r['camelot'] for r in lote if r['camelot']}
+                vistos = set()
+                for t in self._tracks_por_huella_o_id(
+                        c, "id, fingerprint, "
+                           "json_extract(analysis_json, '$.croma') AS croma",
+                        list(verdad)):
+                    clave = t['fingerprint'] if t['fingerprint'] in verdad else t['id']
+                    if clave not in verdad or clave in vistos or not t['croma']:
+                        continue
+                    try:
+                        croma = json.loads(t['croma'])
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(croma, list) and len(croma) == 12:
+                        vistos.add(clave)
+                        temas.append((clave, croma, verdad[clave]))
+        finally:
+            conn.close()
+        return evaluar_perfiles(temas)
 
     def lo_importado_de(self, fingerprints, exacta: Optional[str] = None) -> Dict:
         """Lo que los programas de DJ dicen de estas huellas (las versiones de
