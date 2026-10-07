@@ -2993,6 +2993,18 @@ class AnalysisDB:
         'local_engine': 'motor_local',
     }
 
+    @classmethod
+    def _camino_del_dsp(cls, fuente: Optional[str], motor: Optional[str]) -> str:
+        """El camino por el MOTOR que lo calculó, no solo por la fuente. Lo
+        del motor local llega a Render por `/cache-analysis` con SU fuente
+        (`analysis`), y la marca `local_engine` en la fuente es solo de filas
+        viejas: hasta el 2026-10-07 todo lo del motor local caía en `corto`, y
+        la línea «corto (Render)» de `embudo.sh` lo mezclaba. Quién lo calculó
+        lo dice `engine_source`."""
+        if motor == 'local_engine':
+            return 'motor_local'
+        return cls.CAMINO_DEL_DSP.get(fuente, fuente)
+
     @staticmethod
     def _clase_de_bpm(dsp: float, programa: float) -> Optional[str]:
         """Cómo se parece el BPM medido al del programa de DJ. `igual` es lo
@@ -3047,29 +3059,35 @@ class AnalysisDB:
         anteriores al 2026-09-26 salieron con una tabla mala, y aparte lo
         analizado en los últimos `dias_recientes` (`analyzed_at`): el DSP ha
         cambiado sin subir `ANALYSIS_VERSION` (la rejilla, el afinado del
-        intervalo), y lo viejo no dice nada del de hoy. Recorre
-        `imported_values` con el cursor y busca las filas de `tracks` por
-        lotes, por índice.
+        intervalo), y lo viejo no dice nada del de hoy. Lo reciente se parte
+        además por PLATAFORMA (`recientes_por_plataforma`): las ráfagas de
+        análisis de un solo Mac de pruebas (`macos-mas`, ver CLAUDE.md) pesan
+        tanto que sin ese reparto no se sabe si lo reciente es el DSP o la
+        biblioteca de un aparato. Recorre `imported_values` con el cursor y
+        busca las filas de `tracks` por lotes, por índice.
         """
         def vacio():
             return {'comparados': 0, 'igual': 0}
 
         salida = {campo: {'total': vacio(), 'por_programa': {}, 'recientes': vacio(),
-                          'por_camino': {}}
+                          'por_camino': {}, 'recientes_por_plataforma': {}}
                   for campo in ('bpm', 'tonalidad')}
         salida['dias_recientes'] = dias_recientes
         desde = (datetime.utcnow() - timedelta(days=dias_recientes)).isoformat()
 
-        def apuntar(campo, programa, clase, reciente, fuente):
+        def apuntar(campo, programa, clase, reciente, fila, fuente):
             bloque = salida[campo]
             camino = bloque['por_camino'].setdefault(
-                self.CAMINO_DEL_DSP.get(fuente, fuente),
+                self._camino_del_dsp(fuente, fila['engine_source']),
                 {'total': vacio(), 'recientes': vacio()})
             for d in (bloque['total'],
                       bloque['por_programa'].setdefault(programa, vacio()),
                       bloque['recientes'] if reciente else None,
                       camino['total'],
-                      camino['recientes'] if reciente else None):
+                      camino['recientes'] if reciente else None,
+                      bloque['recientes_por_plataforma'].setdefault(
+                          fila['platform'] or 'unknown', vacio())
+                      if reciente else None):
                 if d is None:
                     continue
                 d['comparados'] += 1
@@ -3094,6 +3112,7 @@ class AnalysisDB:
                 # Las fuentes no son columnas: viven en `analysis_json`.
                 for t in self._tracks_por_huella_o_id(
                         c, "id, fingerprint, bpm, camelot, analyzed_at, "
+                           "engine_source, platform, "
                            "json_extract(analysis_json, '$.bpm_source') AS bpm_source, "
                            "json_extract(analysis_json, '$.key_source') AS key_source",
                         fps):
@@ -3114,14 +3133,14 @@ class AnalysisDB:
                         except (TypeError, ValueError):
                             clase = None
                         if clase:
-                            apuntar('bpm', r['source'], clase, reciente,
+                            apuntar('bpm', r['source'], clase, reciente, t,
                                     t['bpm_source'])
                     else:
                         if t['key_source'] not in self.FUENTES_DEL_DSP:
                             continue
                         clase = self._clase_de_tonalidad(t['camelot'], r['camelot'])
                         if clase:
-                            apuntar('tonalidad', r['source'], clase, reciente,
+                            apuntar('tonalidad', r['source'], clase, reciente, t,
                                     t['key_source'])
         finally:
             conn.close()
