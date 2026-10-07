@@ -36,6 +36,7 @@ import numpy as np
 # Lo que los dos caminos de /analyze calculan con las mismas cuentas (el corto
 # aqui, el de trozos en `chunked_analyzer`). Se importan con su nombre de
 # siempre: hay tests y llamadas que los piden a `main`.
+from tonalidad import croma_para_guardar
 from rasgos_del_tema import (try_bpm_double_half, classify_track_type,
                              pulso_de_beats, rasgos_espectrales,
                              rejilla_y_bpm, HOP as HOP_RASGOS)
@@ -1211,6 +1212,10 @@ class AnalysisResult(BaseModel):
     camelot: Optional[str] = None
     key_confidence: float = 0.0
     key_source: str = "analysis"
+    # El croma medio del tema (12 números que suman 1, de Do a Si): lo que la
+    # tonalidad mira. Se guarda para medir otros perfiles contra lo importado
+    # sin volver a tener el audio (`tonalidad.py`, #4 de PENDING, 2026-10-07).
+    croma: Optional[List[float]] = None
     energy_raw: float = 0.0
     energy_normalized: float = 0.0
     energy_dj: int = 5
@@ -2583,6 +2588,7 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         camelot=camelot,
         key_confidence=key_confidence,
         key_source=key_source,
+        croma=croma_para_guardar(chroma_mean),
         energy_raw=energy_raw,
         energy_normalized=energy_normalized,
         energy_dj=energy_dj,
@@ -2770,6 +2776,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         camelot=camelot,
         key_confidence=result['key_confidence'],
         key_source=key_source,
+        croma=result.get('croma'),
         energy_raw=result['energy_raw'],
         energy_normalized=result['energy_normalized'],
         energy_dj=result['energy_dj'],

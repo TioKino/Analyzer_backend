@@ -29,6 +29,7 @@ from beat_grid import onset_envelope as beat_grid_onset_envelope
 # Lo que este camino tiene que calcular IGUAL que el corto (`main.analyze_audio`):
 # el BPM y su doble/mitad, la rejilla, el groove, el tipo de track, los graves,
 # los pads, la percusion y el genero espectral. Ver el docstring del modulo.
+from tonalidad import croma_de_trozos
 from rasgos_del_tema import (HOP, pulso_de_beats, rasgos_espectrales,
                              rejilla_y_bpm, tempo_y_beats, tempograma,
                              try_bpm_double_half)
@@ -932,6 +933,9 @@ class ChunkedAudioAnalyzer:
             'camelot': key_final['camelot'],
             'key_confidence': key_final['confidence'],
             'key_source': 'chunked_analysis',
+            # El croma del tema entero, para medir otros perfiles de
+            # tonalidad (`tonalidad.py`): la media del de cada trozo.
+            'croma': croma_de_trozos(r.get('chroma_vector') for r in key_results),
             'energy_raw': energy_mean,
             'energy_normalized': energy_dj / 10,
             'energy_dj': energy_dj,
