@@ -39,7 +39,9 @@ import numpy as np
 from tonalidad import croma_para_guardar
 from rasgos_del_tema import (try_bpm_double_half, classify_track_type,
                              pulso_de_beats, rasgos_espectrales,
-                             rejilla_y_bpm, HOP as HOP_RASGOS)
+                             rejilla_y_bpm, energia_del_tema,
+                             nivel_de_energia, HOP as HOP_RASGOS)
+import puesta_al_dia
 import sys
 import tempfile
 import os
@@ -1699,7 +1701,8 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
                         duration: float, id3_data: dict,
                         original_filename: Optional[str],
                         force_audd: bool = False,
-                        device_id: Optional[str] = None) -> dict:
+                        device_id: Optional[str] = None,
+                        con_audd: bool = True) -> dict:
     """Quién es el tema y de qué género: lo mismo para los dos caminos de
     /analyze (el corto y el chunked repetían el bloque entero).
 
@@ -1708,6 +1711,9 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
     basura, con presupuesto) -> Discogs / MusicBrainz con lo que haya salido
     (`_genero_por_identidad`) -> género de la etiqueta. `genre` None = el que
     midió el DSP.
+
+    `con_audd=False` no llama a AudD nunca (la puesta al día de lo ya
+    analizado: el nombre no cambia y no hay presupuesto que gastar).
     """
     label = id3_data.get('label')
     year = id3_data.get('year')
@@ -1733,7 +1739,7 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
     # Beatport iba por aqui y se elimino (WAF de Cloudflare).
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
     audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
-    if AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+    if con_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
         try:
             from audd_helper import (enrich_with_audd_if_needed,
                                      download_artwork_from_audd, isrc_de_audd)
@@ -2178,7 +2184,8 @@ def robust_audio_load(file_path: str, sr: int = 44100, mono: bool = True):
 
 def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = False,
                   original_filename: Optional[str] = None,
-                  device_id: Optional[str] = None) -> AnalysisResult:
+                  device_id: Optional[str] = None,
+                  con_audd: bool = True) -> AnalysisResult:
     import warnings
     warnings.filterwarnings('ignore')
 
@@ -2212,7 +2219,7 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         logger.info(f" Track largo ({duration/60:.1f} min) - Usando anlisis por chunks")
         return analyze_audio_chunked(file_path, fingerprint, duration, force_audd=force_audd,
                                      original_filename=original_filename,
-                                     device_id=device_id)
+                                     device_id=device_id, con_audd=con_audd)
 
     # Track corto: anlisis tradicional (carga todo en RAM)
     logger.info(f" Track corto ({duration/60:.1f} min) - Usando anlisis tradicional")
@@ -2374,38 +2381,13 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         key, camelot = id3_norm
         key_source = "id3"
     
-    # Energy - Escala DJ 1-10 con curva power para mejor distribucion
+    # Energía: nivel DJ 1-10 y el principio y el final para mezclar. Las
+    # mismas cuentas que el camino por trozos (`energia_del_tema`), que cose
+    # este mismo RMS trozo a trozo.
     rms = librosa.feature.rms(y=y)[0]
-    energy_raw = float(np.mean(rms))
-    
-    # RMS tipico en musica electronica: 0.02 (ambient) a 0.42+ (hardstyle)
-    # MEJORA 2: Curva power 0.55 que expande el rango medio
-    # El frontend puede ADEMAS aplicar percentiles sobre la biblioteca local
-    # para distribucion aun mas precisa (energy_raw se guarda para esto)
-    
-    if energy_raw <= 0.02:
-        energy_dj = 1
-    elif energy_raw >= 0.42:
-        energy_dj = 10
-    elif not math.isfinite(energy_raw):
-        # NaN/Inf: el RMS puede salir NaN con audios muy cortos, silencio
-        # total o frames problematicos. Sin esta guard, int(NaN) explota
-        # con ValueError 'cannot convert float NaN to integer' (era el
-        # error #1 mas frecuente en el panel admin, 112 ocurrencias).
-        energy_dj = 5
-        logger.warning(f"   Energia: energy_raw={energy_raw} NaN/Inf, fallback a 5")
-    else:
-        normalized = (energy_raw - 0.02) / (0.42 - 0.02)
-        powered = normalized ** 0.55  # expande rango bajo-medio
-        energy_dj = int(round(1 + powered * 9))
-        energy_dj = max(1, min(10, energy_dj))
-    
+    energy_raw, energy_dj, mix_energy_start, mix_energy_end = energia_del_tema(rms, sr)
     energy_normalized = energy_dj / 10.0
     logger.info(f"   Energia: raw={energy_raw:.4f} -> DJ level {energy_dj}")
-    
-    chunk_size = int(sr * 30)
-    mix_energy_start = float(np.mean(rms[:min(chunk_size//512, len(rms))]))
-    mix_energy_end = float(np.mean(rms[max(0, len(rms)-chunk_size//512):]))
     
     # Structure
     segments = detect_structure(y, sr, duration)
@@ -2445,7 +2427,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # Etiquetas -> nombre del fichero -> cluster -> AudD, y con eso Discogs /
     # MusicBrainz. Los dos caminos de /analyze pasan por el mismo sitio.
     _ident = _identidad_y_genero(file_path, fingerprint, duration, id3_data,
-                                 original_filename, force_audd, device_id)
+                                 original_filename, force_audd, device_id,
+                                 con_audd=con_audd)
     artist_name, title_name = _ident['artist'], _ident['title']
     label, year = _ident['label'], _ident['year']
     audd_artwork, audd_isrc = _ident['audd_artwork'], _ident['audd_isrc']
@@ -2622,7 +2605,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
 
 def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, force_audd: bool = False,
                           original_filename: Optional[str] = None,
-                          device_id: Optional[str] = None) -> AnalysisResult:
+                          device_id: Optional[str] = None,
+                          con_audd: bool = True) -> AnalysisResult:
     """
     Analiza tracks largos por chunks para reducir uso de RAM.
     Usado automticamente para tracks > 4 minutos.
@@ -2667,7 +2651,8 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
     genre = result.get('genre') or "Electronic"
     genre_source = "spectral_analysis"
     _ident = _identidad_y_genero(file_path, fingerprint, duration, id3_data,
-                                 original_filename, force_audd, device_id)
+                                 original_filename, force_audd, device_id,
+                                 con_audd=con_audd)
     artist_name, title_name = _ident['artist'], _ident['title']
     label, year = _ident['label'], _ident['year']
     audd_artwork, audd_isrc = _ident['audd_artwork'], _ident['audd_isrc']
@@ -2865,46 +2850,98 @@ async def analyze_track(
     return result
 
 
-async def _analizar(request: Request, file: UploadFile, force: bool,
-                    force_audd: bool):
-    """El cuerpo de /analyze. Tiene cinco salidas (acierto por nombre, por
-    huella, fallback a Render, análisis nuevo y el de emergencia), y por eso
-    lo común a todas va en `analyze_track`, que lo envuelve.
+# ==================== PUESTA AL DÍA DE LO YA ANALIZADO ====================
+# Las reglas y el interruptor viven en `puesta_al_dia.py`.
 
-    EL EVENT LOOP NO SE TOCA. Render corre UN proceso de uvicorn (`Procfile`),
-    así que lo que bloquea aquí bloquea a todos: el sync, la comunidad y
-    Escuchar esperan detrás. Hasta la auditoría del 2026-10-02 solo el DSP iba
-    al threadpool; el MD5 del fichero (hasta 100 MB), `fpcalc` sobre el audio
-    entero (`_attach_acoustic`), el preview con ffmpeg y la consulta a Render
-    del motor local corrían aquí mismo, segundos por análisis y también en los
-    aciertos de caché que curan la huella. Todo lo que lee el fichero, lanza
-    un subproceso o sale a la red va por `run_in_threadpool`; lo vigila
-    `test_analyze_no_bloquea_el_worker.py`."""
-    # force_audd implica force=true: el usuario pidio explicitamente AudD y el
-    # registro cacheado debe sobreescribirse con el resultado nuevo.
-    if force_audd:
-        force = True
-    # Rate limiting — /analyze es CPU-bound (librosa) y acepta hasta 100MB,
-    # por lo que es un vector de DoS trivial sin limite. Ver AUDIT 2026-04-20 B-H2.
+class PeticionDePuestaAlDia(BaseModel):
+    fingerprints: List[str]
+
+
+_tope_de_la_puesta_al_dia = puesta_al_dia.TopeDiario()
+
+
+@app.post("/puesta-al-dia/candidatos")
+async def candidatos_para_poner_al_dia(peticion: PeticionDePuestaAlDia):
+    """De un lote de huellas (500 como mucho), cuáles hay que rehacer y por
+    qué (`closing`, `trozos`). Con el interruptor apagado (`PUESTA_AL_DIA`
+    sin poner) dice `activa: false` y ninguna: el cliente no rehace nada."""
+    if len(peticion.fingerprints) > 500:
+        raise HTTPException(400, "Como mucho 500 huellas por petición")
+    desde = puesta_al_dia.corte()
+    respuesta = {
+        'activa': desde is not None,
+        'corte': desde,
+        'tope_diario_render': puesta_al_dia.tope_render(),
+        'candidatos': {},
+    }
+    if desde is None:
+        return respuesta
+    huellas = [h for h in peticion.fingerprints if h]
+    filas = await run_in_threadpool(
+        db.filas_por_huella, huellas, puesta_al_dia.COLUMNAS)
+    for h in huellas:
+        fila = filas.get(h)
+        m = puesta_al_dia.motivos(fila, desde) if fila else []
+        if m:
+            respuesta['candidatos'][h] = m
+    return respuesta
+
+
+@app.post("/puesta-al-dia/analizar", response_model=AnalysisResult)
+async def analizar_para_poner_al_dia(request: Request,
+                                     file: UploadFile = File(...)):
+    """El DSP de HOY sobre un tema ya analizado, y nada más.
+
+    A diferencia de `/analyze`: no mira ninguna caché, no llama a AudD (el
+    nombre no cambia), no guarda la fila, no saca portada, preview ni huella
+    acústica, no cuenta popularidad y no le aplica la comunidad. El cliente
+    toma de aquí solo los rasgos del DSP (energía, tipo, género, graves…) y
+    deja lo suyo. En Render, con el interruptor encendido y con tope diario
+    por aparato; en el motor local, siempre (es el ordenador del DJ)."""
     check_rate_limit(get_client_ip(request))
-
-    # Obtener path original del cliente (para generacion de previews).
-    # Validar para mitigar path traversal: solo aceptamos rutas absolutas
-    # normalizadas; si el cliente envia algo raro lo descartamos silenciosamente.
-    # Ver AUDIT 2026-04-20 B-H3.
-    raw_original_path = request.headers.get("X-Original-Path", "")
-    original_path = ""
-    if raw_original_path:
+    if not IS_LOCAL_ENGINE:
+        if puesta_al_dia.corte() is None:
+            raise HTTPException(409, "La puesta al día está apagada")
+        aparato = (request.headers.get('X-Device-Id')
+                   or get_client_ip(request) or '?')
+        if not _tope_de_la_puesta_al_dia.apuntar(
+                aparato, puesta_al_dia.tope_render()):
+            raise HTTPException(429, "Tope diario de la puesta al día")
+    tmp_path = await _recibir_audio(file)
+    try:
+        async with _get_analysis_semaphore():
+            return await run_in_threadpool(
+                analyze_audio,
+                tmp_path,
+                None,  # sin huella: ni portada ni comunidad (ver arriba)
+                force_audd=False,
+                original_filename=file.filename,
+                device_id=request.headers.get('X-Device-Id'),
+                con_audd=False,
+            )
+    except Exception as e:  # noqa: BLE001
+        _emsg = str(e).lower()
+        ilegible = (
+            isinstance(e, subprocess.CalledProcessError)
+            or _emsg.startswith('empty_audio_signal')
+            or (type(e).__name__ == 'ParameterError'
+                and ('length=0' in _emsg or 'too short' in _emsg)))
+        if ilegible:
+            # Del fichero, no del servidor: el cliente no lo vuelve a pedir.
+            raise HTTPException(422, "Audio ilegible")
+        logger.error(f"[PuestaAlDia] fallo analizando {file.filename!r}: "
+                     f"{type(e).__name__}: {e}", exc_info=True)
+        raise HTTPException(500, "No se pudo analizar")
+    finally:
         try:
-            normalized = os.path.abspath(raw_original_path)
-            # Solo usar la ruta si apunta a un fichero existente y legible.
-            # La unica razon para aceptarla es que el engine local la use para
-            # generar previews desde el mismo PC donde corren backend + app.
-            if os.path.isfile(normalized) and os.access(normalized, os.R_OK):
-                original_path = normalized
-        except (OSError, ValueError):
-            original_path = ""
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
+
+async def _recibir_audio(file: UploadFile) -> str:
+    """Valida lo subido y lo escribe a un temporal en bloques; devuelve la
+    ruta. Lo comparten `/analyze` y `/puesta-al-dia/analizar`."""
     #  Validacin mejorada de archivo
     if not file.filename:
         raise HTTPException(400, "No se proporcion archivo")
@@ -2969,6 +3006,50 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         except OSError:
             pass
         raise HTTPException(400, "Archivo demasiado pequeño o corrupto")
+    return tmp_path
+
+
+async def _analizar(request: Request, file: UploadFile, force: bool,
+                    force_audd: bool):
+    """El cuerpo de /analyze. Tiene cinco salidas (acierto por nombre, por
+    huella, fallback a Render, análisis nuevo y el de emergencia), y por eso
+    lo común a todas va en `analyze_track`, que lo envuelve.
+
+    EL EVENT LOOP NO SE TOCA. Render corre UN proceso de uvicorn (`Procfile`),
+    así que lo que bloquea aquí bloquea a todos: el sync, la comunidad y
+    Escuchar esperan detrás. Hasta la auditoría del 2026-10-02 solo el DSP iba
+    al threadpool; el MD5 del fichero (hasta 100 MB), `fpcalc` sobre el audio
+    entero (`_attach_acoustic`), el preview con ffmpeg y la consulta a Render
+    del motor local corrían aquí mismo, segundos por análisis y también en los
+    aciertos de caché que curan la huella. Todo lo que lee el fichero, lanza
+    un subproceso o sale a la red va por `run_in_threadpool`; lo vigila
+    `test_analyze_no_bloquea_el_worker.py`."""
+    # force_audd implica force=true: el usuario pidio explicitamente AudD y el
+    # registro cacheado debe sobreescribirse con el resultado nuevo.
+    if force_audd:
+        force = True
+    # Rate limiting — /analyze es CPU-bound (librosa) y acepta hasta 100MB,
+    # por lo que es un vector de DoS trivial sin limite. Ver AUDIT 2026-04-20 B-H2.
+    check_rate_limit(get_client_ip(request))
+
+    # Obtener path original del cliente (para generacion de previews).
+    # Validar para mitigar path traversal: solo aceptamos rutas absolutas
+    # normalizadas; si el cliente envia algo raro lo descartamos silenciosamente.
+    # Ver AUDIT 2026-04-20 B-H3.
+    raw_original_path = request.headers.get("X-Original-Path", "")
+    original_path = ""
+    if raw_original_path:
+        try:
+            normalized = os.path.abspath(raw_original_path)
+            # Solo usar la ruta si apunta a un fichero existente y legible.
+            # La unica razon para aceptarla es que el engine local la use para
+            # generar previews desde el mismo PC donde corren backend + app.
+            if os.path.isfile(normalized) and os.access(normalized, os.R_OK):
+                original_path = normalized
+        except (OSError, ValueError):
+            original_path = ""
+
+    tmp_path = await _recibir_audio(file)
 
     # ── SEC-01: el nombre de fichero NO es identidad ──────────────────────
     #
@@ -3023,6 +3104,18 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                 logger.info(
                     f"[Cache] '{file.filename}' existe en la BD colectiva pero con "
                     f"OTRO audio (huella distinta). Se ignora el cache y se analiza."
+                )
+                existing = None
+            # ...y de la version de analisis de AHORA, como el camino por
+            # huella. Sin esto, subir ANALYSIS_VERSION no rehacia el caso mas
+            # comun —reimportar el mismo fichero con el mismo nombre—: el
+            # pre-check decia «no analizado» (ese si mira la version), el
+            # cliente subia el fichero entero y este atajo le devolvia el
+            # analisis viejo.
+            elif not _is_analysis_current(db._row_to_dict(existing) or {}):
+                logger.info(
+                    f"[Cache] '{file.filename}' tiene un analisis de otra version; "
+                    f"se analiza otra vez."
                 )
                 existing = None
         if existing:
@@ -3939,23 +4032,10 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             key_source = 'analysis'
             logger.info(f"Key: {key} ({camelot})")
             
-            # MEJORA 2: Energy con power curve
+            # Energía: la escala de los dos caminos de /analyze.
             rms = librosa.feature.rms(y=y_full)[0]
             avg_rms = float(np.mean(rms))
-            if avg_rms <= 0.02:
-                energy_dj = 1
-            elif avg_rms >= 0.42:
-                energy_dj = 10
-            elif not math.isfinite(avg_rms):
-                # Mismo guard NaN/Inf que en analyze_audio (linea 1266).
-                # Defensivo aqui aunque el except externo ya lo come — asi
-                # no perdemos el track al fallback de BD colectiva.
-                energy_dj = 5
-            else:
-                normalized = (avg_rms - 0.02) / (0.42 - 0.02)
-                powered = normalized ** 0.55
-                energy_dj = int(round(1 + powered * 9))
-                energy_dj = max(1, min(10, energy_dj))
+            energy_dj = nivel_de_energia(avg_rms)
             logger.info(f"Energy: {energy_dj} (raw: {avg_rms:.4f})")
             
         except Exception as e:

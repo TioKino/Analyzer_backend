@@ -3069,8 +3069,15 @@ class AnalysisDB:
             bloque = salida[campo]
             camino = bloque['por_camino'].setdefault(
                 self._camino_del_dsp(fuente, fila['engine_source']),
-                {'total': vacio(), 'recientes': vacio()})
+                {'total': vacio(), 'recientes': vacio(), 'por_duracion': {}})
+            # Por duración: los temas de 4 minutos o menos de Render van por
+            # el corto y los del motor local también, así que «hasta_4min»
+            # compara el mismo tipo de tema en los dos motores (el 19 % del
+            # corto de Render frente al 48 % del motor local, lectura 55).
+            tramo = ('hasta_4min' if (fila['duration'] or 0) <= self.UMBRAL_DEL_CAMINO_POR_TROZOS
+                     else 'mas_de_4min')
             for d in (bloque['total'],
+                      camino['por_duracion'].setdefault(tramo, vacio()),
                       bloque['por_programa'].setdefault(programa, vacio()),
                       bloque['recientes'] if reciente else None,
                       camino['total'],
@@ -3102,7 +3109,7 @@ class AnalysisDB:
                 # Las fuentes no son columnas: viven en `analysis_json`.
                 for t in self._tracks_por_huella_o_id(
                         c, "id, fingerprint, bpm, camelot, analyzed_at, "
-                           "engine_source, platform, "
+                           "engine_source, platform, duration, "
                            "json_extract(analysis_json, '$.bpm_source') AS bpm_source, "
                            "json_extract(analysis_json, '$.key_source') AS key_source",
                         fps):
@@ -3149,8 +3156,9 @@ class AnalysisDB:
         perfil usa /analyze. Solo cuentan los temas analizados desde que
         `/analyze` guarda el croma (`croma` en `analysis_json`), así que al
         principio son los que alguien haya reanalizado."""
-        from tonalidad import evaluar_perfiles
+        from tonalidad import evaluar_perfiles, guardada_frente_a_kk
         temas = []
+        por_camino = []
         marcas = ','.join('?' * len(self.PROGRAMAS_DE_REFERENCIA_TONALIDAD))
         conn = self._open_conn()
         try:
@@ -3170,7 +3178,8 @@ class AnalysisDB:
                 verdad = {r['fingerprint']: r['camelot'] for r in lote if r['camelot']}
                 vistos = set()
                 for t in self._tracks_por_huella_o_id(
-                        c, "id, fingerprint, "
+                        c, "id, fingerprint, camelot, engine_source, "
+                           "json_extract(analysis_json, '$.key_source') AS key_source, "
                            "json_extract(analysis_json, '$.croma') AS croma",
                         list(verdad)):
                     clave = t['fingerprint'] if t['fingerprint'] in verdad else t['id']
@@ -3183,9 +3192,194 @@ class AnalysisDB:
                     if isinstance(croma, list) and len(croma) == 12:
                         vistos.add(clave)
                         temas.append((clave, croma, verdad[clave]))
+                        por_camino.append((croma, verdad[clave],
+                                           self._camino_de_la_tonalidad(t),
+                                           t['camelot']))
         finally:
             conn.close()
-        return evaluar_perfiles(temas)
+        salida = evaluar_perfiles(temas)
+        salida['por_camino'] = guardada_frente_a_kk(por_camino)
+        return salida
+
+    @classmethod
+    def _camino_de_la_tonalidad(cls, fila) -> str:
+        """Quién puso la tonalidad guardada: el motor local (por
+        `engine_source`), el de trozos, el corto o las etiquetas."""
+        if fila['engine_source'] == 'local_engine':
+            return 'motor_local'
+        fuente = fila['key_source']
+        if fuente in cls.FUENTES_DEL_DSP:
+            return cls.CAMINO_DEL_DSP.get(fuente, fuente)
+        return 'etiquetas'
+
+    def resumen_puesta_al_dia(self, dias: int = 30) -> Dict:
+        """Lo que la PUESTA AL DÍA (`puesta_al_dia.py`) ha rehecho en los
+        ordenadores, desde los eventos `puesta_al_dia` que manda el cliente
+        (uno por tanda). Para leer dos cosas: que corre (aparatos, temas,
+        fallos, por motor) y qué cambió — sobre todo los *closing* que dejan
+        de serlo (#7) y la energía que baja en los largos de Render (#5).
+
+          aparatos, tandas, hechos, errores, ilegibles
+          por_motor   {local | render: {hechos, errores, ilegibles}}
+          cambios     {energia, tipo, genero, bpm, graves: temas}
+          energia     {baja, sube}: temas cuyo nivel bajó o subió
+          closing     {siguen, pasan_a: {tipo: temas}}
+
+        Recorre el cursor (la trampa del panel)."""
+        conn = self._open_conn()
+        try:
+            aparatos = set()
+            salida = {
+                'aparatos': 0, 'tandas': 0,
+                'hechos': 0, 'errores': 0, 'ilegibles': 0,
+                'por_motor': {},
+                'cambios': {},
+                'energia': {'baja': 0, 'sube': 0},
+                'closing': {'siguen': 0, 'pasan_a': {}},
+            }
+
+            def _n(v):
+                try:
+                    return max(0, int(v))
+                except (TypeError, ValueError):
+                    return 0
+
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'puesta_al_dia' AND day >= date('now', ?)",
+                (f"-{int(dias)} days",))
+            for dev, props in cur:
+                try:
+                    p = json.loads(props) if props else {}
+                except (TypeError, ValueError):
+                    p = {}
+                if not isinstance(p, dict):
+                    continue
+                salida['tandas'] += 1
+                if dev:
+                    aparatos.add(dev)
+                motor = 'local' if p.get('motor') == 'local' else 'render'
+                pm = salida['por_motor'].setdefault(
+                    motor, {'hechos': 0, 'errores': 0, 'ilegibles': 0})
+                for k in ('hechos', 'errores', 'ilegibles'):
+                    salida[k] += _n(p.get(k))
+                    pm[k] += _n(p.get(k))
+                cambios = p.get('cambios')
+                if isinstance(cambios, dict):
+                    for k, v in cambios.items():
+                        k = str(k)[:16]
+                        salida['cambios'][k] = salida['cambios'].get(k, 0) + _n(v)
+                salida['energia']['baja'] += _n(p.get('energia_baja'))
+                salida['energia']['sube'] += _n(p.get('energia_sube'))
+                salida['closing']['siguen'] += _n(p.get('closing_sigue'))
+                pasan = p.get('closing_a')
+                if isinstance(pasan, dict):
+                    for k, v in pasan.items():
+                        k = str(k)[:24]
+                        salida['closing']['pasan_a'][k] = (
+                            salida['closing']['pasan_a'].get(k, 0) + _n(v))
+            salida['aparatos'] = len(aparatos)
+            return salida
+        finally:
+            conn.close()
+
+    # Lo que decide en Render el camino por trozos (`CHUNK_ANALYSIS_THRESHOLD`).
+    UMBRAL_DEL_CAMINO_POR_TROZOS = 240
+
+    # Los tramos de duración del reparto de rasgos. 4 minutos es donde Render
+    # pasa al camino por trozos (`CHUNK_ANALYSIS_THRESHOLD`); 5, donde
+    # `classify_track_type` empieza a sumar a *closing* con un outro.
+    TRAMOS_DE_DURACION = (('hasta_4min', 240), ('4_a_5min', 300), ('mas_de_5min', None))
+
+    def rasgos_por_camino(self, dias_recientes: int = 30) -> Dict:
+        """La energía y el tipo de tema que da el DSP, por CAMINO (corto,
+        trozos, motor local) y por tramo de duración (#5 y #7 de PENDING,
+        2026-10-07).
+
+        Para dos cosas: comprobar con datos de verdad que la energía de los
+        temas largos de Render salía un nivel arriba y deja de salir (el motor
+        local analiza los largos por el camino corto, así que sus «más de 5
+        min» son la comparación justa con los de trozos), y ver cuánto
+        *closing* sale y dónde antes de decidir qué significa (#7). Lo
+        reciente (`analyzed_at` en los últimos `dias_recientes`) va aparte:
+        es el DSP de hoy.
+
+        Sin leer `analysis_json`, que es lo caro (~2 KB por fila: 0,6 s por
+        cada 40.000 temas contra 0,09 s solo con columnas). El camino sale de
+        quién lo calculó (`engine_source`) y, en Render, de la duración, que
+        es lo que lo decide (`CHUNK_ANALYSIS_THRESHOLD`). Lo del motor local
+        anterior a que se sellara `engine_source` cae por duración: en el
+        total, no en lo reciente. Si el tema tiene outro solo se mira en lo
+        reciente, con `instr` (el `has_outro` de antes salía de otro detector
+        de estructura). Fuera las filas con BPM 0: el fallback de un análisis
+        fallido y las que siembra Escuchar llevan energía y tipo de relleno.
+        """
+        desde = (datetime.utcnow() - timedelta(days=dias_recientes)).isoformat()
+        (t1, s1), (t2, s2), (t3, _) = self.TRAMOS_DE_DURACION
+        salida = {'dias_recientes': dias_recientes, 'total': {}, 'recientes': {}}
+        conn = self._open_conn()
+        try:
+            try:
+                cur = conn.execute(
+                    "SELECT"
+                    "  CASE WHEN engine_source = 'local_engine' THEN 'motor_local'"
+                    "       WHEN duration > ? THEN 'trozos' ELSE 'corto' END AS camino,"
+                    "  CASE WHEN COALESCE(duration, 0) <= ? THEN ?"
+                    "       WHEN duration <= ? THEN ? ELSE ? END AS tramo,"
+                    "  energy_dj AS energia, COALESCE(track_type, '') AS tipo,"
+                    "  COALESCE(analyzed_at, '') >= ? AS reciente,"
+                    "  COUNT(*) AS n"
+                    # `+bpm`: sin el más, SQLite entra por `idx_bpm` y va al
+                    # disco fila a fila; aquí se recorre la tabla una vez.
+                    " FROM tracks WHERE +bpm > 0 GROUP BY 1, 2, 3, 4, 5",
+                    (s1, s1, t1, s2, t2, t3, desde))
+                filas = cur.fetchall()
+                # El outro, aparte y solo en lo reciente (por el índice de
+                # `analyzed_at`): nombrar `analysis_json` en la consulta de
+                # arriba la hacía casi tres veces más lenta aunque no se
+                # evaluara.
+                outros = {(r['camino'], r['tramo']): r['n'] for r in conn.execute(
+                    "SELECT"
+                    "  CASE WHEN engine_source = 'local_engine' THEN 'motor_local'"
+                    "       WHEN duration > ? THEN 'trozos' ELSE 'corto' END AS camino,"
+                    "  CASE WHEN COALESCE(duration, 0) <= ? THEN ?"
+                    "       WHEN duration <= ? THEN ? ELSE ? END AS tramo,"
+                    "  COUNT(*) AS n"
+                    # `+bpm`, para que entre por el índice de `analyzed_at` y
+                    # no por el de BPM, que es toda la tabla.
+                    " FROM tracks WHERE analyzed_at >= ? AND +bpm > 0"
+                    "  AND (instr(analysis_json, '\"has_outro\": true') > 0"
+                    "       OR instr(analysis_json, '\"has_outro\":true') > 0)"
+                    " GROUP BY 1, 2",
+                    (s1, s1, t1, s2, t2, t3, desde))}
+            except sqlite3.OperationalError:
+                return salida
+            for r in filas:
+                n = r['n']
+                for clave in ('total', 'recientes') if r['reciente'] else ('total',):
+                    g = salida[clave].setdefault(r['camino'], {}).setdefault(
+                        r['tramo'], {'temas': 0, 'energia': {}, 'tipos': {},
+                                     'energia_media': None,
+                                     '_suma': 0, '_con_energia': 0})
+                    g['temas'] += n
+                    if r['energia'] is not None:
+                        nivel = str(int(r['energia']))
+                        g['energia'][nivel] = g['energia'].get(nivel, 0) + n
+                        g['_suma'] += int(r['energia']) * n
+                        g['_con_energia'] += n
+                    tipo = r['tipo'] or 'sin_tipo'
+                    g['tipos'][tipo] = g['tipos'].get(tipo, 0) + n
+                    if clave == 'recientes':
+                        g['con_outro'] = outros.get((r['camino'], r['tramo']), 0)
+        finally:
+            conn.close()
+        for clave in ('total', 'recientes'):
+            for tramos in salida[clave].values():
+                for g in tramos.values():
+                    if g['_con_energia']:
+                        g['energia_media'] = round(g['_suma'] / g['_con_energia'], 2)
+                    del g['_suma'], g['_con_energia']
+        return salida
 
     def lo_importado_de(self, fingerprints, exacta: Optional[str] = None) -> Dict:
         """Lo que los programas de DJ dicen de estas huellas (las versiones de

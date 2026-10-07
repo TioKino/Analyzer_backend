@@ -126,8 +126,11 @@ class TestClassifyTrackType:
         result = classify_track_type(0.3, segments, 360.0)
         assert result['type'] == 'warmup'
 
-    def test_closing_with_outro(self):
-        """Track closing con outro largo"""
+    def test_un_outro_no_hace_closing(self):
+        """Un outro largo es el de cualquier extended mix, para MEZCLAR: no
+        dice que el tema cierre una sesión (owner, 2026-10-07). Hasta ese día
+        esto salía closing con confianza 1,0. Ver
+        `test_closing_es_cerrar_la_sesion.py`."""
         segments = {
             'has_drop': False,
             'has_buildup': False,
@@ -136,7 +139,7 @@ class TestClassifyTrackType:
             'has_breakdown': False
         }
         result = classify_track_type(0.5, segments, 400.0)
-        assert result['type'] == 'closing'
+        assert result['type'] != 'closing'
 
 
 # ============================================================================

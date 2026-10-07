@@ -287,8 +287,6 @@ def classify_track_type_spectral(
     trend = m.get('energyTrend', 0.0)
     variance = m.get('energyVariance', 0.0)
     peak_pos = m.get('peakPosition', 0.5)
-    intro_pct = m.get('introPercent', 0.0)
-    outro_pct = m.get('outroPercent', 0.0)
     transients = m.get('transientDensity', 0.0)
     bass_reg = m.get('bassRegularity', 0.0)
 
@@ -341,13 +339,13 @@ def classify_track_type_spectral(
     if peak_pos < 0.20: scores['cooldown'] += 1.5
     if trend > 0: scores['cooldown'] -= 5.0  # penalizacion
 
-    # CLOSING: outro largo, energia baja, tendencia descendente.
-    if outro_pct > 0.08: scores['closing'] += 3.0
-    if outro_pct > 0.15: scores['closing'] += 2.0
+    # CLOSING: el tema con el que se cierra una sesion (owner, 2026-10-07):
+    # energia baja que va bajando. Ni el outro, ni la intro, ni la duracion:
+    # hasta ese dia un outro del 8 % del tema daba +3 (+2 mas pasado el 15 %),
+    # y eso es el outro de bateria de cualquier extended mix, que esta para
+    # MEZCLAR, no para cerrar.
     if core < 0.30: scores['closing'] += 2.0
     if trend < -0.03: scores['closing'] += 1.5
-    if intro_pct > 0.10: scores['closing'] += 1.0
-    if duration > 420: scores['closing'] += 0.5  # tracks largos
 
     # BPM adjustments.
     if bpm > 0:
@@ -386,7 +384,6 @@ def _build_reason(track_type: str, m: Dict[str, float], bpm: float) -> str:
     trend = m.get('energyTrend', 0.0)
     variance = m.get('energyVariance', 0.0)
     peak_pos = m.get('peakPosition', 0.0)
-    outro_pct = m.get('outroPercent', 0.0)
 
     if track_type == 'builder':
         return f"Trend +{trend:.2f}, peak at {int(peak_pos * 100)}%"
@@ -395,7 +392,7 @@ def _build_reason(track_type: str, m: Dict[str, float], bpm: float) -> str:
     if track_type == 'opener':
         return f"Core {core:.2f}, low dynamics"
     if track_type == 'closing':
-        return f"Outro {int(outro_pct * 100)}%, core {core:.2f}"
+        return f"Core {core:.2f}, trend {trend:.2f}"
     if track_type == 'peak_time':
         return f"Core {core:.2f}, contrast {contrast:.1f}x, var {variance:.2f}"
     if track_type == 'anthem':

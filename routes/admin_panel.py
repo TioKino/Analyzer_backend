@@ -1637,6 +1637,10 @@ async def telemetry(request: Request):
         # 2026-10-06). La única verdad de referencia que hay a mano.
         "dsp_frente_a_lo_importado": _dsp_frente_a_lo_importado(),
         "tonalidad_en_sombra": _tonalidad_en_sombra(),
+        "rasgos_por_camino": _rasgos_por_camino(),
+        # Lo que la puesta al día ha rehecho en los ordenadores (desde el
+        # 2026-10-07, apagada hasta que se pone `PUESTA_AL_DIA` en Render).
+        "puesta_al_dia": _puesta_al_dia(),
     }
 
 
@@ -1987,6 +1991,22 @@ def _tonalidad_en_sombra():
         return _get_db().tonalidad_en_sombra()
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] tonalidad en sombra fallo: {e}")
+        return None
+
+
+def _rasgos_por_camino():
+    try:
+        return _get_db().rasgos_por_camino(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] rasgos por camino fallo: {e}")
+        return None
+
+
+def _puesta_al_dia():
+    try:
+        return _get_db().resumen_puesta_al_dia(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] puesta al día fallo: {e}")
         return None
 
 
