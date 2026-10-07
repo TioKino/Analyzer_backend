@@ -422,6 +422,38 @@ class AnalysisDB:
             )
         ''')
 
+        # Quién es cada FICHERO, verificado por Shazam: dos trozos del mismo
+        # fichero que dan el mismo tema con los tiempos encajando (la pasada
+        # del Mac, veredicto «seguro»; desde el 2026-10-07). Por huella EXACTA:
+        # es la grabación de ese fichero, así que su ISRC y su nombre valen
+        # para todos los que lo tienen. Una fila por huella: con una
+        # verificación basta (como lo importado), y la última manda.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS identidad_verificada (
+                fingerprint TEXT PRIMARY KEY,
+                artist TEXT NOT NULL,
+                title TEXT NOT NULL,
+                isrc TEXT,
+                shazam_id TEXT,
+                fuente TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_identidad_isrc '
+                  'ON identidad_verificada(isrc)')
+        # Las veces que NO hizo falta pagar AudD porque ya se sabía quién era
+        # el tema, por día y por vía (`apuntar_audd_no_hizo_falta`). Es lo que
+        # dice si la identidad verificada ahorra algo.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS audd_no_hizo_falta (
+                dia TEXT NOT NULL,
+                via TEXT NOT NULL,
+                n INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (dia, via)
+            )
+        ''')
+
         # Correcciones manuales (memoria colectiva)
         c.execute('''
             CREATE TABLE IF NOT EXISTS corrections (
@@ -1068,6 +1100,16 @@ class AnalysisDB:
                 ):
                     if fila['fingerprint']:
                         huellas.add(fila['fingerprint'])
+                # Y los ficheros que Shazam VERIFICÓ con ese ISRC (la pasada
+                # del Mac): su fila de `tracks` puede traer otro ISRC de las
+                # etiquetas, que `completar_isrc` no pisa.
+                try:
+                    for fila in conn.execute(
+                            'SELECT fingerprint FROM identidad_verificada '
+                            'WHERE isrc = ?', (isrc,)):
+                        huellas.add(fila['fingerprint'])
+                except sqlite3.OperationalError:
+                    pass
             finally:
                 conn.close()
         return sorted(h for h in huellas if h)[:limite]
@@ -2910,6 +2952,178 @@ class AnalysisDB:
             return {f: by_key[canon[f]] for f in fps if canon[f] in by_key}
         finally:
             conn.close()
+
+    # ==================== IDENTIDAD VERIFICADA POR HUELLA ====================
+
+    def guardar_identidades(self, device_id: str, items: List[Dict]) -> Dict:
+        """Guarda quién es cada fichero según Shazam (`identidad_verificada`)
+        y le pone el ISRC a su fila de `tracks` si no lo tiene (nunca pisa
+        uno): es lo que une lo que Escuchar reconoce con la huella del fichero
+        (`huellas_del_tema`, `buscar_analizado`). `items` llega ya validado
+        (endpoint). Devuelve {'guardadas', 'isrc_completados'}."""
+        if not items:
+            return {'guardadas': 0, 'isrc_completados': 0}
+        ahora = datetime.utcnow().isoformat()
+        conn = self._open_conn()
+        try:
+            conn.executemany('''
+                INSERT INTO identidad_verificada (fingerprint, artist, title,
+                    isrc, shazam_id, fuente, device_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'shazam', ?, ?)
+                ON CONFLICT(fingerprint) DO UPDATE SET
+                    artist = excluded.artist,
+                    title = excluded.title,
+                    isrc = COALESCE(excluded.isrc, identidad_verificada.isrc),
+                    shazam_id = COALESCE(excluded.shazam_id,
+                                         identidad_verificada.shazam_id),
+                    device_id = excluded.device_id,
+                    updated_at = excluded.updated_at
+            ''', [(it['fingerprint'], it['artist'], it['title'], it.get('isrc'),
+                   it.get('shazam_id'), device_id, ahora) for it in items])
+            completados = 0
+            for it in items:
+                if not it.get('isrc'):
+                    continue
+                # Por huella y por id, en dos UPDATE (ver `_tracks_por_huella_o_id`).
+                for columna in ('fingerprint', 'id'):
+                    completados += conn.execute(
+                        f"UPDATE tracks SET isrc = ? WHERE {columna} = ? "
+                        "AND (isrc IS NULL OR isrc = '')",
+                        (it['isrc'], it['fingerprint']),
+                    ).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        return {'guardadas': len(items), 'isrc_completados': completados}
+
+    @staticmethod
+    def _identidad_de_fila(r, exacta: bool) -> Dict:
+        return {'artist': r['artist'], 'title': r['title'], 'isrc': r['isrc'],
+                'shazam_id': r['shazam_id'], 'exacta': exacta}
+
+    def identidades_verificadas(self, huellas: List[str]) -> Dict[str, Dict]:
+        """La identidad verificada de cada huella: la de ESE fichero o, si no
+        la hay, la de otra copia del mismo sonido (su cluster acústico), con
+        `exacta` diciendo cuál. Las que no tienen ninguna no salen.
+
+        Por lotes y en un puñado de consultas, no una por huella: la
+        biblioteca de un DJ pregunta por miles."""
+        pedidas = [h for h in dict.fromkeys(huellas or []) if h]
+        if not pedidas:
+            return {}
+        salida: Dict[str, Dict] = {}
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            for i in range(0, len(pedidas), 500):
+                trozo = pedidas[i:i + 500]
+                marcas = ','.join('?' * len(trozo))
+                for r in c.execute(
+                        f'SELECT * FROM identidad_verificada '
+                        f'WHERE fingerprint IN ({marcas})', trozo).fetchall():
+                    salida[r['fingerprint']] = self._identidad_de_fila(r, True)
+            faltan = [h for h in pedidas if h not in salida]
+            if not faltan:
+                return salida
+            # El cluster de las que faltan…
+            cluster_de: Dict[str, str] = {}
+            pendientes = set(faltan)
+            for i in range(0, len(faltan), 500):
+                for f in self._tracks_por_huella_o_id(
+                        c, 'id, fingerprint, acoustic_id', faltan[i:i + 500]):
+                    if not f['acoustic_id']:
+                        continue
+                    for k in (f['fingerprint'], f['id']):
+                        if k in pendientes:
+                            cluster_de.setdefault(k, f['acoustic_id'])
+            if not cluster_de:
+                return salida
+            # …los ficheros de esos clusters…
+            ficheros_de: Dict[str, str] = {}
+            clusters = sorted(set(cluster_de.values()))
+            for i in range(0, len(clusters), 500):
+                trozo = clusters[i:i + 500]
+                marcas = ','.join('?' * len(trozo))
+                for r in c.execute(
+                        f'SELECT fingerprint, id, acoustic_id FROM tracks '
+                        f'WHERE acoustic_id IN ({marcas})', trozo).fetchall():
+                    for k in (r['fingerprint'], r['id']):
+                        if k:
+                            ficheros_de[k] = r['acoustic_id']
+            # …y la verificación más reciente de cualquiera de ellos.
+            mejor: Dict[str, Dict] = {}
+            claves = sorted(ficheros_de)
+            for i in range(0, len(claves), 500):
+                trozo = claves[i:i + 500]
+                marcas = ','.join('?' * len(trozo))
+                for r in c.execute(
+                        f'SELECT * FROM identidad_verificada '
+                        f'WHERE fingerprint IN ({marcas})', trozo).fetchall():
+                    aid = ficheros_de[r['fingerprint']]
+                    if aid not in mejor or r['updated_at'] > mejor[aid]['updated_at']:
+                        mejor[aid] = dict(r)
+            for h, aid in cluster_de.items():
+                if aid in mejor:
+                    salida[h] = self._identidad_de_fila(mejor[aid], False)
+            return salida
+        except sqlite3.OperationalError:
+            return salida
+        finally:
+            conn.close()
+
+    def identidad_verificada_de(self, fingerprint: Optional[str]) -> Optional[Dict]:
+        """`identidades_verificadas` de una sola huella."""
+        if not fingerprint:
+            return None
+        return self.identidades_verificadas([fingerprint]).get(fingerprint)
+
+    def apuntar_audd_no_hizo_falta(self, via: str) -> None:
+        """Una vez que NO se pagó AudD porque ya se sabía quién era el tema:
+        `identidad` (verificada por Shazam), `limpiar` (lo mismo, en un
+        «Limpiar con AudD») o `cluster` (la identidad limpia de otra copia).
+        Best-effort: un contador no tumba un análisis."""
+        try:
+            conn = self._open_conn()
+            try:
+                conn.execute(
+                    'INSERT INTO audd_no_hizo_falta (dia, via, n) VALUES (?, ?, 1) '
+                    'ON CONFLICT(dia, via) DO UPDATE SET n = n + 1',
+                    (datetime.utcnow().strftime('%Y-%m-%d'), via))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Identidad] contador de AudD fallo: {e}")
+
+    def resumen_identidad_verificada(self, dias: int = 30) -> Dict:
+        """Para el panel: cuántas huellas tienen identidad verificada (y con
+        ISRC), de cuántos aparatos, cuántas llegaron en la ventana, y cuántas
+        veces no hizo falta AudD por vía en la ventana."""
+        desde = (datetime.utcnow() - timedelta(days=dias))
+        conn = self._open_conn()
+        try:
+            t = conn.execute(
+                "SELECT COUNT(*) AS huellas, "
+                "COALESCE(SUM(CASE WHEN isrc IS NOT NULL AND isrc != '' "
+                "THEN 1 ELSE 0 END), 0) AS con_isrc, "
+                "COUNT(DISTINCT device_id) AS aparatos, "
+                "COALESCE(SUM(CASE WHEN updated_at >= ? THEN 1 ELSE 0 END), 0) "
+                "AS recientes FROM identidad_verificada",
+                (desde.isoformat(),)).fetchone()
+            ahorro = {r['via']: r['n'] for r in conn.execute(
+                'SELECT via, SUM(n) AS n FROM audd_no_hizo_falta '
+                'WHERE dia >= ? GROUP BY via',
+                (desde.strftime('%Y-%m-%d'),)).fetchall()}
+        finally:
+            conn.close()
+        return {
+            'huellas': t['huellas'],
+            'con_isrc': t['con_isrc'],
+            'aparatos': t['aparatos'],
+            'recientes': t['recientes'],
+            'dias': dias,
+            'audd_no_hizo_falta': ahorro,
+        }
 
     # ==================== LO IMPORTADO DE LOS PROGRAMAS DE DJ ====================
 

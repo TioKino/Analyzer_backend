@@ -1641,6 +1641,9 @@ async def telemetry(request: Request):
         # Lo que la puesta al día ha rehecho en los ordenadores (desde el
         # 2026-10-07, apagada hasta que se pone `PUESTA_AL_DIA` en Render).
         "puesta_al_dia": _puesta_al_dia(),
+        # Quién es cada fichero según Shazam (la pasada del Mac, desde el
+        # 2026-10-07) y cuántas veces no hizo falta AudD por saberlo.
+        "identidad_verificada": _identidad_verificada(),
     }
 
 
@@ -2007,6 +2010,14 @@ def _puesta_al_dia():
         return _get_db().resumen_puesta_al_dia(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] puesta al día fallo: {e}")
+        return None
+
+
+def _identidad_verificada():
+    try:
+        return _get_db().resumen_identidad_verificada(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] identidad verificada fallo: {e}")
         return None
 
 
