@@ -291,3 +291,28 @@ def test_un_credito_compartido_vale():
     gs = [{'title': 'Ringo', 'artist-credit': [
         {'name': 'Joris Voorn', 'joinphrase': ' & '}, {'name': 'Kris Wadsworth'}]}]
     assert GenreDetector._grabacion_que_casa(gs, 'Joris Voorn', 'Ringo') is gs[0]
+
+
+def test_EL_CASO_el_artista_repetido_delante_del_titulo_no_tapa_el_tema(
+        detector, sin_audd):
+    """Log de Render del 2026-10-07: «[Genero] buscando: Wannabe Djs - Wannabe
+    Djs - Whoops» y «ni Discogs ni MusicBrainz lo conocen». La etiqueta del
+    título llevaba el artista delante, y con él no se encuentra el tema."""
+    d = detector(discogs={('Wannabe Djs', 'Whoops'): 'Tech House'})
+    r = _identidad({'artist': 'Wannabe Djs', 'title': 'Wannabe Djs - Whoops'},
+                   'x.mp3')
+    assert d.preguntas == [('discogs', 'Wannabe Djs', 'Whoops')]
+    assert r['genre'] == 'Tech House'
+
+
+def test_el_titulo_sin_el_artista_solo_quita_lo_que_es_el_artista():
+    t = main._titulo_sin_el_artista
+    assert t('Wannabe Djs', 'wannabe djs – Whoops') == 'Whoops'
+    assert t('Plastikman', 'Plastikman: Spastik') == 'Spastik'
+    # Un título que EMPIEZA por el nombre del artista sin separador es suyo.
+    assert t('Underworld', 'Underworld Born Slippy') == 'Underworld Born Slippy'
+    assert t('Moby', 'Go - Woodtick Mix') == 'Go - Woodtick Mix'
+    # Sin nada detrás del separador, el título se queda como estaba.
+    assert t('Moby', 'Moby - ') == 'Moby - '
+    assert t(None, 'X - Y') == 'X - Y'
+    assert t('C++', 'C++ - Tema') == 'Tema', 'el artista va escapado'
