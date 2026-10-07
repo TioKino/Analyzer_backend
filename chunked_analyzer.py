@@ -32,7 +32,8 @@ from beat_grid import onset_envelope as beat_grid_onset_envelope
 from tonalidad import croma_de_trozos
 from rasgos_del_tema import (HOP, pulso_de_beats, rasgos_espectrales,
                              rejilla_y_bpm, tempo_y_beats, tempograma,
-                             try_bpm_double_half)
+                             try_bpm_double_half, energia_del_tema,
+                             nivel_de_energia)
 import warnings
 import gc
 
@@ -754,6 +755,9 @@ class ChunkedAudioAnalyzer:
           es con lo que `librosa.beat.beat_track` decide el tempo.
         - `centroid`, `rolloff`: genero y pads.
         - `bass`, `mid`, `treble`: las bandas del clasificador espectral.
+        - `rms`: la energía, con la ventana de 46 ms del camino corto
+          (`energia_del_tema`). La de `analyze_chunk_energy`, de 2 s, sigue
+          para la estructura y para pesar la tonalidad de cada trozo.
         """
         from spectral_classifier import bandas_de_audio
         onset = librosa.onset.onset_strength(y=y, sr=sr)
@@ -769,6 +773,7 @@ class ChunkedAudioAnalyzer:
             'bass': bandas[0] if bandas else vacio,
             'mid': bandas[1] if bandas else vacio,
             'treble': bandas[2] if bandas else vacio,
+            'rms': librosa.feature.rms(y=y)[0],
         }
 
     def full_analysis(self, file_path: str,
@@ -818,7 +823,7 @@ class ChunkedAudioAnalyzer:
         key_results = []
         energy_results = []
         cosido = {k: [] for k in ('onset', 'onset_med', 'centroid', 'rolloff',
-                                  'bass', 'mid', 'treble')}
+                                  'bass', 'mid', 'treble', 'rms')}
         suma_tg = None
         frames_tg = 0
         sr = self.sr
@@ -902,16 +907,24 @@ class ChunkedAudioAnalyzer:
         # Cue points automaticos deshabilitados - el usuario los pone a mano
         cue_points = []
         
-        # Energía DJ (1-10)
-        energy_mean = np.mean([r.get('energy_mean', 0.1) for r in energy_results]) if energy_results else 0.1
-        energy_dj = self._calculate_energy_dj(energy_mean)
-        
-        # Energía inicio/fin para mix
-        if energy_results:
-            mix_energy_start = energy_results[0].get('energy_mean', 0.5)
-            mix_energy_end = energy_results[-1].get('energy_mean', 0.5)
+        # Energía: la del camino corto, sobre el RMS cosido frame a frame
+        # (`energia_del_tema`). Hasta el 2026-10-07 era la media de RMS en
+        # ventanas de 2 s, que con el mismo audio sale más alta: los temas
+        # largos quedaban ~1 nivel por encima de los cortos, y con ellos su
+        # tipo y su género. Sin nada cosido (todos los trozos fallaron), la
+        # de las ventanas de 2 s, que es lo único que queda.
+        if len(f['rms']):
+            energy_mean, energy_dj, mix_energy_start, mix_energy_end = \
+                energia_del_tema(f['rms'], sr)
         else:
-            mix_energy_start = mix_energy_end = 0.5
+            energy_mean = float(np.mean([r.get('energy_mean', 0.1) for r in energy_results])
+                                if energy_results else 0.1)
+            energy_dj = nivel_de_energia(energy_mean)
+            if energy_results:
+                mix_energy_start = energy_results[0].get('energy_mean', 0.5)
+                mix_energy_end = energy_results[-1].get('energy_mean', 0.5)
+            else:
+                mix_energy_start = mix_energy_end = 0.5
 
         # Tipo, graves, pads, percusion y genero: las cuentas del camino corto
         # sobre lo cosido (`rasgos_espectrales`).
@@ -965,27 +978,8 @@ class ChunkedAudioAnalyzer:
             'beat_interval': round(beat_interval, 6),
             'analyzer': 'chunked_librosa'
         }
-    
-    def _calculate_energy_dj(self, energy_raw: float) -> int:
-        """Convierte energia raw a escala DJ 1-10 con curva power 0.55.
 
-        Guard NaN/Inf: si el RMS del chunked analyzer sale NaN (audio muy
-        corto, silencio total o frames problematicos), las comparaciones
-        <=0.02 y >=0.42 devuelven False y el `int(NaN)` explota con
-        ValueError. Era el error #1 del panel admin (112 ocurrencias)
-        antes del fix paralelo en main.py:1266.
-        """
-        if not math.isfinite(energy_raw):
-            return 5
-        if energy_raw <= 0.02:
-            return 1
-        if energy_raw >= 0.42:
-            return 10
-        normalized = (energy_raw - 0.02) / (0.42 - 0.02)
-        powered = normalized ** 0.55
-        energy_dj = int(round(1 + powered * 9))
-        return max(1, min(10, energy_dj))
-    
+
 def get_chunked_analyzer(chunk_duration: int = 60) -> ChunkedAudioAnalyzer:
     """Factory function para obtener el analizador."""
     return ChunkedAudioAnalyzer(chunk_duration=chunk_duration)

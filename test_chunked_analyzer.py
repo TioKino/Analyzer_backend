@@ -28,7 +28,7 @@ pytest.importorskip("librosa")
 soundfile = pytest.importorskip("soundfile")
 
 from chunked_analyzer import ChunkedAudioAnalyzer  # noqa: E402
-from rasgos_del_tema import rejilla_y_bpm  # noqa: E402
+from rasgos_del_tema import nivel_de_energia, rejilla_y_bpm  # noqa: E402
 
 SR = 22050
 
@@ -152,15 +152,15 @@ class TestEnergiaYEstructura:
 class TestEscalaDeEnergia:
     @pytest.mark.parametrize("raw,esperado", [(0.0, 1), (0.01, 1), (0.42, 10), (1.0, 10)])
     def test_los_extremos_se_saturan(self, analyzer, raw, esperado):
-        assert analyzer._calculate_energy_dj(raw) == esperado
+        assert nivel_de_energia(raw) == esperado
 
     def test_siempre_dentro_de_1_10(self, analyzer):
         for raw in (0.0, 0.05, 0.1, 0.2, 0.3, 0.41, 0.5, 5.0):
-            v = analyzer._calculate_energy_dj(raw)
+            v = nivel_de_energia(raw)
             assert 1 <= v <= 10, f"raw={raw} -> {v}"
 
     def test_es_monotona(self, analyzer):
-        vals = [analyzer._calculate_energy_dj(r) for r in
+        vals = [nivel_de_energia(r) for r in
                 (0.03, 0.08, 0.15, 0.25, 0.35, 0.41)]
         assert vals == sorted(vals), f"la escala no es monótona: {vals}"
 
@@ -169,7 +169,7 @@ class TestEscalaDeEnergia:
         """REGRESIÓN: era el error #1 del panel admin (112 ocurrencias). Un RMS
         NaN hacía que las comparaciones dieran False y `int(NaN)` explotara con
         ValueError, tumbando el análisis entero."""
-        v = analyzer._calculate_energy_dj(malo)
+        v = nivel_de_energia(malo)
         assert 1 <= v <= 10 and not math.isnan(v)
 
 

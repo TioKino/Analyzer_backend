@@ -39,7 +39,8 @@ import numpy as np
 from tonalidad import croma_para_guardar
 from rasgos_del_tema import (try_bpm_double_half, classify_track_type,
                              pulso_de_beats, rasgos_espectrales,
-                             rejilla_y_bpm, HOP as HOP_RASGOS)
+                             rejilla_y_bpm, energia_del_tema,
+                             nivel_de_energia, HOP as HOP_RASGOS)
 import sys
 import tempfile
 import os
@@ -2374,38 +2375,13 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         key, camelot = id3_norm
         key_source = "id3"
     
-    # Energy - Escala DJ 1-10 con curva power para mejor distribucion
+    # Energía: nivel DJ 1-10 y el principio y el final para mezclar. Las
+    # mismas cuentas que el camino por trozos (`energia_del_tema`), que cose
+    # este mismo RMS trozo a trozo.
     rms = librosa.feature.rms(y=y)[0]
-    energy_raw = float(np.mean(rms))
-    
-    # RMS tipico en musica electronica: 0.02 (ambient) a 0.42+ (hardstyle)
-    # MEJORA 2: Curva power 0.55 que expande el rango medio
-    # El frontend puede ADEMAS aplicar percentiles sobre la biblioteca local
-    # para distribucion aun mas precisa (energy_raw se guarda para esto)
-    
-    if energy_raw <= 0.02:
-        energy_dj = 1
-    elif energy_raw >= 0.42:
-        energy_dj = 10
-    elif not math.isfinite(energy_raw):
-        # NaN/Inf: el RMS puede salir NaN con audios muy cortos, silencio
-        # total o frames problematicos. Sin esta guard, int(NaN) explota
-        # con ValueError 'cannot convert float NaN to integer' (era el
-        # error #1 mas frecuente en el panel admin, 112 ocurrencias).
-        energy_dj = 5
-        logger.warning(f"   Energia: energy_raw={energy_raw} NaN/Inf, fallback a 5")
-    else:
-        normalized = (energy_raw - 0.02) / (0.42 - 0.02)
-        powered = normalized ** 0.55  # expande rango bajo-medio
-        energy_dj = int(round(1 + powered * 9))
-        energy_dj = max(1, min(10, energy_dj))
-    
+    energy_raw, energy_dj, mix_energy_start, mix_energy_end = energia_del_tema(rms, sr)
     energy_normalized = energy_dj / 10.0
     logger.info(f"   Energia: raw={energy_raw:.4f} -> DJ level {energy_dj}")
-    
-    chunk_size = int(sr * 30)
-    mix_energy_start = float(np.mean(rms[:min(chunk_size//512, len(rms))]))
-    mix_energy_end = float(np.mean(rms[max(0, len(rms)-chunk_size//512):]))
     
     # Structure
     segments = detect_structure(y, sr, duration)
@@ -3939,23 +3915,10 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             key_source = 'analysis'
             logger.info(f"Key: {key} ({camelot})")
             
-            # MEJORA 2: Energy con power curve
+            # Energía: la escala de los dos caminos de /analyze.
             rms = librosa.feature.rms(y=y_full)[0]
             avg_rms = float(np.mean(rms))
-            if avg_rms <= 0.02:
-                energy_dj = 1
-            elif avg_rms >= 0.42:
-                energy_dj = 10
-            elif not math.isfinite(avg_rms):
-                # Mismo guard NaN/Inf que en analyze_audio (linea 1266).
-                # Defensivo aqui aunque el except externo ya lo come — asi
-                # no perdemos el track al fallback de BD colectiva.
-                energy_dj = 5
-            else:
-                normalized = (avg_rms - 0.02) / (0.42 - 0.02)
-                powered = normalized ** 0.55
-                energy_dj = int(round(1 + powered * 9))
-                energy_dj = max(1, min(10, energy_dj))
+            energy_dj = nivel_de_energia(avg_rms)
             logger.info(f"Energy: {energy_dj} (raw: {avg_rms:.4f})")
             
         except Exception as e:

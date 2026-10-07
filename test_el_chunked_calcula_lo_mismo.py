@@ -13,9 +13,10 @@ distinto según durara 3:59 o 4:01. Medido con un tema sintético de 5 minutos:
     doble/mitad      sí                 no
     BPM              128,00             128,01            (deriva al coser)
 
-Hoy los dos pasan por `rasgos_del_tema`. Lo que NO es igual todavía, a
-propósito, es la energía (y lo que cuelga de ella), la tonalidad y la
-estructura: ver el docstring de ese módulo.
+Hoy los dos pasan por `rasgos_del_tema`, y desde el 2026-10-07 también la
+energía (antes, ventanas de 2 s en trozos: un nivel más arriba). Lo que NO
+es igual todavía, a propósito, es la tonalidad y la estructura: ver el
+docstring de ese módulo.
 
     pytest test_el_chunked_calcula_lo_mismo.py -v
 """
@@ -162,3 +163,28 @@ def test_el_croma_se_guarda_en_los_dos_y_es_el_mismo(los_dos):
         assert int(np.argmax(croma)) == 9, croma
     a, b = np.array(corto.croma), np.array(trozos['croma'])
     assert a @ b / (np.linalg.norm(a) * np.linalg.norm(b)) > 0.95
+
+
+def test_la_energia_es_la_misma_en_los_dos(los_dos):
+    """El de trozos medía la energía en ventanas de 2 s y el corto en las de
+    46 ms de librosa. La media de RMS sube con la ventana, así que el mismo
+    audio salía más alto por trozos: en este tema, 0,144 frente a 0,132, y en
+    uno de 5 minutos nivel 6 frente a 5. Hoy los dos cosen el mismo RMS y
+    pasan por `energia_del_tema`."""
+    corto, trozos = los_dos
+    assert trozos['energy_raw'] == pytest.approx(corto.energy_raw, rel=1e-4)
+    assert trozos['energy_dj'] == corto.energy_dj
+    assert trozos['energy_normalized'] == pytest.approx(corto.energy_normalized)
+    assert trozos['mix_energy_start'] == pytest.approx(corto.mix_energy_start, rel=1e-4)
+    assert trozos['mix_energy_end'] == pytest.approx(corto.mix_energy_end, rel=1e-4)
+
+
+def test_la_escala_de_energia_esta_en_un_solo_sitio():
+    """Había tres copias de la escala (el corto, el de trozos y el
+    reanálisis), y la del corto y la de trozos ya se habían separado una vez
+    en el trato de un NaN."""
+    for f in ('main.py', 'chunked_analyzer.py'):
+        src = open(f, encoding='utf-8').read()
+        assert '0.42 - 0.02' not in src and '** 0.55' not in src, f
+    src = open('chunked_analyzer.py', encoding='utf-8').read()
+    assert 'energia_del_tema(f[\'rms\'], sr)' in src

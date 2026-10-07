@@ -21,14 +21,20 @@ llama con el tema entero y el por trozos con lo de cada trozo cosido
 (`chunked_analyzer.full_analysis`). Con un solo trozo, sale lo mismo que el
 corto bit a bit (`test_el_chunked_calcula_lo_mismo.py`).
 
-Lo que todavía NO es igual, a propósito: la ENERGÍA (ventanas de 2 s en los
-trozos, de 46 ms en el corto: los temas largos salen ~1 nivel más arriba),
-la TONALIDAD (voto por trozos frente a croma del tema entero) y la ESTRUCTURA
-(dos algoritmos). Cambiarlas mueve valores que la gente ya tiene guardados,
-y se deciden con medidas en sus propios puntos (`PENDING.md`).
+La ENERGÍA es igual desde el 2026-10-07 (`energia_del_tema`): el de trozos
+la medía en ventanas de 2 s y el corto en las de 46 ms de `librosa`, y como
+la media de RMS sube con la ventana, los temas largos salían ~1 nivel más
+arriba con el mismo volumen (0,146 frente a 0,132 en el mismo tema
+sintético: nivel 6 frente a 5), y con ella cambiaban el tipo y el género.
+
+Lo que todavía NO es igual, a propósito: la TONALIDAD (voto por trozos
+frente a croma del tema entero) y la ESTRUCTURA (dos algoritmos). Cambiarlas
+mueve valores que la gente ya tiene guardados, y se deciden con medidas en
+sus propios puntos (`PENDING.md`).
 """
 
 import logging
+import math
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -157,6 +163,58 @@ def classify_track_type(energy: float, segments: dict, duration: float) -> dict:
         ),
         'source': 'waveform',
     }
+
+
+# La escala DJ de la energía: el RMS medio del tema, de 0,02 (ambient) a 0,42
+# (hardstyle), con una curva 0,55 que abre el rango medio. El cliente puede
+# además repartirla por percentiles de su biblioteca (por eso se guarda
+# `energy_raw`).
+ENERGIA_RMS_MIN = 0.02
+ENERGIA_RMS_MAX = 0.42
+# Lo que se mide para mezclar: el principio y el final del tema.
+SEGUNDOS_DE_MEZCLA = 30
+
+
+def nivel_de_energia(energy_raw: float) -> int:
+    """El RMS medio → nivel DJ de 1 a 10.
+
+    Un RMS que no es un número (audio muy corto, silencio total) da 5: sin
+    esa guarda `int(NaN)` reventaba el análisis entero (era el error nº 1 del
+    panel admin, 112 veces).
+    """
+    if not math.isfinite(energy_raw):
+        logger.warning(f"   Energia: energy_raw={energy_raw} NaN/Inf, fallback a 5")
+        return 5
+    if energy_raw <= ENERGIA_RMS_MIN:
+        return 1
+    if energy_raw >= ENERGIA_RMS_MAX:
+        return 10
+    normalizada = (energy_raw - ENERGIA_RMS_MIN) / (ENERGIA_RMS_MAX - ENERGIA_RMS_MIN)
+    return max(1, min(10, int(round(1 + normalizada ** 0.55 * 9))))
+
+
+def energia_del_tema(rms: np.ndarray, sr: int,
+                     hop: int = HOP) -> Tuple[float, int, float, float]:
+    """(energy_raw, energy_dj, mix_energy_start, mix_energy_end) a partir del
+    RMS frame a frame de TODO el tema: `librosa.feature.rms` con sus valores
+    por defecto (ventana de 2048 muestras, hop 512). El corto lo calcula con
+    el tema entero y el de trozos lo cose trozo a trozo, igual que la
+    envolvente de onset.
+
+    No cambies la ventana en uno solo: la media de RMS sube con ella (lo que
+    se promedia dentro de cada ventana va bajo la raíz), y con ventanas de
+    2 s el de trozos salía un nivel más arriba que el corto con el mismo
+    audio.
+    """
+    rms = np.asarray(rms, dtype=float)
+    energy_raw = float(np.mean(rms)) if len(rms) else float('nan')
+    frames = int(sr * SEGUNDOS_DE_MEZCLA) // hop
+    if len(rms):
+        inicio = float(np.mean(rms[:min(frames, len(rms))]))
+        final = float(np.mean(rms[max(0, len(rms) - frames):]))
+    else:
+        inicio = final = 0.5
+    return energy_raw, nivel_de_energia(energy_raw), inicio, final
 
 
 def pulso_de_beats(beats, sr: int, hop: int = HOP) -> Tuple[float, float, float]:
