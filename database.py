@@ -2980,7 +2980,18 @@ class AnalysisDB:
 
     # Las fuentes de `tracks` que son lo MEDIDO sobre el audio (el DSP del
     # servidor o del motor local), no un tag ni un programa de DJ.
-    FUENTES_DEL_DSP = ('analysis', 'local_engine')
+    FUENTES_DEL_DSP = ('analysis', 'chunked_analysis', 'local_engine')
+
+    # El CAMINO de cada fuente del DSP. En Render un tema de más de 4 minutos
+    # —casi cualquier tema de club— va por trozos y escribe `chunked_analysis`;
+    # los cortos, `analysis`; el motor local lo analiza todo entero. Hasta el
+    # 2026-10-07 la medida solo miraba `analysis`/`local_engine`, o sea que
+    # dejaba fuera justo el camino de la mayoría de los temas.
+    CAMINO_DEL_DSP = {
+        'analysis': 'corto',
+        'chunked_analysis': 'trozos',
+        'local_engine': 'motor_local',
+    }
 
     @staticmethod
     def _clase_de_bpm(dsp: float, programa: float) -> Optional[str]:
@@ -3030,7 +3041,9 @@ class AnalysisDB:
         Solo cuentan las filas de `tracks` cuya fuente es el DSP
         (`FUENTES_DEL_DSP`): si la fila ya dice `rekordbox` o `id3`, el DSP no
         está ahí para medirlo. Un valor por huella y campo (el voto más
-        reciente). Se reparte por programa, porque las tonalidades de Traktor
+        reciente). Se reparte por CAMINO (`por_camino`: corto, trozos, motor
+        local; el #4 de `PENDING.md` es justo comparar el corto con el de
+        trozos, que sacan la tonalidad con algoritmos distintos), por programa, porque las tonalidades de Traktor
         anteriores al 2026-09-26 salieron con una tabla mala, y aparte lo
         analizado en los últimos `dias_recientes` (`analyzed_at`): el DSP ha
         cambiado sin subir `ANALYSIS_VERSION` (la rejilla, el afinado del
@@ -3041,16 +3054,22 @@ class AnalysisDB:
         def vacio():
             return {'comparados': 0, 'igual': 0}
 
-        salida = {campo: {'total': vacio(), 'por_programa': {}, 'recientes': vacio()}
+        salida = {campo: {'total': vacio(), 'por_programa': {}, 'recientes': vacio(),
+                          'por_camino': {}}
                   for campo in ('bpm', 'tonalidad')}
         salida['dias_recientes'] = dias_recientes
         desde = (datetime.utcnow() - timedelta(days=dias_recientes)).isoformat()
 
-        def apuntar(campo, programa, clase, reciente):
+        def apuntar(campo, programa, clase, reciente, fuente):
             bloque = salida[campo]
+            camino = bloque['por_camino'].setdefault(
+                self.CAMINO_DEL_DSP.get(fuente, fuente),
+                {'total': vacio(), 'recientes': vacio()})
             for d in (bloque['total'],
                       bloque['por_programa'].setdefault(programa, vacio()),
-                      bloque['recientes'] if reciente else None):
+                      bloque['recientes'] if reciente else None,
+                      camino['total'],
+                      camino['recientes'] if reciente else None):
                 if d is None:
                     continue
                 d['comparados'] += 1
@@ -3095,13 +3114,15 @@ class AnalysisDB:
                         except (TypeError, ValueError):
                             clase = None
                         if clase:
-                            apuntar('bpm', r['source'], clase, reciente)
+                            apuntar('bpm', r['source'], clase, reciente,
+                                    t['bpm_source'])
                     else:
                         if t['key_source'] not in self.FUENTES_DEL_DSP:
                             continue
                         clase = self._clase_de_tonalidad(t['camelot'], r['camelot'])
                         if clase:
-                            apuntar('tonalidad', r['source'], clase, reciente)
+                            apuntar('tonalidad', r['source'], clase, reciente,
+                                    t['key_source'])
         finally:
             conn.close()
         return salida

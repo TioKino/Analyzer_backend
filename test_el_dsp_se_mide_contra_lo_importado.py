@@ -137,3 +137,30 @@ def test_sale_en_el_panel_y_en_embudo():
     if os.path.exists(embudo):
         with open(embudo, encoding='utf-8') as fh:
             assert "'dsp_frente_a_lo_importado' not in t" in fh.read()
+
+
+def test_el_camino_por_trozos_tambien_se_mide_y_se_parte_por_camino(db):
+    """Un tema de más de 4 minutos va por trozos en Render y su fuente es
+    `chunked_analysis`. Hasta el 2026-10-07 la medida no la contaba: dejaba
+    fuera casi cualquier tema de club. Y el #4 de PENDING es comparar la
+    tonalidad del camino corto con la del de trozos."""
+    corto = _tema(db, camelot='8A', bpm_source='analysis', key_source='analysis')
+    _importado(db, corto, bpm=128.0, key='Am', camelot='8A')
+    largo = _tema(db, camelot='8B', bpm_source='chunked_analysis',
+                  key_source='chunked_analysis')
+    _importado(db, largo, bpm=128.0, key='Am', camelot='8A')
+    local = _tema(db, camelot='3A', bpm_source='local_engine',
+                  key_source='local_engine', hace_dias=60)
+    _importado(db, local, bpm=128.0, key='Am', camelot='8A')
+
+    m = db.dsp_frente_a_lo_importado()
+    assert m['tonalidad']['total']['comparados'] == 3
+    caminos = m['tonalidad']['por_camino']
+    assert caminos['corto']['total'] == {'comparados': 1, 'igual': 1}
+    assert caminos['trozos']['total'] == {'comparados': 1, 'igual': 0,
+                                          'relativa': 1}
+    assert caminos['motor_local']['total'] == {'comparados': 1, 'igual': 0,
+                                               'otra': 1}
+    assert caminos['motor_local']['recientes'] == {'comparados': 0, 'igual': 0}
+    assert m['bpm']['por_camino']['trozos']['total'] == {'comparados': 1,
+                                                         'igual': 1}
