@@ -3187,6 +3187,101 @@ class AnalysisDB:
             conn.close()
         return evaluar_perfiles(temas)
 
+    # Los tramos de duración del reparto de rasgos. 4 minutos es donde Render
+    # pasa al camino por trozos (`CHUNK_ANALYSIS_THRESHOLD`); 5, donde
+    # `classify_track_type` empieza a sumar a *closing* con un outro.
+    TRAMOS_DE_DURACION = (('hasta_4min', 240), ('4_a_5min', 300), ('mas_de_5min', None))
+
+    def rasgos_por_camino(self, dias_recientes: int = 30) -> Dict:
+        """La energía y el tipo de tema que da el DSP, por CAMINO (corto,
+        trozos, motor local) y por tramo de duración (#5 y #7 de PENDING,
+        2026-10-07).
+
+        Para dos cosas: comprobar con datos de verdad que la energía de los
+        temas largos de Render salía un nivel arriba y deja de salir (el motor
+        local analiza los largos por el camino corto, así que sus «más de 5
+        min» son la comparación justa con los de trozos), y ver cuánto
+        *closing* sale y dónde antes de decidir qué significa (#7). Lo
+        reciente (`analyzed_at` en los últimos `dias_recientes`) va aparte:
+        es el DSP de hoy.
+
+        Sin leer `analysis_json`, que es lo caro (~2 KB por fila: 0,6 s por
+        cada 40.000 temas contra 0,09 s solo con columnas). El camino sale de
+        quién lo calculó (`engine_source`) y, en Render, de la duración, que
+        es lo que lo decide (`CHUNK_ANALYSIS_THRESHOLD`). Lo del motor local
+        anterior a que se sellara `engine_source` cae por duración: en el
+        total, no en lo reciente. Si el tema tiene outro solo se mira en lo
+        reciente, con `instr` (el `has_outro` de antes salía de otro detector
+        de estructura). Fuera las filas con BPM 0: el fallback de un análisis
+        fallido y las que siembra Escuchar llevan energía y tipo de relleno.
+        """
+        desde = (datetime.utcnow() - timedelta(days=dias_recientes)).isoformat()
+        (t1, s1), (t2, s2), (t3, _) = self.TRAMOS_DE_DURACION
+        salida = {'dias_recientes': dias_recientes, 'total': {}, 'recientes': {}}
+        conn = self._open_conn()
+        try:
+            try:
+                cur = conn.execute(
+                    "SELECT"
+                    "  CASE WHEN engine_source = 'local_engine' THEN 'motor_local'"
+                    "       WHEN duration > ? THEN 'trozos' ELSE 'corto' END AS camino,"
+                    "  CASE WHEN COALESCE(duration, 0) <= ? THEN ?"
+                    "       WHEN duration <= ? THEN ? ELSE ? END AS tramo,"
+                    "  energy_dj AS energia, COALESCE(track_type, '') AS tipo,"
+                    "  COALESCE(analyzed_at, '') >= ? AS reciente,"
+                    "  COUNT(*) AS n"
+                    # `+bpm`: sin el más, SQLite entra por `idx_bpm` y va al
+                    # disco fila a fila; aquí se recorre la tabla una vez.
+                    " FROM tracks WHERE +bpm > 0 GROUP BY 1, 2, 3, 4, 5",
+                    (s1, s1, t1, s2, t2, t3, desde))
+                filas = cur.fetchall()
+                # El outro, aparte y solo en lo reciente (por el índice de
+                # `analyzed_at`): nombrar `analysis_json` en la consulta de
+                # arriba la hacía casi tres veces más lenta aunque no se
+                # evaluara.
+                outros = {(r['camino'], r['tramo']): r['n'] for r in conn.execute(
+                    "SELECT"
+                    "  CASE WHEN engine_source = 'local_engine' THEN 'motor_local'"
+                    "       WHEN duration > ? THEN 'trozos' ELSE 'corto' END AS camino,"
+                    "  CASE WHEN COALESCE(duration, 0) <= ? THEN ?"
+                    "       WHEN duration <= ? THEN ? ELSE ? END AS tramo,"
+                    "  COUNT(*) AS n"
+                    # `+bpm`, para que entre por el índice de `analyzed_at` y
+                    # no por el de BPM, que es toda la tabla.
+                    " FROM tracks WHERE analyzed_at >= ? AND +bpm > 0"
+                    "  AND (instr(analysis_json, '\"has_outro\": true') > 0"
+                    "       OR instr(analysis_json, '\"has_outro\":true') > 0)"
+                    " GROUP BY 1, 2",
+                    (s1, s1, t1, s2, t2, t3, desde))}
+            except sqlite3.OperationalError:
+                return salida
+            for r in filas:
+                n = r['n']
+                for clave in ('total', 'recientes') if r['reciente'] else ('total',):
+                    g = salida[clave].setdefault(r['camino'], {}).setdefault(
+                        r['tramo'], {'temas': 0, 'energia': {}, 'tipos': {},
+                                     'energia_media': None,
+                                     '_suma': 0, '_con_energia': 0})
+                    g['temas'] += n
+                    if r['energia'] is not None:
+                        nivel = str(int(r['energia']))
+                        g['energia'][nivel] = g['energia'].get(nivel, 0) + n
+                        g['_suma'] += int(r['energia']) * n
+                        g['_con_energia'] += n
+                    tipo = r['tipo'] or 'sin_tipo'
+                    g['tipos'][tipo] = g['tipos'].get(tipo, 0) + n
+                    if clave == 'recientes':
+                        g['con_outro'] = outros.get((r['camino'], r['tramo']), 0)
+        finally:
+            conn.close()
+        for clave in ('total', 'recientes'):
+            for tramos in salida[clave].values():
+                for g in tramos.values():
+                    if g['_con_energia']:
+                        g['energia_media'] = round(g['_suma'] / g['_con_energia'], 2)
+                    del g['_suma'], g['_con_energia']
+        return salida
+
     def lo_importado_de(self, fingerprints, exacta: Optional[str] = None) -> Dict:
         """Lo que los programas de DJ dicen de estas huellas (las versiones de
         un mismo sonido), listo para competir en el ranking.
