@@ -1620,6 +1620,15 @@ def _cluster_clean_identity(audio_path, duration):
         return None
 
 
+def _audd_no_hizo_falta(via: str) -> None:
+    """Apunta que no se pagó AudD porque ya se sabía quién era el tema
+    (`audd_no_hizo_falta`). Nunca rompe el análisis."""
+    try:
+        db.apuntar_audd_no_hizo_falta(via)
+    except Exception as e:  # noqa: BLE001 - un contador no tumba nada
+        logger.warning(f"[Identidad] contador fallo: {e}")
+
+
 def _resolver_identidad(id3_data: dict, file_path: str,
                         original_filename: Optional[str]):
     """(artista, título) con los que se va a buscar todo lo demás.
@@ -1715,17 +1724,39 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
     `con_audd=False` no llama a AudD nunca (la puesta al día de lo ya
     analizado: el nombre no cambia y no hay presupuesto que gastar).
     """
+    from audd_helper import is_garbage_metadata
     label = id3_data.get('label')
     year = id3_data.get('year')
     artist_name, title_name = _resolver_identidad(id3_data, file_path, original_filename)
+
+    # QUIÉN ES ESTE FICHERO, SI YA SE SABE (`identidad_verificada`, desde el
+    # 2026-10-07): Shazam lo verificó con dos trozos en la pasada de un Mac,
+    # este fichero o otra copia del mismo sonido. Con nombre basura, o en un
+    # «Limpiar con AudD» (`force_audd`), es la respuesta que daría AudD, y no
+    # se paga. Con un nombre limpio no se toca (lo que se ve lo decide el
+    # cliente, `origenDelNombre`), pero su ISRC sí vale.
+    verificada = None
+    if fingerprint:
+        try:
+            verificada = db.identidad_verificada_de(fingerprint)
+        except Exception as e:  # noqa: BLE001 - best-effort, como el cluster
+            logger.warning(f"[Identidad] consulta fallo (no critico): {e}")
+    ya_se_sabe = bool(verificada) and (
+        force_audd or is_garbage_metadata(artist_name, title_name))
+    if ya_se_sabe:
+        artist_name, title_name = verificada['artist'], verificada['title']
+        logger.info(f"[AudD-skip] identidad verificada "
+                    f"({'este fichero' if verificada.get('exacta') else 'su cluster'}): "
+                    f"{artist_name} - {title_name}")
+        if con_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+            _audd_no_hizo_falta('limpiar' if force_audd else 'identidad')
 
     # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
     # ya tiene identidad limpia en el cluster (rekordbox / AudD previo de otro
     # usuario), la heredamos y NOS SALTAMOS AudD — el trigger de abajo vera
     # metadata ya utilizable y no dispara. Solo cuando la metadata local sigue
     # siendo basura y no es una peticion force del usuario.
-    if AUDD_AUTO_ENABLED and not force_audd:
-        from audd_helper import is_garbage_metadata
+    if AUDD_AUTO_ENABLED and not force_audd and not ya_se_sabe:
         if is_garbage_metadata(artist_name, title_name):
             _inherited = _cluster_clean_identity(file_path, duration)
             if _inherited:
@@ -1733,13 +1764,15 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
                 logger.info(
                     f"[AudD-skip] identidad heredada del cluster: "
                     f"{artist_name} - {title_name}")
+                if con_audd and AUDD_API_TOKEN:
+                    _audd_no_hizo_falta('cluster')
 
     # AudD como ultimo recurso si la identidad sigue siendo basura (con
     # presupuesto y cooldown; con `force_audd`, siempre: «Limpiar con AudD»).
     # Beatport iba por aqui y se elimino (WAF de Cloudflare).
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
     audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
-    if con_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+    if con_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN and not ya_se_sabe:
         try:
             from audd_helper import (enrich_with_audd_if_needed,
                                      download_artwork_from_audd, isrc_de_audd)
@@ -1793,7 +1826,10 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
         'artist': artist_name, 'title': title_name,
         'label': label, 'year': year,
         'genre': genre, 'genre_source': genre_source,
-        'audd_artwork': audd_artwork, 'audd_isrc': audd_isrc,
+        'audd_artwork': audd_artwork,
+        # El ISRC de la grabación: el de AudD o, si no, el que verificó Shazam
+        # (vale aunque el nombre de las etiquetas sea limpio).
+        'audd_isrc': audd_isrc or (verificada or {}).get('isrc'),
     }
 
 
@@ -5627,6 +5663,86 @@ async def lo_importado_endpoint(req: LoImportadoRequest, request: Request):
             "descartados": len(req.items) - len(validos)}
 
 
+# ==================== IDENTIDAD VERIFICADA POR HUELLA ====================
+#
+# Quién es cada FICHERO según Shazam, verificado con dos trozos que encajan (la
+# pasada del Mac, veredicto «seguro»). La manda el aparato que lo verificó y la
+# reciben todos los que tienen ese sonido: el ISRC une lo que Escuchar
+# reconoce con la huella del fichero, `/analyze` deja de pagar AudD por un tema
+# que ya se sabe quién es, y el cliente pone el nombre con su propia regla
+# (`IdentidadDeLaComunidad`). Lo que se manda ya viene filtrado por el cliente
+# (sin «Shazam sucio»): la clasificación vive en Dart y no se reimplementa.
+
+_MAX_IDENTIDADES = 500
+
+
+class IdentidadItem(BaseModel):
+    fingerprint: str
+    artist: str
+    title: str
+    isrc: Optional[str] = None
+    shazam_id: Optional[str] = None
+
+
+class IdentidadesRequest(BaseModel):
+    items: List[IdentidadItem]
+
+
+class ConsultaIdentidadRequest(BaseModel):
+    huellas: List[str]
+
+
+def _limpiar_identidades(items):
+    """Lo que de verdad se guarda: huella MD5 bien formada, un artista y un
+    título que no sean basura, y el ISRC solo si tiene su formato. Lo demás se
+    descarta sin tumbar el lote."""
+    from audd_helper import is_garbage_metadata, isrc_valido
+    validos = []
+    for it in items:
+        fp = re.sub(r'[^a-fA-F0-9]', '', it.fingerprint or '').lower()
+        artista = (it.artist or '').strip()[:200]
+        titulo = (it.title or '').strip()[:300]
+        if len(fp) != 32 or is_garbage_metadata(artista, titulo):
+            continue
+        shazam_id = re.sub(r'[^0-9A-Za-z_.-]', '', it.shazam_id or '')[:40]
+        validos.append({'fingerprint': fp, 'artist': artista, 'title': titulo,
+                        'isrc': isrc_valido(it.isrc),
+                        'shazam_id': shazam_id or None})
+    return validos
+
+
+@app.post("/identidad/verificada")
+async def guardar_identidad_verificada(req: IdentidadesRequest, request: Request):
+    """Quién es cada fichero según la pasada de Shazam de un aparato. Con una
+    verificación basta, pero tiene que venir de un aparato REGISTRADO: sin
+    `X-Device-Token` válido, 401 (la misma credencial que lo importado)."""
+    device = dispositivo_del_token(request.headers.get("X-Device-Token", ""))
+    if not device:
+        raise HTTPException(401, "Device token required")
+    if len(req.items) > _MAX_IDENTIDADES:
+        raise HTTPException(400, f"Máximo {_MAX_IDENTIDADES} temas por petición")
+    validos = _limpiar_identidades(req.items)
+    hecho = await run_in_threadpool(db.guardar_identidades, device, validos)
+    logger.info(f"[Identidad] {hecho['guardadas']} guardadas "
+                f"({hecho['isrc_completados']} ISRC nuevos en tracks), "
+                f"{len(req.items) - len(validos)} descartadas")
+    return {"status": "ok", **hecho,
+            "descartadas": len(req.items) - len(validos)}
+
+
+@app.post("/identidad/verificada/consulta")
+async def consultar_identidad_verificada(req: ConsultaIdentidadRequest):
+    """La identidad verificada de un lote de huellas: la de ese fichero o la
+    de otra copia del mismo sonido (`exacta` dice cuál). Las que no tienen
+    ninguna no salen. Sin token: es lo mismo que da una ficha por huella."""
+    if len(req.huellas) > _MAX_IDENTIDADES:
+        raise HTTPException(400, f"Máximo {_MAX_IDENTIDADES} huellas por petición")
+    huellas = [re.sub(r'[^a-fA-F0-9]', '', h or '').lower() for h in req.huellas]
+    huellas = [h for h in huellas if len(h) == 32]
+    identidades = await run_in_threadpool(db.identidades_verificadas, huellas)
+    return {"identidades": identidades}
+
+
 @app.get("/community/de-este-aparato")
 async def lo_de_este_aparato(device_id: str):
     """SOLO en el motor local: lo que este aparato dejó en la memoria colectiva
@@ -6303,7 +6419,7 @@ async def reset_database(
             "community_cues", "community_notes",
             "track_ratings", "track_popularity",
             "beat_grid_corrections", "audd_call_log", "imported_values",
-            "audd_motor_local",
+            "audd_motor_local", "identidad_verificada", "audd_no_hizo_falta",
         )
         conn = sqlite3.connect(db.db_path, timeout=30.0)
         conn.execute("PRAGMA busy_timeout=30000")
