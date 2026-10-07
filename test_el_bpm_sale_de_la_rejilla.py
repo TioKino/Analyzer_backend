@@ -88,14 +88,18 @@ def test_sin_afinar_el_bpm_no_cambia():
 
 
 def test_los_dos_caminos_del_dsp_lo_usan():
+    """Los dos pasan por `rasgos_del_tema.rejilla_y_bpm`, y solo afinan el BPM
+    si lo midió el DSP (el de las etiquetas manda su número)."""
+    rej = open('rasgos_del_tema.py', encoding='utf-8').read()
+    i = rej.index('def rejilla_y_bpm(')
+    assert 'bpm_de_la_rejilla(bpm, beat_interval)' in rej[i:]
     src = open('main.py', encoding='utf-8').read()
-    # El análisis corto y el motor local: solo si lo midió el DSP.
     i = src.index('def analyze_audio(')
     corto = src[i:src.index('\ndef ', i + 10)]
-    assert 'if bpm_source == "analysis":' in corto
-    assert 'bpm = bpm_de_la_rejilla(bpm, beat_interval)' in corto
-    # Render, temas de más de 4 minutos: ANTES de que las etiquetas lo pisen.
+    assert 'bpm_del_dsp=(bpm_source == "analysis")' in corto
+    largo = open('chunked_analyzer.py', encoding='utf-8').read()
+    assert "bpm_del_dsp=(bpm_source == 'chunked_analysis')" in largo
+    # El BPM de las etiquetas llega al análisis por trozos ANTES de afinar.
     i = src.index('def analyze_audio_chunked(')
-    largo = src[i:src.index('\ndef ', i + 10)]
-    a = largo.index("bpm = bpm_de_la_rejilla(result['bpm'], result.get('beat_interval'))")
-    assert a < largo.index('bpm_source = "id3"')
+    envoltorio = src[i:src.index('\ndef ', i + 10)]
+    assert "full_analysis(file_path, bpm_etiqueta=id3_data.get('bpm'))" in envoltorio

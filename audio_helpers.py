@@ -37,7 +37,9 @@ def beat_track_seguro(y, sr, **kwargs):
         y energia enteros por no poder recortar unos beats de los bordes.
       · `ChunkedAudioAnalyzer.analyze_chunk_bpm` -> devolvia **120 BPM** de
         default. Un chunk mudo contaminaba el BPM agregado del track largo con
-        un numero inventado, sin un solo error en ningun lado.
+        un numero inventado, sin un solo error en ningun lado. (Desde el
+        2026-10-06 ya no hay BPM por trozo: el tema largo se mide como el
+        corto, sobre su envolvente cosida — `rasgos_del_tema.tempo_y_beats`.)
 
     Por eso la regla vive aqui y no repetida en cada sitio.
     """
@@ -271,33 +273,12 @@ def find_drop_timestamp(y, sr, segments: dict) -> float:
 
 
 # NOTA: `classify_track_type` (version string vieja) se borro aqui — estaba
-# muerta (no la importaba nadie). La version viva es `main.classify_track_type`
-# (Fase 1 v2: devuelve dict con confidence + alternativas), espejada en
-# `ChunkedAudioAnalyzer._classify_track_type`. No la recrees en audio_helpers.
-
-
-def detect_vocals_improved(y, sr, spectral_centroid):
-    try:
-        centroid_mean = float(np.mean(spectral_centroid))
-        has_high_centroid = centroid_mean > 3500
-
-        flatness = librosa.feature.spectral_flatness(y=y)
-        flatness_mean = float(np.mean(flatness))
-        is_tonal = flatness_mean < 0.15
-
-        centroid_std = float(np.std(spectral_centroid))
-        has_variation = centroid_std > 500
-
-        zcr = librosa.feature.zero_crossing_rate(y)
-        zcr_mean = float(np.mean(zcr))
-        zcr_in_voice_range = 0.05 < zcr_mean < 0.15
-
-        criteria_met = sum([has_high_centroid, is_tonal, has_variation, zcr_in_voice_range])
-        return criteria_met >= 3
-
-    except (ValueError, TypeError, RuntimeError) as e:
-        logger.error(f"Error detectando vocals: {e}")
-        return False
+# muerta (no la importaba nadie). La version viva es
+# `rasgos_del_tema.classify_track_type` (Fase 1 v2: devuelve dict con
+# confidence + alternativas), la MISMA para los dos caminos de /analyze desde
+# el 2026-10-06 (antes el de trozos tenia una copia). No la recrees aqui.
+# Y `detect_vocals_improved` tambien se borro ese dia: decia «con voces» a
+# casi cualquier tema con agudos (ver `main.analyze_audio`).
 
 
 def get_acousticbrainz_genre(fingerprint=None, artist=None, title=None):

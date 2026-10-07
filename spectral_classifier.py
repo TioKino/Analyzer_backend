@@ -50,6 +50,20 @@ def compute_spectral_metrics(y: np.ndarray, sr: int) -> Dict[str, float]:
         introPercent, outroPercent, coreEnergy, bassRegularity,
         transientDensity, midVariance.
     """
+    bandas = bandas_de_audio(y, sr)
+    if bandas is None:
+        return _empty_metrics()
+    return metricas_de_bandas(*bandas)
+
+
+def bandas_de_audio(y: np.ndarray, sr: int):
+    """(graves, medios, agudos) por frame —STFT n_fft 2048, hop 512—, o None
+    si el audio es demasiado corto.
+
+    Aparte de `metricas_de_bandas` para que el análisis por trozos de los
+    temas largos (`chunked_analyzer`) las calcule trozo a trozo, las cosa, y
+    saque las MISMAS métricas que el análisis del tema entero (2026-10-06).
+    """
     n_fft = 2048
     hop = 512
 
@@ -57,13 +71,13 @@ def compute_spectral_metrics(y: np.ndarray, sr: int) -> Dict[str, float]:
         y = np.mean(y, axis=0)
 
     if len(y) < n_fft:
-        return _empty_metrics()
+        return None
 
     # STFT magnitudes — mismas dimensiones que la version Dart (hop=512, nFft=2048).
     stft_mag = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))  # (n_freq, n_frames)
     n_freq, n = stft_mag.shape
     if n == 0:
-        return _empty_metrics()
+        return None
 
     # Banding identico al Dart: bass 0-250Hz, mid 250-4000Hz, treble >4000Hz.
     freq_per_bin = sr / n_fft
@@ -79,6 +93,17 @@ def compute_spectral_metrics(y: np.ndarray, sr: int) -> Dict[str, float]:
     bass = stft_mag[1:bass_max_bin + 1, :].sum(axis=0) / bass_bins
     mid = stft_mag[bass_max_bin + 1:mid_max_bin + 1, :].sum(axis=0) / mid_bins
     treble = stft_mag[mid_max_bin + 1:half_n, :].sum(axis=0) / treble_bins
+    return bass, mid, treble
+
+
+def metricas_de_bandas(bass: np.ndarray, mid: np.ndarray,
+                       treble: np.ndarray) -> Dict[str, float]:
+    """Las 16 métricas a partir de las bandas por frame (`bandas_de_audio`)."""
+    bass, mid, treble = np.asarray(bass), np.asarray(mid), np.asarray(treble)
+    n = int(min(len(bass), len(mid), len(treble)))
+    if n == 0:
+        return _empty_metrics()
+    bass, mid, treble = bass[:n], mid[:n], treble[:n]
 
     # Paso 0: peaks per band.
     peak_bass = float(bass.max()) if len(bass) else 0.0

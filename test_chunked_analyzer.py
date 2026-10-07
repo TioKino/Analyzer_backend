@@ -4,7 +4,9 @@ ChunkedAudioAnalyzer — la ruta de los tracks > 4 min.
 POR QUÉ IMPORTA: en Render, todo track de más de 4 minutos va por aquí
 (`main.CHUNK_ANALYSIS_THRESHOLD`), o sea buena parte de lo que analiza un DJ.
 El módulo estaba al 15 % de cobertura y lo único probado era
-`fuse_bpm_results` (en `test_bpm_fusion.py`). Toda la fusión de tonalidad, la
+`fuse_bpm_results` (la media de los BPM de cada trozo; desde el 2026-10-06 el
+BPM sale como en el camino corto y esa función ya no existe — ver
+`test_el_chunked_calcula_lo_mismo.py`). Toda la fusión de tonalidad, la
 curva de energía, la estructura y el beat-grid iban sin red.
 
 ESTRATEGIA: las funciones de fusión son puras (reciben listas de dicts), así que
@@ -26,6 +28,7 @@ pytest.importorskip("librosa")
 soundfile = pytest.importorskip("soundfile")
 
 from chunked_analyzer import ChunkedAudioAnalyzer  # noqa: E402
+from rasgos_del_tema import rejilla_y_bpm  # noqa: E402
 
 SR = 22050
 
@@ -173,19 +176,19 @@ class TestEscalaDeEnergia:
 # ==================== BEAT GRID ====================
 
 class TestBeatGrid:
-    def test_el_intervalo_es_60_partido_bpm(self, analyzer):
-        g = analyzer.calculate_beat_grid(128.0)
-        assert g['beat_interval'] == pytest.approx(60.0 / 128.0, abs=1e-6)
-        assert g['bpm'] == 128.0
-        assert g['first_beat'] == 0.0
+    """La rejilla de los dos caminos es `rasgos_del_tema.rejilla_y_bpm`."""
 
-    def test_con_la_envolvente_encuentra_la_FASE(self, analyzer):
-        """Hasta el 2026-09-18 esta funcion tenia un parametro
-        `first_beat_offset` que NADIE le pasaba nunca, asi que `first_beat`
-        salia 0.0 siempre: la rejilla arrancaba donde arranca el FICHERO. El
-        test de entonces comprobaba que el parametro se respetaba —y se
-        respetaba— mientras el bug seguia entero. Lo que hay que comprobar es
-        que la fase se BUSCA en el audio."""
+    def test_el_intervalo_es_60_partido_bpm(self):
+        fb, iv, bpm = rejilla_y_bpm(np.zeros(0), 86.13, 128.0, bpm_del_dsp=True)
+        assert iv == pytest.approx(60.0 / 128.0, abs=1e-6)
+        assert bpm == 128.0
+        assert fb == 0.0
+
+    def test_con_la_envolvente_encuentra_la_FASE(self):
+        """Hasta el 2026-09-18 la rejilla del camino por trozos tenia un
+        parametro `first_beat_offset` que NADIE le pasaba nunca, asi que
+        `first_beat` salia 0.0 siempre: la rejilla arrancaba donde arranca el
+        FICHERO. Lo que hay que comprobar es que la fase se BUSCA en el audio."""
         bpm, fase, fps = 128.0, 0.137, 86.13
         rnd = np.random.RandomState(1)
         n = int(360 * fps)
@@ -198,33 +201,28 @@ class TestBeatGrid:
                 onset[i] += 2.2 if k % 4 == 0 else 1.0
             k += 1
 
-        g = analyzer.calculate_beat_grid(bpm, onset=onset, onset_fps=fps)
+        fb, iv, _ = rejilla_y_bpm(onset, fps, bpm, bpm_del_dsp=True)
 
-        d = (fase - g['first_beat']) % g['beat_interval']
-        assert min(d, g['beat_interval'] - d) < 0.012
-        assert g['beat_confidence'] > 0.5
+        d = (fase - fb) % iv
+        assert min(d, iv - d) < 0.012
 
-    def test_sin_envolvente_no_se_inventa_la_fase(self, analyzer):
+    def test_sin_envolvente_no_se_inventa_la_fase(self):
         """Sin audio que mirar solo se puede decir el intervalo. Un 0.0 aqui es
         honesto; una fase inventada mueve la rejilla a un sitio que no es."""
-        g = analyzer.calculate_beat_grid(120.0)
-        assert g['first_beat'] == 0.0
-        assert g['beat_interval'] == pytest.approx(0.5, abs=1e-6)
+        fb, iv, _ = rejilla_y_bpm(np.zeros(0), 86.13, 120.0, bpm_del_dsp=True)
+        assert fb == 0.0
+        assert iv == pytest.approx(0.5, abs=1e-6)
 
-    def test_bpm_cero_no_divide_por_cero(self, analyzer):
+    def test_bpm_cero_no_divide_por_cero(self):
         """Un análisis fallido deja bpm=0; el grid tiene que degradar, no
         lanzar ZeroDivisionError."""
-        g = analyzer.calculate_beat_grid(0.0)
-        assert g['beat_interval'] > 0
+        _, iv, _ = rejilla_y_bpm(np.zeros(0), 86.13, 0.0, bpm_del_dsp=True)
+        assert iv > 0
 
 
 # ==================== ANÁLISIS DE UN CHUNK ====================
 
 class TestAnalisisDeChunk:
-    def test_bpm_de_un_chunk_con_pulso_conocido(self, analyzer):
-        r = analyzer.analyze_chunk_bpm(_click(128, 12), SR)
-        assert abs(r['bpm'] - 128) / 128 < 0.08, f"bpm={r['bpm']}"
-
     def test_energia_de_un_chunk_ordena(self, analyzer):
         flojo = analyzer.analyze_chunk_energy(_click(128, 8, amp=0.05), SR, 0.0)
         fuerte = analyzer.analyze_chunk_energy(_click(128, 8, amp=0.95), SR, 0.0)

@@ -33,8 +33,12 @@ import numpy as np
 # Rejilla de beats (intervalo + fase + downbeat). Modulo propio y compartido
 # con el analizador por chunks; el cliente lleva el mismo algoritmo en
 # lib/services/beat_grid_detector.dart.
-from beat_grid import (fit_beat_grid, bpm_de_la_rejilla,
-                       onset_envelope as beat_grid_onset_envelope)
+# Lo que los dos caminos de /analyze calculan con las mismas cuentas (el corto
+# aqui, el de trozos en `chunked_analyzer`). Se importan con su nombre de
+# siempre: hay tests y llamadas que los piden a `main`.
+from rasgos_del_tema import (try_bpm_double_half, classify_track_type,
+                             pulso_de_beats, rasgos_espectrales,
+                             rejilla_y_bpm, HOP as HOP_RASGOS)
 import sys
 import tempfile
 import os
@@ -133,7 +137,7 @@ if _os_log.getenv('QUIET_ASSET_LOGS', '1') not in ('0', 'false', 'False'):
 
 from pydantic import BaseModel
 from audio_helpers import silence_native_stderr, beat_track_seguro
-from spectral_genre_classifier import classify_genre_advanced
+from spectral_genre_classifier import classify_genre_advanced  # noqa: F401 (compat)
 from config import (
     AUDD_API_TOKEN,
     AUDD_AUTO_ENABLED,
@@ -689,64 +693,6 @@ class SafeJSONResponse(JSONResponse):
             allow_nan=False,
         ).encode("utf-8")
 
-
-def try_bpm_double_half(y, sr, original_bpm: float, bpm_confidence: float, onset_env=None) -> float:
-    """
-    Si la confianza del BPM es baja, probar con doble y mitad.
-    
-    Logica: si librosa dice 131 con confianza 0.4, probar 262 y 65.5.
-    Si alguno de esos tiene sentido musical (60-200 BPM range) Y tiene
-    mejor alineacion con los beats, usarlo.
-    
-    Args:
-        onset_env: Si ya se calculó onset_strength, pasarlo para no duplicar CPU.
-    """
-    if bpm_confidence >= 0.7:
-        return original_bpm  # Alta confianza, no tocar
-    
-    candidates = [original_bpm]
-    
-    # Probar doble
-    double = original_bpm * 2
-    if 60 <= double <= 200:
-        candidates.append(double)
-    
-    # Probar mitad
-    half = original_bpm / 2
-    if 60 <= half <= 200:
-        candidates.append(half)
-    
-    if len(candidates) == 1:
-        return original_bpm
-    
-    # Evaluar cual se alinea mejor con onset strength
-    try:
-        if onset_env is None:
-            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        best_bpm = original_bpm
-        best_score = 0
-        
-        for candidate in candidates:
-            # Crear pulso teorico para este BPM
-            beat_interval = 60.0 / candidate
-            sr_onset = sr / 512  # hop_length default
-            
-            # Autocorrelacion con el BPM candidato
-            period = int(round(sr_onset * beat_interval))
-            if period > 0 and period < len(onset_env) // 2:
-                corr = np.correlate(onset_env[:len(onset_env)//2], 
-                                     onset_env[period:period + len(onset_env)//2])
-                score = float(np.max(corr)) if len(corr) > 0 else 0
-                if score > best_score:
-                    best_score = score
-                    best_bpm = candidate
-        
-        if best_bpm != original_bpm:
-            logger.info(f"   BPM auto-corregido: {original_bpm:.1f} -> {best_bpm:.1f} (confianza baja: {bpm_confidence:.2f})")
-        
-        return best_bpm
-    except Exception:
-        return original_bpm
 
 # ==================== APP ====================
 
@@ -1918,89 +1864,6 @@ def find_drop_timestamp(y, sr, segments: dict) -> float:
     duration = segments['sections'][-1]['end'] if segments['sections'] else 180
     return duration / 3
 
-def classify_track_type(energy: float, segments: dict, duration: float) -> dict:
-    # Fase 1 Track Type v2: pasamos de cascada de returns simples a scoring
-    # con margin top-1 vs top-2 -> confidence (0..1). Permite a la UI mostrar
-    # honestidad sobre tracks ambiguos en lugar de mentir con un tipo forzado.
-    # Plan completo en Analyzer/PENDING_NEXT_SESSION_TRACKTYPE_V2.md.
-    #
-    # Mismas señales que la cascada original (has_intro/has_drop/has_outro +
-    # energy + duration), pero acumulamos en lugar de decidir inmediato.
-    # Ej. Oxia - Domino (energy=0.7, has_outro=True, duration=433): closing
-    # acumula 1.0 + 0.3 = 1.3, peak_time solo 0.2 (energy>0.6 soft signal),
-    # warmup 0. Margin grande -> confidence ~0.85.
-    scores = {'warmup': 0.0, 'peak_time': 0.0, 'closing': 0.0}
-
-    if energy < 0.5 and segments['has_intro']:
-        scores['warmup'] += 1.0
-    if energy < 0.4 and segments['has_intro']:
-        scores['warmup'] += 0.5
-    if energy > 0.7 and segments['has_drop']:
-        scores['peak_time'] += 1.0
-    if energy > 0.8 and segments['has_drop']:
-        scores['peak_time'] += 0.5
-    if segments['has_outro'] and duration > 300:
-        scores['closing'] += 1.0
-    if segments['has_outro'] and duration > 420:
-        scores['closing'] += 0.3
-    # Soft signals para desempates: cualquier track con energia alta
-    # tira hacia peak_time, cualquiera con energia baja hacia warmup.
-    if energy > 0.6:
-        scores['peak_time'] += 0.2
-    elif energy < 0.5:
-        scores['warmup'] += 0.2
-
-    sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-    winner_type, winner_score = sorted_scores[0]
-    second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
-
-    if winner_score == 0.0:
-        # Track sin señales claras: caer al fallback de la cascada original
-        # (energy>0.6 -> peak_time, sino warmup) y reportar confidence 0
-        # para que la UI muestre el badge como "incierto".
-        winner_type = 'peak_time' if energy > 0.6 else 'warmup'
-        confidence = 0.0
-    else:
-        margin = winner_score - second_score
-        confidence = min(1.0, margin / max(winner_score, 0.5))
-
-    return {
-        'type': winner_type,
-        'confidence': round(confidence, 2),
-        'alternatives': [
-            {'type': t, 'score': round(s, 2)} for t, s in sorted_scores
-        ],
-        'reason': (
-            f"energy={energy:.2f} duration={duration:.0f} "
-            f"intro={segments['has_intro']} drop={segments['has_drop']} "
-            f"outro={segments['has_outro']}"
-        ),
-        'source': 'waveform',
-    }
-
-def detect_vocals_improved(y, sr, spectral_centroid):
-    try:
-        centroid_mean = float(np.mean(spectral_centroid))
-        has_high_centroid = centroid_mean > 3500
-        
-        flatness = librosa.feature.spectral_flatness(y=y)
-        flatness_mean = float(np.mean(flatness))
-        is_tonal = flatness_mean < 0.15
-        
-        centroid_std = float(np.std(spectral_centroid))
-        has_variation = centroid_std > 500
-        
-        zcr = librosa.feature.zero_crossing_rate(y)
-        zcr_mean = float(np.mean(zcr))
-        zcr_in_voice_range = 0.05 < zcr_mean < 0.15
-        
-        criteria_met = sum([has_high_centroid, is_tonal, has_variation, zcr_in_voice_range])
-        return criteria_met >= 3
-        
-    except Exception as e:
-        logger.error(f"Error detectando vocals: {e}")
-        return False
-
 def get_acousticbrainz_genre(fingerprint=None, artist=None, title=None):
     """AcousticBrainz cerró en 2022. Stub que retorna None para no romper llamadas."""
     return None
@@ -2393,8 +2256,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         bpm = id3_data['bpm']
         bpm_source = "id3"
     
-    beat_intervals = np.diff(librosa.frames_to_time(beats, sr=sr))
-    bpm_confidence = 1.0 - min(np.std(beat_intervals) * 2, 0.5) if len(beat_intervals) > 0 else 0.5
+    # Confianza, groove y swing: las mismas cuentas en los dos caminos.
+    bpm_confidence, groove_score, swing_factor = pulso_de_beats(beats, sr)
     
     # Calcular onset_env una sola vez (se reusa en BPM correction + percussion_density)
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
@@ -2402,14 +2265,14 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # MEJORA 3: Auto-correccion half/double tempo si confianza baja
     if bpm_source == "analysis":
         bpm = try_bpm_double_half(y, sr, bpm, bpm_confidence, onset_env=onset_env)
-    
-    if len(beat_intervals) > 1:
-        groove_score = min(np.std(beat_intervals) * 10, 1.0)
-        swing_factor = float(np.mean(beat_intervals[::2]) / np.mean(beat_intervals[1::2]) 
-                           if len(beat_intervals) > 2 else 0.5)
-    else:
-        groove_score = 0.0
-        swing_factor = 0.5
+
+    # ==================== BEAT GRID ====================
+    # Fase, downbeat e intervalo afinado, y con el el BPM si lo midio el DSP
+    # (`rejilla_y_bpm`, lo mismo en los dos caminos). La envolvente es la de
+    # arriba: `beat_grid.onset_envelope` es `onset_strength` con hop 512, o
+    # sea la misma.
+    first_beat, beat_interval, bpm = rejilla_y_bpm(
+        onset_env, sr / HOP_RASGOS, bpm, bpm_del_dsp=(bpm_source == "analysis"))
     
     # Key - Krumhansl-Kessler profiles (academicamente validados)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12, n_octaves=7)
@@ -2530,61 +2393,33 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     
     # Spectral features
     spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
-    has_vocals = detect_vocals_improved(y, sr, spectral_centroid)
-    
-    low_freq_energy = np.mean(np.abs(y[:int(sr*10)]))
-    has_heavy_bass = low_freq_energy > energy_raw * 0.8
-    
-    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
-    has_pads = float(np.std(rolloff)) < 1000
-    
-    # onset_env ya calculado arriba (antes de BPM correction) - reusar
-    percussion_density = min(float(np.mean(onset_env)) / 10, 1.0)
-    
-    # Classification (heuristic, Fase 1 v2)
-    track_type = 'peak_time'  # default seguro
-    track_type_confidence = 0.5  # neutral si la clasificacion falla
-    track_type_alternatives: List[Dict[str, Any]] = []
-    try:
-        classification = classify_track_type(energy_normalized, segments, duration)
-        track_type = classification['type']
-        track_type_confidence = classification['confidence']
-        track_type_alternatives = classification['alternatives']
-    except Exception as e:
-        logger.error(f"  [TrackType] Error clasificando: {e}")
-        classification = None
+    # Las voces NO se miden: `detect_vocals_improved` decia que si a cualquier
+    # tema con agudos (dos de cinco instrumentales sinteticos, sin una sola
+    # voz, salian «con voces»: sus cuatro criterios —centroide, planitud,
+    # variacion y cruces por cero— los cumple casi cualquier musica). El
+    # camino por trozos ya la tenia apagada por eso; ahora ninguno la usa
+    # (2026-10-06).
+    has_vocals = False
 
-    # Spectral + ensemble (Fase 3 v2): metrics FFT + scoring 7 tipos
-    # (vs 3 del heuristic). El spectral pesa β=1.5 vs α=1.0 del heuristic.
-    # Refina tambien has_heavy_bass con bassRatio normalizado per-band.
-    try:
-        from spectral_classifier import (
-            compute_spectral_metrics,
-            classify_track_type_spectral,
-            detect_heavy_bass as _spectral_detect_heavy_bass,
-            ensemble_classify,
-        )
-        spectral_metrics = compute_spectral_metrics(y, sr)
-        spectral_classification = classify_track_type_spectral(
-            spectral_metrics, bpm, duration
-        )
-        ensemble = ensemble_classify(classification, spectral_classification)
-        track_type = ensemble['type']
-        track_type_confidence = ensemble['confidence']
-        track_type_alternatives = ensemble['alternatives']
-        # Heavy bass refinado (per-band ratio > heuristic crudo de low_freq_energy)
-        has_heavy_bass = _spectral_detect_heavy_bass(spectral_metrics)
-        logger.info(
-            f"  [Spectral+Ensemble] {ensemble['type']} "
-            f"conf={ensemble['confidence']:.2f} | {ensemble['reason']}"
-        )
-    except Exception as e:
-        logger.warning(f"  [Spectral] Failed, usando solo heuristic: {e}")
-    genre = classify_genre_advanced(
-        bpm, energy_normalized, has_heavy_bass,
-        y, sr, percussion_density,
-        spectral_centroid, rolloff
-    )
+    low_freq_energy = np.mean(np.abs(y[:int(sr*10)]))
+    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
+
+    # Tipo, graves, pads, percusion y genero: las mismas cuentas que el camino
+    # por trozos (`rasgos_espectrales`), con el tema entero.
+    from spectral_classifier import bandas_de_audio
+    _rasgos = rasgos_espectrales(
+        bpm=bpm, energy_normalized=energy_normalized, segments=segments,
+        duration=duration, onset_env=onset_env,
+        spectral_centroid=spectral_centroid, rolloff=rolloff,
+        bandas=bandas_de_audio(y, sr),
+        graves_si_falla=low_freq_energy > energy_raw * 0.8)
+    track_type = _rasgos['track_type']
+    track_type_confidence = _rasgos['track_type_confidence']
+    track_type_alternatives = _rasgos['track_type_alternatives']
+    has_heavy_bass = _rasgos['has_heavy_bass']
+    has_pads = _rasgos['has_pads']
+    percussion_density = _rasgos['percussion_density']
+    genre = _rasgos['genre']
     genre_source = "spectral_analysis"
 
     # ==================== IDENTIDAD Y GENERO ====================
@@ -2602,50 +2437,9 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     
     # ==================== CUE POINTS ====================
     cue_points = []
-    first_beat = 0.0
-    # Lo peor que puede salir es 60/bpm, no 0.5: ese 0.5 son 120 BPM clavados,
-    # un intervalo que no tiene nada que ver con el track y que ademas se
-    # exporta tal cual al XML de Rekordbox.
-    beat_interval = 60.0 / bpm if bpm > 0 else 0.5
-
     if ARTWORK_ENABLED:
         cue_points = detect_cue_points(y, sr, duration, segments)
 
-    # ==================== BEAT GRID ====================
-    # La rejilla NO depende del modulo de artwork. Que estuviera dentro de su
-    # `if` era un accidente de donde vivia la funcion, y tenia consecuencia: si
-    # ese modulo no cargaba, el track salia con la rejilla anclada al 0 y a 120
-    # BPM sin un solo error.
-    #
-    # `fit_beat_grid` da fase Y downbeat, que es lo que le faltaba a la version
-    # anterior: con el BPM y la fase perfectos, la linea de compas podia caer
-    # igualmente en el 3. Devuelve None cuando no hay pulso que medir, y
-    # entonces se deja el 0 — una fase inventada mueve la rejilla a un sitio que
-    # no es y el usuario deja de fiarse.
-    try:
-        _env, _env_fps = beat_grid_onset_envelope(y, sr)
-        _fit = fit_beat_grid(_env, _env_fps, bpm)
-        if _fit:
-            first_beat = _fit['first_beat']
-            beat_interval = _fit['beat_interval']
-            logger.info(
-                f"  [BeatGrid] first_beat={first_beat:.3f}s "
-                f"iv={beat_interval:.5f}s downbeat={_fit['downbeat_index']} "
-                f"conf={_fit['confidence']:.2f}"
-            )
-            # El BPM que se guarda es el del intervalo AFINADO, no el bin del
-            # tempograma de librosa (129,20 para un 128). Solo si lo midio el
-            # DSP: el de las etiquetas manda su numero. Ver `bpm_de_la_rejilla`.
-            if bpm_source == "analysis":
-                _bpm_librosa = bpm
-                bpm = bpm_de_la_rejilla(bpm, beat_interval)
-                if bpm != _bpm_librosa:
-                    logger.info(f"  [BPM] de la rejilla: {_bpm_librosa:.2f} -> {bpm:.2f}")
-        else:
-            logger.info("  [BeatGrid] sin pulso claro; rejilla sin fase")
-    except Exception as e:
-        logger.warning(f"  [BeatGrid] fallo la fase ({type(e).__name__}): {e}")
-    
     # ==================== ARTWORK ====================
     artwork_embedded = False
     artwork_url = None
@@ -2815,33 +2609,27 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
     """
     import gc
     
+    # ==================== ID3 METADATA ====================
+    # Antes del analisis: el BPM de las etiquetas manda como en el camino corto
+    # (sin doble/mitad, sin afinarlo con la rejilla), y el tipo de track y el
+    # genero espectral se calculan con el.
+    id3_data = {}
+    if ARTWORK_ENABLED:
+        id3_data = extract_id3_metadata(file_path)
+
     # Crear analizador por chunks
     analyzer = get_chunked_analyzer(chunk_duration=60)
     
-    # Ejecutar anlisis chunked
-    result = analyzer.full_analysis(file_path)
+    # Ejecutar anlisis chunked: BPM, rejilla, groove, tipo, graves, pads y
+    # genero con las mismas cuentas que el camino corto (`rasgos_del_tema`).
+    result = analyzer.full_analysis(file_path, bpm_etiqueta=id3_data.get('bpm'))
     
     # Limpiar memoria
     del analyzer
     gc.collect()
-    
-    # ==================== ID3 METADATA ====================
-    id3_data = {}
-    if ARTWORK_ENABLED:
-        id3_data = extract_id3_metadata(file_path)
-    
-    # Sobrescribir con ID3 si existe y es vlido
-    #
-    # El BPM del DSP es el del intervalo AFINADO de la rejilla, no la media de
-    # los bins de librosa de cada trozo (ver `bpm_de_la_rejilla`). La rejilla
-    # sale de la envolvente del tema entero, cosida trozo a trozo.
-    bpm = bpm_de_la_rejilla(result['bpm'], result.get('beat_interval'))
-    if bpm != result['bpm']:
-        logger.info(f"  [BPM] de la rejilla: {result['bpm']:.2f} -> {bpm:.2f}")
+
+    bpm = result['bpm']
     bpm_source = result['bpm_source']
-    if id3_data.get('bpm') and 60 < id3_data['bpm'] < 200:
-        bpm = id3_data['bpm']
-        bpm_source = "id3"
     
     key = result['key']
     camelot = result['camelot']
@@ -2853,9 +2641,11 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         key_source = "id3"
     
     # ==================== IDENTIDAD Y GENERO ====================
-    # La misma cascada que el camino corto (`_identidad_y_genero`).
-    genre = "Electronic"
-    genre_source = "chunked_analysis"
+    # La misma cascada que el camino corto (`_identidad_y_genero`). Sin
+    # Discogs/MusicBrainz/etiqueta, el genero espectral del analisis, como en
+    # el corto (hasta el 2026-10-06 era «Electronic» fijo).
+    genre = result.get('genre') or "Electronic"
+    genre_source = "spectral_analysis"
     _ident = _identidad_y_genero(file_path, fingerprint, duration, id3_data,
                                  original_filename, force_audd, device_id)
     artist_name, title_name = _ident['artist'], _ident['title']
@@ -4064,6 +3854,8 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
         duration = 0.0
         bpm_source = 'pending'
         key_source = 'pending'
+        first_beat_re = 0.0
+        beat_interval_re = 0.0
         logger.info(f"Re-analizando audio...")
         try:
             # Local: sr=44100 para maxima precision. Render: sr=22050 para ahorrar RAM.
@@ -4090,6 +3882,11 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             # MEJORA 3: Auto-correccion half/double
             onset_env_re = librosa.onset.onset_strength(y=y_full, sr=sr_full)
             bpm = try_bpm_double_half(y_full, sr_full, bpm, bpm_confidence, onset_env=onset_env_re)
+            # La rejilla, como en /analyze (`rejilla_y_bpm`): hasta el
+            # 2026-10-06 este reanalisis guardaba `first_beat` 0 y el BPM del
+            # bin de librosa a una cifra.
+            first_beat_re, beat_interval_re, bpm = rejilla_y_bpm(
+                onset_env_re, sr_full / HOP_RASGOS, bpm, bpm_del_dsp=True)
             logger.info(f"BPM: {bpm} (confianza: {bpm_confidence:.2f})")
             
             # MEJORA 1: Key con Krumhansl-Kessler (mismo codigo que analisis principal)
@@ -4225,8 +4022,8 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             'mix_energy_end': 0,
             'drop_timestamp': 0,
             'cue_points': [],
-            'first_beat': 0,
-            'beat_interval': 0,
+            'first_beat': first_beat_re,
+            'beat_interval': beat_interval_re,
         }
 
         # Huella acustica + cluster para la memoria colectiva por sonido.
