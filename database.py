@@ -1070,9 +1070,37 @@ class AnalysisDB:
                 "ORDER BY analyzed_at DESC LIMIT 1",
                 (isrc,),
             ).fetchone()
+            if fila is None:
+                fila = self._analizado_verificado_con_isrc(conn, isrc)
             return self._row_to_dict(fila)
         finally:
             conn.close()
+
+    def _analizado_verificado_con_isrc(self, conn, isrc: str):
+        """El análisis más reciente de un fichero que Shazam VERIFICÓ con ese
+        ISRC (`identidad_verificada`). Su fila de `tracks` puede traer otro
+        ISRC de las etiquetas, que `completar_isrc` no pisa: sin esto, la
+        ficha de Escuchar no salía por el ISRC justo del fichero verificado."""
+        try:
+            huellas = [r['fingerprint'] for r in conn.execute(
+                'SELECT fingerprint FROM identidad_verificada WHERE isrc = ? '
+                'ORDER BY updated_at DESC LIMIT 50', (isrc,))]
+        except sqlite3.OperationalError:
+            return None
+        if not huellas:
+            return None
+        marcas = ','.join('?' * len(huellas))
+        mejor = None
+        # Por huella y por id, en dos consultas (ver `_tracks_por_huella_o_id`).
+        for columna in ('fingerprint', 'id'):
+            for fila in conn.execute(
+                    f"SELECT * FROM tracks WHERE {columna} IN ({marcas}) "
+                    "AND bpm IS NOT NULL AND bpm > 0 "
+                    "AND instr(COALESCE(analysis_json, ''), 'recognize_only') = 0",
+                    huellas):
+                if mejor is None or (fila['analyzed_at'] or '') > (mejor['analyzed_at'] or ''):
+                    mejor = fila
+        return mejor
 
     def huellas_del_tema(self, fingerprint: Optional[str],
                          isrc: Optional[str] = None,
@@ -2996,6 +3024,46 @@ class AnalysisDB:
             conn.close()
         return {'guardadas': len(items), 'isrc_completados': completados}
 
+    def retirar_identidades(self, device_id: str, huellas: List[str]) -> Dict:
+        """Quita lo que ESTE aparato verificó de esas huellas: el DJ lo
+        descartó al revisarlo uno a uno, o su pasada dejó de darlo por seguro.
+        Lo que verificó otro aparato no se toca. Y el ISRC que eso puso en
+        `tracks` se quita solo si sigue siendo ese y el análisis no lo trae
+        (entonces vino de aquí, no de AudD ni de las etiquetas).
+        Devuelve {'retiradas', 'isrc_quitados'}."""
+        huellas = [h for h in dict.fromkeys(huellas or []) if h]
+        if not huellas:
+            return {'retiradas': 0, 'isrc_quitados': 0}
+        conn = self._open_conn()
+        try:
+            retiradas = quitados = 0
+            for i in range(0, len(huellas), 500):
+                trozo = huellas[i:i + 500]
+                marcas = ','.join('?' * len(trozo))
+                filas = conn.execute(
+                    f'SELECT fingerprint, isrc FROM identidad_verificada '
+                    f'WHERE device_id = ? AND fingerprint IN ({marcas})',
+                    [device_id, *trozo]).fetchall()
+                for f in filas:
+                    if not f['isrc']:
+                        continue
+                    for columna in ('fingerprint', 'id'):
+                        quitados += conn.execute(
+                            f"UPDATE tracks SET isrc = NULL WHERE {columna} = ? "
+                            "AND isrc = ? "
+                            "AND instr(COALESCE(analysis_json, ''), ?) = 0",
+                            (f['fingerprint'], f['isrc'], f['isrc'])).rowcount
+                retiradas += conn.execute(
+                    f'DELETE FROM identidad_verificada '
+                    f'WHERE device_id = ? AND fingerprint IN ({marcas})',
+                    [device_id, *trozo]).rowcount
+            conn.commit()
+        except sqlite3.OperationalError:
+            return {'retiradas': 0, 'isrc_quitados': 0}
+        finally:
+            conn.close()
+        return {'retiradas': retiradas, 'isrc_quitados': quitados}
+
     @staticmethod
     def _identidad_de_fila(r, exacta: bool) -> Dict:
         return {'artist': r['artist'], 'title': r['title'], 'isrc': r['isrc'],
@@ -3077,6 +3145,39 @@ class AnalysisDB:
             return None
         return self.identidades_verificadas([fingerprint]).get(fingerprint)
 
+    def identidad_verificada_del_cluster(self, acoustic_id: Optional[str]) -> Optional[Dict]:
+        """La verificación más reciente de cualquier fichero de un cluster
+        acústico (`exacta` False). Es la que vale para una copia NUEVA del
+        tema —otros bytes, todavía sin fila—, que `identidad_verificada_de`
+        no puede encontrar por su huella: `/analyze` saca el cluster del
+        audio y pregunta por él."""
+        if not acoustic_id:
+            return None
+        conn = self._open_conn()
+        try:
+            claves = set()
+            for r in conn.execute(
+                    'SELECT id, fingerprint FROM tracks WHERE acoustic_id = ?',
+                    (acoustic_id,)):
+                claves.update(k for k in (r['fingerprint'], r['id']) if k)
+            if not claves:
+                return None
+            mejor = None
+            claves = sorted(claves)
+            for i in range(0, len(claves), 500):
+                trozo = claves[i:i + 500]
+                marcas = ','.join('?' * len(trozo))
+                for r in conn.execute(
+                        f'SELECT * FROM identidad_verificada '
+                        f'WHERE fingerprint IN ({marcas})', trozo):
+                    if mejor is None or r['updated_at'] > mejor['updated_at']:
+                        mejor = r
+            return self._identidad_de_fila(mejor, False) if mejor else None
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            conn.close()
+
     def apuntar_audd_no_hizo_falta(self, via: str) -> None:
         """Una vez que NO se pagó AudD porque ya se sabía quién era el tema:
         `identidad` (verificada por Shazam), `limpiar` (lo mismo, en un
@@ -3114,6 +3215,7 @@ class AnalysisDB:
                 'SELECT via, SUM(n) AS n FROM audd_no_hizo_falta '
                 'WHERE dia >= ? GROUP BY via',
                 (desde.strftime('%Y-%m-%d'),)).fetchall()}
+            en_los_aparatos = self._identidad_en_los_aparatos(conn, dias)
         finally:
             conn.close()
         return {
@@ -3123,7 +3225,46 @@ class AnalysisDB:
             'recientes': t['recientes'],
             'dias': dias,
             'audd_no_hizo_falta': ahorro,
+            'en_los_aparatos': en_los_aparatos,
         }
+
+    @staticmethod
+    def _identidad_en_los_aparatos(conn, dias: int) -> Dict:
+        """Lo que les LLEGA a los aparatos, de los eventos
+        `identidad_comunidad` (uno por pasada que preguntó algo): cuántos
+        aparatos preguntaron, cuántas huellas, cuántas tenían identidad y
+        cuántos nombres e ISRC se pusieron. Recorre el cursor."""
+        salida = {'aparatos': 0, 'pasadas': 0, 'preguntadas': 0,
+                  'con_identidad': 0, 'nombres': 0, 'isrc': 0}
+        aparatos = set()
+
+        def _n(v):
+            try:
+                return max(0, int(v))
+            except (TypeError, ValueError):
+                return 0
+
+        try:
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'identidad_comunidad' "
+                "AND day >= date('now', ?)", (f"-{int(dias)} days",))
+        except sqlite3.OperationalError:
+            return salida
+        for dev, props in cur:
+            try:
+                p = json.loads(props) if props else {}
+            except (TypeError, ValueError):
+                p = {}
+            if not isinstance(p, dict):
+                continue
+            salida['pasadas'] += 1
+            if dev:
+                aparatos.add(dev)
+            for k in ('preguntadas', 'con_identidad', 'nombres', 'isrc'):
+                salida[k] += _n(p.get(k))
+        salida['aparatos'] = len(aparatos)
+        return salida
 
     # ==================== LO IMPORTADO DE LOS PROGRAMAS DE DJ ====================
 

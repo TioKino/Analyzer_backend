@@ -104,6 +104,60 @@ def test_la_ficha_de_escuchar_sale_por_el_isrc(db, monkeypatch):
     assert db.get_analyzed_track_by_isrc('ILA250500123')['fingerprint'] == fp
 
 
+def test_la_ficha_sale_por_el_isrc_verificado_aunque_la_fila_traiga_otro(db):
+    """La fila del fichero trae el ISRC de sus etiquetas (que no se pisa) y
+    Shazam verificó otro: la ficha de Escuchar sale igual por el verificado."""
+    fp = _fp()
+    _tema(db, fp, isrc='GBAAA0000001')
+    db.guardar_identidades('mac', [_verificada(fp)])
+    ficha = db.get_analyzed_track_by_isrc('ILA250500123')
+    assert ficha is not None and ficha['fingerprint'] == fp
+    assert db.get_analyzed_track_by_isrc('GBAAA0000001')['fingerprint'] == fp
+
+
+def test_el_cluster_da_la_identidad_a_una_copia_que_aun_no_tiene_fila(db):
+    verificado, viejo = _fp(), _fp()
+    _tema(db, verificado, aid='c1')
+    db.guardar_identidades('mac', [_verificada(verificado, titulo='Viejo')])
+    _tema(db, viejo, aid='c1')
+    db.guardar_identidades('otro', [_verificada(viejo)])
+    r = db.identidad_verificada_del_cluster('c1')
+    assert r['title'] == 'Pure Energy', 'la más reciente del cluster'
+    assert r['exacta'] is False
+    assert db.identidad_verificada_del_cluster('nada') is None
+    assert db.identidad_verificada_del_cluster(None) is None
+
+
+def test_retirar_quita_solo_lo_de_ese_aparato(db):
+    mio, de_otro = _fp(), _fp()
+    _tema(db, mio)
+    _tema(db, de_otro)
+    db.guardar_identidades('mac', [_verificada(mio)])
+    db.guardar_identidades('otro', [_verificada(de_otro)])
+    r = db.retirar_identidades('mac', [mio, de_otro])
+    assert r == {'retiradas': 1, 'isrc_quitados': 1}
+    assert db.identidad_verificada_de(mio) is None
+    assert db.identidad_verificada_de(de_otro) is not None
+    isrc = {f['id']: f['isrc'] for f in db.conn.execute('SELECT id, isrc FROM tracks')}
+    assert isrc[mio] is None, 'el ISRC que puso la verificación se va con ella'
+    assert isrc[de_otro] == 'ILA250500123'
+
+
+def test_retirar_no_quita_un_isrc_que_trae_el_analisis(db):
+    """Si el análisis ya traía ese ISRC (AudD o las etiquetas), no vino de la
+    verificación y se queda."""
+    fp = _fp()
+    db.conn.execute(
+        'INSERT INTO tracks (id, fingerprint, filename, isrc, bpm, analysis_json) '
+        "VALUES (?, ?, 'x.mp3', 'ILA250500123', 128, ?)",
+        (fp, fp, '{"isrc": "ILA250500123"}'))
+    db.conn.commit()
+    db.guardar_identidades('mac', [_verificada(fp)])
+    assert db.retirar_identidades('mac', [fp]) == {'retiradas': 1, 'isrc_quitados': 0}
+    assert db.conn.execute('SELECT isrc FROM tracks WHERE id = ?',
+                           (fp,)).fetchone()['isrc'] == 'ILA250500123'
+
+
 def test_el_resumen_del_panel(db):
     db.guardar_identidades('mac', [_verificada(_fp()), _verificada(_fp(), isrc=None)])
     db.apuntar_audd_no_hizo_falta('identidad')
@@ -112,6 +166,29 @@ def test_el_resumen_del_panel(db):
     r = db.resumen_identidad_verificada(30)
     assert (r['huellas'], r['con_isrc'], r['aparatos'], r['recientes']) == (2, 1, 1, 2)
     assert r['audd_no_hizo_falta'] == {'identidad': 2, 'cluster': 1}
+
+
+def test_el_panel_cuenta_lo_que_les_llega_a_los_aparatos(db):
+    """Sin los eventos `identidad_comunidad`, Render sabe lo que guarda pero
+    no si a alguien le sirve."""
+    import json
+
+    for dev, p in (('a', {'preguntadas': 500, 'con_identidad': 40,
+                          'nombres': 3, 'isrc': 30}),
+                   ('a', {'preguntadas': 20, 'con_identidad': 2,
+                          'nombres': 0, 'isrc': 2}),
+                   ('b', {'preguntadas': 'x'}),
+                   ('c', None)):
+        db.conn.execute(
+            "INSERT INTO events (device_id, event_name, props) "
+            "VALUES (?, 'identidad_comunidad', ?)",
+            (dev, json.dumps(p) if p is not None else None))
+    db.conn.execute("INSERT INTO events (device_id, event_name, props) "
+                    "VALUES ('d', 'puesta_al_dia', '{\"hechos\": 9}')")
+    db.conn.commit()
+    r = db.resumen_identidad_verificada(30)['en_los_aparatos']
+    assert r == {'aparatos': 3, 'pasadas': 4, 'preguntadas': 520,
+                 'con_identidad': 42, 'nombres': 3, 'isrc': 32}
 
 
 # ── La API ────────────────────────────────────────────────────────────────────
@@ -164,6 +241,23 @@ def test_se_descarta_lo_que_no_vale(app_mod):
     assert guardada['isrc'] == 'ILA250500123', 'normalizado'
 
 
+def test_retirar_por_la_api(app_mod):
+    fp, token = _fp(), _token()
+    c = TestClient(app_mod.app)
+    c.post('/identidad/verificada', headers={'X-Device-Token': token},
+           json={'items': [{'fingerprint': fp, 'artist': 'Joan Reyes',
+                            'title': 'Psicodelicia'}]})
+    assert c.post('/identidad/verificada/retirar',
+                  json={'huellas': [fp]}).status_code == 401
+    r = c.post('/identidad/verificada/retirar',
+               headers={'X-Device-Token': _token()}, json={'huellas': [fp]})
+    assert r.json()['retiradas'] == 0, 'otro aparato no retira lo de este'
+    r = c.post('/identidad/verificada/retirar',
+               headers={'X-Device-Token': token}, json={'huellas': [fp, 'x']})
+    assert (r.status_code, r.json()['retiradas']) == (200, 1)
+    assert app_mod.db.identidad_verificada_de(fp) is None
+
+
 def test_la_consulta_por_lote(app_mod):
     fp = _fp()
     TestClient(app_mod.app).post(
@@ -204,6 +298,7 @@ def sin_red(monkeypatch, app_mod):
     monkeypatch.setattr(app_mod, 'AUDD_API_TOKEN', 'token')
     monkeypatch.setattr(app_mod, 'GENRE_DETECTOR_ENABLED', False)
     monkeypatch.setattr(app_mod, '_cluster_clean_identity', lambda *a: None)
+    monkeypatch.setattr(app_mod, '_verificada_del_sonido', lambda *a: None)
     def audd(**kw):
         # Como el de verdad: solo salta con nombre basura o a la fuerza.
         if not kw['force'] and not audd_helper.is_garbage_metadata(
@@ -230,6 +325,31 @@ def test_EL_CASO_nombre_basura_y_ya_se_sabe_quien_es(app_mod, sin_red, monkeypat
     assert r['audd_isrc'] == 'ILA250500123'
     assert sin_red == [], 'AudD no se llama'
     assert falso.ahorros == ['identidad']
+
+
+def test_una_copia_NUEVA_con_nombre_basura_tampoco_paga(app_mod, sin_red,
+                                                        monkeypatch):
+    """Otros bytes del mismo tema: por su huella no hay nada (no tiene fila),
+    por el cluster de su audio sí. Es el caso del ahorro: el segundo DJ."""
+    falso = _Db(None)
+    monkeypatch.setattr(app_mod, 'db', falso)
+    monkeypatch.setattr(app_mod, '_verificada_del_sonido', lambda *a: {
+        'artist': 'Astrix & Domestic', 'title': 'Pure Energy',
+        'isrc': 'ILA250500123', 'exacta': False})
+    r = _identidad(app_mod, {'artist': 'Unknown Artist', 'title': 'Track 01'})
+    assert (r['artist'], r['title']) == ('Astrix & Domestic', 'Pure Energy')
+    assert r['audd_isrc'] == 'ILA250500123'
+    assert sin_red == [] and falso.ahorros == ['identidad']
+
+
+def test_con_nombre_limpio_no_se_saca_el_cluster_del_audio(app_mod, sin_red,
+                                                           monkeypatch):
+    monkeypatch.setattr(app_mod, 'db', _Db(None))
+    def no(*a):
+        raise AssertionError('fpcalc sobra con un nombre limpio')
+    monkeypatch.setattr(app_mod, '_verificada_del_sonido', no)
+    r = _identidad(app_mod, {'artist': 'Astral Projection', 'title': 'Pure NRG'})
+    assert r['artist'] == 'Astral Projection'
 
 
 def test_limpiar_con_audd_tampoco_paga(app_mod, sin_red, monkeypatch):
