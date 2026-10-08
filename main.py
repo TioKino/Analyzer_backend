@@ -1600,6 +1600,21 @@ def _pick_clean_identity(identities):
     return None
 
 
+def _cluster_del_audio(audio_path, duration):
+    """El cluster acústico de este audio, o None. Saca la huella del fichero
+    (`compute_raw_chromaprint` la recuerda: `_attach_acoustic` no la vuelve a
+    sacar). Best-effort: sin fpcalc, None."""
+    try:
+        from acoustic_fingerprint import compute_raw_chromaprint
+        raw = compute_raw_chromaprint(audio_path, etiqueta='(pre-check AudD)')
+        if not raw:
+            return None
+        return db.find_acoustic_cluster(raw, duration)
+    except Exception as e:  # noqa: BLE001 - best-effort, no romper el analisis
+        logger.warning(f"[AudD-skip] cluster del audio fallo (no critico): {e}")
+        return None
+
+
 def _cluster_clean_identity(audio_path, duration):
     """AHORRO AudD por SONIDO: si el cluster acustico de este audio ya tiene una
     identidad LIMPIA (otra copia con buenos tags / AudD previo de otro usuario),
@@ -1607,16 +1622,24 @@ def _cluster_clean_identity(audio_path, duration):
     None si no hay cluster o toda su identidad es basura. Best-effort — nunca
     rompe el analisis (si fpcalc no esta, cae a AudD como antes)."""
     try:
-        from acoustic_fingerprint import compute_raw_chromaprint
-        raw = compute_raw_chromaprint(audio_path, etiqueta='(pre-check AudD)')
-        if not raw:
-            return None
-        acoustic_id = db.find_acoustic_cluster(raw, duration)
+        acoustic_id = _cluster_del_audio(audio_path, duration)
         if not acoustic_id:
             return None
         return _pick_clean_identity(db.cluster_identities(acoustic_id))
     except Exception as e:  # noqa: BLE001 - best-effort, no romper el analisis
         logger.warning(f"[AudD-skip] cluster identity fallo (no critico): {e}")
+        return None
+
+
+def _verificada_del_sonido(audio_path, duration):
+    """La identidad verificada (Shazam) de OTRA copia del mismo sonido, para
+    una copia nueva —otros bytes, sin fila todavía—: por su huella no se
+    encuentra, por su cluster sí. None si no la hay."""
+    try:
+        acoustic_id = _cluster_del_audio(audio_path, duration)
+        return db.identidad_verificada_del_cluster(acoustic_id) if acoustic_id else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[Identidad] cluster del audio fallo (no critico): {e}")
         return None
 
 
@@ -1741,6 +1764,12 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
             verificada = db.identidad_verificada_de(fingerprint)
         except Exception as e:  # noqa: BLE001 - best-effort, como el cluster
             logger.warning(f"[Identidad] consulta fallo (no critico): {e}")
+    # Una copia NUEVA (otros bytes) no tiene fila: ni su huella ni su cluster
+    # salen por `identidad_verificada_de`. Si hace falta la identidad (nombre
+    # basura o «Limpiar con AudD»), se saca el cluster del AUDIO, que es justo
+    # el caso del ahorro: el segundo DJ con el mismo tema mal etiquetado.
+    if verificada is None and (force_audd or is_garbage_metadata(artist_name, title_name)):
+        verificada = _verificada_del_sonido(file_path, duration)
     ya_se_sabe = bool(verificada) and (
         force_audd or is_garbage_metadata(artist_name, title_name))
     if ya_se_sabe:
@@ -5728,6 +5757,25 @@ async def guardar_identidad_verificada(req: IdentidadesRequest, request: Request
                 f"{len(req.items) - len(validos)} descartadas")
     return {"status": "ok", **hecho,
             "descartadas": len(req.items) - len(validos)}
+
+
+@app.post("/identidad/verificada/retirar")
+async def retirar_identidad_verificada(req: ConsultaIdentidadRequest,
+                                       request: Request):
+    """Quita lo que ESTE aparato verificó de esas huellas (el DJ lo descartó
+    al revisarlo, o su pasada dejó de darlo por seguro). Lo de otros aparatos
+    se queda. Mismo token que mandarlo."""
+    device = dispositivo_del_token(request.headers.get("X-Device-Token", ""))
+    if not device:
+        raise HTTPException(401, "Device token required")
+    if len(req.huellas) > _MAX_IDENTIDADES:
+        raise HTTPException(400, f"Máximo {_MAX_IDENTIDADES} huellas por petición")
+    huellas = [re.sub(r'[^a-fA-F0-9]', '', h or '').lower() for h in req.huellas]
+    huellas = [h for h in huellas if len(h) == 32]
+    hecho = await run_in_threadpool(db.retirar_identidades, device, huellas)
+    logger.info(f"[Identidad] {hecho['retiradas']} retiradas "
+                f"({hecho['isrc_quitados']} ISRC quitados de tracks)")
+    return {"status": "ok", **hecho}
 
 
 @app.post("/identidad/verificada/consulta")
