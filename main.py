@@ -53,6 +53,7 @@ import hmac
 import requests
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 import asyncio
@@ -1022,6 +1023,22 @@ try:
     logger.info(f"[Community] {_mudadas} filas de la memoria mudadas a su cluster")
 except Exception as _e:  # noqa: BLE001 - best-effort
     logger.warning(f"[Community] realinear la memoria fallo: {_e}")
+
+
+# Las filas cuyo `analysis_json` se anidó al volver a guardarlas (hasta el
+# 2026-10-13: ver `analisis_sin_anidar`). En segundo plano: el primer arranque
+# puede tener muchas, y el servidor no tiene por qué esperarlas. Dice SIEMPRE
+# cuántas, también con 0.
+def _aplanar_analisis_anidados():
+    try:
+        _n = db.aplanar_analisis_anidados()
+        logger.info(f"[Tracks] {_n} análisis anidados aplanados")
+    except Exception as _e:  # noqa: BLE001 - best-effort
+        logger.warning(f"[Tracks] aplanar los análisis anidados falló: {_e}")
+
+
+threading.Thread(target=_aplanar_analisis_anidados, daemon=True,
+                 name='aplanar-analisis').start()
 
 # El motor local manda a Render lo que gasta en AudD (ver
 # `_mandar_audd_a_render`): tras cada llamada, con un rato de espera, y una vez
