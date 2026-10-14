@@ -37,6 +37,7 @@ import numpy as np
 # aqui, el de trozos en `chunked_analyzer`). Se importan con su nombre de
 # siempre: hay tests y llamadas que los piden a `main`.
 from tonalidad import croma_para_guardar
+import analisis_fallido
 from rasgos_del_tema import (try_bpm_double_half, classify_track_type,
                              pulso_de_beats, rasgos_espectrales,
                              rejilla_y_bpm, energia_del_tema,
@@ -3200,6 +3201,15 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                     f"se analiza otra vez."
                 )
                 existing = None
+            # ...y un analisis FALLIDO que se puede reintentar (no era del
+            # fichero) no se devuelve: hasta el 2026-10-14 un fallback era
+            # para siempre. Ver `analisis_fallido`.
+            elif analisis_fallido.se_reintenta(db._row_to_dict(existing) or {}):
+                logger.info(
+                    f"[Cache] '{file.filename}' fue un analisis fallido; "
+                    f"se intenta otra vez."
+                )
+                existing = None
         if existing:
             analysis_json = json.loads(existing[11]) if len(existing) > 11 and existing[11] else {}
 
@@ -3289,6 +3299,14 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # Esto recupera datos de AudD guardados previamente
         if not force:
             existing_by_fp = db.get_track_by_fingerprint(fingerprint)
+            # Un fallo que se puede reintentar no es un acierto de cache
+            # (`analisis_fallido`): se analiza otra vez.
+            if existing_by_fp and analisis_fallido.se_reintenta(existing_by_fp):
+                logger.info(
+                    f"[Cache] {fingerprint[:8]}... fue un analisis fallido; "
+                    f"se intenta otra vez."
+                )
+                existing_by_fp = None
             if existing_by_fp and _is_analysis_current(existing_by_fp):
                 # Log dedup multi-dispositivo: si un track sube desde móvil
                 # con nombre distinto al que tenía en PC, este log permite
@@ -3823,6 +3841,13 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
             track_data['filename'] = file.filename
             track_data['fingerprint'] = fingerprint
             track_data['analysis_status'] = 'failed'  # Marcador especial
+            # Por qué falló y cuántas veces lleva, para saber si se reintenta
+            # (`analisis_fallido`): un fichero ilegible no; un error nuestro,
+            # como mucho tres veces más.
+            track_data['fallo'] = (analisis_fallido.ILEGIBLE if is_corrupt_audio
+                                   else analisis_fallido.ERROR)
+            track_data['intentos_fallidos'] = analisis_fallido.intentos_tras(
+                db.get_track_by_fingerprint(fingerprint))
             # La plataforma SI se sella, igual que en el camino normal. El
             # motor (`engine_source`) no, y eso es una decision aparte. Sin la
             # plataforma, una rafaga de fallbacks (289 en 7 dias el 27-sep) no
