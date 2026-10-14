@@ -40,6 +40,60 @@ def _scrub_volatile_tokens(text: str) -> str:
     return text
 
 
+# Lo que `save_track` NO mete en `analysis_json`: el blob de la huella (tiene
+# su columna) y el propio `analysis_json` de una fila leída de la BD.
+_FUERA_DEL_ANALISIS = ('chromaprint', 'analysis_json')
+
+
+def analisis_sin_anidar(datos: Dict[str, Any]) -> Dict[str, Any]:
+    """El análisis que se guarda en `analysis_json`, sin anidar.
+
+    Quien vuelve a guardar una fila leída de la BD (el cache-hit por huella de
+    `/analyze`, que solo quiere refrescar el `filename`) le pasa a
+    `save_track` lo que da `_row_to_dict`: las COLUMNAS, unos pocos campos
+    copiados del JSON y el `analysis_json` entero como texto. Hasta el
+    2026-10-13 eso se volcaba tal cual, así que el JSON nuevo llevaba DENTRO
+    el viejo, escapado, y a cada reimportación otra capa:
+
+    - en primer nivel solo quedaban las columnas: la estructura, el croma, el
+      groove y los demás rasgos se quedaban enterrados, y la ficha que se
+      servía después (cache-hit, `/analysis/by-fingerprint`) iba sin ellos;
+    - la marca de un fallback (`"analysis_status": "failed"`) quedaba
+      escapada, y el panel, que la busca como texto, contaba esa fila como
+      «análisis OK sin huella»;
+    - y la fila crecía ~1,6× por reimportación.
+
+    Aquí se deshacen las capas: de la más honda a la de fuera, y la de fuera
+    manda (es lo último que se escribió), salvo con un `None`, que no borra lo
+    que diga una capa de dentro. Un análisis nuevo no trae `analysis_json`, y
+    sale igual que siempre: todo menos el `chromaprint`.
+    """
+    capas = []
+    actual: Any = datos
+    for _ in range(64):  # más capas que reimportaciones razonables
+        if not isinstance(actual, dict):
+            break
+        capas.append(actual)
+        anidado = actual.get('analysis_json')
+        if isinstance(anidado, str):
+            try:
+                actual = json.loads(anidado)
+            except (json.JSONDecodeError, TypeError):
+                break
+        elif isinstance(anidado, dict):
+            actual = anidado
+        else:
+            break
+    plano: Dict[str, Any] = {}
+    for capa in reversed(capas):
+        for k, v in capa.items():
+            if k in _FUERA_DEL_ANALISIS:
+                continue
+            if v is not None or k not in plano:
+                plano[k] = v
+    return plano
+
+
 def normalize_error_key(error_msg: Optional[str]) -> str:
     """Clave de agrupacion estable de un error: el mensaje SIN el prefijo
     '[plataforma version]' que anade /client-error, primera linea, tokens
@@ -1537,6 +1591,48 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def aplanar_analisis_anidados(self, lote: int = 200) -> int:
+        """Deshace el `analysis_json` anidado de las filas que se volvieron a
+        guardar antes del 2026-10-13 (ver `analisis_sin_anidar`). Devuelve
+        cuántas filas arregló. Idempotente: una fila plana no se toca.
+
+        Solo cambia `analysis_json`: ni la fecha, ni la huella, ni las columnas.
+        Primero junta los ids (un recorrido que lee el JSON de la tabla, una
+        vez por arranque) y luego arregla de `lote` en `lote`, fila a fila, sin
+        tener la tabla entera en memoria (ver «Los endpoints admin recorren la
+        biblioteca ENTERA» en CLAUDE.md).
+        """
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT id FROM tracks "
+                "WHERE instr(COALESCE(analysis_json, ''), '\"analysis_json\"') > 0")
+            ids = [r[0] for r in c.fetchall()]
+            arregladas = 0
+            for i, track_id in enumerate(ids, 1):
+                fila = c.execute(
+                    'SELECT analysis_json FROM tracks WHERE id = ?',
+                    (track_id,)).fetchone()
+                if not fila or not fila[0]:
+                    continue
+                try:
+                    datos = json.loads(fila[0])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(datos, dict) or 'analysis_json' not in datos:
+                    continue
+                c.execute(
+                    'UPDATE tracks SET analysis_json = ? WHERE id = ?',
+                    (json.dumps(analisis_sin_anidar(datos)), track_id))
+                arregladas += 1
+                if i % lote == 0:
+                    conn.commit()
+            conn.commit()
+            return arregladas
+        finally:
+            conn.close()
+
     def lo_de_este_aparato(self, device_id: str) -> Dict[str, list]:
         """Lo que [device_id] dejó para la comunidad en esta BD —valoraciones,
         notas, votos de cambios a mano y rejillas corregidas—, cada cosa con la
@@ -2103,9 +2199,9 @@ class AnalysisDB:
             # `chromaprint` es un blob tecnico (base64 de varios KB) cuyo sitio es
             # su columna dedicada; fuera del analysis_json para no duplicarlo ni
             # engordar lo que se envia al cliente ni el AnalysisResult del cache-hit.
-            analysis_json_data = {
-                k: v for k, v in track_data.items() if k != 'chromaprint'
-            }
+            # Y una fila leida de la BD trae su `analysis_json`: se deshace en
+            # vez de meterlo dentro del nuevo (ver `analisis_sin_anidar`).
+            analysis_json_data = analisis_sin_anidar(track_data)
 
             c.execute('''
                 INSERT OR REPLACE INTO tracks

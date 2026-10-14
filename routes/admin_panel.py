@@ -2183,27 +2183,41 @@ def _reparto_por_version(adb, dias, plat_sql, plat_params):
     # MAX() esta DEFINIDO en SQLite (devuelve la fila del maximo) y evita una
     # window function, que exige 3.25+.
     sql = (
-        "SELECT device_id, app_version, MAX(timestamp) FROM events "
+        "SELECT device_id, app_version, platform, MAX(timestamp) FROM events "
         "WHERE device_id IS NOT NULL AND timestamp >= ?" + plat_sql +
         " GROUP BY device_id"
     )
     por_version = {}
+    # Y por PLATAFORMA (`macos-mas`, `macos-dmg`, `windows`…), la de esa
+    # misma ultima fila. Lectura 56 (2026-10-13): dos tercios del escritorio
+    # seguian en la 2.9.11 dos semanas despues de la 2.10.1, con el appcast
+    # sirviendola. Las dos causas piden cosas distintas —el Mac App Store
+    # actualiza con la tienda; el DMG y Windows, con Sparkle— y sin partirlo
+    # no se sabe cual es.
+    por_plataforma = {}
     sin_version = 0
     total = 0
     # Cursor iterado, no fetchall: estos endpoints recorren la tabla entera y
     # un fetchall ya tumbo produccion con un OOM una vez.
-    for _dev, ver, _ts in adb.execute(sql, [desde] + list(plat_params)):
+    for _dev, ver, plat, _ts in adb.execute(sql, [desde] + list(plat_params)):
         total += 1
         if not ver:
             sin_version += 1
             continue
         por_version[ver] = por_version.get(ver, 0) + 1
-    ordenadas = dict(
-        sorted(por_version.items(), key=lambda kv: _orden_de_version(kv[0]), reverse=True)
-    )
+        suya = por_plataforma.setdefault(plat or "(sin)", {})
+        suya[ver] = suya.get(ver, 0) + 1
+
+    def _ordenar(d):
+        return dict(sorted(d.items(), key=lambda kv: _orden_de_version(kv[0]), reverse=True))
+
+    ordenadas = _ordenar(por_version)
     return {
         "devices": total,
         "por_version": ordenadas,
+        "por_plataforma": {
+            p: _ordenar(v) for p, v in sorted(por_plataforma.items())
+        },
         "sin_version": sin_version,
         "nota": (
             "ultima version vista por dispositivo en la ventana. `sin_version` "
