@@ -90,6 +90,12 @@ MIN_PICO_INTERVALO = 12.0
 # fase cualquiera, y una rejilla inventada es peor que ninguna.
 MIN_CONFIANZA = 0.12
 
+# Cuánto más tienen que pegar los GRAVES medio beat más allá para mover la
+# rejilla allí (un 20 %, en cada uno de los cuatro tiempos del compás), y el
+# ataque mínimo de esos graves frente a los de aquí. Ver `_fase_del_bombo`.
+MAS_GRAVES = 1.2
+ATAQUE_MINIMO = 0.5
+
 
 def _histograma_de_fase(onset: np.ndarray, fps: float, intervalo: float,
                         desde: int = 0, hasta: Optional[int] = None) -> np.ndarray:
@@ -225,9 +231,100 @@ def _afinar_intervalo(onset: np.ndarray, fps: float, base: float) -> float:
     return float(cands[i] + desplaz * paso)
 
 
+def _graves_por_tiempo(graves: np.ndarray, fps: float, fase: float,
+                       intervalo: float):
+    """El grave en los beats que empiezan en `fase`, por tiempo del compás
+    (beat k → k % 4): el NIVEL (el máximo entre 20 ms antes y 60 ms después
+    del beat, lo que dura el cuerpo de un bombo) y el ATAQUE (ese máximo menos
+    el mínimo de los 80 ms de antes). Media de todos los beats de cada tiempo."""
+    antes = max(1, int(round(0.020 * fps)))
+    despues = max(1, int(round(0.060 * fps)))
+    previo = max(1, int(round(0.080 * fps)))
+    nivel = np.zeros(4, dtype=float)
+    ataque = np.zeros(4, dtype=float)
+    n = np.zeros(4, dtype=int)
+    k = 0
+    while True:
+        idx = int(round((fase + k * intervalo) * fps))
+        if idx + despues >= graves.size:
+            break
+        if idx - previo >= 0:
+            alto = float(graves[idx - antes:idx + despues + 1].max())
+            bajo = float(graves[idx - previo:idx + 1].min())
+            nivel[k % 4] += alto
+            ataque[k % 4] += max(0.0, alto - bajo)
+            n[k % 4] += 1
+        k += 1
+    con = n > 0
+    nivel[con] /= n[con]
+    ataque[con] /= n[con]
+    return nivel, ataque
+
+
+def _fase_cerca(onset: np.ndarray, fps: float, intervalo: float,
+                cerca: float) -> float:
+    """La fase del pico de la envolvente más cercano a `cerca` (a menos de un
+    octavo de beat), con su centroide como en `_fase_de`. Si allí la envolvente
+    es plana, `cerca` tal cual."""
+    h = _suavizar_circular(
+        _histograma_de_fase(onset, fps, intervalo),
+        SUAVIZADO_MS // MS_POR_BIN,
+    )
+    n = len(h)
+    centro = int(round(cerca * 1000 / MS_POR_BIN))
+    radio = max(1, int(round(intervalo * 1000 / MS_POR_BIN / 8)))
+    desplaz = np.arange(-radio, radio + 1)
+    zona = h[(centro + desplaz) % n]
+    maximo = float(zona.max())
+    minimo = float(zona.min())
+    if not maximo > minimo:
+        return cerca
+    pico = centro + int(desplaz[int(np.argmax(zona))])
+    r = min(SUAVIZADO_MS // MS_POR_BIN, n // 2)
+    alrededor = np.arange(-r, r + 1)
+    valores = np.maximum(h[(pico + alrededor) % n] - minimo, 0.0)
+    total = float(valores.sum())
+    c = pico + (float((valores * alrededor).sum()) / total if total > 0 else 0.0)
+    return (c % n) * MS_POR_BIN / 1000.0
+
+
+def _fase_del_bombo(onset: np.ndarray, graves: Optional[np.ndarray],
+                    fps: float, fase: float, intervalo: float) -> float:
+    """La fase del BOMBO: `fase` o medio beat más allá, según los graves.
+
+    La fase sale de la envolvente de onset, que cuenta lo que SUBE, y en el
+    trance lo que más sube puede ser el contratiempo: el bajo sostenido hasta
+    el bombo siguiente le come la subida al bombo, y el charles abierto suma la
+    suya. Reportado por el owner el 2026-10-14 con *The Age of Love* (Jam &
+    Spoon, 132,5 BPM): la rejilla salía medio beat corrida. **En un cuatro al
+    suelo el beat es donde el grave pega**, así que se mueve medio beat SOLO si
+    allí, en cada uno de los cuatro tiempos del compás, el grave pega al menos
+    un 20 % más (`MAS_GRAVES`) con un ataque de al menos la mitad del de aquí
+    (`ATAQUE_MINIMO`). La condición de los cuatro tiempos protege al breakbeat,
+    al garage y al drum & bass, que tienen bombos en contratiempos SUELTOS.
+
+    Espejo de `_faseDelBombo` en `lib/services/beat_grid_detector.dart` (el
+    porqué entero, y lo medido, está allí): si tocas uno, toca el otro.
+    """
+    if graves is None or graves.size < onset.size // 2 or fps < 20:
+        return fase
+    otra = (fase + intervalo / 2) % intervalo
+    nivel_aqui, ataque_aqui = _graves_por_tiempo(graves, fps, fase, intervalo)
+    nivel_alli, ataque_alli = _graves_por_tiempo(graves, fps, otra, intervalo)
+    for r in range(4):
+        if nivel_aqui[r] <= 0:
+            return fase
+        if not nivel_alli[r] >= nivel_aqui[r] * MAS_GRAVES:
+            return fase
+        if not ataque_alli[r] >= ataque_aqui[r] * ATAQUE_MINIMO:
+            return fase
+    return _fase_cerca(onset, fps, intervalo, otra)
+
+
 def fit_beat_grid(onset: Sequence[float], fps: float, bpm: float,
                   afinar_intervalo: bool = True,
-                  t0: float = 0.0) -> Optional[Dict]:
+                  t0: float = 0.0,
+                  graves: Optional[Sequence[float]] = None) -> Optional[Dict]:
     """Fase, downbeat e intervalo a partir de una envolvente de onset.
 
     Args:
@@ -239,6 +336,9 @@ def fit_beat_grid(onset: Sequence[float], fps: float, bpm: float,
         t0: instante absoluto del primer frame. Sirve para medir sobre un chunk
             del medio del track y devolver la rejilla en tiempos del track
             entero.
+        graves: la banda grave de cada frame (los mismos frames que `onset`).
+            Si se pasa, decide entre el beat y el contratiempo
+            (`_fase_del_bombo`).
 
     Returns:
         dict con first_beat / beat_interval / confidence / downbeat_index, o
@@ -262,6 +362,12 @@ def fit_beat_grid(onset: Sequence[float], fps: float, bpm: float,
     fase, confianza = _fase_de(onset, fps, intervalo)
     if confianza < MIN_CONFIANZA:
         return None
+
+    # ¿Beat o contratiempo? Lo deciden los graves (`_fase_del_bombo`).
+    fase_onset = fase
+    fase = _fase_del_bombo(
+        onset, None if graves is None else np.asarray(graves, dtype=float),
+        fps, fase, intervalo)
 
     # Downbeat: cuál de cada cuatro es el «1».
     ventana = max(1, int(round(0.030 * fps)))
@@ -288,6 +394,7 @@ def fit_beat_grid(onset: Sequence[float], fps: float, bpm: float,
         "beat_interval": round(float(intervalo), 6),
         "confidence": round(float(confianza), 3),
         "downbeat_index": downbeat,
+        "al_bombo": bool(fase != fase_onset),
     }
 
 

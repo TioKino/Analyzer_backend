@@ -343,7 +343,7 @@ def rasgos_espectrales(*, bpm: float, energy_normalized: float,
 
 
 def rejilla_y_bpm(onset_env, fps: float, bpm: float,
-                  bpm_del_dsp: bool) -> Tuple[float, float, float]:
+                  bpm_del_dsp: bool, graves=None) -> Tuple[float, float, float]:
     """(primer beat, intervalo, BPM) a partir de la envolvente de onset.
 
     `fit_beat_grid` da fase, downbeat e intervalo afinado; None = no hay pulso
@@ -355,6 +355,11 @@ def rejilla_y_bpm(onset_env, fps: float, bpm: float,
     Va ANTES del tipo de track y del género, que dependen del BPM: con el del
     bin de librosa (129,20 para un 128) un tema podía caer al otro lado del
     rango de BPM de un género.
+
+    `graves` es la banda grave por frame (`bandas_de_audio`, los mismos frames
+    que la envolvente): con ella la rejilla no cae a contratiempo en el trance
+    (`beat_grid._fase_del_bombo`, 2026-10-14). Si no casa en número de frames
+    con la envolvente, no se usa.
     """
     from beat_grid import bpm_de_la_rejilla, fit_beat_grid
     first_beat = 0.0
@@ -362,8 +367,10 @@ def rejilla_y_bpm(onset_env, fps: float, bpm: float,
     # un intervalo que no tiene nada que ver con el track y que ademas se
     # exporta tal cual al XML de Rekordbox.
     beat_interval = 60.0 / bpm if bpm > 0 else 0.5
+    if graves is not None and len(graves) != len(onset_env):
+        graves = None
     try:
-        fit = fit_beat_grid(onset_env, fps, bpm)
+        fit = fit_beat_grid(onset_env, fps, bpm, graves=graves)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"  [BeatGrid] fallo la fase ({type(e).__name__}): {e}")
         return first_beat, beat_interval, bpm
@@ -376,6 +383,7 @@ def rejilla_y_bpm(onset_env, fps: float, bpm: float,
         f"  [BeatGrid] first_beat={first_beat:.3f}s "
         f"iv={beat_interval:.5f}s downbeat={fit['downbeat_index']} "
         f"conf={fit['confidence']:.2f}"
+        + (" (estaba a contratiempo: movida al bombo)" if fit.get('al_bombo') else "")
     )
     if bpm_del_dsp:
         afinado = bpm_de_la_rejilla(bpm, beat_interval)

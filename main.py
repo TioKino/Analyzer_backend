@@ -37,6 +37,7 @@ import numpy as np
 # aqui, el de trozos en `chunked_analyzer`). Se importan con su nombre de
 # siempre: hay tests y llamadas que los piden a `main`.
 from tonalidad import croma_para_guardar
+import analisis_fallido
 from rasgos_del_tema import (try_bpm_double_half, classify_track_type,
                              pulso_de_beats, rasgos_espectrales,
                              rejilla_y_bpm, energia_del_tema,
@@ -2379,8 +2380,13 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
     # (`rejilla_y_bpm`, lo mismo en los dos caminos). La envolvente es la de
     # arriba: `beat_grid.onset_envelope` es `onset_strength` con hop 512, o
     # sea la misma.
+    # Las bandas van aquí y no abajo, con el tipo de tema: los graves deciden
+    # entre el beat y el contratiempo (`beat_grid._fase_del_bombo`).
+    from spectral_classifier import bandas_de_audio
+    bandas = bandas_de_audio(y, sr)
     first_beat, beat_interval, bpm = rejilla_y_bpm(
-        onset_env, sr / HOP_RASGOS, bpm, bpm_del_dsp=(bpm_source == "analysis"))
+        onset_env, sr / HOP_RASGOS, bpm, bpm_del_dsp=(bpm_source == "analysis"),
+        graves=bandas[0] if bandas else None)
     
     # Key - Krumhansl-Kessler profiles (academicamente validados)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12, n_octaves=7)
@@ -2489,12 +2495,11 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
 
     # Tipo, graves, pads, percusion y genero: las mismas cuentas que el camino
     # por trozos (`rasgos_espectrales`), con el tema entero.
-    from spectral_classifier import bandas_de_audio
     _rasgos = rasgos_espectrales(
         bpm=bpm, energy_normalized=energy_normalized, segments=segments,
         duration=duration, onset_env=onset_env,
         spectral_centroid=spectral_centroid, rolloff=rolloff,
-        bandas=bandas_de_audio(y, sr),
+        bandas=bandas,
         graves_si_falla=low_freq_energy > energy_raw * 0.8)
     track_type = _rasgos['track_type']
     track_type_confidence = _rasgos['track_type_confidence']
@@ -3200,6 +3205,15 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                     f"se analiza otra vez."
                 )
                 existing = None
+            # ...y un analisis FALLIDO que se puede reintentar (no era del
+            # fichero) no se devuelve: hasta el 2026-10-14 un fallback era
+            # para siempre. Ver `analisis_fallido`.
+            elif analisis_fallido.se_reintenta(db._row_to_dict(existing) or {}):
+                logger.info(
+                    f"[Cache] '{file.filename}' fue un analisis fallido; "
+                    f"se intenta otra vez."
+                )
+                existing = None
         if existing:
             analysis_json = json.loads(existing[11]) if len(existing) > 11 and existing[11] else {}
 
@@ -3289,6 +3303,14 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # Esto recupera datos de AudD guardados previamente
         if not force:
             existing_by_fp = db.get_track_by_fingerprint(fingerprint)
+            # Un fallo que se puede reintentar no es un acierto de cache
+            # (`analisis_fallido`): se analiza otra vez.
+            if existing_by_fp and analisis_fallido.se_reintenta(existing_by_fp):
+                logger.info(
+                    f"[Cache] {fingerprint[:8]}... fue un analisis fallido; "
+                    f"se intenta otra vez."
+                )
+                existing_by_fp = None
             if existing_by_fp and _is_analysis_current(existing_by_fp):
                 # Log dedup multi-dispositivo: si un track sube desde móvil
                 # con nombre distinto al que tenía en PC, este log permite
@@ -3823,6 +3845,13 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
             track_data['filename'] = file.filename
             track_data['fingerprint'] = fingerprint
             track_data['analysis_status'] = 'failed'  # Marcador especial
+            # Por qué falló y cuántas veces lleva, para saber si se reintenta
+            # (`analisis_fallido`): un fichero ilegible no; un error nuestro,
+            # como mucho tres veces más.
+            track_data['fallo'] = (analisis_fallido.ILEGIBLE if is_corrupt_audio
+                                   else analisis_fallido.ERROR)
+            track_data['intentos_fallidos'] = analisis_fallido.intentos_tras(
+                db.get_track_by_fingerprint(fingerprint))
             # La plataforma SI se sella, igual que en el camino normal. El
             # motor (`engine_source`) no, y eso es una decision aparte. Sin la
             # plataforma, una rafaga de fallbacks (289 en 7 dias el 27-sep) no
@@ -4081,8 +4110,11 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             # La rejilla, como en /analyze (`rejilla_y_bpm`): hasta el
             # 2026-10-06 este reanalisis guardaba `first_beat` 0 y el BPM del
             # bin de librosa a una cifra.
+            from spectral_classifier import bandas_de_audio
+            bandas_re = bandas_de_audio(y_full, sr_full)
             first_beat_re, beat_interval_re, bpm = rejilla_y_bpm(
-                onset_env_re, sr_full / HOP_RASGOS, bpm, bpm_del_dsp=True)
+                onset_env_re, sr_full / HOP_RASGOS, bpm, bpm_del_dsp=True,
+                graves=bandas_re[0] if bandas_re else None)
             logger.info(f"BPM: {bpm} (confianza: {bpm_confidence:.2f})")
             
             # MEJORA 1: Key con Krumhansl-Kessler (mismo codigo que analisis principal)

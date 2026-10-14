@@ -43,6 +43,7 @@ from fastapi.responses import FileResponse, Response
 from validation import artwork_online_allowed, get_client_ip
 from pydantic import BaseModel
 from sync_endpoints import dispositivo_del_token
+import analisis_fallido
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +269,13 @@ class CheckAnalyzedByFingerprintRequest(BaseModel):
     con_datos: bool = False
 
 
+def _bpm_positivo(fila: dict) -> bool:
+    try:
+        return float(fila.get('bpm') or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _vale(fila: dict, version: Optional[str], con_datos: bool) -> bool:
     if version is not None:
         if (fila.get('analysis_version') or '1') != version:
@@ -275,11 +283,7 @@ def _vale(fila: dict, version: Optional[str], con_datos: bool) -> bool:
     elif not _is_analysis_current(fila):
         return False
     if con_datos:
-        try:
-            bpm = float(fila.get('bpm') or 0)
-        except (TypeError, ValueError):
-            bpm = 0
-        if bpm <= 0 or not (fila.get('key') or '').strip():
+        if not _bpm_positivo(fila) or not (fila.get('key') or '').strip():
             return False
     return True
 
@@ -318,8 +322,19 @@ async def check_analyzed_by_fingerprint(request: CheckAnalyzedByFingerprintReque
     def _de_esta_bd():
         filas = db.filas_por_huella(
             validas, 'id, fingerprint, analysis_version, bpm, key')
-        return {fp for fp, fila in filas.items()
-                if _vale(fila, request.version, request.con_datos)}
+        ya = {fp for fp, fila in filas.items()
+              if _vale(fila, request.version, request.con_datos)}
+        # Un análisis FALLIDO que se puede reintentar no está analizado: así
+        # la app vuelve a subir el fichero (`analisis_fallido`). Hasta el
+        # 2026-10-14 contaba como hecho y el tema se quedaba a BPM 0 para
+        # siempre. Solo un fallback tiene BPM 0, así que el JSON se lee solo
+        # de esas filas.
+        sin_bpm = [fp for fp in ya if not _bpm_positivo(filas[fp])]
+        if sin_bpm:
+            con_json = db.filas_por_huella(sin_bpm, 'id, fingerprint, analysis_json')
+            ya -= {fp for fp, fila in con_json.items()
+                   if analisis_fallido.se_reintenta(fila)}
+        return ya
 
     ya = await run_in_threadpool(_de_esta_bd)
 
