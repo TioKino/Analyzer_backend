@@ -892,7 +892,8 @@ class ChunkedAudioAnalyzer:
         if bpm_source == 'chunked_analysis':
             bpm = try_bpm_double_half(None, sr, bpm, bpm_confidence, onset_env=f['onset'])
         first_beat, beat_interval, bpm = rejilla_y_bpm(
-            f['onset'], fps, bpm, bpm_del_dsp=(bpm_source == 'chunked_analysis'))
+            f['onset'], fps, bpm, bpm_del_dsp=(bpm_source == 'chunked_analysis'),
+            graves=f['bass'])
         
         # Key final (ponderado por energía de cada chunk)
         energy_weights = [r.get('energy_mean', 0.5) for r in energy_results]
