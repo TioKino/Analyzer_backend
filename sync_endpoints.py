@@ -528,13 +528,26 @@ def _get_all_devices_for_user(conn: sqlite3.Connection, user_id: str) -> list[di
 
 
 def _issue_device_token(conn: sqlite3.Connection, device_id: str) -> Optional[str]:
-    """Emite el token de un dispositivo si aun no tiene, y lo devuelve.
+    """El token de un dispositivo: lo emite si aun no tiene, y lo devuelve.
 
-    Devuelve None si YA tenia uno. Esto es deliberado y es la parte importante:
-    el token se entrega UNA sola vez. Si /sync/register lo devolviera siempre,
-    cualquiera con el secreto global (que es cualquiera: viaja en el binario)
-    podria pedir el token de un device_id conocido y quedarse con la cuenta —
-    justo lo que este mecanismo existe para impedir.
+    Devuelve None si ese token YA SE HA USADO (`token_seen_at`). Esto es
+    deliberado y es la parte importante: un token que el aparato ya manda no
+    se revela nunca mas. Si /sync/register lo devolviera siempre, cualquiera
+    con el secreto global (que es cualquiera: viaja en el binario) podria
+    pedir el de un device_id conocido y quedarse con la cuenta — justo lo que
+    este mecanismo existe para impedir.
+
+    Mientras NO se ha usado nunca, se devuelve el MISMO, cada vez que se pida
+    (decision owner, 2026-10-16: «si quieren token nuevo, que actualicen la
+    app»). Hasta ese dia se entregaba una sola vez, y 74 aparatos (el 5 % del
+    parque el 27-sep) lo recibieron con una version que lo ignoraba: aunque
+    actualizaran, `reclamarToken` no volvia a recibirlo y no podian mandar
+    nada de lo que exige token (lo importado, los cues por lotes, pisar una
+    portada). Repetirlo no abre nada: sin usarlo, ese aparato no tiene token
+    exigido (`token_seen_at` nulo), asi que con su device_id ya se entra
+    igual, como en los que aun no lo tienen emitido. El MISMO y no uno nuevo:
+    dos registros a la vez darian dos tokens, el cliente se quedaria con uno y
+    el servidor con el otro, y su sync acabaria en «Invalid device token».
 
     Consecuencia asumida durante la migracion: los dispositivos ya registrados
     no tienen token, asi que el PRIMERO que llame a register se lo lleva. En la
@@ -545,13 +558,15 @@ def _issue_device_token(conn: sqlite3.Connection, device_id: str) -> Optional[st
     dispositivo nuevo y recibe token nuevo: no hay estado irrecuperable.
     """
     row = conn.execute(
-        "SELECT device_token FROM user_devices WHERE device_id = ?",
+        "SELECT device_token, token_seen_at FROM user_devices "
+        "WHERE device_id = ?",
         (device_id,),
     ).fetchone()
     if row is None:
         return None
     if row[0]:
-        return None  # ya emitido: no se revela nunca mas
+        # Usado: no se revela nunca mas. Sin usar: el mismo, otra vez.
+        return None if row[1] else row[0]
     token = secrets.token_urlsafe(32)
     conn.execute(
         "UPDATE user_devices SET device_token = ? WHERE device_id = ?",
@@ -566,7 +581,7 @@ def dispositivo_del_token(token: str) -> Optional[str]:
 
     Para lo que no es /sync y quiere saber si quien llama es un aparato
     registrado: hoy, pisar la portada de una huella. El token es aleatorio y
-    se entrega una sola vez, así que basta con buscarlo. Best-effort: si
+    de un solo aparato, así que basta con buscarlo. Best-effort: si
     sync.db falla, None — nunca tumba la petición de fuera.
     """
     if not token or len(token) < 16:
@@ -722,8 +737,8 @@ async def sync_register(req: RegisterRequest):
         devices = _get_all_devices_for_user(conn, existing)
         # Migracion de los dispositivos que se registraron antes de que
         # existieran los tokens: se les emite aqui, la primera vez que su
-        # cliente actualizado vuelva a llamar. Si ya tenian, _issue_device_token
-        # devuelve None y NO se revela — ver su docstring.
+        # cliente actualizado vuelva a llamar. Si ya lo han usado,
+        # _issue_device_token devuelve None y NO se revela — ver su docstring.
         issued = _issue_device_token(conn, req.device_id)
         resp = {
             "user_id": existing,
@@ -763,8 +778,8 @@ async def sync_register(req: RegisterRequest):
         "linked_devices": devices,
         "max_devices": MAX_DEVICES_PER_USER,
     }
-    # Dispositivo nuevo: token recien emitido. Es la UNICA vez que se entrega
-    # (ver _issue_device_token); el cliente tiene que persistirlo.
+    # Dispositivo nuevo: token recien emitido. En cuanto lo use no se vuelve
+    # a entregar (ver _issue_device_token); el cliente tiene que persistirlo.
     issued = _issue_device_token(conn, req.device_id)
     if issued:
         resp["device_token"] = issued

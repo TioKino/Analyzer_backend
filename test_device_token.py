@@ -9,7 +9,8 @@ llama SEA ese dispositivo. Con el secreto y un device_id conocido se puede leer
 y sobrescribir la biblioteca de cualquier usuario.
 
 Lo que cubre esta fase (y lo que NO):
-  - El token se emite UNA sola vez por dispositivo y no se vuelve a revelar.
+  - El token se emite UNA sola vez por dispositivo, y en cuanto el aparato lo
+    usa no se vuelve a revelar (mientras no lo ha usado, se repite el mismo).
   - Si el cliente manda X-Device-Token, tiene que ser el suyo.
   - Si NO lo manda, se acepta igual que siempre (los dispositivos en campo no
     se rompen). O sea: quien omita la cabecera sigue entrando. Cerrar eso es
@@ -59,7 +60,7 @@ def _register(conn, device_id, user_id='u1'):
 
 class TestEmisionDelToken:
 
-    def test_se_emite_una_vez_y_no_se_revela_mas(self, conn):
+    def test_usado_no_se_revela_mas(self, conn):
         """Lo importante: si register devolviera el token siempre, cualquiera
         con el secreto global podria pedir el de un device_id conocido y
         quedarse con la cuenta — justo lo que esto viene a impedir."""
@@ -67,9 +68,30 @@ class TestEmisionDelToken:
 
         primero = se._issue_device_token(conn, 'dja_a')
         assert primero, "no emitio token la primera vez"
+        conn.execute(
+            "UPDATE user_devices SET token_seen_at = ? WHERE device_id = 'dja_a'",
+            (se._now_iso(),),
+        )
+        conn.commit()
 
         segundo = se._issue_device_token(conn, 'dja_a')
-        assert segundo is None, "revelo el token una segunda vez"
+        assert segundo is None, "revelo un token que el aparato ya usa"
+
+    def test_sin_usar_se_repite_el_mismo(self, conn):
+        """Decision owner, 2026-10-16: 74 aparatos lo recibieron con una
+        version que lo ignoraba y, aunque actualizaran, no volvian a recibirlo
+        («si quieren token nuevo, que actualicen la app»). Sin usarlo no esta
+        exigido, asi que repetirlo no abre nada. Y es el MISMO: uno nuevo en
+        cada llamada dejaria al cliente con uno y al servidor con otro si dos
+        registros se cruzan."""
+        _register(conn, 'dja_a')
+        primero = se._issue_device_token(conn, 'dja_a')
+        assert se._issue_device_token(conn, 'dja_a') == primero
+        assert se._issue_device_token(conn, 'dja_a') == primero
+        row = conn.execute(
+            "SELECT device_token FROM user_devices WHERE device_id = 'dja_a'"
+        ).fetchone()
+        assert row['device_token'] == primero, "lo roto"
 
     def test_el_token_persiste_y_es_el_mismo(self, conn):
         _register(conn, 'dja_a')
@@ -263,7 +285,7 @@ class TestVinculacionEntreDispositivos:
         cuenta (si rotara, el cliente se quedaria con una copia obsoleta)."""
         _register(conn, 'dja_movil', user_id='u_movil')
         token = se._issue_device_token(conn, 'dja_movil')
-        assert se._issue_device_token(conn, 'dja_movil') is None
+        assert se._issue_device_token(conn, 'dja_movil') in (None, token)
         row = conn.execute(
             "SELECT device_token FROM user_devices WHERE device_id = 'dja_movil'"
         ).fetchone()
@@ -504,3 +526,30 @@ class TestCensoDeDispositivosProtegidos:
         c.close()
         ed = self._adopcion(nuevo, monkeypatch)['enforced_devices']
         assert ed == {'protected': 0, 'total': 1, 'pct': 0.0}
+
+
+class TestReclamarDesdeUnaAppActualizada:
+    """`/sync/register` de verdad, como lo llama `reclamarToken` al arrancar
+    un aparato con cuenta y sin token (decision owner, 2026-10-16)."""
+
+    def _registrar(self, device_id):
+        import asyncio
+        return asyncio.run(se.sync_register(
+            se.RegisterRequest(device_id=device_id, device_type='macos')))
+
+    def test_emitido_a_una_version_que_lo_ignoro_le_llega(self, conn):
+        _register(conn, 'dja_74')
+        ignorado = se._issue_device_token(conn, 'dja_74')  # la version vieja
+        resp = self._registrar('dja_74')
+        assert resp['already_registered'] is True
+        assert resp.get('device_token') == ignorado
+
+    def test_el_que_ya_lo_usa_no_lo_recibe(self, conn):
+        _register(conn, 'dja_usa')
+        se._issue_device_token(conn, 'dja_usa')
+        conn.execute(
+            "UPDATE user_devices SET token_seen_at = ? WHERE device_id = 'dja_usa'",
+            (se._now_iso(),),
+        )
+        conn.commit()
+        assert 'device_token' not in self._registrar('dja_usa')
