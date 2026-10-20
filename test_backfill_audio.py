@@ -284,3 +284,38 @@ def test_el_backfill_por_audio_no_llama_a_audd():
             f'{prohibido} no pinta nada en un backfill: encarece una peticion '
             f'que el usuario cree gratis'
         )
+
+
+# ============================================================================
+# NO BLOQUEA EL WORKER (2026-10-20)
+# ============================================================================
+
+def test_el_backfill_por_audio_no_bloquea_el_worker():
+    """Render corre UN proceso de uvicorn. El MD5 del fichero, `fpcalc` (y su
+    reintento por ffmpeg) y el cluster corrian en el event loop: segundos por
+    subida sin atender a nadie, y quien sube su biblioteca manda decenas
+    seguidas. Lo mismo que `test_analyze_no_bloquea_el_worker.py` ata en
+    `/analyze`."""
+    import ast
+    from pathlib import Path
+
+    arbol = ast.parse(Path('main.py').read_text(encoding='utf-8'))
+    fn = next(n for n in ast.walk(arbol)
+              if isinstance(n, ast.AsyncFunctionDef)
+              and n.name == 'backfill_audio_endpoint')
+    llamadas = [n.func.id for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    for bloqueante in ('calculate_fingerprint', '_attach_acoustic',
+                       'compute_raw_chromaprint'):
+        assert bloqueante not in llamadas, (
+            f'{bloqueante} en el event loop: va por run_in_threadpool')
+    hilos = [n for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == 'run_in_threadpool']
+    assert any(isinstance(h.args[0], ast.Name)
+               and h.args[0].id == '_backfill_audio_de' for h in hilos)
+    # Y la BD tampoco: `db.` dentro del endpoint seria otra espera en el loop.
+    atributos = [n for n in ast.walk(fn)
+                 if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                 and n.value.id == 'db']
+    assert not atributos, 'la BD de /backfill-audio va en el threadpool'
