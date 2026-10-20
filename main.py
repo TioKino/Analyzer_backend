@@ -6098,65 +6098,75 @@ async def backfill_audio_endpoint(
     try:
         if total_bytes < 1000:
             raise HTTPException(400, "Archivo demasiado pequeño o corrupto")
-
-        try:
-            fingerprint = calculate_fingerprint(tmp_path)
-        except (OSError, IOError) as e:
-            logger.error(f"[BackfillAudio] No se pudo leer el fichero subido: {e}")
-            raise HTTPException(400, "No se pudo leer el archivo subido")
-
-        fila = db.get_track_by_fingerprint(fingerprint)
-        if not fila:
-            # Deliberado: NO se analiza. Este endpoint rellena huecos de la
-            # memoria colectiva, no da de alta tracks — analizar aqui gastaria
-            # CPU y posiblemente AudD por una peticion que el usuario creia
-            # gratis. El cliente ya sabe cuales son cuales por /acoustic/pending.
-            return {"ok": False, "status": "no_analizado", "fingerprint": fingerprint}
-
-        if fila.get('chromaprint'):
-            return {
-                "ok": True,
-                "status": "ya_tenia",
-                "fingerprint": fingerprint,
-                "acoustic_id": fila.get('acoustic_id'),
-            }
-
-        _attach_acoustic(fila, tmp_path)
-        if not fila.get('chromaprint'):
-            # `_attach_acoustic` es best-effort y se traga la excepcion: si no
-            # dejo huella, fpcalc no pudo con este fichero. Decirlo en vez de
-            # devolver un OK vacio es lo que permite al cliente marcarlo y no
-            # volver a subir los mismos megas en cada tanda.
-            return {"ok": False, "status": "sin_huella", "fingerprint": fingerprint}
-
-        # UPDATE de dos columnas, NO `save_track`: reescribir la fila entera
-        # arriesga `analyzed_at` (el numero que decide si el hueco de huella es
-        # legado o una via abierta) sin ganar nada.
-        db.backfill_track_fingerprint(
-            fingerprint, fila['chromaprint'], fila.get('acoustic_id'),
-        )
-        best = (db.best_cluster_analysis(fila.get('acoustic_id'))
-                if fila.get('acoustic_id') else None)
-        return {
-            "ok": True,
-            "status": "curada",
-            "fingerprint": fingerprint,
-            "acoustic_id": fila.get('acoustic_id'),
-            "best": {
-                "bpm": best.get('bpm'),
-                "bpm_source": best.get('bpm_source'),
-                "key": best.get('key'),
-                "camelot": best.get('camelot'),
-                "key_source": best.get('key_source'),
-                "genre": best.get('genre'),
-                "genre_source": best.get('genre_source'),
-            } if best else None,
-        }
+        # Fuera del event loop: el MD5 lee el fichero entero, `fpcalc` (y su
+        # reintento por ffmpeg) son subprocesos de segundos y el cluster barre
+        # la BD. Render corre UN proceso de uvicorn, y en el loop eso dejaba a
+        # todo el mundo esperando — Escuchar incluido — mientras alguien subia
+        # su biblioteca (2026-10-20; la misma regla que /analyze).
+        return await run_in_threadpool(_backfill_audio_de, tmp_path)
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _backfill_audio_de(tmp_path):
+    """El trabajo de `/backfill-audio` con el fichero ya en disco. Sincrono a
+    proposito: se llama por `run_in_threadpool`."""
+    try:
+        fingerprint = calculate_fingerprint(tmp_path)
+    except (OSError, IOError) as e:
+        logger.error(f"[BackfillAudio] No se pudo leer el fichero subido: {e}")
+        raise HTTPException(400, "No se pudo leer el archivo subido")
+
+    fila = db.get_track_by_fingerprint(fingerprint)
+    if not fila:
+        # Deliberado: NO se analiza. Este endpoint rellena huecos de la
+        # memoria colectiva, no da de alta tracks — analizar aqui gastaria
+        # CPU y posiblemente AudD por una peticion que el usuario creia
+        # gratis. El cliente ya sabe cuales son cuales por /acoustic/pending.
+        return {"ok": False, "status": "no_analizado", "fingerprint": fingerprint}
+
+    if fila.get('chromaprint'):
+        return {
+            "ok": True,
+            "status": "ya_tenia",
+            "fingerprint": fingerprint,
+            "acoustic_id": fila.get('acoustic_id'),
+        }
+
+    _attach_acoustic(fila, tmp_path)
+    if not fila.get('chromaprint'):
+        # `_attach_acoustic` es best-effort y se traga la excepcion: si no
+        # dejo huella, fpcalc no pudo con este fichero. Decirlo en vez de
+        # devolver un OK vacio es lo que permite al cliente marcarlo y no
+        # volver a subir los mismos megas en cada tanda.
+        return {"ok": False, "status": "sin_huella", "fingerprint": fingerprint}
+
+    # UPDATE de dos columnas, NO `save_track`: reescribir la fila entera
+    # arriesga `analyzed_at` (el numero que decide si el hueco de huella es
+    # legado o una via abierta) sin ganar nada.
+    db.backfill_track_fingerprint(
+        fingerprint, fila['chromaprint'], fila.get('acoustic_id'),
+    )
+    best = (db.best_cluster_analysis(fila.get('acoustic_id'))
+            if fila.get('acoustic_id') else None)
+    return {
+        "ok": True,
+        "status": "curada",
+        "fingerprint": fingerprint,
+        "acoustic_id": fila.get('acoustic_id'),
+        "best": {
+            "bpm": best.get('bpm'),
+            "bpm_source": best.get('bpm_source'),
+            "key": best.get('key'),
+            "camelot": best.get('camelot'),
+            "key_source": best.get('key_source'),
+            "genre": best.get('genre'),
+            "genre_source": best.get('genre_source'),
+        } if best else None,
+    }
 
 
 # ==================== CACHE-LOOKUP / ARTWORK ====================
