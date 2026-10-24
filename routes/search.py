@@ -22,10 +22,11 @@ import json
 import logging
 import re
 import unicodedata
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from validation import (
     ValidationError,
@@ -462,6 +463,73 @@ async def search_analyzed_track(
             "error": str(e)
         }
 
+# ── POST /search-analyzed/batch — las fichas de un set de una vez ─────────
+# El modo set de Escuchar guarda un tracklist (artista, título, ISRC) sin la
+# ficha de cada tema: pedirla por /search-analyzed era una llamada por tema
+# (PENDING, 13-oct). Desde el 2026-10-24 el set la pide al abrirse, en UN lote,
+# para enseñar BPM y tonalidad, abrir la ficha de un tema y «Rehazlo con lo
+# tuyo» (el tema más parecido de tu biblioteca para los que no tienes). La
+# regla es la de siempre (`buscar_analizado`), y la ficha va CORTA: un set
+# entero con el análisis completo de cada tema serían megas para enseñar dos
+# números.
+
+MAX_FICHAS_POR_LOTE = 100
+
+CAMPOS_DE_LA_FICHA_CORTA = (
+    'artist', 'title', 'bpm', 'key', 'camelot', 'energy_dj', 'genre',
+    'subgenre', 'track_type', 'duration', 'isrc', 'fingerprint', 'label',
+    'has_vocals', 'has_drop', 'has_intro', 'has_outro', 'has_breakdown',
+    'has_heavy_bass', 'bpm_source', 'key_source', 'genre_source',
+)
+
+
+def ficha_corta(ficha: Optional[dict]) -> Optional[dict]:
+    """Lo que hace falta para enseñar y mezclar un tema, sin el análisis
+    entero."""
+    if not ficha:
+        return None
+    return {k: ficha[k] for k in CAMPOS_DE_LA_FICHA_CORTA if k in ficha}
+
+
+class TemaParaFicha(BaseModel):
+    artist: str = ''
+    title: str = ''
+    isrc: Optional[str] = None
+
+
+class LoteDeFichas(BaseModel):
+    temas: List[TemaParaFicha]
+
+
+def fichas_de(temas: List[TemaParaFicha]) -> List[Optional[dict]]:
+    """Una ficha corta (o None) por tema, en el MISMO orden."""
+    fichas: List[Optional[dict]] = []
+    for t in temas:
+        artista = sanitize_string(t.artist or '', max_length=200)
+        titulo = sanitize_string(t.title or '', max_length=200)
+        isrc = (t.isrc or '').strip() or None
+        try:
+            fichas.append(ficha_corta(buscar_analizado(artista, titulo, isrc)))
+        except Exception as e:  # un tema raro no tumba el lote
+            logger.warning("search-analyzed/batch: %s – %s: %s",
+                           artista, titulo, e)
+            fichas.append(None)
+    return fichas
+
+
+@search_router.post("/search-analyzed/batch")
+async def search_analyzed_batch(lote: LoteDeFichas):
+    """Las fichas de hasta `MAX_FICHAS_POR_LOTE` temas, en el mismo orden que
+    llegan (`null` donde nadie lo ha analizado). Fuera del event loop: son
+    hasta cien búsquedas en la BD."""
+    if len(lote.temas) > MAX_FICHAS_POR_LOTE:
+        raise HTTPException(413, f"Como mucho {MAX_FICHAS_POR_LOTE} temas por lote")
+    fichas = await run_in_threadpool(fichas_de, lote.temas)
+    logger.info("[Fichas] lote: %d temas, %d con ficha", len(fichas),
+                sum(1 for f in fichas if f))
+    return {"fichas": fichas}
+
+
 @search_router.get("/search/track-type/{track_type}")
 async def search_by_track_type(track_type: str, limit: int = Query(100, ge=1, le=500)):
     #  Validar tipo de track
@@ -516,7 +584,7 @@ async def get_all_tracks(request: Request, limit: int = Query(1000, ge=1, le=500
     La memoria colectiva es el activo diferencial del producto y se podía
     clonar con un curl; además los fingerprints obtenidos aquí servían para
     cebar el fallback online de /artwork (auditoría 2026-08-09, SEC-13).
-    Ningún cliente lo consume — el panel admin usa /admin/all-tracks — así que
+    Ningún cliente lo consume —el catálogo del panel admin es /admin/catalogo— así que
     cerrarlo no rompe nada. Las agregaciones (/library/artists, /genres,
     /stats) siguen abiertas: no exponen la biblioteca fila a fila.
     """

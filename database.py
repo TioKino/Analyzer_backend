@@ -476,6 +476,25 @@ class AnalysisDB:
             )
         ''')
 
+        # A quién LE LLEGA lo importado (2026-10-24): un aparato que recibe
+        # el BPM o la tonalidad de un programa de DJ de OTRA cuenta, en la
+        # respuesta de `/analyze` o en su ficha por huella. Una fila por tema,
+        # aparato y campo: `primera` es cuándo le llegó por primera vez y
+        # `ultima` la última. `imported_values` dice cuánto se comparte; esta,
+        # a cuántos sirve (ver `apuntar_lo_importado_recibido`).
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS imported_recibido (
+                fingerprint TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                field TEXT NOT NULL,
+                primera TEXT NOT NULL,
+                ultima TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, device_id, field)
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_imported_recibido_primera '
+                  'ON imported_recibido(primera)')
+
         # Quién es cada FICHERO, verificado por Shazam: dos trozos del mismo
         # fichero que dan el mismo tema con los tiempos encajando (la pasada
         # del Mac, veredicto «seguro»; desde el 2026-10-07). Por huella EXACTA:
@@ -3400,11 +3419,107 @@ class AnalysisDB:
             conn.close()
         return len(filas)
 
+    # Las fuentes que son un programa de DJ: lo que dicen llega por
+    # `imported_values` (o por la fila de otra versión del cluster).
+    FUENTES_DE_PROGRAMA = ('rekordbox', 'traktor', 'virtualdj')
+
+    def apuntar_lo_importado_recibido(self, device_id: str,
+                                      entregas: Dict[str, Dict]) -> int:
+        """Apunta que a `device_id` le ha llegado lo que dice el programa de
+        DJ de OTRA cuenta. `entregas` es {huella: {'campos': ['bpm', 'key'],
+        'huellas': [las del mismo sonido]}}: los campos de la respuesta cuya
+        fuente es un programa de DJ.
+
+        «De otra cuenta» = la cuenta de este aparato no ha votado nada de ese
+        sonido en `imported_values` (ni de esa huella ni de otra versión del
+        cluster): entonces el valor no puede ser suyo. Un voto propio y uno
+        ajeno no se distinguen en el valor ganador, así que con un voto
+        propio no se apunta: es una cota inferior, no infla.
+
+        Devuelve cuántas filas nuevas o refrescadas. Best-effort: sin la
+        tabla, 0."""
+        if not device_id or not entregas:
+            return 0
+        todas = sorted({h for e in entregas.values()
+                        for h in (e.get('huellas') or [])} | set(entregas))
+        conn = self._open_conn()
+        try:
+            votantes = {}
+            for i in range(0, len(todas), 500):
+                trozo = todas[i:i + 500]
+                for f in conn.execute(
+                        'SELECT DISTINCT fingerprint, device_id FROM imported_values '
+                        f"WHERE fingerprint IN ({','.join('?' * len(trozo))})",
+                        trozo):
+                    votantes.setdefault(f['fingerprint'], set()).add(f['device_id'])
+            aparatos = {d for v in votantes.values() for d in v} | {device_id}
+            cuentas = self.cuentas_de_votantes(aparatos)
+            receptor = cuentas.get(device_id, device_id)
+            ahora = datetime.utcnow().isoformat()
+            filas = []
+            for huella, e in entregas.items():
+                del_sonido = set(e.get('huellas') or []) | {huella}
+                suyos = {cuentas.get(d, d) for h in del_sonido
+                         for d in votantes.get(h, ())}
+                if receptor in suyos:
+                    continue
+                for campo in dict.fromkeys(e.get('campos') or []):
+                    filas.append((huella, device_id, campo, ahora, ahora))
+            if not filas:
+                return 0
+            conn.executemany('''
+                INSERT INTO imported_recibido (fingerprint, device_id, field,
+                    primera, ultima)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint, device_id, field) DO UPDATE SET
+                    ultima = excluded.ultima
+            ''', filas)
+            conn.commit()
+            return len(filas)
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def _resumen_lo_recibido(self, conn, dias_recientes: int = 30) -> Dict:
+        """A cuántos temas y aparatos (y cuentas) les ha llegado lo importado
+        de otros: el total y lo que llegó por PRIMERA vez en los últimos
+        `dias_recientes` días, con el reparto por campo."""
+        desde = (datetime.utcnow() - timedelta(days=dias_recientes)).isoformat()
+        total = conn.execute(
+            'SELECT COUNT(DISTINCT fingerprint) AS temas, '
+            'COUNT(DISTINCT device_id) AS aparatos FROM imported_recibido'
+        ).fetchone()
+        recientes = conn.execute(
+            'SELECT COUNT(DISTINCT fingerprint) AS temas, '
+            'COUNT(DISTINCT device_id) AS aparatos FROM imported_recibido '
+            'WHERE primera >= ?', (desde,)
+        ).fetchone()
+        por_campo = {
+            r['field']: r['n'] for r in conn.execute(
+                'SELECT field, COUNT(*) AS n FROM imported_recibido '
+                'GROUP BY field')
+        }
+        aparatos = [r['device_id'] for r in conn.execute(
+            'SELECT DISTINCT device_id FROM imported_recibido')]
+        cuentas = self.cuentas_de_votantes(aparatos)
+        return {
+            'temas': total['temas'],
+            'aparatos': total['aparatos'],
+            'cuentas': len({cuentas.get(d, d) for d in aparatos}),
+            'por_campo': por_campo,
+            f'ultimos_{dias_recientes}d': {
+                'temas': recientes['temas'],
+                'aparatos': recientes['aparatos'],
+            },
+        }
+
     def resumen_lo_importado(self) -> Dict:
         """Cuánto de lo importado ha llegado a la memoria colectiva, para el
-        panel: votos, huellas y aparatos distintos, por programa y campo.
-        Agregado de una tabla pequeña (un voto por aparato, campo y tema), sin
-        recorrer `tracks`."""
+        panel: votos, huellas y aparatos distintos, por programa y campo, y
+        `recibido`: a cuántos temas y aparatos de OTRAS cuentas les ha llegado
+        (`apuntar_lo_importado_recibido`). Agregado de dos tablas pequeñas,
+        sin recorrer `tracks`."""
         conn = self._open_conn()
         try:
             total = conn.execute(
@@ -3415,8 +3530,13 @@ class AnalysisDB:
                 'SELECT source, field, COUNT(*) AS n FROM imported_values '
                 'GROUP BY source, field'
             ).fetchall()
+            try:
+                recibido = self._resumen_lo_recibido(conn)
+            except sqlite3.OperationalError:
+                recibido = None
         except sqlite3.OperationalError:
-            return {'votos': 0, 'huellas': 0, 'aparatos': 0, 'por_fuente': {}}
+            return {'votos': 0, 'huellas': 0, 'aparatos': 0, 'por_fuente': {},
+                    'recibido': None}
         finally:
             conn.close()
         por_fuente = {}
@@ -3427,6 +3547,7 @@ class AnalysisDB:
             'huellas': total['huellas'],
             'aparatos': total['aparatos'],
             'por_fuente': por_fuente,
+            'recibido': recibido,
         }
 
     # Las fuentes de `tracks` que son lo MEDIDO sobre el audio (el DSP del
