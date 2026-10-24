@@ -1124,6 +1124,10 @@ init_lookup(
     # Las fichas de un lote: lo que el motor local no tiene, a Render en una
     # petición (antes, un GET por huella).
     render_fichas=(_fichas_en_render if IS_LOCAL_ENGINE else None),
+    # A quién le llega lo importado de otros (solo Render: el motor local no
+    # tiene la memoria colectiva). Lambda: se define más abajo.
+    al_entregar=(None if IS_LOCAL_ENGINE
+                 else lambda *a: _apuntar_lo_importado_recibido(*a)),
     # Lambda y no la función: `_lo_mejor_para` se define más abajo.
     # Sin ir a Render desde el motor local: es la lectura por huella del
     # pre-check del import, una por tema (ver `_lo_mejor_para`).
@@ -1605,6 +1609,38 @@ def _mejorar_con_la_comunidad(result, fingerprint=None, a_render=False):
         _adopt_better_metadata(result, best)
     except Exception as e:  # noqa: BLE001 - best-effort
         logger.warning(f"[Comunidad] mejorar /analyze fallo (no critico): {e}")
+
+
+def _fuente_de(ficha, campo):
+    if isinstance(ficha, dict):
+        return ficha.get(campo)
+    return getattr(ficha, campo, None)
+
+
+def _apuntar_lo_importado_recibido(device_id, fichas):
+    """(Solo Render) Apunta a qué aparato le llega el BPM o la tonalidad de
+    un programa de DJ de OTRA cuenta. `fichas` es {huella: ficha}, la ficha
+    tal como sale hacia el cliente (un `AnalysisResult` o el dict de
+    `/analysis/by-fingerprint`). Hasta el 2026-10-24 se sabía cuánto se
+    comparte (`imported_values`) y no a cuántos les llega. Best-effort: medir
+    nunca tumba la respuesta."""
+    if not device_id or not fichas:
+        return
+    try:
+        entregas = {}
+        for huella, ficha in fichas.items():
+            campos = [c for c in ('bpm', 'key')
+                      if _fuente_de(ficha, f'{c}_source')
+                      in db.FUENTES_DE_PROGRAMA]
+            if huella and campos:
+                entregas[huella] = {
+                    'campos': campos,
+                    'huellas': db.fingerprints_in_cluster(huella),
+                }
+        if entregas:
+            db.apuntar_lo_importado_recibido(device_id, entregas)
+    except Exception as e:  # noqa: BLE001 - medir nunca tumba nada
+        logger.warning(f"[LoImportado] apuntar lo recibido fallo: {e}")
 
 
 def _pick_clean_identity(identities):
@@ -2934,6 +2970,10 @@ async def analyze_track(
                 await run_in_threadpool(db.registrar_analista, huella, analista)
             except Exception as e:  # noqa: BLE001 - contar nunca tumba /analyze
                 logger.warning(f"[Popularidad] registrar analista fallo: {e}")
+            # Y si le llega lo que dice el programa de DJ de otro, se apunta
+            # (ver `apuntar_lo_importado_recibido`).
+            await run_in_threadpool(
+                _apuntar_lo_importado_recibido, analista, {huella: result})
     return result
 
 
@@ -6473,7 +6513,8 @@ async def reset_database(
     Borra SIEMPRE:
         analysis.db: tracks, corrections, dj_notes, community_cues,
             community_notes, track_ratings, track_popularity,
-            beat_grid_corrections, audd_call_log, imported_values
+            beat_grid_corrections, audd_call_log, imported_values,
+            imported_recibido
         sync.db: sync_items, device_seen, users, user_devices,
             link_codes, detected_tracks_sync, listen_sets_sync
 
@@ -6526,6 +6567,7 @@ async def reset_database(
             "community_cues", "community_notes",
             "track_ratings", "track_popularity",
             "beat_grid_corrections", "audd_call_log", "imported_values",
+            "imported_recibido",
             "audd_motor_local", "identidad_verificada", "audd_no_hizo_falta",
         )
         conn = sqlite3.connect(db.db_path, timeout=30.0)

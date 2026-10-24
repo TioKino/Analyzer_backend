@@ -69,17 +69,22 @@ fichas_en_render = None
 # (`db.registrar_analistas`). None en el motor local: su BD no es la de la
 # comunidad, y lo que él sabe llega a Render reenviando el pre-check.
 registrar_analistas = None
+# Solo en Render: apunta a qué aparato le llega lo que dice el programa de DJ
+# de otro (`main._apuntar_lo_importado_recibido`), con las fichas que se le
+# dan. None en el motor local.
+al_entregar_fichas = None
 
 
 def init(database, is_analysis_current, artwork_cache_dir,
          search_online=None, save_to_cache=None, render_cache_lookup=None,
          buscar=None, lo_mejor=None, render_precheck=None,
-         registrar=None, render_fichas=None):
+         registrar=None, render_fichas=None, al_entregar=None):
     """Inyecta deps desde main.py. Llamar ANTES de include_router(router)."""
     global db, _is_analysis_current, ARTWORK_CACHE_DIR, buscar_portada
     global search_artwork_online, save_artwork_to_cache, fetch_render_cache
     global lo_mejor_para, precheck_en_render, registrar_analistas
-    global fichas_en_render
+    global fichas_en_render, al_entregar_fichas
+    al_entregar_fichas = al_entregar
     precheck_en_render = render_precheck
     fichas_en_render = render_fichas
     registrar_analistas = registrar
@@ -415,8 +420,21 @@ def _ficha_desde_fila(safe_fp, existing):
     return result
 
 
+async def _apuntar_entregas(request, fichas):
+    """Apunta a qué aparato le llega lo importado de otros con estas fichas
+    (solo Render y solo si el cliente dice quién es, `X-Device-Id`: los de
+    antes del 2026-10-24 no lo mandan aquí). Nunca rompe la respuesta."""
+    aparato = (request.headers.get('X-Device-Id') or '') if request else ''
+    if al_entregar_fichas is None or not aparato or not fichas:
+        return
+    try:
+        await run_in_threadpool(al_entregar_fichas, aparato, fichas)
+    except Exception as e:  # noqa: BLE001 - medir nunca tumba nada
+        logger.info("[LoImportado] apuntar lo recibido fallo: %s", e)
+
+
 @router.get("/analysis/by-fingerprint/{fingerprint}")
-async def get_analysis_by_fingerprint(fingerprint: str):
+async def get_analysis_by_fingerprint(fingerprint: str, request: Request = None):
     """Devuelve el análisis cacheado de un track por su fingerprint
     (MD5 del contenido). El cliente puede usar este endpoint tras
     `/check-analyzed-by-fingerprint` para hidratar su cache local sin
@@ -438,7 +456,9 @@ async def get_analysis_by_fingerprint(fingerprint: str):
             if remote:
                 return remote
         raise HTTPException(404, "fingerprint no encontrado")
-    return _ficha_desde_fila(safe_fp, existing)
+    ficha = _ficha_desde_fila(safe_fp, existing)
+    await _apuntar_entregas(request, {safe_fp: ficha})
+    return ficha
 
 
 class FichasPorHuellaRequest(BaseModel):
@@ -450,7 +470,7 @@ MAX_FICHAS_POR_PETICION = 100
 
 
 @router.post("/analysis/by-fingerprint/batch")
-async def fichas_por_huella(req: FichasPorHuellaRequest):
+async def fichas_por_huella(req: FichasPorHuellaRequest, request: Request = None):
     """Las fichas de varias huellas en UNA petición: `{"fichas": {huella:
     ficha}}`, la misma ficha que da el GET de una (`_ficha_desde_fila`). Las
     que no hay no salen.
@@ -479,6 +499,7 @@ async def fichas_por_huella(req: FichasPorHuellaRequest):
         except Exception as e:  # nunca romper el lote por esto
             logger.info("[Fichas] Render no contesto (%d huellas): %s",
                         len(faltan), e)
+    await _apuntar_entregas(request, fichas)
     return {"fichas": fichas}
 
 
