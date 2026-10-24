@@ -584,7 +584,7 @@ async def get_all_tracks(request: Request, limit: int = Query(1000, ge=1, le=500
     La memoria colectiva es el activo diferencial del producto y se podía
     clonar con un curl; además los fingerprints obtenidos aquí servían para
     cebar el fallback online de /artwork (auditoría 2026-08-09, SEC-13).
-    Ningún cliente lo consume — el panel admin usa /admin/all-tracks — así que
+    Ningún cliente lo consume —el catálogo del panel admin es /admin/catalogo— así que
     cerrarlo no rompe nada. Las agregaciones (/library/artists, /genres,
     /stats) siguen abiertas: no exponen la biblioteca fila a fila.
     """

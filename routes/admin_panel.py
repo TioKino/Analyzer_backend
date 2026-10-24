@@ -14,12 +14,17 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
+
+import catalogo
+import resumen_diario
 from validation import DESKTOP_PLATFORMS, is_desktop_platform, is_mobile_platform
 
 logger = logging.getLogger(__name__)
@@ -744,74 +749,12 @@ async def user_sessions(device_id: str, request: Request):
 
 # ── GET /admin/stats ────────────────────────────────────────
 
-# ── GET /admin/all-tracks ───────────────────────────────────
-# Admin endpoint: devuelve TODOS los análisis de TODOS los usuarios
-
-@admin_panel_router.get("/all-tracks")
-async def all_tracks(request: Request):
-    """Return all analyzed tracks from all users (for admin user)."""
-    await _verify_admin_secret(request)
-    conn = _get_sync_conn()
-    try:
-        # Cursor sin fetchall(): materializar todas las cargas utiles de
-        # analisis a la vez es el pico de memoria que tumba el worker en Render.
-        analysis_rows = conn.execute(
-            "SELECT last_device_id, device_type, payload FROM sync_items WHERE data_type = 'analysis'"
-        )
-
-        base_url = os.environ.get("BASE_URL", "").rstrip("/")
-        result = []
-        seen_fingerprints = set()  # Deduplicar por fingerprint
-
-        for arow in analysis_rows:
-            device_id = arow["last_device_id"]
-            device_type = arow["device_type"] or "unknown"
-            tracks = _parse_analysis_payload(arow["payload"])
-
-            for track_id, t in tracks.items():
-                if not isinstance(t, dict):
-                    continue
-                fingerprint = t.get("fingerprint", "")
-
-                # Deduplicar: si ya vimos este fingerprint, skip
-                if fingerprint and fingerprint in seen_fingerprints:
-                    continue
-                if fingerprint:
-                    seen_fingerprints.add(fingerprint)
-
-                has_preview = _preview_exists(fingerprint)
-                artwork_url = t.get("artworkUrl", "")
-                if not artwork_url and fingerprint and base_url:
-                    artwork_url = f"{base_url}/artwork/{fingerprint}"
-
-                track_info = t.get("track", t)
-                tempo_info = t.get("tempo", t)
-                key_info = t.get("key", t)
-                energy_info = t.get("energy", t)
-
-                result.append({
-                    "track_id": track_id,
-                    "fingerprint": fingerprint,
-                    "file_name": track_info.get("fileName", t.get("fileName", "")),
-                    "artist": track_info.get("artist", t.get("artist", "")),
-                    "title": track_info.get("title", t.get("title", "")),
-                    "bpm": tempo_info.get("bpm", t.get("bpm")),
-                    "key": key_info.get("key", t.get("key", "")),
-                    "camelot": key_info.get("camelot", t.get("camelot", "")),
-                    "genre": t.get("genre", ""),
-                    "energy": energy_info.get("energy_dj", t.get("energy_dj", t.get("energy"))),
-                    "track_type": t.get("trackType", t.get("track_type", "")),
-                    "analyzed_at": t.get("analyzedAt", t.get("analyzed_at", "")),
-                    "has_preview": has_preview,
-                    "artwork_url": artwork_url,
-                    "preview_url": f"{base_url}/preview/{fingerprint}" if has_preview and base_url else "",
-                    "owner_device": device_id,
-                    "owner_device_type": device_type,
-                })
-
-        return {"tracks": result, "total": len(result)}
-    finally:
-        conn.close()
+# ── GET /admin/all-tracks: BORRADO el 2026-10-24 ────────────
+# Leía `sync.db` (las bibliotecas PERSONALES) y devolvía el nombre del fichero
+# y el aparato de cada tema —lo contrario de lo que promete la cabecera de
+# este módulo— y no lo usaba ningún cliente. El catálogo de todo lo analizado
+# es `GET /admin/catalogo`, que sale de la memoria colectiva (`tracks` de
+# `analysis.db`, por huella y sin dueño).
 
 
 # ── GET /admin/all-previews ────────────────────────────────
@@ -3435,3 +3378,241 @@ async def disk_usage(request: Request):
         # algo raro -> alerta.
         'data_root_contents': data_root_contents,
     }
+
+
+# ── EL RESUMEN Y EL CATÁLOGO (2026-10-24) ──────────────────────
+# Owner: «el panel admin es un caos». El Resumen contesta «¿vamos bien?» con
+# ~16 números calculados UNA vez al día (`resumen_diario.py`); el catálogo es
+# la biblioteca de DJ Analyzer, la memoria colectiva entera, sin dueño
+# (`catalogo.py`). Ver CLAUDE.md → «Admin y datos».
+
+def _ruta_analysis_db() -> str:
+    """La de la base que usa el servidor (`main.db`), no la variable de
+    entorno: son la misma en Render, y si algún día no lo fueran, el Resumen y
+    el catálogo tienen que leer la base de verdad."""
+    try:
+        return _get_db().db_path
+    except Exception:  # noqa: BLE001 - sin `main` montado (scripts sueltos)
+        return os.environ.get(
+            "DATABASE_PATH", os.environ.get("ANALYSIS_DB_PATH", "analysis.db"))
+
+
+def _conn_analysis(solo_lectura: bool = False) -> sqlite3.Connection:
+    ruta = _ruta_analysis_db()
+    if solo_lectura:
+        conn = sqlite3.connect(f"file:{ruta}?mode=ro", uri=True,
+                               check_same_thread=False, timeout=30.0)
+    else:
+        conn = sqlite3.connect(ruta, check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def _uso_del_resumen() -> dict:
+    tool = _get_db().get_tool_usage_metrics() or {}
+    return {
+        "activos_30d": tool.get("active_last_30d"),
+        "volvio_alguna_vez_pct": (tool.get("ever_returned") or {}).get("rate"),
+    }
+
+
+def _vuelven_del_resumen() -> dict:
+    ret = _get_db().get_return_rates() or {}
+    return {"d7_rolling_pct": (ret.get("d7") or {}).get("rate")}
+
+
+def _activos_y_altas_del_resumen() -> dict:
+    ahora = datetime.now(timezone.utc)
+    hace_7 = (ahora - timedelta(days=7)).strftime("%Y-%m-%d")
+    hace_30 = (ahora - timedelta(days=30)).strftime("%Y-%m-%d")
+    conn = _conn_analysis(solo_lectura=True)
+    try:
+        activos_7d = conn.execute(
+            "SELECT COUNT(DISTINCT device_id) FROM events "
+            "WHERE device_id IS NOT NULL AND timestamp >= ?", (hace_7,)).fetchone()[0]
+        altas = conn.execute(
+            "SELECT COUNT(*) FROM device_first_seen WHERE first_day >= ?",
+            (hace_30,)).fetchone()[0]
+    finally:
+        conn.close()
+    return {"activos_7d": activos_7d, "altas_30d": altas}
+
+
+def _biblioteca_del_resumen() -> dict:
+    inv = _library_investment_real(_tracks_por_device()) or {}
+    return {
+        "con_biblioteca": inv.get("devices_with_library"),
+        "mediana_temas": inv.get("median_tracks"),
+        "gte_500": (inv.get("buckets") or {}).get("gte_500"),
+    }
+
+
+def _huella_del_resumen() -> dict:
+    return {"cobertura_huella_pct": (_get_db().acoustic_coverage() or {}).get("chromaprint_pct")}
+
+
+def _audd_del_resumen() -> dict:
+    desde = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    conn = _conn_analysis(solo_lectura=True)
+    try:
+        # El marcador de una pulsación de Escuchar no es una llamada a AudD
+        # (el mismo filtro que `/admin/telemetry`).
+        render = conn.execute(
+            "SELECT COUNT(*) FROM audd_call_log WHERE called_at >= ? "
+            "AND (source IS NULL OR source != 'recognize_session')",
+            (desde,)).fetchone()[0]
+    finally:
+        conn.close()
+    motor = _resumen_audd_motor_local()
+    return {
+        "audd_30d_render": render,
+        "audd_30d_motor_local": (motor or {}).get("total") if motor is not None else None,
+    }
+
+
+def _errores_del_resumen() -> dict:
+    return {"errores_sin_resolver": _get_db().count_errors(resolved=False)}
+
+
+def _versiones_del_resumen() -> dict:
+    import main
+    version = getattr(main, "API_VERSION", None)
+    conn = _conn_analysis(solo_lectura=True)
+    try:
+        out = {"version_actual": version}
+        for grupo, clave in (("desktop", "adopcion_escritorio_pct"),
+                             ("mobile", "adopcion_movil_pct")):
+            plat_sql, plat_params = _platform_filter(grupo)
+            reparto = _reparto_por_version(conn, 30, plat_sql, plat_params)
+            out[clave] = resumen_diario.adopcion_pct(
+                reparto.get("por_version") or {}, version)
+    finally:
+        conn.close()
+    return out
+
+
+def _medidas_del_resumen():
+    return {
+        "uso": _uso_del_resumen,
+        "vuelven": _vuelven_del_resumen,
+        "activos_y_altas": _activos_y_altas_del_resumen,
+        "biblioteca": _biblioteca_del_resumen,
+        "huella": _huella_del_resumen,
+        "audd": _audd_del_resumen,
+        "errores": _errores_del_resumen,
+        "versiones": _versiones_del_resumen,
+    }
+
+
+_resumen_cerrojo = threading.Lock()
+_resumen_en_marcha = False
+
+
+def _hacer_foto_de_hoy() -> dict:
+    t0 = time.monotonic()
+    datos = resumen_diario.calcular(_medidas_del_resumen())
+    segundos = round(time.monotonic() - t0, 2)
+    dia = resumen_diario.hoy()
+    conn = _conn_analysis()
+    try:
+        resumen_diario.guardar(conn, dia, datos, segundos)
+    finally:
+        conn.close()
+    fallos = datos.get("_fallos") or []
+    logger.info(f"[Resumen] foto del {dia}: {segundos} s, {len(fallos)} fallos"
+                + (f" ({'; '.join(fallos)})" if fallos else ""))
+    return datos
+
+
+def _foto_en_segundo_plano() -> bool:
+    """Pide la foto de hoy en un hilo. False si ya había una en marcha."""
+    global _resumen_en_marcha
+    with _resumen_cerrojo:
+        if _resumen_en_marcha:
+            return False
+        _resumen_en_marcha = True
+
+    def correr():
+        global _resumen_en_marcha
+        try:
+            _hacer_foto_de_hoy()
+        except Exception as e:  # noqa: BLE001 - el panel sigue con la de ayer
+            logger.warning(f"[Resumen] la foto de hoy falló: {e}")
+        finally:
+            with _resumen_cerrojo:
+                _resumen_en_marcha = False
+
+    threading.Thread(target=correr, daemon=True, name="resumen-admin").start()
+    return True
+
+
+def _leer_fotos(n: int = 14):
+    conn = _conn_analysis()
+    try:
+        return resumen_diario.ultimas(conn, n)
+    finally:
+        conn.close()
+
+
+def _respuesta_del_resumen(fotos, calculando: bool) -> dict:
+    return {
+        "hoy": fotos[0] if fotos else None,
+        "anterior": fotos[1] if len(fotos) > 1 else None,
+        "serie": fotos,
+        "calculando": calculando,
+        "metricas": list(resumen_diario.METRICAS),
+    }
+
+
+@admin_panel_router.get("/resumen")
+async def resumen(request: Request):
+    """La foto de hoy y las anteriores, leídas de la tabla (milisegundos). Si
+    falta la de hoy se calcula en segundo plano, y mientras tanto sale la
+    última que haya con `calculando: true`."""
+    await _verify_admin_secret(request)
+    fotos = await run_in_threadpool(_leer_fotos)
+    calculando = _resumen_en_marcha
+    if not fotos or fotos[0]["dia"] != resumen_diario.hoy():
+        calculando = _foto_en_segundo_plano() or _resumen_en_marcha
+    return _respuesta_del_resumen(fotos, calculando)
+
+
+@admin_panel_router.post("/resumen/recalcular")
+async def resumen_recalcular(request: Request):
+    """Rehace la foto de hoy y espera a que termine (unos segundos)."""
+    await _verify_admin_secret(request)
+    await run_in_threadpool(_hacer_foto_de_hoy)
+    fotos = await run_in_threadpool(_leer_fotos)
+    return _respuesta_del_resumen(fotos, False)
+
+
+@admin_panel_router.get("/catalogo")
+async def catalogo_de_todo(
+    request: Request,
+    q: str = Query("", max_length=100),
+    orden: str = Query("fecha", pattern="^(fecha|djs)$"),
+    genero: Optional[str] = Query(None, max_length=60),
+    bpm_min: Optional[float] = Query(None, ge=0, le=400),
+    bpm_max: Optional[float] = Query(None, ge=0, le=400),
+    camelot: Optional[str] = Query(None, max_length=3),
+    cluster: Optional[str] = Query(None, max_length=80),
+    pagina: int = Query(0, ge=0, le=100000),
+    por_pagina: int = Query(catalogo.POR_PAGINA, ge=1, le=catalogo.MAX_POR_PAGINA),
+):
+    """Una página de la biblioteca de DJ Analyzer (la memoria colectiva):
+    sin nombre de fichero ni aparato. Ver `catalogo.py`."""
+    await _verify_admin_secret(request)
+    base_url = os.environ.get("BASE_URL", "").rstrip("/")
+
+    def leer():
+        conn = _conn_analysis(solo_lectura=True)
+        try:
+            return catalogo.pagina_del_catalogo(
+                conn, q=q, orden=orden, genero=genero, bpm_min=bpm_min,
+                bpm_max=bpm_max, camelot=camelot, cluster=cluster,
+                pagina=pagina, por_pagina=por_pagina,
+                con_preview=_preview_exists, base_url=base_url)
+        finally:
+            conn.close()
+
+    return await run_in_threadpool(leer)
