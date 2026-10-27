@@ -999,6 +999,10 @@ class AnalysisDB:
             'ON corrections(fingerprint, field, device_id)')
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_tracks_platform ON tracks(platform)')
+        # El filtro «tipo» del catálogo del panel (`catalogo.py`): cada filtro
+        # sale de su índice, sin leer la tabla.
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_tracks_track_type ON tracks(track_type)')
 
         conn.commit()
         conn.close()

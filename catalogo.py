@@ -12,22 +12,28 @@ Paginado en el servidor, y cada consulta entra por un índice: `tracks` tiene
 más de 120.000 filas con su `analysis_json` dentro, y un recorrido de la tabla
 son segundos en caliente y 35 s en frío (CLAUDE.md, la ficha de Escuchar):
 
-  - **Por fecha** (lo de por defecto): `idx_tracks_analyzed_at` hacia atrás y
-    el `LIMIT` corta. Con filtros de género, BPM o tonalidad SQLite sigue por
-    ese índice y descarta: caro solo si el filtro casa con muy pocos.
-  - **Buscando** (`q`): las filas que casan salen de `idx_tracks_ficha` (que
-    cubre artista, título y BPM), sin tocar la tabla.
+  - **Sin filtros** (lo de por defecto): `idx_tracks_analyzed_at` hacia atrás
+    y el `LIMIT` corta.
+  - **Con filtros** (los de la biblioteca —género, BPM, tonalidad, energía,
+    tipo— y los del panel —plataforma, motor, huella, ISRC, fecha—, y también
+    buscando o dentro de un cluster): cada filtro es el conjunto de `rowid` que
+    saca SU índice (`_conjuntos`), y se recorre el índice de la fecha mirando
+    si cada `rowid` está en todos. Solo índices: de la tabla se leen los temas
+    de la página. Medido con 120.000 filas (878 MB): todas por debajo de
+    125 ms, también la que no casa con nada (recorre el índice entero).
   - **Por nº de DJs**: desde `track_popularity` (filas pequeñas), y cada clave
     a su tema por `idx_acoustic` o `idx_tracks_fingerprint`. Una fila por TEMA
-    (el cluster), no por fichero. Con este orden no hay filtros: cruzarlos
-    obligaría a recorrer la tabla.
+    (el cluster), no por fichero. Con este orden solo se busca (o se abre un
+    cluster): cruzar filtros obligaría a recorrer la tabla.
 
-El total solo se da cuando sale de un índice (sin filtros, o buscando);
-con filtros es `None` y vale `hay_mas`.
+El total sale siempre de un índice, salvo por nº de DJs buscando (las que
+casan, como mucho `MAX_COINCIDENCIAS`). Buscando se miran como mucho esas:
+`al_tope` dice que el total es «o más».
 """
 
 import json
 import sqlite3
+from datetime import date, timedelta
 from typing import Callable, Dict, List, Optional
 
 POR_PAGINA = 50
@@ -127,6 +133,80 @@ def _como_like(q: str) -> str:
     return f"%{q}%"
 
 
+# Los valores que guarda el clasificador (`spectral_classifier.py`); el cliente
+# los enseña con su nombre (`trackTypes` de `genre_constants.dart`).
+TIPOS = ("opener", "warmup", "builder", "peak_time", "anthem", "cooldown",
+         "closing")
+MOTORES = ("render", "local_engine", "sin_sellar")
+
+
+def _buscando(q: str):
+    return ("SELECT rowid FROM tracks INDEXED BY idx_tracks_ficha "
+            "WHERE (artist LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\') "
+            "AND bpm > 0 LIMIT ?", [_como_like(q), _como_like(q), MAX_COINCIDENCIAS])
+
+
+def _conjuntos(*, q, cluster, genero, bpm_min, bpm_max, camelot, energia_min,
+               energia_max, tipo, plataforma, motor, huella, isrc):
+    """Cada filtro, como el conjunto de `rowid` que saca SU índice (sin leer
+    la tabla). `dentro`: el tema tiene que estar; `fuera`: no puede."""
+    dentro, fuera = [], []
+    if q:
+        dentro.append(_buscando(q))
+    if cluster:
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_acoustic "
+                       "WHERE acoustic_id = ?", [cluster]))
+    if genero:
+        # Sin mayúsculas: el índice entero (solo el índice, sin la tabla).
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_genre "
+                       "WHERE genre = ? COLLATE NOCASE", [genero]))
+    if bpm_min is not None or bpm_max is not None:
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_bpm "
+                       "WHERE bpm > 0 AND bpm >= ? AND bpm <= ?",
+                       [float(bpm_min or 0), float(bpm_max if bpm_max is not None else 1e9)]))
+    else:
+        # Solo lo ANALIZADO: fuera las filas a 0 (un fallback, lo que siembra
+        # Escuchar), que son pocas.
+        fuera.append(("SELECT rowid FROM tracks INDEXED BY idx_bpm "
+                      "WHERE bpm IS NULL OR bpm <= 0", []))
+    if camelot:
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_camelot "
+                       "WHERE camelot = ?", [camelot.upper()]))
+    if energia_min is not None or energia_max is not None:
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_energy "
+                       "WHERE energy_dj >= ? AND energy_dj <= ?",
+                       [int(energia_min or 0), int(energia_max if energia_max is not None else 99)]))
+    if tipo:
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_tracks_track_type "
+                       "WHERE track_type = ?",
+                       [tipo.strip().lower().replace(" ", "_")]))
+    if plataforma:
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_tracks_platform "
+                       "WHERE platform = ?", [plataforma]))
+    if motor == "sin_sellar":
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_tracks_engine "
+                       "WHERE engine_source IS NULL OR engine_source = ''", []))
+    elif motor:
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_tracks_engine "
+                       "WHERE engine_source = ?", [motor]))
+    if huella in ("con", "sin"):
+        # Las huellas pesan KB: del índice solo se leen las que NO hay.
+        sin = ("SELECT rowid FROM tracks INDEXED BY idx_chromaprint "
+               "WHERE chromaprint IS NULL OR chromaprint = ''", [])
+        (dentro if huella == "sin" else fuera).append(sin)
+    if isrc == "con":
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_isrc "
+                       "WHERE isrc > ''", []))
+    elif isrc == "sin":
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_isrc "
+                       "WHERE isrc IS NULL OR isrc = ''", []))
+    return dentro, fuera
+
+
+def _dia_siguiente(dia: str) -> str:
+    return (date.fromisoformat(dia) + timedelta(days=1)).isoformat()
+
+
 def pagina_del_catalogo(
     conn: sqlite3.Connection,
     *,
@@ -136,6 +216,15 @@ def pagina_del_catalogo(
     bpm_min: Optional[float] = None,
     bpm_max: Optional[float] = None,
     camelot: Optional[str] = None,
+    energia_min: Optional[int] = None,
+    energia_max: Optional[int] = None,
+    tipo: Optional[str] = None,
+    plataforma: Optional[str] = None,
+    motor: Optional[str] = None,
+    huella: Optional[str] = None,
+    isrc: Optional[str] = None,
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
     cluster: Optional[str] = None,
     pagina: int = 0,
     por_pagina: int = POR_PAGINA,
@@ -149,16 +238,35 @@ def pagina_del_catalogo(
     pagina = max(0, int(pagina or 0))
     q = (q or "").strip()
     orden = "djs" if orden == "djs" else "fecha"
-    filtros = bool(genero or camelot or bpm_min is not None or bpm_max is not None)
+    filtros = dict(
+        genero=genero, bpm_min=bpm_min, bpm_max=bpm_max, camelot=camelot,
+        energia_min=energia_min, energia_max=energia_max, tipo=tipo,
+        plataforma=plataforma, motor=motor if motor in MOTORES else None,
+        huella=huella, isrc=isrc)
+    hay_filtros = any(v is not None and v != "" for v in filtros.values()) \
+        or bool(desde or hasta)
 
+    al_tope = False
     if orden == "djs" and not q and not cluster:
+        # Con este orden no se cruzan filtros: obligaría a recorrer la tabla.
         filas, total, hay_mas = _por_djs(conn, pagina, por_pagina)
-        filtros = False
+    elif not q and not cluster and not hay_filtros:
+        filas, total, hay_mas = _lo_mas_nuevo(conn, pagina, por_pagina)
     else:
-        filas, total, hay_mas = _por_fecha_o_busqueda(
-            conn, q=q, orden=orden, genero=genero, bpm_min=bpm_min,
-            bpm_max=bpm_max, camelot=camelot, cluster=cluster,
-            pagina=pagina, por_pagina=por_pagina, filtros=filtros)
+        if desde or hasta:
+            try:
+                desde = date.fromisoformat(desde).isoformat() if desde else None
+                hasta = _dia_siguiente(hasta) if hasta else None
+            except ValueError:
+                desde = hasta = None
+        dentro, fuera = _conjuntos(q=q, cluster=cluster, **filtros)
+        filas, total, hay_mas = _por_conjuntos(
+            conn, dentro, fuera, desde=desde, hasta=hasta, orden=orden,
+            pagina=pagina, por_pagina=por_pagina)
+        if q:
+            sql, params = _buscando(q)
+            al_tope = conn.execute(
+                f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0] >= MAX_COINCIDENCIAS
 
     djs = _djs_de(conn, [r["acoustic_id"] or r["fingerprint"] for r in filas])
     versiones = _versiones_de(conn, [r["acoustic_id"] for r in filas])
@@ -169,76 +277,103 @@ def pagina_del_catalogo(
         "total": total,
         "hay_mas": hay_mas,
         "orden": orden,
-        # Buscando, como mucho se cuentan estas: un total igual es «o más».
+        # Buscando se miran como mucho `tope` temas: con `al_tope`, el total
+        # es «o más».
         "tope": MAX_COINCIDENCIAS,
+        "al_tope": al_tope,
     }
 
 
-def _por_fecha_o_busqueda(conn, *, q, orden, genero, bpm_min, bpm_max, camelot,
-                          cluster, pagina, por_pagina, filtros):
-    donde = ["+t.bpm > 0"]
-    params: list = []
-    if q:
-        # Las que casan, del índice de la ficha (cubre artista, título y BPM).
-        donde.append(
-            "t.rowid IN (SELECT rowid FROM tracks INDEXED BY idx_tracks_ficha "
-            "WHERE (artist LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\') "
-            "AND bpm > 0 LIMIT ?)")
-        like = _como_like(q)
-        params += [like, like, MAX_COINCIDENCIAS]
-    if cluster:
-        donde.append("t.acoustic_id = ?")
-        params.append(cluster)
-    if genero:
-        donde.append("t.genre = ? COLLATE NOCASE")
-        params.append(genero)
-    if camelot:
-        donde.append("t.camelot = ?")
-        params.append(camelot.upper())
-    if bpm_min is not None:
-        donde.append("t.bpm >= ?")
-        params.append(float(bpm_min))
-    if bpm_max is not None:
-        donde.append("t.bpm <= ?")
-        params.append(float(bpm_max))
-    where = " AND ".join(donde)
+def _filas_en_orden(conn, rowids: List[int]) -> List[sqlite3.Row]:
+    if not rowids:
+        return []
+    marcas = ",".join("?" for _ in rowids)
+    por_id = {r["rid"]: r for r in conn.execute(
+        f"SELECT t.rowid AS rid, {_COLUMNAS} FROM tracks t "
+        f"WHERE t.rowid IN ({marcas})", rowids)}
+    return [por_id[i] for i in rowids if i in por_id]
+
+
+def _por_conjuntos(conn, dentro, fuera, *, desde, hasta, orden, pagina,
+                   por_pagina):
+    """Con cualquier filtro: se recorre el índice de la fecha (solo el
+    índice) mirando si cada `rowid` está en los conjuntos, y de la tabla solo
+    se leen los temas de la página."""
+    donde, params = [], []
+    for sql, ps in dentro:
+        donde.append(f"rowid IN ({sql})")
+        params += ps
+    for sql, ps in fuera:
+        donde.append(f"rowid NOT IN ({sql})")
+        params += ps
+    if desde:
+        donde.append("analyzed_at >= ?")
+        params.append(desde)
+    if hasta:
+        donde.append("analyzed_at < ?")
+        params.append(hasta)
+    where = " AND ".join(donde) or "1"
+    recorrido = (f"SELECT rowid FROM tracks INDEXED BY idx_tracks_analyzed_at "
+                 f"WHERE {where} ORDER BY analyzed_at DESC")
 
     if orden == "djs":
         # Buscando (o dentro de un cluster): pocas filas, se ordenan aquí.
-        filas = conn.execute(
-            f"SELECT {_COLUMNAS} FROM tracks t WHERE {where} LIMIT ?",
-            params + [MAX_COINCIDENCIAS]).fetchall()
-        djs = _djs_de(conn, [r["acoustic_id"] or r["fingerprint"] for r in filas])
-        filas.sort(key=lambda r: (djs.get(r["acoustic_id"] or r["fingerprint"], 0),
-                                  r["analyzed_at"] or ""), reverse=True)
-        total = len(filas)
-        trozo = filas[pagina * por_pagina:(pagina + 1) * por_pagina]
-        return trozo, total, (pagina + 1) * por_pagina < total
+        ids = [r[0] for r in conn.execute(f"{recorrido} LIMIT ?",
+                                          params + [MAX_COINCIDENCIAS])]
+        claves = {}
+        for i in range(0, len(ids), 500):
+            trozo = ids[i:i + 500]
+            marcas = ",".join("?" for _ in trozo)
+            for r in conn.execute(
+                    f"SELECT rowid, acoustic_id, fingerprint, analyzed_at FROM tracks "
+                    f"WHERE rowid IN ({marcas})", trozo):
+                claves[r[0]] = (r[1] or r[2], r[3] or "")
+        djs = _djs_de(conn, [c for c, _ in claves.values()])
+        ids.sort(key=lambda i: (djs.get(claves.get(i, ("", ""))[0], 0),
+                                claves.get(i, ("", ""))[1]), reverse=True)
+        total = len(ids)
+        trozo = ids[pagina * por_pagina:(pagina + 1) * por_pagina]
+        return _filas_en_orden(conn, trozo), total, (pagina + 1) * por_pagina < total
 
+    ids = [r[0] for r in conn.execute(f"{recorrido} LIMIT ? OFFSET ?",
+                                      params + [por_pagina + 1, pagina * por_pagina])]
+    hay_mas = len(ids) > por_pagina
+    # El total, del mismo recorrido: solo índices.
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM tracks INDEXED BY idx_tracks_analyzed_at WHERE {where}",
+        params).fetchone()[0]
+    return _filas_en_orden(conn, ids[:por_pagina]), total, hay_mas
+
+
+def _lo_mas_nuevo(conn, pagina, por_pagina):
+    """Sin filtros: el índice de la fecha hacia atrás y el `LIMIT` corta."""
     filas = conn.execute(
-        f"SELECT {_COLUMNAS} FROM tracks t WHERE {where} "
-        f"ORDER BY t.analyzed_at DESC LIMIT ? OFFSET ?",
-        params + [por_pagina + 1, pagina * por_pagina]).fetchall()
+        f"SELECT {_COLUMNAS} FROM tracks t INDEXED BY idx_tracks_analyzed_at "
+        f"WHERE +t.bpm > 0 ORDER BY t.analyzed_at DESC LIMIT ? OFFSET ?",
+        [por_pagina + 1, pagina * por_pagina]).fetchall()
     hay_mas = len(filas) > por_pagina
-    filas = filas[:por_pagina]
+    # Solo el índice del BPM, sin leer la tabla.
+    total = conn.execute(
+        "SELECT COUNT(*) FROM tracks INDEXED BY idx_bpm WHERE bpm > 0").fetchone()[0]
+    return filas[:por_pagina], total, hay_mas
 
-    total = None
-    if q and not filtros and not cluster:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM (SELECT rowid FROM tracks INDEXED BY idx_tracks_ficha "
-            "WHERE (artist LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\') "
-            "AND bpm > 0 LIMIT ?)", [_como_like(q), _como_like(q), MAX_COINCIDENCIAS],
-        ).fetchone()[0]
-    elif cluster and not q and not filtros:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM tracks WHERE acoustic_id = ? AND +bpm > 0",
-            [cluster]).fetchone()[0]
-    elif not q and not filtros and not cluster:
-        # Solo el índice del BPM, sin leer la tabla.
-        total = conn.execute(
-            "SELECT COUNT(*) FROM tracks INDEXED BY idx_bpm WHERE bpm > 0"
-        ).fetchone()[0]
-    return filas, total, hay_mas
+
+def opciones_del_catalogo(conn: sqlite3.Connection) -> dict:
+    """Lo que hay para elegir en los filtros, de los índices (sin la tabla)."""
+    def grupos(columna, indice):
+        return [
+            {"valor": r[0], "temas": int(r[1])}
+            for r in conn.execute(
+                f"SELECT {columna}, COUNT(*) FROM tracks INDEXED BY {indice} "
+                f"WHERE {columna} IS NOT NULL AND {columna} != '' "
+                f"GROUP BY {columna} ORDER BY COUNT(*) DESC LIMIT 300")
+        ]
+    return {
+        "generos": grupos("genre", "idx_genre"),
+        "plataformas": grupos("platform", "idx_tracks_platform"),
+        "tipos": list(TIPOS),
+        "motores": list(MOTORES),
+    }
 
 
 def _por_djs(conn, pagina, por_pagina):

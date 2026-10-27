@@ -188,8 +188,70 @@ def test_filtros(bd):
     assert fps(genero='techno') == ['f2', 'f1', 'f6']
     assert fps(camelot='8a') == ['f2', 'f1', 'f6']
     assert fps(bpm_min=126, bpm_max=130) == ['f5', 'f6']
-    assert catalogo.pagina_del_catalogo(bd, genero='techno')['total'] is None, \
-        'con filtros el total no sale de un índice: no se da'
+    assert catalogo.pagina_del_catalogo(bd, genero='techno')['total'] == 3, \
+        'con filtros el total también sale de los índices'
+
+
+def _mas_datos(bd):
+    """Lo que la fixture no rellena: energía, tipo, motor, plataforma, ISRC."""
+    for fp, energia, tipo, motor, plataforma, isrc in (
+            ('f1', 8, 'peak_time', 'render', 'windows', 'GBAAA0000001'),
+            ('f2', 8, 'peak_time', 'local_engine', 'macos-dmg', ''),
+            ('f3', 5, 'anthem', None, 'ios', 'DEBBB0000002'),
+            ('f5', 3, 'warmup', 'render', 'android', None),
+            ('f6', 9, 'closing', 'render', 'windows', None)):
+        bd.execute("UPDATE tracks SET energy_dj=?, track_type=?, engine_source=?, "
+                   "platform=?, isrc=? WHERE id=?",
+                   (energia, tipo, motor, plataforma, isrc, fp))
+    bd.commit()
+
+
+def test_los_filtros_de_la_biblioteca_y_los_del_panel(bd):
+    """Owner, 2026-10-27: «los mismos filtros que tiene la biblioteca. Tipo,
+    bpm, estilo, tonalidad…». Y los del panel: plataforma, motor, huella,
+    ISRC y fecha."""
+    _mas_datos(bd)
+
+    def fps(**kw):
+        return [t['fingerprint'] for t in catalogo.pagina_del_catalogo(bd, **kw)['temas']]
+    assert fps(energia_min=8, energia_max=10) == ['f2', 'f1', 'f6']
+    assert fps(energia_max=5) == ['f5', 'f3']
+    assert fps(tipo='Peak Time') == ['f2', 'f1'], 'el nombre de la app vale'
+    assert fps(plataforma='windows') == ['f1', 'f6']
+    assert fps(motor='render') == ['f5', 'f1', 'f6']
+    assert fps(motor='sin_sellar') == ['f3']
+    assert fps(motor='lo_que_sea') == fps(), 'un motor desconocido no filtra'
+    assert fps(huella='con') == ['f5', 'f2', 'f1']
+    assert fps(huella='sin') == ['f3', 'f6']
+    assert fps(isrc='con') == ['f3', 'f1']
+    assert fps(isrc='sin') == ['f5', 'f2', 'f6'], 'un ISRC vacío no es un ISRC'
+    assert fps(desde='2026-10-02', hasta='2026-10-03') == ['f2', 'f3'], \
+        '«hasta» incluye ese día entero'
+    assert fps(desde='mal') == fps(), 'una fecha que no lo es no filtra'
+    # Cruzados, con la búsqueda y con el total.
+    p = catalogo.pagina_del_catalogo(bd, q='oxia', energia_min=8, huella='con',
+                                     plataforma='macos-dmg')
+    assert [t['fingerprint'] for t in p['temas']] == ['f2']
+    assert p['total'] == 1 and p['al_tope'] is False
+    # La fila a BPM 0 no sale por ningún filtro.
+    bd.execute("UPDATE tracks SET energy_dj=8, platform='windows' WHERE id='f4'")
+    assert 'f4' not in fps(energia_min=8) and 'f4' not in fps(plataforma='windows')
+
+
+def test_buscando_al_tope_el_total_es_o_mas(bd, monkeypatch):
+    monkeypatch.setattr(catalogo, 'MAX_COINCIDENCIAS', 2)
+    p = catalogo.pagina_del_catalogo(bd, q='o')
+    assert p['al_tope'] is True and p['total'] == 2
+    assert catalogo.pagina_del_catalogo(bd, q='age')['al_tope'] is False
+
+
+def test_las_opciones_de_los_filtros(bd):
+    _mas_datos(bd)
+    o = catalogo.opciones_del_catalogo(bd)
+    assert o['generos'][0] == {'valor': 'Techno', 'temas': 3}
+    assert {g['valor'] for g in o['generos']} == {'Techno', 'Trance', 'Minimal'}
+    assert o['plataformas'][0] == {'valor': 'windows', 'temas': 3}
+    assert 'peak_time' in o['tipos'] and 'sin_sellar' in o['motores']
 
 
 def test_las_versiones_del_mismo_audio_juntas(bd):
@@ -225,9 +287,15 @@ def test_cada_consulta_entra_por_un_indice(bd):
             return bd.execute(sql, params)
 
     for kw in ({}, {'q': 'oxia'}, {'cluster': 'c1'}, {'orden': 'djs'},
-               {'orden': 'djs', 'q': 'oxia'}, {'genero': 'techno'}):
+               {'orden': 'djs', 'q': 'oxia'}, {'genero': 'techno'},
+               {'genero': 'techno', 'bpm_min': 120, 'camelot': '8A',
+                'energia_min': 6, 'energia_max': 9, 'tipo': 'peak_time',
+                'plataforma': 'windows', 'motor': 'sin_sellar', 'huella': 'con',
+                'isrc': 'sin', 'desde': '2026-01-01', 'hasta': '2026-12-31'},
+               {'huella': 'sin', 'isrc': 'con', 'motor': 'render'}):
         catalogo.pagina_del_catalogo(Espia(), **kw)
-    assert len(planes) >= 8
+    catalogo.opciones_del_catalogo(Espia())
+    assert len(planes) >= 12
     for sql, pasos in planes:
         for paso in pasos:
             if paso.startswith('SCAN') and 'subquery' not in paso:
@@ -242,6 +310,16 @@ def test_el_endpoint_del_catalogo(bd):
     assert {'temas', 'pagina', 'por_pagina', 'total', 'hay_mas', 'orden'} <= set(r.json())
     assert cliente.get('/admin/catalogo', params={'orden': 'nombre'}).status_code == 422
     assert cliente.get('/admin/catalogo', params={'por_pagina': 1000}).status_code == 422
+    r = cliente.get('/admin/catalogo', params={
+        'energia_min': 6, 'energia_max': 9, 'tipo': 'peak_time', 'plataforma': 'ios',
+        'motor': 'render', 'huella': 'con', 'isrc': 'sin',
+        'desde': '2026-01-01', 'hasta': '2026-12-31'})
+    assert r.status_code == 200, r.text
+    assert cliente.get('/admin/catalogo', params={'huella': 'quizas'}).status_code == 422
+    assert cliente.get('/admin/catalogo', params={'desde': 'ayer'}).status_code == 422
+    r = cliente.get('/admin/catalogo/opciones')
+    assert r.status_code == 200, r.text
+    assert {'generos', 'plataformas', 'tipos', 'motores'} <= set(r.json())
 
 
 def test_all_tracks_ya_no_existe():

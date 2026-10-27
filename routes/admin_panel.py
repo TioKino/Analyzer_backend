@@ -3693,6 +3693,15 @@ async def catalogo_de_todo(
     bpm_min: Optional[float] = Query(None, ge=0, le=400),
     bpm_max: Optional[float] = Query(None, ge=0, le=400),
     camelot: Optional[str] = Query(None, max_length=3),
+    energia_min: Optional[int] = Query(None, ge=0, le=10),
+    energia_max: Optional[int] = Query(None, ge=0, le=10),
+    tipo: Optional[str] = Query(None, max_length=20),
+    plataforma: Optional[str] = Query(None, max_length=20),
+    motor: Optional[str] = Query(None, pattern="^(render|local_engine|sin_sellar)$"),
+    huella: Optional[str] = Query(None, pattern="^(con|sin)$"),
+    isrc: Optional[str] = Query(None, pattern="^(con|sin)$"),
+    desde: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    hasta: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     cluster: Optional[str] = Query(None, max_length=80),
     pagina: int = Query(0, ge=0, le=100000),
     por_pagina: int = Query(catalogo.POR_PAGINA, ge=1, le=catalogo.MAX_POR_PAGINA),
@@ -3707,10 +3716,29 @@ async def catalogo_de_todo(
         try:
             return catalogo.pagina_del_catalogo(
                 conn, q=q, orden=orden, genero=genero, bpm_min=bpm_min,
-                bpm_max=bpm_max, camelot=camelot, cluster=cluster,
+                bpm_max=bpm_max, camelot=camelot, energia_min=energia_min,
+                energia_max=energia_max, tipo=tipo, plataforma=plataforma,
+                motor=motor, huella=huella, isrc=isrc, desde=desde,
+                hasta=hasta, cluster=cluster,
                 pagina=pagina, por_pagina=por_pagina,
                 con_preview=_preview_exists, base_url=base_url)
         finally:
             conn.close()
 
     return await run_in_threadpool(leer)
+
+
+@admin_panel_router.get("/catalogo/opciones")
+async def catalogo_opciones(request: Request):
+    """Lo que hay para elegir en los filtros del catálogo (géneros y
+    plataformas con cuántos temas tiene cada uno), de los índices."""
+    await _verify_admin_secret(request)
+
+    def leer():
+        conn = _conn_analysis(solo_lectura=True)
+        try:
+            return catalogo.opciones_del_catalogo(conn)
+        finally:
+            conn.close()
+
+    return await _en_un_hilo(leer)
