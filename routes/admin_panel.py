@@ -310,6 +310,36 @@ def _previews_en_disco():
     return _previews_cache
 
 
+# ── LO PESADO DEL PANEL, FUERA DEL EVENT LOOP (2026-10-25) ──────
+# Render corre UN proceso de uvicorn, y estas rutas eran `async def` que hacían
+# todo su trabajo de SQLite en el event loop: mientras una recorría `sync.db`
+# entera (/users, /stats, el embudo, la retención, la telemetría), Render no
+# atendía a NADIE más — ni a /analyze ni a Escuchar —, y con la foto diaria del
+# Resumen corriendo a la vez, dos recorridos de la biblioteca de todos se
+# juntaban en memoria. El owner lo vio el 2026-10-25 como «Usuarios, Errores y
+# Técnico se quedan pensando hasta que sale un error». Hoy cada una corre en un
+# hilo (`_en_un_hilo`) y las pesadas, además, de una en una (`_pesado`, con la
+# foto del Resumen dentro del mismo cerrojo): la memoria de UN recorrido, no la
+# de varios a la vez.
+_cerrojo_pesado = threading.Lock()
+
+
+def _de_uno_en_uno(fn, *args, **kwargs):
+    with _cerrojo_pesado:
+        return fn(*args, **kwargs)
+
+
+async def _pesado(fn, *args, **kwargs):
+    """Una consulta que recorre la biblioteca de todos: en un hilo y de una en
+    una (ver arriba)."""
+    return await run_in_threadpool(_de_uno_en_uno, fn, *args, **kwargs)
+
+
+async def _en_un_hilo(fn, *args, **kwargs):
+    """Una consulta que no cabe en el event loop pero no recorre todo."""
+    return await run_in_threadpool(fn, *args, **kwargs)
+
+
 def _preview_exists(fingerprint: str) -> bool:
     """Check if a preview MP3 exists for the given fingerprint."""
     if not fingerprint:
@@ -571,6 +601,10 @@ def _count_unique_tracks(analysis_rows, check_previews: bool = True):
 @admin_panel_router.get("/users")
 async def list_users(request: Request):
     await _verify_admin_secret(request)
+    return await _pesado(_list_users, request=request)
+
+
+def _list_users(request: Request):
     conn = _get_sync_conn()
     try:
         # Get all distinct devices from sync_items
@@ -807,6 +841,10 @@ async def all_previews(request: Request):
 @admin_panel_router.get("/stats")
 async def global_stats(request: Request):
     await _verify_admin_secret(request)
+    return await _pesado(_global_stats, request=request)
+
+
+def _global_stats(request: Request):
     conn = _get_sync_conn()
     try:
         # Distinct devices
@@ -881,6 +919,10 @@ async def global_stats(request: Request):
 @admin_panel_router.get("/users/{device_id}/summary")
 async def user_summary(device_id: str, request: Request):
     await _verify_admin_secret(request)
+    return await _pesado(_user_summary, device_id=device_id, request=request)
+
+
+def _user_summary(device_id: str, request: Request):
     conn = _get_sync_conn()
     try:
         def _count_payload(data_type: str, key: str = "") -> int:
@@ -1081,6 +1123,10 @@ def _vote_registration_stats() -> dict:
 @admin_panel_router.get("/users/{device_id}/errors")
 async def user_errors(device_id: str, request: Request, resolved: Optional[int] = None):
     await _verify_admin_secret(request)
+    return await _en_un_hilo(_user_errors, device_id=device_id, request=request, resolved=resolved)
+
+
+def _user_errors(device_id: str, request: Request, resolved: Optional[int] = None):
     resolved_bool = None if resolved is None else bool(resolved)
     errors = _get_db().get_analysis_errors(
         device_id=device_id, resolved=resolved_bool, limit=200,
@@ -1091,6 +1137,10 @@ async def user_errors(device_id: str, request: Request, resolved: Optional[int] 
 @admin_panel_router.get("/errors")
 async def global_errors(request: Request, resolved: Optional[int] = None, limit: int = 200):
     await _verify_admin_secret(request)
+    return await _en_un_hilo(_global_errors, request=request, resolved=resolved, limit=limit)
+
+
+def _global_errors(request: Request, resolved: Optional[int] = None, limit: int = 200):
     resolved_bool = None if resolved is None else bool(resolved)
     errors = _get_db().get_analysis_errors(resolved=resolved_bool, limit=limit)
     return {"errors": errors, "total": len(errors)}
@@ -1118,6 +1168,15 @@ async def errors_grouped(
     until: Optional[str] = None,
 ):
     await _verify_admin_secret(request)
+    return await _en_un_hilo(_errors_grouped, request=request, resolved=resolved, since=since, until=until)
+
+
+def _errors_grouped(
+    request: Request,
+    resolved: Optional[int] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+):
     resolved_bool = None if resolved is None else bool(resolved)
     groups = _get_db().get_errors_grouped(
         resolved=resolved_bool, since=_norm_since(since), until=_norm_until(until),
@@ -1231,6 +1290,10 @@ async def resolve_error(error_id: int, request: Request):
 @admin_panel_router.get("/telemetry")
 async def telemetry(request: Request):
     await _verify_admin_secret(request)
+    return await _pesado(_telemetry, request=request)
+
+
+def _telemetry(request: Request):
     # 1) AudD stats desde la BD de analisis. La tabla vive en analysis.db
     # (no sync.db), por eso abrimos otra conexion.
     analysis_db_path = os.environ.get(
@@ -2172,6 +2235,10 @@ def _reparto_por_version(adb, dias, plat_sql, plat_params):
 @admin_panel_router.get("/funnel")
 async def funnel(request: Request, platform: str = None):
     await _verify_admin_secret(request)
+    return await _pesado(_funnel, request=request, platform=platform)
+
+
+def _funnel(request: Request, platform: str = None):
     analysis_db_path = os.environ.get(
         "DATABASE_PATH",
         os.environ.get("ANALYSIS_DB_PATH", "analysis.db"),
@@ -2553,6 +2620,10 @@ def _vinculacion_segun_sync(adb, firsts_sql, plat_sql, plat_params) -> dict:
 @admin_panel_router.get("/retention")
 async def retention(request: Request):
     await _verify_admin_secret(request)
+    return await _pesado(_retention, request=request)
+
+
+def _retention(request: Request):
     try:
         cohorts = _get_db().get_retention_cohorts()
     except Exception:  # noqa: BLE001 - best-effort, tabla vieja / sin datos
@@ -2657,37 +2728,58 @@ def _percentil(ordenados, pct):
     return ordenados[k]
 
 
+# El recuento por aparato se reusa mientras `sync_items` no cambie (mismas
+# filas de análisis y la misma última) y durante como mucho estos segundos:
+# el Resumen, el embudo, la retención y «Trae tu biblioteca» lo piden en la
+# misma visita al panel, y eran cuatro recorridos de la biblioteca de todos.
+_POR_DEVICE_VALE_S = 600
+_por_device_guardado: dict = {"clave": None, "cuando": 0.0, "valor": None}
+_por_device_cerrojo = threading.Lock()
+
+
 def _tracks_por_device() -> Dict[str, int]:
     """`{device_id: numero de tracks}` de las bibliotecas de `sync.db`.
 
     Se saco a funcion propia para que el escaneo de `sync_items` —que recorre
     la biblioteca ENTERA y ya tumbo produccion con un OOM una vez— se haga UNA
-    sola vez y lo compartan sus dos consumidores: el reparto de `investment` y
-    el diagnostico de los que se quedan cortos. Cursor sin `fetchall()`.
+    sola vez y lo compartan sus consumidores: el reparto de `investment`, el
+    diagnostico de los que se quedan cortos, «Trae tu biblioteca» y la foto
+    del Resumen. Desde el 2026-10-25 se recorre APARATO A APARATO (hasta ese
+    día guardaba en memoria las filas de todos con su payload antes de
+    contar), sin mirar los previews (solo hace falta el número) y se reusa
+    mientras `sync_items` no cambie (ver `_POR_DEVICE_VALE_S`).
 
     Solo salen devices con al menos un track: un device sin biblioteca no es un
     device con biblioteca de tamano cero, es otra cosa.
     """
     conn = _get_sync_conn()
     try:
-        filas_por_device = {}
-        rows = conn.execute(
-            "SELECT last_device_id, item_key, payload FROM sync_items "
-            "WHERE data_type = 'analysis'"
-        )
-        for r in rows:
-            dev = r["last_device_id"]
-            if not dev:
-                continue
-            filas_por_device.setdefault(dev, []).append(r)
-
-        out = {}
-        for dev, filas in filas_por_device.items():
-            ids, _prev, sin_id = _count_unique_tracks(filas)
-            n = len(ids) + sin_id
-            if n > 0:
-                out[dev] = n
-        return out
+        # Cuántas filas de análisis hay y la última: si no cambian, el recuento
+        # tampoco (salvo un blob legacy reescrito, que caduca por tiempo).
+        clave = (_SYNC_DB_PATH,) + tuple(conn.execute(
+            "SELECT COUNT(*), MAX(rowid) FROM sync_items "
+            "WHERE data_type = 'analysis'").fetchone())
+        with _por_device_cerrojo:
+            g = _por_device_guardado
+            if (g["valor"] is not None and g["clave"] == clave
+                    and time.monotonic() - g["cuando"] < _POR_DEVICE_VALE_S):
+                return dict(g["valor"])
+            out = {}
+            aparatos = [r[0] for r in conn.execute(
+                "SELECT DISTINCT last_device_id FROM sync_items")]
+            for dev in aparatos:
+                if not dev:
+                    continue
+                filas = conn.execute(
+                    "SELECT item_key, payload FROM sync_items "
+                    "WHERE data_type = 'analysis' AND last_device_id = ?", (dev,))
+                ids, _prev, sin_id = _count_unique_tracks(
+                    filas, check_previews=False)
+                n = len(ids) + sin_id
+                if n > 0:
+                    out[dev] = n
+            g.update(clave=clave, cuando=time.monotonic(), valor=out)
+            return dict(out)
     finally:
         conn.close()
 
@@ -3104,6 +3196,10 @@ def _trae_tu_biblioteca(
 @admin_panel_router.get("/activity")
 async def activity(request: Request):
     await _verify_admin_secret(request)
+    return await _en_un_hilo(_activity, request=request)
+
+
+def _activity(request: Request):
     import time as _time
     from datetime import datetime
 
@@ -3535,7 +3631,9 @@ def _foto_en_segundo_plano() -> bool:
     def correr():
         global _resumen_en_marcha
         try:
-            _hacer_foto_de_hoy()
+            # Con el mismo cerrojo que las rutas pesadas: la foto recorre la
+            # biblioteca de todos, igual que /users o el embudo.
+            _de_uno_en_uno(_hacer_foto_de_hoy)
         except Exception as e:  # noqa: BLE001 - el panel sigue con la de ayer
             logger.warning(f"[Resumen] la foto de hoy falló: {e}")
         finally:
@@ -3581,7 +3679,7 @@ async def resumen(request: Request):
 async def resumen_recalcular(request: Request):
     """Rehace la foto de hoy y espera a que termine (unos segundos)."""
     await _verify_admin_secret(request)
-    await run_in_threadpool(_hacer_foto_de_hoy)
+    await _pesado(_hacer_foto_de_hoy)
     fotos = await run_in_threadpool(_leer_fotos)
     return _respuesta_del_resumen(fotos, False)
 
