@@ -238,6 +238,56 @@ def test_los_filtros_de_la_biblioteca_y_los_del_panel(bd):
     assert 'f4' not in fps(energia_min=8) and 'f4' not in fps(plataforma='windows')
 
 
+def test_ordenar_por_columna_como_la_biblioteca(bd):
+    """Owner, 2026-10-28: «al ordenar por columnas ya hace función de filtro».
+    Cada columna, en los dos sentidos, y lo que no tiene valor al final."""
+    _mas_datos(bd)
+    bd.execute("UPDATE tracks SET duration = 300 WHERE id IN ('f1', 'f2')")
+    bd.execute("UPDATE tracks SET duration = 200 WHERE id = 'f3'")
+    bd.commit()
+
+    def fps(orden, dir):
+        return [t['fingerprint'] for t in catalogo.pagina_del_catalogo(
+            bd, orden=orden, dir=dir)['temas']]
+    assert fps('bpm', 'asc') == ['f1', 'f2', 'f5', 'f6', 'f3']
+    assert fps('bpm', 'desc') == ['f3', 'f6', 'f5', 'f2', 'f1']
+    assert fps('titulo', 'asc') == ['f3', 'f5', 'f1', 'f2', 'f6'], 'Age, Air, Domino…'
+    assert fps('artista', 'asc')[:2] == ['f6', 'f3'], '«100%_raro», «Jam & Spoon»…'
+    assert fps('artista', 'asc')[-2:] == ['f1', 'f2'], 'Oxia, y dentro, por título'
+    generos = [t['genre'] for t in catalogo.pagina_del_catalogo(
+        bd, orden='genero', dir='asc')['temas']]
+    assert generos == sorted(generos)
+    assert fps('energia', 'desc')[0] == 'f6' and fps('energia', 'asc')[0] == 'f5'
+    assert fps('tipo', 'asc')[0] == 'f3', 'anthem'
+    # La tonalidad por su número: 4A, 8A, 8A, 8A, 9A (no «10A» antes que «1A»).
+    camelots = [t['camelot'] for t in catalogo.pagina_del_catalogo(
+        bd, orden='tonalidad', dir='asc')['temas']]
+    assert camelots == ['4A', '8A', '8A', '8A', '9A']
+    # Lo que no tiene valor, al final en los dos sentidos.
+    assert fps('duracion', 'asc')[:3] == ['f3', 'f1', 'f2']
+    assert fps('duracion', 'desc')[:3] == ['f2', 'f1', 'f3']
+    assert set(fps('duracion', 'desc')[3:]) == {'f5', 'f6'}
+    # Paginado sin perder ni repetir: los de valor y los de sin valor.
+    vistos = []
+    for pag in range(3):
+        vistos += [t['fingerprint'] for t in catalogo.pagina_del_catalogo(
+            bd, orden='duracion', dir='asc', pagina=pag, por_pagina=2)['temas']]
+    assert sorted(vistos) == ['f1', 'f2', 'f3', 'f5', 'f6']
+    assert catalogo.pagina_del_catalogo(bd, orden='bpm', dir='asc')['total'] == 5
+    # Buscando, también.
+    assert [t['fingerprint'] for t in catalogo.pagina_del_catalogo(
+        bd, q='oxia', orden='titulo', dir='desc')['temas']] == ['f2', 'f1']
+
+
+def test_el_anio_sale_del_analisis(bd):
+    bd.execute("UPDATE tracks SET analysis_json = ? WHERE id = 'f3'",
+               (json.dumps({'year': 1992}),))
+    bd.commit()
+    temas = {t['fingerprint']: t for t in catalogo.pagina_del_catalogo(bd)['temas']}
+    assert temas['f3']['year'] == '1992'
+    assert temas['f1']['year'] is None
+
+
 def test_buscando_al_tope_el_total_es_o_mas(bd, monkeypatch):
     monkeypatch.setattr(catalogo, 'MAX_COINCIDENCIAS', 2)
     p = catalogo.pagina_del_catalogo(bd, q='o')
@@ -292,7 +342,10 @@ def test_cada_consulta_entra_por_un_indice(bd):
                 'energia_min': 6, 'energia_max': 9, 'tipo': 'peak_time',
                 'plataforma': 'windows', 'motor': 'sin_sellar', 'huella': 'con',
                 'isrc': 'sin', 'desde': '2026-01-01', 'hasta': '2026-12-31'},
-               {'huella': 'sin', 'isrc': 'con', 'motor': 'render'}):
+               {'huella': 'sin', 'isrc': 'con', 'motor': 'render'},
+               *({'orden': o, 'dir': d} for o in catalogo.ORDENES
+                 for d in ('asc', 'desc')),
+               {'orden': 'genero', 'dir': 'asc', 'q': 'oxia'}):
         catalogo.pagina_del_catalogo(Espia(), **kw)
     catalogo.opciones_del_catalogo(Espia())
     assert len(planes) >= 12
@@ -317,6 +370,9 @@ def test_el_endpoint_del_catalogo(bd):
     assert r.status_code == 200, r.text
     assert cliente.get('/admin/catalogo', params={'huella': 'quizas'}).status_code == 422
     assert cliente.get('/admin/catalogo', params={'desde': 'ayer'}).status_code == 422
+    r = cliente.get('/admin/catalogo', params={'orden': 'tonalidad', 'dir': 'asc'})
+    assert r.status_code == 200 and r.json()['dir'] == 'asc'
+    assert cliente.get('/admin/catalogo', params={'dir': 'arriba'}).status_code == 422
     r = cliente.get('/admin/catalogo/opciones')
     assert r.status_code == 200, r.text
     assert {'generos', 'plataformas', 'tipos', 'motores'} <= set(r.json())
@@ -327,3 +383,59 @@ def test_all_tracks_ya_no_existe():
     rutas = {getattr(r, 'path', '') for r in main.app.routes}
     assert '/admin/all-tracks' not in rutas
     assert '/admin/catalogo' in rutas and '/admin/resumen' in rutas
+
+
+# ── La biblioteca de un usuario (2026-10-28) ─────────────────────────────
+
+
+def test_la_biblioteca_de_un_usuario_con_los_nombres_que_ve(tmp_path, monkeypatch):
+    """Owner: «sustitúyeles carpetas por usuarios». Al elegir uno, SU
+    biblioteca (de `sync.db`), con sus overrides y sin la ruta del fichero."""
+    import routes.admin_panel as ap
+    ruta = str(tmp_path / 'sync.db')
+    conn = sqlite3.connect(ruta)
+    conn.execute(
+        "CREATE TABLE sync_items (key TEXT PRIMARY KEY, data_type TEXT NOT NULL, "
+        "item_key TEXT NOT NULL, payload TEXT NOT NULL, deleted INTEGER DEFAULT 0, "
+        "updated_at TEXT NOT NULL, last_device_id TEXT NOT NULL, "
+        "device_type TEXT DEFAULT 'unknown', hash TEXT NOT NULL)")
+
+    def fila(item_key, payload, data_type='analysis', device='mac', deleted=0):
+        conn.execute(
+            "INSERT INTO sync_items VALUES (?,?,?,?,?,?,?,?,?)",
+            (f'{device}|{data_type}|{item_key}', data_type, item_key,
+             json.dumps(payload), deleted, '2026-10-28', device, 'macos-dmg', 'h'))
+
+    fila('t1', {'track': {'title': 'Domino', 'artist': 'Oxia',
+                          'filePath': '/Users/dj/Music/domino.mp3', 'duration': 412.0},
+                'tempo': {'bpm': 125.0}, 'key': {'key': 'Am', 'camelot': '8A'},
+                'energy': {'energyDJ': 7}, 'genre': 'Techno', 'trackType': 'peak_time',
+                'year': '2004', 'fingerprint': 'fp1', 'analyzedAt': '2026-10-01T10:00:00'})
+    fila('t2', {'track': {'title': 'feo_01', 'artist': ''}, 'tempo': {'bpm': 128.0},
+                'analyzerVersion': 'imported'})
+    fila('t3', {'track': {'title': 'Borrado'}}, deleted=1)
+    fila('t9', {'track': {'title': 'De otro'}}, device='pc')
+    fila('all_overrides', {'overrides': {'t2': {'title': 'Bonito', 'artist': 'DJ X',
+                                                 'style': 'House', 'bpmAdjust': 0.0}}},
+         data_type='override')
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(ap, '_SYNC_DB_PATH', ruta)
+
+    r = ap._biblioteca_de('mac')
+    temas = {t['id']: t for t in r['temas']}
+    assert set(temas) == {'t1', 't2'}, 'ni lo borrado ni lo de otro aparato'
+    t1 = temas['t1']
+    assert (t1['title'], t1['artist'], t1['bpm'], t1['camelot'], t1['energy_dj'],
+            t1['genre'], t1['track_type'], t1['year'], t1['duration']) == \
+        ('Domino', 'Oxia', 125.0, '8A', 7, 'Techno', 'peak_time', '2004', 412.0)
+    assert '/Users/dj' not in json.dumps(r), 'sin la ruta del fichero'
+    t2 = temas['t2']
+    assert (t2['title'], t2['artist'], t2['genre']) == ('Bonito', 'DJ X', 'House')
+    assert t2['sin_audio'] is True and t1['sin_audio'] is False
+
+    import main
+    cliente = TestClient(main.app)
+    r = cliente.get('/admin/catalogo/usuario/mac')
+    assert r.status_code == 200, r.text
+    assert len(r.json()['temas']) == 2

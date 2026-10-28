@@ -59,10 +59,12 @@ def _fuentes(analysis_json: Optional[str]) -> Dict[str, Optional[str]]:
         d = {}
     if not isinstance(d, dict):
         d = {}
+    anio = d.get("year")
     return {
         "bpm_source": d.get("bpm_source"),
         "key_source": d.get("key_source"),
         "genre_source": d.get("genre_source"),
+        "year": str(anio) if anio not in (None, "", 0) else None,
     }
 
 
@@ -226,6 +228,7 @@ def pagina_del_catalogo(
     desde: Optional[str] = None,
     hasta: Optional[str] = None,
     cluster: Optional[str] = None,
+    dir: str = "desc",
     pagina: int = 0,
     por_pagina: int = POR_PAGINA,
     con_preview: Callable[[str], bool] = lambda _fp: False,
@@ -237,7 +240,8 @@ def pagina_del_catalogo(
     por_pagina = max(1, min(int(por_pagina or POR_PAGINA), MAX_POR_PAGINA))
     pagina = max(0, int(pagina or 0))
     q = (q or "").strip()
-    orden = "djs" if orden == "djs" else "fecha"
+    orden = orden if orden == "djs" or orden in ORDENES else "fecha"
+    dir = "asc" if dir == "asc" else "desc"
     filtros = dict(
         genero=genero, bpm_min=bpm_min, bpm_max=bpm_max, camelot=camelot,
         energia_min=energia_min, energia_max=energia_max, tipo=tipo,
@@ -250,7 +254,10 @@ def pagina_del_catalogo(
     if orden == "djs" and not q and not cluster:
         # Con este orden no se cruzan filtros: obligaría a recorrer la tabla.
         filas, total, hay_mas = _por_djs(conn, pagina, por_pagina)
-    elif not q and not cluster and not hay_filtros:
+    elif orden == "fecha" and dir == "desc" and pagina == 0 and not q \
+            and not cluster and not hay_filtros:
+        # La primera página de lo de siempre: el índice de la fecha y el LIMIT
+        # corta. Las demás, por el índice solo (no lee la tabla para saltar).
         filas, total, hay_mas = _lo_mas_nuevo(conn, pagina, por_pagina)
     else:
         if desde or hasta:
@@ -260,9 +267,14 @@ def pagina_del_catalogo(
             except ValueError:
                 desde = hasta = None
         dentro, fuera = _conjuntos(q=q, cluster=cluster, **filtros)
-        filas, total, hay_mas = _por_conjuntos(
-            conn, dentro, fuera, desde=desde, hasta=hasta, orden=orden,
-            pagina=pagina, por_pagina=por_pagina)
+        if orden == "djs":
+            filas, total, hay_mas = _por_conjuntos(
+                conn, dentro, fuera, desde=desde, hasta=hasta, orden=orden,
+                pagina=pagina, por_pagina=por_pagina)
+        else:
+            filas, total, hay_mas = _por_columna(
+                conn, dentro, fuera, desde=desde, hasta=hasta, orden=orden,
+                dir=dir, pagina=pagina, por_pagina=por_pagina)
         if q:
             sql, params = _buscando(q)
             al_tope = conn.execute(
@@ -277,11 +289,89 @@ def pagina_del_catalogo(
         "total": total,
         "hay_mas": hay_mas,
         "orden": orden,
+        "dir": dir,
         # Buscando se miran como mucho `tope` temas: con `al_tope`, el total
         # es «o más».
         "tope": MAX_COINCIDENCIAS,
         "al_tope": al_tope,
     }
+
+
+# Ordenar por una columna, como en la biblioteca (owner, 2026-10-28: «al
+# ordenar por columnas ya hace función de filtro»). Cada columna se recorre por
+# SU índice —solo el índice—, con el desempate por `rowid` en el mismo sentido
+# (el índice ya lo lleva detrás). Lo que no tiene valor va al final en los dos
+# sentidos, como en la biblioteca.
+#   orden: (índice, términos del ORDER BY, condición de «tiene valor»)
+ORDENES = {
+    "fecha": ("idx_tracks_analyzed_at", ("analyzed_at",),
+              "analyzed_at IS NOT NULL AND analyzed_at != ''"),
+    "titulo": ("idx_tracks_titulo", ("title COLLATE NOCASE",),
+               "title IS NOT NULL AND title != ''"),
+    # El índice de la ficha entero: artista, y dentro su título.
+    "artista": ("idx_tracks_ficha", ("artist COLLATE NOCASE", "title COLLATE NOCASE",
+                                     "bpm", "analyzed_at"),
+                "artist IS NOT NULL AND artist != ''"),
+    "genero": ("idx_genre", ("genre",), "genre IS NOT NULL AND genre != ''"),
+    "bpm": ("idx_bpm", ("bpm",), "bpm > 0"),
+    # 1A, 1B, 2A… 12B: el número delante (CAST lee el prefijo numérico).
+    "tonalidad": ("idx_tracks_camelot_orden",
+                  ("CAST(camelot AS INTEGER)", "camelot"),
+                  "camelot IS NOT NULL AND camelot != ''"),
+    "energia": ("idx_energy", ("energy_dj",), "energy_dj IS NOT NULL"),
+    "tipo": ("idx_tracks_track_type", ("track_type",),
+             "track_type IS NOT NULL AND track_type != ''"),
+    "duracion": ("idx_tracks_duration", ("duration",), "duration > 0"),
+}
+
+
+def _por_columna(conn, dentro, fuera, *, desde, hasta, orden, dir, pagina,
+                 por_pagina):
+    indice, terminos, con_valor = ORDENES[orden]
+    dentro = list(dentro)
+    if desde or hasta:
+        conds, ps = [], []
+        if desde:
+            conds.append("analyzed_at >= ?")
+            ps.append(desde)
+        if hasta:
+            conds.append("analyzed_at < ?")
+            ps.append(hasta)
+        dentro.append(("SELECT rowid FROM tracks INDEXED BY idx_tracks_analyzed_at "
+                       f"WHERE {' AND '.join(conds)}", ps))
+    donde, params = [], []
+    for sql, ps in dentro:
+        donde.append(f"rowid IN ({sql})")
+        params += ps
+    for sql, ps in fuera:
+        donde.append(f"rowid NOT IN ({sql})")
+        params += ps
+    where = " AND ".join(donde) or "1"
+    orden_sql = ", ".join(f"{t} {dir.upper()}" for t in terminos) + \
+        f", rowid {dir.upper()}"
+    con = (f"SELECT rowid FROM tracks INDEXED BY {indice} "
+           f"WHERE ({con_valor}) AND {where} ORDER BY {orden_sql}")
+    # `IS NOT 1` y no `NOT (…)`: con un NULL la condición da NULL, y su NOT
+    # también, así que esa fila no salía ni en un lado ni en el otro.
+    sin = (f"SELECT rowid FROM tracks INDEXED BY {indice} "
+           f"WHERE ({con_valor}) IS NOT 1 AND {where} ORDER BY rowid {dir.upper()}")
+    desde_n = pagina * por_pagina
+    ids = [r[0] for r in conn.execute(f"{con} LIMIT ? OFFSET ?",
+                                      params + [por_pagina + 1, desde_n])]
+    if len(ids) <= por_pagina:
+        # Se acabaron los que tienen valor: siguen los que no.
+        cuantos_con = conn.execute(
+            f"SELECT COUNT(*) FROM tracks INDEXED BY {indice} "
+            f"WHERE ({con_valor}) AND {where}", params).fetchone()[0]
+        falta = por_pagina + 1 - len(ids)
+        ids += [r[0] for r in conn.execute(
+            f"{sin} LIMIT ? OFFSET ?",
+            params + [falta, max(0, desde_n - cuantos_con)])]
+    hay_mas = len(ids) > por_pagina
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM tracks INDEXED BY idx_tracks_analyzed_at WHERE {where}",
+        params).fetchone()[0]
+    return _filas_en_orden(conn, ids[:por_pagina]), total, hay_mas
 
 
 def _filas_en_orden(conn, rowids: List[int]) -> List[sqlite3.Row]:

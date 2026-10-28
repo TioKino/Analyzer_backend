@@ -1003,6 +1003,14 @@ class AnalysisDB:
         # sale de su índice, sin leer la tabla.
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_tracks_track_type ON tracks(track_type)')
+        # Y ordenarlo por columna como la biblioteca (2026-10-28): el título
+        # sin mayúsculas, y la tonalidad por su número (1A, 1B, 2A… 12B; por
+        # texto saldría 10A antes que 1A).
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_tracks_titulo ON tracks(title COLLATE NOCASE)')
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_tracks_camelot_orden '
+            'ON tracks(CAST(camelot AS INTEGER), camelot)')
 
         conn.commit()
         conn.close()
@@ -5424,6 +5432,38 @@ class AnalysisDB:
         try:
             c = conn.cursor()
             c.execute(f'DELETE FROM analysis_errors WHERE {clause}', params)
+            conn.commit()
+            return c.rowcount
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def resolve_errors_before(self, antes: Optional[str] = None) -> int:
+        """«Dar todo por visto» del panel (2026-10-28): marca como resueltos
+        los errores sin resolver anteriores a `antes` (UTC; por defecto,
+        ahora). No borra nada, y un error que vuelve a pasar entra como una
+        fila nueva sin resolver: su grupo sale otra vez. Devuelve cuántos."""
+        from datetime import datetime, timezone
+        corte = None
+        if antes:
+            try:
+                d = datetime.fromisoformat(antes.replace('Z', '+00:00'))
+                if d.tzinfo is not None:
+                    d = d.astimezone(timezone.utc)
+                corte = d.strftime('%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                corte = None
+        if corte is None:
+            corte = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'UPDATE analysis_errors SET resolved = 1, resolved_at = ? '
+                'WHERE resolved = 0 AND timestamp <= ?',
+                (datetime.now(timezone.utc).isoformat(), corte),
+            )
             conn.commit()
             return c.rowcount
         except sqlite3.OperationalError:

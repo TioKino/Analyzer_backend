@@ -7,12 +7,14 @@ users, tracks, previews, sessions, and global statistics.
 Auth: X-Admin-Secret header checked against ADMIN_SECRET env var.
 """
 
+import asyncio
 import csv
 import hmac
 import io
 import json
 import logging
 import os
+import queue
 import sqlite3
 import threading
 import time
@@ -20,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 import catalogo
@@ -340,6 +342,115 @@ async def _en_un_hilo(fn, *args, **kwargs):
     return await run_in_threadpool(fn, *args, **kwargs)
 
 
+# ── LO PESADO, EN SEGUNDO PLANO: LA PANTALLA NUNCA ESPERA (2026-10-28) ──────
+# Con lo de arriba Render ya atendía a todos, pero el panel seguía en
+# «TimeoutException after 0:02:00» en Usuarios y en el embudo, la retención y
+# la telemetría de Técnico (owner, 2026-10-28): esos recorridos tardan más de
+# dos minutos con la biblioteca de todos (`embudo.sh` les da 240 s), y al ir de
+# uno en uno cada pestaña esperaba además a la anterior —y a la foto del
+# Resumen, la primera del día—. Hoy cada uno se calcula en un trabajador de
+# fondo (el mismo cerrojo de siempre, uno a la vez) y la ruta contesta AL
+# MOMENTO con el último resultado (`_foto` dice de hace cuánto) o, si todavía
+# no hay ninguno, con un 202 `calculando` que el cliente vuelve a pedir. Un
+# resultado viejo se sirve mientras se rehace. `?esperar=N` (segundos) espera
+# a que haya uno: es para `embudo.sh`, que necesita los datos en la primera.
+_FOTO_VALE_S = {
+    "users": 600,
+    "stats": 600,
+    "summary": 600,
+    "telemetry": 900,
+    "funnel": 1800,
+    "retention": 1800,
+}
+# Solo para la suite de tests (lo pone `conftest.py`): calcula al pedir y no
+# guarda foto. Cada test monta su propia BD, y una foto guardada por otro test
+# le devolvería los números de aquel.
+CALCULAR_AL_PEDIR = False
+
+_fotos: Dict[tuple, dict] = {}
+_fotos_pendientes: set = set()
+_fotos_cerrojo = threading.Lock()
+_fotos_cola: "queue.Queue" = queue.Queue()
+_fotos_trabajador: Optional[threading.Thread] = None
+
+
+def _trabajar_las_fotos():
+    while True:
+        clave, fn, params = _fotos_cola.get()
+        t0 = time.monotonic()
+        try:
+            valor = _de_uno_en_uno(fn, request=None, **params)
+            tardo = round(time.monotonic() - t0, 1)
+            with _fotos_cerrojo:
+                _fotos[clave] = {"valor": valor, "cuando": time.time(),
+                                 "tardo_s": tardo, "error": None}
+            logger.info(f"[Admin] {clave[0]} {params or ''} calculado en {tardo} s")
+        except Exception as e:  # noqa: BLE001 - se queda la anterior
+            with _fotos_cerrojo:
+                prev = _fotos.get(clave)
+                if prev is not None:
+                    prev["error"] = f"{type(e).__name__}: {e}"[:300]
+            logger.warning(f"[Admin] {clave[0]} {params or ''} falló: {e}")
+        finally:
+            with _fotos_cerrojo:
+                _fotos_pendientes.discard(clave)
+
+
+def _pedir_foto(clave: tuple, fn, params: dict) -> None:
+    """La pone en la cola del trabajador si no está ya pedida."""
+    global _fotos_trabajador
+    with _fotos_cerrojo:
+        if clave in _fotos_pendientes:
+            return
+        _fotos_pendientes.add(clave)
+        if _fotos_trabajador is None or not _fotos_trabajador.is_alive():
+            _fotos_trabajador = threading.Thread(
+                target=_trabajar_las_fotos, daemon=True, name="fotos-admin")
+            _fotos_trabajador.start()
+    _fotos_cola.put((clave, fn, params))
+
+
+def _con_su_foto(f: dict, clave: tuple) -> dict:
+    valor = f["valor"]
+    out = dict(valor) if isinstance(valor, dict) else {"valor": valor}
+    out["_foto"] = {
+        "hace_s": round(time.time() - f["cuando"], 1),
+        "tardo_s": f["tardo_s"],
+        "actualizando": clave in _fotos_pendientes,
+        "error": f["error"],
+    }
+    return out
+
+
+async def _desde_la_foto(request: Request, nombre: str, fn, **params):
+    """El último resultado de `fn(**params)`, sin esperar a calcularlo (ver
+    arriba). Si es viejo, o no lo hay, lo pide al trabajador."""
+    if CALCULAR_AL_PEDIR:
+        return await _pesado(fn, request=request, **params)
+    clave = (nombre,) + tuple(sorted(params.items()))
+    with _fotos_cerrojo:
+        f = _fotos.get(clave)
+    if f is None or time.time() - f["cuando"] > _FOTO_VALE_S.get(nombre, 600):
+        _pedir_foto(clave, fn, params)
+    try:
+        esperar = min(900.0, max(0.0, float(request.query_params.get("esperar", 0))))
+    except (TypeError, ValueError):
+        esperar = 0.0
+    limite = time.monotonic() + esperar
+    while f is None and time.monotonic() < limite:
+        await asyncio.sleep(1)
+        with _fotos_cerrojo:
+            f = _fotos.get(clave)
+    if f is None:
+        return JSONResponse(status_code=202, content={
+            "calculando": True,
+            "_foto": {"hace_s": None, "tardo_s": None, "actualizando": True,
+                      "error": None},
+        })
+    with _fotos_cerrojo:
+        return _con_su_foto(f, clave)
+
+
 def _preview_exists(fingerprint: str) -> bool:
     """Check if a preview MP3 exists for the given fingerprint."""
     if not fingerprint:
@@ -601,7 +712,7 @@ def _count_unique_tracks(analysis_rows, check_previews: bool = True):
 @admin_panel_router.get("/users")
 async def list_users(request: Request):
     await _verify_admin_secret(request)
-    return await _pesado(_list_users, request=request)
+    return await _desde_la_foto(request, "users", _list_users)
 
 
 def _list_users(request: Request):
@@ -841,7 +952,7 @@ async def all_previews(request: Request):
 @admin_panel_router.get("/stats")
 async def global_stats(request: Request):
     await _verify_admin_secret(request)
-    return await _pesado(_global_stats, request=request)
+    return await _desde_la_foto(request, "stats", _global_stats)
 
 
 def _global_stats(request: Request):
@@ -919,7 +1030,8 @@ def _global_stats(request: Request):
 @admin_panel_router.get("/users/{device_id}/summary")
 async def user_summary(device_id: str, request: Request):
     await _verify_admin_secret(request)
-    return await _pesado(_user_summary, device_id=device_id, request=request)
+    return await _desde_la_foto(request, "summary", _user_summary,
+                                device_id=device_id)
 
 
 def _user_summary(device_id: str, request: Request):
@@ -1274,6 +1386,15 @@ async def resolve_error_group_endpoint(request: Request):
     return {"resolved": n}
 
 
+@admin_panel_router.post("/errors/resolve-all")
+async def resolve_all_errors(request: Request, antes: Optional[str] = None):
+    """«Dar todo por visto»: resuelve los errores sin resolver hasta `antes`
+    (por defecto, ahora). No borra nada; lo que vuelva a pasar sale otra vez."""
+    await _verify_admin_secret(request)
+    n = await _en_un_hilo(lambda: _get_db().resolve_errors_before(antes))
+    return {"resolved": n}
+
+
 @admin_panel_router.post("/errors/{error_id}/resolve")
 async def resolve_error(error_id: int, request: Request):
     await _verify_admin_secret(request)
@@ -1290,7 +1411,7 @@ async def resolve_error(error_id: int, request: Request):
 @admin_panel_router.get("/telemetry")
 async def telemetry(request: Request):
     await _verify_admin_secret(request)
-    return await _pesado(_telemetry, request=request)
+    return await _desde_la_foto(request, "telemetry", _telemetry)
 
 
 def _telemetry(request: Request):
@@ -2235,7 +2356,7 @@ def _reparto_por_version(adb, dias, plat_sql, plat_params):
 @admin_panel_router.get("/funnel")
 async def funnel(request: Request, platform: str = None):
     await _verify_admin_secret(request)
-    return await _pesado(_funnel, request=request, platform=platform)
+    return await _desde_la_foto(request, "funnel", _funnel, platform=platform)
 
 
 def _funnel(request: Request, platform: str = None):
@@ -2620,7 +2741,7 @@ def _vinculacion_segun_sync(adb, firsts_sql, plat_sql, plat_params) -> dict:
 @admin_panel_router.get("/retention")
 async def retention(request: Request):
     await _verify_admin_secret(request)
-    return await _pesado(_retention, request=request)
+    return await _desde_la_foto(request, "retention", _retention)
 
 
 def _retention(request: Request):
@@ -3688,7 +3809,8 @@ async def resumen_recalcular(request: Request):
 async def catalogo_de_todo(
     request: Request,
     q: str = Query("", max_length=100),
-    orden: str = Query("fecha", pattern="^(fecha|djs)$"),
+    orden: str = Query("fecha", pattern="^(fecha|djs|titulo|artista|genero|bpm|tonalidad|energia|tipo|duracion)$"),
+    dir: str = Query("desc", pattern="^(asc|desc)$"),
     genero: Optional[str] = Query(None, max_length=60),
     bpm_min: Optional[float] = Query(None, ge=0, le=400),
     bpm_max: Optional[float] = Query(None, ge=0, le=400),
@@ -3719,13 +3841,121 @@ async def catalogo_de_todo(
                 bpm_max=bpm_max, camelot=camelot, energia_min=energia_min,
                 energia_max=energia_max, tipo=tipo, plataforma=plataforma,
                 motor=motor, huella=huella, isrc=isrc, desde=desde,
-                hasta=hasta, cluster=cluster,
+                hasta=hasta, cluster=cluster, dir=dir,
                 pagina=pagina, por_pagina=por_pagina,
                 con_preview=_preview_exists, base_url=base_url)
         finally:
             conn.close()
 
     return await run_in_threadpool(leer)
+
+
+# ── La biblioteca de UN usuario, para el catálogo (2026-10-28) ──────────────
+# Owner: el catálogo «exactamente igual que la biblioteca, sustitúyeles
+# carpetas por usuarios». A la izquierda, «Todos» (la memoria colectiva, de
+# `analysis.db`) y cada usuario; al elegir uno, SU biblioteca, de `sync.db`: lo
+# que su aparato subió por el sync, con los nombres que él ve (sus overrides).
+# Sin la ruta del fichero. Viene entera (como mucho `_MAX_BIBLIOTECA`) y la
+# app la ordena como la biblioteca. Es un aparato, no la biblioteca de todos:
+# en un hilo, sin el cerrojo de lo pesado.
+_MAX_BIBLIOTECA = 25000
+
+
+def _num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
+
+
+def _tema_de_la_biblioteca(track_id: str, t: dict, ov: dict) -> dict:
+    info = t.get("track") if isinstance(t.get("track"), dict) else {}
+    tempo = t.get("tempo") if isinstance(t.get("tempo"), dict) else {}
+    tono = t.get("key") if isinstance(t.get("key"), dict) else {}
+    energia = t.get("energy") if isinstance(t.get("energy"), dict) else {}
+    ov = ov if isinstance(ov, dict) else {}
+
+    def primero(*vs):
+        for v in vs:
+            if v not in (None, ""):
+                return v
+        return None
+
+    bpm = _num(primero(ov.get("bpm"), tempo.get("bpm"), t.get("bpm")))
+    if bpm is not None and ov.get("bpm") is None:
+        bpm += _num(ov.get("bpmAdjust")) or 0.0
+    energia_dj = primero(ov.get("energy") if isinstance(ov.get("energy"), (int, float)) else None,
+                         energia.get("energyDJ"), t.get("energy_dj"))
+    anio = primero(ov.get("year"), t.get("year"))
+    return {
+        "id": track_id,
+        "fingerprint": t.get("fingerprint") or "",
+        "title": primero(ov.get("title"), info.get("title"), t.get("title")) or "",
+        "artist": primero(ov.get("artist"), info.get("artist"), t.get("artist")) or "",
+        "genre": primero(ov.get("style"), t.get("genre")),
+        "bpm": bpm,
+        "key": primero(tono.get("key"), t.get("key") if isinstance(t.get("key"), str) else None),
+        "camelot": primero(ov.get("camelot"), tono.get("camelot"), t.get("camelot")),
+        "energy_dj": int(energia_dj) if isinstance(energia_dj, (int, float)) else None,
+        "track_type": primero(ov.get("trackType"), t.get("trackType"), t.get("track_type")),
+        "duration": _num(primero(t.get("duration"), info.get("duration"))),
+        "year": str(anio) if anio not in (None, "", 0) else None,
+        "analyzed_at": t.get("analyzedAt") or t.get("analyzed_at"),
+        "sin_audio": t.get("analyzerVersion") == "imported",
+    }
+
+
+def _biblioteca_de(device_id: str) -> dict:
+    conn = _get_sync_conn()
+    try:
+        filas = conn.execute(
+            "SELECT item_key, payload FROM sync_items "
+            "WHERE data_type = 'analysis' AND last_device_id = ? AND deleted = 0",
+            (device_id,))
+        temas = {}
+        for fila in filas:
+            ikey = fila["item_key"] or ""
+            if ikey and ikey != "all_analysis":
+                try:
+                    t = json.loads(fila["payload"])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(t, dict):
+                    temas[ikey] = t
+            else:
+                for k, t in _parse_analysis_payload(fila["payload"]).items():
+                    if isinstance(t, dict):
+                        temas.setdefault(str(k), t)
+            if len(temas) >= _MAX_BIBLIOTECA:
+                break
+        overrides = {}
+        fila = conn.execute(
+            "SELECT payload FROM sync_items WHERE data_type = 'override' "
+            "AND item_key = 'all_overrides' AND last_device_id = ?",
+            (device_id,)).fetchone()
+        if fila:
+            try:
+                datos = json.loads(fila["payload"])
+                if isinstance(datos, dict) and isinstance(datos.get("overrides"), dict):
+                    overrides = datos["overrides"]
+            except (TypeError, ValueError):
+                pass
+        return {
+            "device_id": device_id,
+            "temas": [_tema_de_la_biblioteca(k, t, overrides.get(k))
+                      for k, t in temas.items()],
+            "tope": _MAX_BIBLIOTECA,
+        }
+    finally:
+        conn.close()
+
+
+@admin_panel_router.get("/catalogo/usuario/{device_id}")
+async def catalogo_de_un_usuario(device_id: str, request: Request):
+    """La biblioteca de un aparato, con las columnas de la biblioteca."""
+    await _verify_admin_secret(request)
+    return await _en_un_hilo(_biblioteca_de, device_id)
 
 
 @admin_panel_router.get("/catalogo/opciones")
