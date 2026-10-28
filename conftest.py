@@ -45,6 +45,21 @@ os.environ.setdefault('FPCALC_CACHE_DIR', os.path.join(_TEST_TMP, 'bin'))
 os.environ.pop('RENDER', None)
 
 
+@pytest.fixture(autouse=True)
+def _panel_admin_calcula_al_pedir(monkeypatch):
+    """Las rutas pesadas del panel (`/admin/telemetry`, `/funnel`…) contestan
+    en producción con la última foto que calculó un trabajador de fondo, o un
+    202 si aún no hay. En los tests cada uno monta su BD: se calcula al pedir.
+    `test_el_panel_no_para_render.py` lo apaga para probar las fotos."""
+    try:
+        import routes.admin_panel as ap
+    except Exception:  # noqa: BLE001 - un test que no lo importa
+        yield
+        return
+    monkeypatch.setattr(ap, "CALCULAR_AL_PEDIR", True)
+    yield
+
+
 @pytest.fixture(scope="session")
 def test_config():
     """Configuración global para tests"""
