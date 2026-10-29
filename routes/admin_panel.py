@@ -738,7 +738,7 @@ def _list_users(request: Request):
             # los CAMPOS de un unico track). _count_unique_tracks dedup-ea por id
             # y maneja blob legacy + incremental por igual.
             analysis_rows = conn.execute(
-                "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
+                "SELECT item_key, payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ?",
                 (device_id,),
             ).fetchall()
             u_ids, u_prev, u_noid = _count_unique_tracks(analysis_rows)
@@ -747,7 +747,7 @@ def _list_users(request: Request):
 
             # Count sessions
             session_row = conn.execute(
-                "SELECT payload FROM sync_items WHERE data_type = 'session' AND last_device_id = ?",
+                "SELECT payload FROM sync_items WHERE +data_type = 'session' AND last_device_id = ?",
                 (device_id,),
             ).fetchone()
             session_count = 0
@@ -780,7 +780,7 @@ async def user_tracks(device_id: str, request: Request):
         # Get analysis data — could be uploaded by this device or by any device
         # We search all analysis items and look for tracks belonging to this device
         row = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
+            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ?",
             (device_id,),
         ).fetchone()
 
@@ -837,7 +837,7 @@ async def user_previews(device_id: str, request: Request):
     conn = _get_sync_conn()
     try:
         row = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
+            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ?",
             (device_id,),
         ).fetchone()
 
@@ -879,7 +879,7 @@ async def user_sessions(device_id: str, request: Request):
     conn = _get_sync_conn()
     try:
         row = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'session' AND last_device_id = ?",
+            "SELECT payload FROM sync_items WHERE +data_type = 'session' AND last_device_id = ?",
             (device_id,),
         ).fetchone()
 
@@ -1039,7 +1039,7 @@ def _user_summary(device_id: str, request: Request):
     try:
         def _count_payload(data_type: str, key: str = "") -> int:
             row = conn.execute(
-                "SELECT payload FROM sync_items WHERE data_type = ? AND last_device_id = ?",
+                "SELECT payload FROM sync_items WHERE +data_type = ? AND last_device_id = ?",
                 (data_type, device_id),
             ).fetchone()
             if not row:
@@ -1072,7 +1072,7 @@ def _user_summary(device_id: str, request: Request):
         # Previews: contar fingerprints del usuario que tienen .mp3 cacheado
         previews = 0
         arow = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'analysis' AND last_device_id = ?",
+            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ?",
             (device_id,),
         ).fetchone()
         if arow:
@@ -2870,6 +2870,14 @@ def _tracks_por_device() -> Dict[str, int]:
     contar), sin mirar los previews (solo hace falta el número) y se reusa
     mientras `sync_items` no cambie (ver `_POR_DEVICE_VALE_S`).
 
+    **`+data_type`, no `data_type`** (2026-10-29): con las dos columnas en el
+    WHERE, SQLite elegía `idx_sync_items_type`, y `data_type = 'analysis'` son
+    casi todas las filas: cada aparato recorría el análisis de TODOS, con su
+    payload. Mil ochocientos recorridos por llamada: la retención tardó 4.957 s
+    en Render y Usuarios 10-15 min. El `+` deja ese índice fuera y entra por
+    `idx_sync_items_device`. Vale para toda consulta de un aparato en
+    `sync_items` (lo ata `test_el_panel_cuenta_por_aparato.py`).
+
     Solo salen devices con al menos un track: un device sin biblioteca no es un
     device con biblioteca de tamano cero, es otra cosa.
     """
@@ -2893,7 +2901,7 @@ def _tracks_por_device() -> Dict[str, int]:
                     continue
                 filas = conn.execute(
                     "SELECT item_key, payload FROM sync_items "
-                    "WHERE data_type = 'analysis' AND last_device_id = ?", (dev,))
+                    "WHERE +data_type = 'analysis' AND last_device_id = ?", (dev,))
                 ids, _prev, sin_id = _count_unique_tracks(
                     filas, check_previews=False)
                 n = len(ids) + sin_id
@@ -3911,7 +3919,7 @@ def _biblioteca_de(device_id: str) -> dict:
     try:
         filas = conn.execute(
             "SELECT item_key, payload FROM sync_items "
-            "WHERE data_type = 'analysis' AND last_device_id = ? AND deleted = 0",
+            "WHERE +data_type = 'analysis' AND last_device_id = ? AND deleted = 0",
             (device_id,))
         temas = {}
         for fila in filas:
@@ -3931,7 +3939,7 @@ def _biblioteca_de(device_id: str) -> dict:
                 break
         overrides = {}
         fila = conn.execute(
-            "SELECT payload FROM sync_items WHERE data_type = 'override' "
+            "SELECT payload FROM sync_items WHERE +data_type = 'override' "
             "AND item_key = 'all_overrides' AND last_device_id = ?",
             (device_id,)).fetchone()
         if fila:
