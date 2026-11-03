@@ -3867,6 +3867,117 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    # Los eventos de las mezclas (`mezclas.dart` en el cliente).
+    EVENTOS_DE_MEZCLAS = ('mezclas_apartadas', 'mezcla_identificada',
+                          'mezcla_como_tema', 'mezcla_a_mano')
+
+    def resumen_mezclas(self, dias: int = 30) -> Dict:
+        """Las MEZCLAS del escritorio (`mezclas.dart`, desde el 2026-11-03):
+        un fichero con muchos temas pinchados seguidos, que el import aparta
+        en vez de analizarlo como un tema, y su tracklist sacado del FICHERO
+        con Shazam. Desde los eventos del cliente:
+
+          mezclas_apartadas    uno por import que apartó alguna
+          mezcla_identificada  uno por identificación que corrió
+          mezcla_como_tema     «Analizar como tema»: la regla se equivocó
+          mezcla_a_mano        el DJ la añadió (biblioteca o fichero)
+
+        Devuelve:
+          dias, aparatos
+          apartadas      {nuevas, ya_estaban, aparatos, por_motivo}
+          como_tema      {total, por_motivo}
+          a_mano         {total, desde}
+          identificadas  {corridas, aparatos, por_corte, trozos, con_tema,
+                          temas_por_hora, segundos_por_hora}
+
+        `temas_por_hora` sale de las que TERMINARON (una parada a medias no
+        dice cuántos temas tiene la mezcla) y `segundos_por_hora` de las que
+        terminaron de una vez (`seguia` falso: la que siguió donde se quedó
+        tardó solo lo que le faltaba). `como_tema` frente a `apartadas` es
+        cuánto se equivoca la regla, por motivo. Recorre el cursor (la trampa
+        del panel)."""
+        def _n(v):
+            try:
+                return max(0, int(v))
+            except (TypeError, ValueError):
+                return 0
+
+        conn = self._open_conn()
+        try:
+            aparatos, de_apartadas, de_identificadas = set(), set(), set()
+            apartadas = {'nuevas': 0, 'ya_estaban': 0, 'aparatos': 0,
+                         'por_motivo': {}}
+            como_tema = {'total': 0, 'por_motivo': {}}
+            a_mano = {'total': 0, 'desde': {}}
+            ident = {'corridas': 0, 'aparatos': 0, 'por_corte': {},
+                     'trozos': 0, 'con_tema': 0,
+                     'temas_por_hora': None, 'segundos_por_hora': None}
+            temas_hechas = minutos_hechas = 0
+            segundos_de_una = minutos_de_una = 0
+            marcas = ','.join('?' * len(self.EVENTOS_DE_MEZCLAS))
+            cur = conn.execute(
+                "SELECT device_id, event_name, props FROM events "
+                f"WHERE event_name IN ({marcas}) AND day >= date('now', ?)",
+                (*self.EVENTOS_DE_MEZCLAS, f"-{int(dias)} days"))
+            for dev, nombre, props in cur:
+                # Un evento ilegible no cuenta: no se sabe ni qué corrida fue.
+                try:
+                    p = json.loads(props) if props else {}
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(p, dict):
+                    continue
+                if dev:
+                    aparatos.add(dev)
+                if nombre == 'mezclas_apartadas':
+                    if dev:
+                        de_apartadas.add(dev)
+                    apartadas['nuevas'] += _n(p.get('nuevas'))
+                    apartadas['ya_estaban'] += _n(p.get('ya_estaban'))
+                    for k, v in p.items():
+                        if str(k).startswith('por_'):
+                            m = str(k)[4:16]
+                            apartadas['por_motivo'][m] = (
+                                apartadas['por_motivo'].get(m, 0) + _n(v))
+                elif nombre == 'mezcla_como_tema':
+                    como_tema['total'] += 1
+                    m = str(p.get('motivo') or '?')[:16]
+                    como_tema['por_motivo'][m] = como_tema['por_motivo'].get(m, 0) + 1
+                elif nombre == 'mezcla_a_mano':
+                    a_mano['total'] += 1
+                    d = str(p.get('desde') or '?')[:16]
+                    a_mano['desde'][d] = a_mano['desde'].get(d, 0) + 1
+                else:  # mezcla_identificada
+                    if dev:
+                        de_identificadas.add(dev)
+                    ident['corridas'] += 1
+                    corte = str(p.get('corte') or '?')[:16]
+                    ident['por_corte'][corte] = ident['por_corte'].get(corte, 0) + 1
+                    ident['trozos'] += _n(p.get('trozos'))
+                    ident['con_tema'] += _n(p.get('con_tema'))
+                    if corte == 'hecha':
+                        temas_hechas += _n(p.get('temas'))
+                        minutos_hechas += _n(p.get('minutos'))
+                        if not p.get('seguia'):
+                            segundos_de_una += _n(p.get('segundos'))
+                            minutos_de_una += _n(p.get('minutos'))
+            if minutos_hechas:
+                ident['temas_por_hora'] = round(temas_hechas * 60 / minutos_hechas, 1)
+            if minutos_de_una:
+                ident['segundos_por_hora'] = round(segundos_de_una * 60 / minutos_de_una)
+            apartadas['aparatos'] = len(de_apartadas)
+            ident['aparatos'] = len(de_identificadas)
+            return {
+                'dias': int(dias),
+                'aparatos': len(aparatos),
+                'apartadas': apartadas,
+                'como_tema': como_tema,
+                'a_mano': a_mano,
+                'identificadas': ident,
+            }
+        finally:
+            conn.close()
+
     # Lo que decide en Render el camino por trozos (`CHUNK_ANALYSIS_THRESHOLD`).
     UMBRAL_DEL_CAMINO_POR_TROZOS = 240
 
