@@ -3895,7 +3895,9 @@ class AnalysisDB:
           identificadas  {corridas, aparatos, por_corte, trozos, con_tema,
                           temas_por_hora, segundos_por_hora}
           editadas       {total, aparatos, por_que}
-          tramos         {total, aparatos, reconocidos, por_resultado}
+          tramos         {total, aparatos, reconocidos, seguros, por_resultado}
+                         (`seguros`: el tema que dio avanzaba con la mezcla
+                         en dos trozos o más; desde el 2026-11-05)
 
         `temas_por_hora` sale de las que TERMINARON (una parada a medias no
         dice cuántos temas tiene la mezcla) y `segundos_por_hora` de las que
@@ -3921,7 +3923,7 @@ class AnalysisDB:
                      'temas_por_hora': None, 'segundos_por_hora': None}
             editadas = {'total': 0, 'aparatos': 0, 'por_que': {}}
             tramos = {'total': 0, 'aparatos': 0, 'reconocidos': 0,
-                      'por_resultado': {}}
+                      'seguros': 0, 'por_resultado': {}}
             de_editadas, de_tramos = set(), set()
             temas_hechas = minutos_hechas = 0
             segundos_de_una = minutos_de_una = 0
@@ -3973,6 +3975,8 @@ class AnalysisDB:
                         tramos['por_resultado'].get(res, 0) + 1)
                     if res == 'reconocido':
                         tramos['reconocidos'] += 1
+                        if p.get('seguro') is True:
+                            tramos['seguros'] += 1
                 else:  # mezcla_identificada
                     if dev:
                         de_identificadas.add(dev)

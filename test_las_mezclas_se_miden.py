@@ -81,7 +81,12 @@ class TestElResumen:
             _evento(db, 'mac-1', 'mezcla_editada', {'que': que})
         _evento(db, 'mac-2', 'mezcla_editada', {'que': 'deshacer_todo'})
         _evento(db, 'mac-1', 'mezcla_tramo',
-                {'resultado': 'reconocido', 'segundos': 22, 'trozos': 2, 'votos': 2})
+                {'resultado': 'reconocido', 'segundos': 22, 'trozos': 2, 'votos': 2,
+                 'seguro': True})
+        # Uno reconocido pero sin confirmar (un trozo suelto): no es seguro.
+        _evento(db, 'mac-1', 'mezcla_tramo',
+                {'resultado': 'reconocido', 'segundos': 36, 'trozos': 7, 'votos': 1,
+                 'seguro': False})
         _evento(db, 'mac-1', 'mezcla_tramo',
                 {'resultado': 'no', 'segundos': 30, 'trozos': 4, 'votos': 0})
         _evento(db, 'mac-2', 'mezcla_tramo',
@@ -92,8 +97,8 @@ class TestElResumen:
             'por_que': {'mover': 2, 'anadir': 1, 'quitar': 1,
                         'anadir_con_shazam': 1, 'deshacer_todo': 1}}
         assert r['tramos'] == {
-            'total': 3, 'aparatos': 2, 'reconocidos': 1,
-            'por_resultado': {'reconocido': 1, 'no': 1, 'sin_red': 1}}
+            'total': 4, 'aparatos': 2, 'reconocidos': 2, 'seguros': 1,
+            'por_resultado': {'reconocido': 2, 'no': 1, 'sin_red': 1}}
         assert r['aparatos'] == 2
 
     def test_sin_eventos_dice_cero_y_no_lo_se(self):
