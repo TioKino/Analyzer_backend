@@ -3869,7 +3869,8 @@ class AnalysisDB:
 
     # Los eventos de las mezclas (`mezclas.dart` en el cliente).
     EVENTOS_DE_MEZCLAS = ('mezclas_apartadas', 'mezcla_identificada',
-                          'mezcla_como_tema', 'mezcla_a_mano')
+                          'mezcla_como_tema', 'mezcla_a_mano',
+                          'mezcla_editada', 'mezcla_tramo')
 
     def resumen_mezclas(self, dias: int = 30) -> Dict:
         """Las MEZCLAS del escritorio (`mezclas.dart`, desde el 2026-11-03):
@@ -3881,6 +3882,10 @@ class AnalysisDB:
           mezcla_identificada  uno por identificación que corrió
           mezcla_como_tema     «Analizar como tema»: la regla se equivocó
           mezcla_a_mano        el DJ la añadió (biblioteca o fichero)
+          mezcla_editada       el DJ cambió una línea del tracklist (moverla,
+                               marcar un comienzo, quitarla, ponerle nombre;
+                               desde el 2026-11-05)
+          mezcla_tramo         el DJ pasó un tramo por Shazam (2026-11-05)
 
         Devuelve:
           dias, aparatos
@@ -3889,6 +3894,8 @@ class AnalysisDB:
           a_mano         {total, desde}
           identificadas  {corridas, aparatos, por_corte, trozos, con_tema,
                           temas_por_hora, segundos_por_hora}
+          editadas       {total, aparatos, por_que}
+          tramos         {total, aparatos, reconocidos, por_resultado}
 
         `temas_por_hora` sale de las que TERMINARON (una parada a medias no
         dice cuántos temas tiene la mezcla) y `segundos_por_hora` de las que
@@ -3912,6 +3919,10 @@ class AnalysisDB:
             ident = {'corridas': 0, 'aparatos': 0, 'por_corte': {},
                      'trozos': 0, 'con_tema': 0,
                      'temas_por_hora': None, 'segundos_por_hora': None}
+            editadas = {'total': 0, 'aparatos': 0, 'por_que': {}}
+            tramos = {'total': 0, 'aparatos': 0, 'reconocidos': 0,
+                      'por_resultado': {}}
+            de_editadas, de_tramos = set(), set()
             temas_hechas = minutos_hechas = 0
             segundos_de_una = minutos_de_una = 0
             marcas = ','.join('?' * len(self.EVENTOS_DE_MEZCLAS))
@@ -3947,6 +3958,21 @@ class AnalysisDB:
                     a_mano['total'] += 1
                     d = str(p.get('desde') or '?')[:16]
                     a_mano['desde'][d] = a_mano['desde'].get(d, 0) + 1
+                elif nombre == 'mezcla_editada':
+                    if dev:
+                        de_editadas.add(dev)
+                    editadas['total'] += 1
+                    q = str(p.get('que') or '?')[:20]
+                    editadas['por_que'][q] = editadas['por_que'].get(q, 0) + 1
+                elif nombre == 'mezcla_tramo':
+                    if dev:
+                        de_tramos.add(dev)
+                    tramos['total'] += 1
+                    res = str(p.get('resultado') or '?')[:16]
+                    tramos['por_resultado'][res] = (
+                        tramos['por_resultado'].get(res, 0) + 1)
+                    if res == 'reconocido':
+                        tramos['reconocidos'] += 1
                 else:  # mezcla_identificada
                     if dev:
                         de_identificadas.add(dev)
@@ -3967,6 +3993,8 @@ class AnalysisDB:
                 ident['segundos_por_hora'] = round(segundos_de_una * 60 / minutos_de_una)
             apartadas['aparatos'] = len(de_apartadas)
             ident['aparatos'] = len(de_identificadas)
+            editadas['aparatos'] = len(de_editadas)
+            tramos['aparatos'] = len(de_tramos)
             return {
                 'dias': int(dias),
                 'aparatos': len(aparatos),
@@ -3974,6 +4002,8 @@ class AnalysisDB:
                 'como_tema': como_tema,
                 'a_mano': a_mano,
                 'identificadas': ident,
+                'editadas': editadas,
+                'tramos': tramos,
             }
         finally:
             conn.close()

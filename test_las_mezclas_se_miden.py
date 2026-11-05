@@ -72,6 +72,30 @@ class TestElResumen:
         # una hora se identifica en 250 s.
         assert i['segundos_por_hora'] == 300
 
+    def test_lo_que_el_dj_cambia_y_los_tramos_por_shazam(self):
+        # 2026-11-05: las líneas del tracklist se editan, y un tramo elegido
+        # se pasa por Shazam. Lo que importa: cuánto se usa, y cuántos tramos
+        # reconoce Shazam (si casi ninguno, la idea no sirve).
+        db = _db()
+        for que in ('mover', 'mover', 'anadir', 'quitar', 'anadir_con_shazam'):
+            _evento(db, 'mac-1', 'mezcla_editada', {'que': que})
+        _evento(db, 'mac-2', 'mezcla_editada', {'que': 'deshacer_todo'})
+        _evento(db, 'mac-1', 'mezcla_tramo',
+                {'resultado': 'reconocido', 'segundos': 22, 'trozos': 2, 'votos': 2})
+        _evento(db, 'mac-1', 'mezcla_tramo',
+                {'resultado': 'no', 'segundos': 30, 'trozos': 4, 'votos': 0})
+        _evento(db, 'mac-2', 'mezcla_tramo',
+                {'resultado': 'sin_red', 'segundos': 12, 'trozos': 0, 'votos': 0})
+        r = db.resumen_mezclas(30)
+        assert r['editadas'] == {
+            'total': 6, 'aparatos': 2,
+            'por_que': {'mover': 2, 'anadir': 1, 'quitar': 1,
+                        'anadir_con_shazam': 1, 'deshacer_todo': 1}}
+        assert r['tramos'] == {
+            'total': 3, 'aparatos': 2, 'reconocidos': 1,
+            'por_resultado': {'reconocido': 1, 'no': 1, 'sin_red': 1}}
+        assert r['aparatos'] == 2
+
     def test_sin_eventos_dice_cero_y_no_lo_se(self):
         r = _db().resumen_mezclas(30)
         assert r['aparatos'] == 0
