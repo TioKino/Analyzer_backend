@@ -1771,6 +1771,10 @@ def _telemetry(request: Request):
         # Quién es cada fichero según Shazam (la pasada del Mac, desde el
         # 2026-10-07) y cuántas veces no hizo falta AudD por saberlo.
         "identidad_verificada": _identidad_verificada(),
+        # Las mezclas del escritorio (`mezclas.dart`, desde el 2026-11-03):
+        # cuántas aparta el import, cuántas se identifican y cuántas eran un
+        # tema («Analizar como tema»: lo que la regla falla).
+        "mezclas": _resumen_mezclas(),
     }
 
 
@@ -2137,6 +2141,14 @@ def _puesta_al_dia():
         return _get_db().resumen_puesta_al_dia(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] puesta al día fallo: {e}")
+        return None
+
+
+def _resumen_mezclas():
+    try:
+        return _get_db().resumen_mezclas(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] mezclas fallo: {e}")
         return None
 
 
