@@ -1775,6 +1775,9 @@ def _telemetry(request: Request):
         # cuántas aparta el import, cuántas se identifican y cuántas eran un
         # tema («Analizar como tema»: lo que la regla falla).
         "mezclas": _resumen_mezclas(),
+        # La carpeta vigilada del escritorio (`carpeta_vigilada.dart`, desde el
+        # 2026-11-06): cuántos aparatos la tienen y cuántos temas entran por ella.
+        "carpeta_vigilada": _carpeta_vigilada(),
     }
 
 
@@ -2141,6 +2144,14 @@ def _puesta_al_dia():
         return _get_db().resumen_puesta_al_dia(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] puesta al día fallo: {e}")
+        return None
+
+
+def _carpeta_vigilada():
+    try:
+        return _get_db().resumen_carpeta_vigilada(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] carpeta vigilada fallo: {e}")
         return None
 
 

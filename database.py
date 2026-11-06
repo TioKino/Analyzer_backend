@@ -3872,6 +3872,63 @@ class AnalysisDB:
                           'mezcla_como_tema', 'mezcla_a_mano',
                           'mezcla_editada', 'mezcla_tramo')
 
+    def resumen_carpeta_vigilada(self, dias: int = 30) -> Dict:
+        """La CARPETA VIGILADA del escritorio (`carpeta_vigilada.dart`, desde el
+        2026-11-06), desde sus dos eventos: `carpeta_vigilada` ({accion:
+        elegida | dejada}) y `carpeta_vigilada_entran` ({n}: temas que una
+        pasada entregó al import). Para saber si alguien la usa y si le sirve.
+
+          con_carpeta    aparatos cuyo ÚLTIMO `carpeta_vigilada` es «elegida»
+          la_dejaron     aparatos cuyo último es «dejada»
+          entran         temas entregados al import en los últimos `dias`
+          aparatos       aparatos en los que entró algo en esos días
+          pasadas        pasadas que entregaron algo
+
+        `con_carpeta` y `la_dejaron` miran todo lo que hay en `events`, que se
+        purga a los 90 días: es una cota inferior. Recorre el cursor (la trampa
+        del panel)."""
+        conn = self._open_conn()
+        try:
+            ultimo: Dict[str, str] = {}
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'carpeta_vigilada' ORDER BY id")
+            for dev, props in cur:
+                try:
+                    p = json.loads(props) if props else {}
+                except (TypeError, ValueError):
+                    p = {}
+                accion = p.get('accion') if isinstance(p, dict) else None
+                if dev and accion in ('elegida', 'dejada'):
+                    ultimo[dev] = accion
+            salida = {
+                'dias': int(dias),
+                'con_carpeta': sum(1 for a in ultimo.values() if a == 'elegida'),
+                'la_dejaron': sum(1 for a in ultimo.values() if a == 'dejada'),
+                'entran': 0, 'aparatos': 0, 'pasadas': 0,
+            }
+            aparatos = set()
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'carpeta_vigilada_entran' AND day >= date('now', ?)",
+                (f"-{int(dias)} days",))
+            for dev, props in cur:
+                try:
+                    p = json.loads(props) if props else {}
+                    n = max(0, int(p.get('n') or 0)) if isinstance(p, dict) else 0
+                except (TypeError, ValueError):
+                    n = 0
+                if not n:
+                    continue
+                salida['entran'] += n
+                salida['pasadas'] += 1
+                if dev:
+                    aparatos.add(dev)
+            salida['aparatos'] = len(aparatos)
+            return salida
+        finally:
+            conn.close()
+
     def resumen_mezclas(self, dias: int = 30) -> Dict:
         """Las MEZCLAS del escritorio (`mezclas.dart`, desde el 2026-11-03):
         un fichero con muchos temas pinchados seguidos, que el import aparta
