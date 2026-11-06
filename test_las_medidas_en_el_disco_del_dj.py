@@ -538,3 +538,107 @@ def test_el_resumen_del_csv(tmp_path, capsys):
     # 67 % igual · 100 % mezcla · 100 % en menor · 0 % en mayor · dice menor 100 %
     assert edmm.split()[3:13:2] == ['67', '100', '100', '0', '100'], edmm
     assert 'Más de 4 min (Render: el voto de los trozos): 2 temas' in texto
+
+
+# --------------------------------------------------------------- la pista de prueba
+#
+# Con música de verdad no se puede separar el sesgo del detector de lo que
+# cuenta de más cada programa (2026-11-06: ¿51 o 39 ms para Rekordbox?). La
+# pista de prueba es el mismo bombo sintético en un WAV y en cuatro MP3 con
+# distinta cabecera: lo que un programa ponga en el WAV es su sesgo.
+
+import pista_de_prueba as pp  # noqa: E402
+
+
+def test_la_pista_resta_el_sesgo_de_cada_programa():
+    anclas = {'wav': 0.603, 'sin_cabecera': 0.628, 'info_lame': 0.654,
+              'xing_lame': 0.654 + pp.BEAT, 'xing': None}
+    d = pp.donde_cae(anclas)
+    assert d['wav'] == 0.0
+    assert d['sin_cabecera'] == pytest.approx(25.0, abs=0.01)
+    assert d['info_lame'] == pytest.approx(51.0, abs=0.01)
+    assert d['xing_lame'] == pytest.approx(51.0, abs=0.01), 'un beat más es la misma rejilla'
+    assert d['xing'] is None
+    assert pp.donde_cae({'info_lame': 0.654})['info_lame'] is None, 'sin el WAV no hay sesgo que restar'
+
+
+def test_la_pista_lleva_las_cuatro_cabeceras_y_ffmpeg_las_lee_como_en_tu_disco(tmp_path):
+    """La etiqueta que deja ffmpeg dice «Lavc…»; se cambia por «LAME3.100» con su
+    CRC rehecho, y los decodificadores la siguen leyendo (si el CRC estuviera mal
+    la ignorarían y el golpe saldría 25 ms tarde). Y la de Xing sin etiqueta sale
+    como en el disco del owner: 25,1 ms tarde con ffmpeg y 13,1 con mpg123."""
+    ffmpeg = _ffmpeg_con_lame()
+    if not ffmpeg:
+        pytest.skip('sin ffmpeg con libmp3lame')
+    assert pp.crear(str(tmp_path), ffmpeg) == 0
+    for v, tipo in pp.VARIANTES.items():
+        if tipo:
+            assert md.cabecera_mp3(str(tmp_path / pp.nombre(v)))['tipo'] == tipo, v
+    for v in ('info_lame', 'xing_lame'):
+        c = md.cabecera_mp3(str(tmp_path / pp.nombre(v)))
+        assert c['codificador'] == 'LAME3.100'
+        pos_crc = c['pos_codificador'] - c['trama'] + 34
+        with open(tmp_path / pp.nombre(v), 'rb') as f:
+            f.seek(c['trama'])
+            trama = f.read(192)
+        assert int.from_bytes(trama[pos_crc:pos_crc + 2], 'big') == \
+            pp.crc_de_la_etiqueta(trama, pos_crc), v
+
+    app = pp.donde_cae_en_la_app(str(tmp_path), ffmpeg)
+    assert app['ffmpeg']['info_lame'] == pytest.approx(0.0, abs=0.05)
+    assert app['ffmpeg']['xing_lame'] == pytest.approx(0.0, abs=0.05)
+    assert app['ffmpeg']['sin_cabecera'] == pytest.approx(25.06, abs=0.05)
+    assert app['ffmpeg']['xing'] == pytest.approx(25.06, abs=0.05)
+    if 'soundfile' in app:
+        assert app['soundfile']['info_lame'] == pytest.approx(0.0, abs=0.05)
+        assert app['soundfile']['xing'] == pytest.approx(13.06, abs=0.05)
+
+
+def test_el_crc_de_la_etiqueta_es_el_de_ffmpeg(tmp_path):
+    """El CRC que rehace la pista es el mismo que calcula ffmpeg al escribir la
+    etiqueta: se comprueba sobre la que deja él, antes de tocarla, en un MP3
+    mono (el CRC cae DENTRO de los 190 bytes y cuenta como ceros) y en uno
+    estéreo (cae justo fuera). Solo el CBR: en el VBR ffmpeg reescribe la trama
+    al terminar y su CRC no casa con ella."""
+    import subprocess
+    import soundfile as sf
+    ffmpeg = _ffmpeg_con_lame()
+    if not ffmpeg:
+        pytest.skip('sin ffmpeg con libmp3lame')
+    y = _tema_con_bombo(segundos=5)
+    for canales, senal in ((1, y), (2, np.stack([y, y], axis=1))):
+        wav = tmp_path / f'a{canales}.wav'
+        sf.write(str(wav), senal, 44100, subtype='PCM_16')
+        mp3 = tmp_path / f'a{canales}.mp3'
+        subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', str(wav),
+                        '-c:a', 'libmp3lame', '-b:a', '320k', str(mp3)], check=True)
+        c = md.cabecera_mp3(str(mp3))
+        pos_crc = c['pos_codificador'] - c['trama'] + 34
+        assert pos_crc == (175 if canales == 1 else 190)
+        with open(mp3, 'rb') as f:
+            f.seek(c['trama'])
+            trama = f.read(192)
+        assert int.from_bytes(trama[pos_crc:pos_crc + 2], 'big') == \
+            pp.crc_de_la_etiqueta(trama, pos_crc), canales
+
+
+def test_la_lectura_de_la_pista_de_punta_a_punta(tmp_path, capsys):
+    ffmpeg = _ffmpeg_con_lame()
+    if not ffmpeg:
+        pytest.skip('sin ffmpeg con libmp3lame')
+    assert pp.crear(str(tmp_path), ffmpeg) == 0
+    inizio = {'wav': 0.603, 'sin_cabecera': 0.628, 'info_lame': 0.654,
+              'xing_lame': 0.654, 'xing': 0.654}
+    pistas = ''.join(
+        f' <TRACK Location="file://localhost{tmp_path / pp.nombre(v)}" AverageBpm="125.00">'
+        f'<TEMPO Inizio="{a:.3f}" Bpm="125.00" Metro="4/4" Battito="1"/></TRACK>\n'
+        for v, a in inizio.items())
+    xml = tmp_path / 'rekordbox.xml'
+    xml.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<DJ_PLAYLISTS><COLLECTION>\n'
+                   + pistas + '</COLLECTION></DJ_PLAYLISTS>', encoding='utf-8')
+    assert pp.main(['--leer', str(tmp_path), '--rekordbox', str(xml), '--ffmpeg', ffmpeg]) == 0
+    texto = capsys.readouterr().out
+    assert '=== Pista de prueba' in texto
+    fila = next(x for x in texto.splitlines() if x.strip().startswith('Info+LAME'))
+    assert '+51.0' in fila, fila
+    assert 'Lo que hay que restar' in texto
