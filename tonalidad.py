@@ -37,6 +37,32 @@ PERFILES: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {
     # La escala a secas (menor natural): la referencia más tonta.
     'diatonico': ([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1],
                   [1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0]),
+    # Los de la música ELECTRÓNICA (estudio de la competencia, 2026-11-05:
+    # Lexicon acaba de pasarse a una red neuronal para la tonalidad y la
+    # nuestra coincide con Rekordbox/VirtualDJ en un 41-49 %). Son los perfiles
+    # publicados en los artículos, con los valores con que los trae la
+    # biblioteca Essentia (`src/algorithms/tonal/key.cpp`); aquí solo se MIDEN.
+    # ⚠️ Si alguno pasa a /analyze, mirar antes la licencia de esos números.
+    # Sha'ath (2011, KeyFinder): Krumhansl ajustado a pop y electrónica.
+    'shaath': ([6.6, 2.0, 3.5, 2.3, 4.6, 4.0, 2.5, 5.2, 2.4, 3.7, 2.3, 3.4],
+               [6.5, 2.7, 3.5, 5.4, 2.6, 3.5, 2.5, 5.2, 4.0, 2.7, 4.3, 3.2]),
+    # Faraldo, Gómez, Jordà y Herrera (ECIR 2016), «Key Estimation in
+    # Electronic Dance Music»: sacados de un corpus de EDM.
+    'edma': ([1.00, 0.29, 0.50, 0.40, 0.60, 0.56, 0.32, 0.80, 0.31, 0.45, 0.42, 0.39],
+             [1.00, 0.31, 0.44, 0.58, 0.33, 0.49, 0.29, 0.78, 0.43, 0.29, 0.53, 0.32]),
+    # El mismo, retocado a mano: el mayor es plano, así que casi todo sale en
+    # menor (en EDM el mayor es raro; dice el artículo que acierta más igual).
+    'edmm': ([0.083] * 12,
+             [0.17235348, 0.04, 0.0761009, 0.12, 0.05621498, 0.08527853,
+              0.0497915, 0.13451001, 0.07458916, 0.05003023, 0.09187879, 0.05545106]),
+    # Faraldo, Jordà y Herrera (AES Semantic Audio 2017), «A multi-profile
+    # method for key estimation in EDM»: la mediana de cada modo en temas de
+    # Beatport (`braw`) y la misma con los cuatro valores menos útiles a cero
+    # (`bgate`, el que Essentia usa por defecto).
+    'braw': ([1.0000, 0.1573, 0.4200, 0.1570, 0.5296, 0.3669, 0.1632, 0.7711, 0.1676, 0.3827, 0.2113, 0.2965],
+             [1.0000, 0.2330, 0.3615, 0.3905, 0.2925, 0.3777, 0.1961, 0.7425, 0.2701, 0.2161, 0.4228, 0.2272]),
+    'bgate': ([1.00, 0.00, 0.42, 0.00, 0.53, 0.37, 0.00, 0.77, 0.00, 0.38, 0.21, 0.30],
+              [1.00, 0.00, 0.36, 0.39, 0.00, 0.38, 0.00, 0.74, 0.27, 0.00, 0.42, 0.23]),
 }
 
 NOMBRES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
