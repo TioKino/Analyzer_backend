@@ -368,3 +368,173 @@ def test_el_desfase_dice_que_hacen_falta_dos_bibliotecas(tmp_path, capsys):
     assert salida == 1
     assert 'no está' in texto
     assert 'Hacen falta dos bibliotecas' in texto
+
+
+# --------------------------------------------------------------- sobre el audio
+#
+# Lo que decide qué hay que corregir no es lo que se separan dos programas,
+# sino dónde cae la rejilla de cada uno sobre el audio tal como lo leen los
+# decodificadores de DJ Analyzer (2026-11-06: Rekordbox y VirtualDJ se
+# separaban +45-52 ms en los MP3 con cabecera LAME del owner, y 0 en los
+# demás).
+
+def _ffmpeg_con_lame():
+    import shutil
+    import subprocess
+    f = shutil.which('ffmpeg')
+    if not f:
+        return None
+    r = subprocess.run([f, '-hide_banner', '-encoders'], capture_output=True, text=True)
+    return f if 'libmp3lame' in r.stdout else None
+
+
+def _tema_con_bombo(segundos=40.0, sr=44100, bpm=128.0, t0=0.5, hats=True):
+    """Un bombo (un barrido de 130 a 50 Hz que se apaga) en cada beat desde `t0`,
+    y un charles en cada contratiempo."""
+    rng = np.random.RandomState(3)
+    n = int(segundos * sr)
+    y = np.zeros(n)
+    k = np.arange(int(0.12 * sr)) / sr
+    bombo = np.sin(2 * np.pi * (50 + 80 * np.exp(-k * 40)) * k) * np.exp(-k * 18)
+    hat = rng.randn(int(0.03 * sr)) * np.exp(-np.arange(int(0.03 * sr)) / sr * 120) * 0.15
+    beat, j = 60.0 / bpm, 0
+    while t0 + (j + 1) * beat < segundos - 0.2:
+        a = int(round((t0 + j * beat) * sr))
+        y[a:a + len(bombo)] += 0.8 * bombo
+        if hats:
+            h = int(round((t0 + (j + 0.5) * beat) * sr))
+            y[h:h + len(hat)] += hat
+        j += 1
+    y += rng.randn(n) * 0.003
+    return (y / np.abs(y).max() * 0.9).astype(np.float32)
+
+
+def _mp3s(tmp_path, ffmpeg):
+    """El mismo tema en un MP3 con trama Info y etiqueta LAME (CBR) y en uno
+    sin trama (`-write_xing 0`): las mismas tramas de audio, sin la cabecera."""
+    import subprocess
+    import soundfile as sf
+    wav = tmp_path / 'tema.wav'
+    sf.write(str(wav), _tema_con_bombo(), 44100, subtype='PCM_16')
+    salida = {}
+    for nombre, extra in (('info', []), ('sin', ['-write_xing', '0'])):
+        ruta = tmp_path / f'{nombre}.mp3'
+        subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', str(wav),
+                        '-c:a', 'libmp3lame', '-b:a', '320k', *extra, str(ruta)], check=True)
+        salida[nombre] = str(ruta)
+    return salida
+
+
+def test_el_peine_no_salta_al_mover_el_audio():
+    """Mover el audio unas muestras mueve la medida lo mismo, no 4 ms: con el
+    valor absoluto de los graves en vez de la envolvente analítica, el bombo
+    salía con un rizo y el peine saltaba de un rizo a otro."""
+    sr, t0 = 44100, 0.5
+    y = _tema_con_bombo(segundos=30)
+    medidas = []
+    for s in (0, 3, 7, 11, 16, 25, 31):
+        corrido = np.concatenate([np.zeros(s, np.float32), y])
+        r = md.desfase_sobre_el_audio(md.golpes(corrido, sr), md.PASO / sr, 128.0, t0 + s / sr)
+        assert r is not None and r[1] > md.NITIDEZ_MINIMA
+        medidas.append(r[0] * 1000)
+    assert max(medidas) - min(medidas) < 1.0, medidas
+    # Una rejilla puesta 20 ms tarde se mide 20 ms tarde, y medio beat es el borde.
+    r = md.desfase_sobre_el_audio(md.golpes(y, sr), md.PASO / sr, 128.0, t0 + 0.020)
+    assert r[0] * 1000 == pytest.approx(20.0 + medidas[0], abs=1.0)
+
+
+def test_ffmpeg_se_salta_la_cabecera_lame_y_un_programa_ingenuo_no(tmp_path):
+    """Medido con un clic (2026-11-06): ffmpeg, el de DJ Analyzer en el
+    escritorio, se salta la trama Info y el retardo de la etiqueta LAME (el
+    tema sale en su muestra) y sin cabecera sale 25,1 ms tarde (1.105 muestras:
+    no hay de dónde saber el retardo). Una rejilla de un programa que no se
+    salta nada cae 51,2 ms tarde en el de cabecera LAME y en su sitio en el
+    otro; la de uno que se lo salta, en su sitio en los dos."""
+    ffmpeg = _ffmpeg_con_lame()
+    if not ffmpeg:
+        pytest.skip('sin ffmpeg con libmp3lame')
+    sr, t0 = 44100, 0.5
+    f = _mp3s(tmp_path, ffmpeg)
+    assert md.cabecera_mp3(f['info'])['tipo'] == 'Info+LAME'
+    assert md.cabecera_mp3(f['sin'])['tipo'] == 'sin cabecera'
+    decs = {'ffmpeg': ffmpeg}
+    medidas = {}
+    for nombre, ruta in f.items():
+        con_lame = nombre == 'info'
+        ingenuo = t0 + (2257 if con_lame else 1105) / sr
+        el_de_ffmpeg = t0 + (0 if con_lame else 1105) / sr
+        r = md.medir_un_fichero(ruta, sr, {'rekordbox': (128.0, ingenuo),
+                                           'virtualdj': (128.0, el_de_ffmpeg)}, decs)
+        medidas[nombre] = {p: v[0] * 1000 for p, v in r['desfases']['ffmpeg'].items()}
+    assert medidas['info']['rekordbox'] - medidas['sin']['rekordbox'] == \
+        pytest.approx(51.2, abs=2.0)
+    assert medidas['info']['virtualdj'] - medidas['sin']['virtualdj'] == pytest.approx(0, abs=2.0)
+    # mpg123 (soundfile), el del análisis del servidor, lee lo mismo que ffmpeg.
+    if 'soundfile' in md.decodificadores_disponibles(ffmpeg):
+        r = md.medir_un_fichero(f['info'], sr, {}, {'ffmpeg': ffmpeg, 'soundfile': 'soundfile'})
+        assert r['retrasos'].get('soundfile') == pytest.approx(0.0, abs=1e-4)
+
+
+def test_la_medida_sobre_el_audio_de_punta_a_punta(tmp_path, capsys):
+    """Con un solo programa y `--audio`: mide, saca la tabla por cabecera y
+    deja el CSV."""
+    ffmpeg = _ffmpeg_con_lame()
+    if not ffmpeg:
+        pytest.skip('sin ffmpeg con libmp3lame')
+    f = _mp3s(tmp_path, ffmpeg)
+    pistas = ''.join(
+        f' <TRACK Location="file://localhost{ruta}" AverageBpm="128.00">'
+        f'<TEMPO Inizio="{0.5 + (2257 if n == "info" else 1105) / 44100:.3f}" Bpm="128.00" '
+        f'Metro="4/4" Battito="1"/></TRACK>\n'
+        for n, ruta in f.items())
+    xml = tmp_path / 'rekordbox.xml'
+    xml.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<DJ_PLAYLISTS><COLLECTION>\n'
+                   + pistas + '</COLLECTION></DJ_PLAYLISTS>', encoding='utf-8')
+    detalle = tmp_path / 'audio.csv'
+    salida = md.main(['--rekordbox', str(xml), '--audio', '5', '--procesos', '1',
+                      '--ffmpeg', ffmpeg, '--csv-audio', str(detalle)])
+    texto = capsys.readouterr().out
+    assert salida == 0, texto
+    assert 'rekordbox sobre el audio de ffmpeg: 2 temas' in texto
+    linea = next(x for x in texto.splitlines() if x.strip().startswith('Info+LAME'))
+    assert '+51' in linea or '+50' in linea or '+52' in linea, linea
+    filas = detalle.read_text(encoding='utf-8').splitlines()
+    assert filas[0].startswith('ruta,cabecera') and len(filas) >= 3
+
+
+# --------------------------------------------------------------- el resumen del CSV
+
+def test_el_resumen_del_csv(tmp_path, capsys):
+    """Sin volver a analizar: separa mayor de menor (un perfil que lo dice todo
+    en menor acierta los menores y ninguno de los mayores) y arma lo de hoy en
+    Render (el voto de los trozos pasados 4 min)."""
+    cols = ['ruta', 'duracion', 'rekordbox', 'traktor', 'virtualdj', 'etiqueta', 'consenso',
+            'log + edmm', 'todo + kk', 'voto + kk']
+    filas = [
+        # corto: hoy (todo + kk) acierta
+        ['a.mp3', '200', '8A', '', '', '', '', '8A', '8A', '3A'],
+        # largo: hoy en Render es el voto (falla), el tema entero acierta
+        ['b.mp3', '400', '8A', '', '', '', '', '8A', '8A', '9A'],
+        # mayor: el perfil que tira a menor da la relativa
+        ['c.mp3', '380', '8B', '', '', '', '', '8A', '8B', '8B'],
+        ['d.mp3', '390', '', '', '', '', '', '5A', '5A', '5A'],
+    ]
+    ruta = tmp_path / 'medir.csv'
+    import csv as _csv
+    with open(ruta, 'w', newline='', encoding='utf-8') as f:
+        w = _csv.writer(f)
+        w.writerow(cols)
+        w.writerows(filas)
+    fila = dict(zip(cols, filas[1]))
+    assert mt.lo_de_hoy_en_render(fila, 400) == '9A'
+    assert mt.lo_de_hoy_en_render(dict(zip(cols, filas[0])), 200) == '8A'
+
+    assert mt.main(['--resumen', str(ruta)]) == 0
+    texto = capsys.readouterr().out
+    assert 'rekordbox 3' in texto and '67 % en menor' in texto
+    hoy = next(x for x in texto.splitlines() if x.strip().startswith('hoy en Render'))
+    assert hoy.split()[3] == '67', hoy        # a y c bien, b mal
+    edmm = next(x for x in texto.splitlines() if x.strip().startswith('log + edmm'))
+    # 67 % igual · 100 % mezcla · 100 % en menor · 0 % en mayor · dice menor 100 %
+    assert edmm.split()[3:13:2] == ['67', '100', '100', '0', '100'], edmm
+    assert 'Más de 4 min (Render: el voto de los trozos): 2 temas' in texto

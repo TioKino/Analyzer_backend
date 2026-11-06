@@ -45,6 +45,9 @@ Uso (con lo que tengas; basta una fuente):
     --max N         cuántos temas analizar (por defecto 200, al azar)
     --sr 44100      la frecuencia de /analyze en el camino corto (tarda el
                     doble; por defecto 22050, que da el mismo croma)
+    --resumen CSV   no analiza nada: lee el CSV de una medida anterior y saca
+                    lo que no cabe en la tabla (mayor frente a menor, lo de
+                    hoy en los temas largos de Render, por duración)
 
 Requisitos: librosa, numpy, scipy, soundfile y mutagen
 (`pip install -r requirements.txt` del backend, o los cinco a mano).
@@ -347,6 +350,113 @@ def candidatos(args) -> List[Tuple[str, Dict[str, Optional[str]]]]:
     return list(salida.values())
 
 
+# --------------------------------------------------------------- el resumen del CSV
+
+CORTE_DEL_CAMINO_LARGO = 240    # Render analiza por trozos lo que pasa de 4 min
+
+
+def _de_la_celda(x: Optional[str]) -> Optional[str]:
+    return x.strip() if x and x.strip() else None
+
+
+def lo_de_hoy_en_render(fila: Dict[str, str], duracion: float) -> Optional[str]:
+    """Lo que da hoy /analyze en Render: el croma del tema entero hasta 4 min,
+    y el voto por trozos de lo que pasa (casi cualquier tema de club). El
+    motor local lo hace todo por el camino corto (`todo + kk`)."""
+    return _de_la_celda(fila.get(LO_DE_HOY if duracion <= CORTE_DEL_CAMINO_LARGO
+                                 else 'voto + kk'))
+
+
+def _modo(k: Optional[str]) -> Optional[str]:
+    return None if not k else ('menor' if k.endswith('A') else 'mayor')
+
+
+def fila_del_resumen(pred: List[Optional[str]], verdad: List[Optional[str]]) -> Dict:
+    """Aciertos de una variante, en total y separando los temas que tu programa
+    da en MENOR de los que da en MAYOR, y cuántas veces dice ella menor."""
+    pares = [(p, v) for p, v in zip(pred, verdad) if p and v]
+    salida = {'todo': contar([p for p, _ in pares], [v for _, v in pares])}
+    for modo in ('menor', 'mayor'):
+        sub = [(p, v) for p, v in pares if _modo(v) == modo]
+        salida[modo] = contar([p for p, _ in sub], [v for _, v in sub])
+    salida['dice_menor'] = (sum(1 for p, _ in pares if _modo(p) == 'menor') / len(pares)
+                            if pares else None)
+    return salida
+
+
+def resumir_el_csv(ruta: str, mejores: int = 6) -> int:
+    """Lo que no cabía en la tabla de la medida, sacado de su CSV sin volver a
+    analizar nada. Lo que decide si un perfil es mejor o solo tira a menor (en
+    una biblioteca de electrónica casi todo es menor: un perfil que lo dice
+    siempre acierta más contra tu programa sin ser mejor), y lo de hoy de
+    verdad en Render, donde los temas largos van por el voto de los trozos."""
+    try:
+        with open(os.path.expanduser(ruta), newline='', encoding='utf-8') as f:
+            filas = list(csv.DictReader(f))
+    except OSError as e:
+        print(f'No se puede leer {ruta}: {e}')
+        return 1
+    if not filas:
+        print(f'{ruta} no tiene temas.')
+        return 1
+    variantes = [c for c in filas[0] if ' + ' in c]
+    duraciones = [float(r.get('duracion') or 0) for r in filas]
+    verdad = [next((_de_la_celda(r.get(p)) for p in bib.PROGRAMAS if _de_la_celda(r.get(p))),
+                   None) for r in filas]
+    pred = {v: [_de_la_celda(r.get(v)) for r in filas] for v in variantes}
+    pred['hoy en Render'] = [lo_de_hoy_en_render(r, d) for r, d in zip(filas, duraciones)]
+
+    print('\n=== Tonalidad: el resumen del CSV ===')
+    print('Tonalidades que trae cada fuente: ' + ' · '.join(
+        f'{x} {sum(1 for r in filas if _de_la_celda(r.get(x)))}' for x in (*FUENTES, 'consenso')))
+    con = [k for k in verdad if k]
+    if not con:
+        print('Ningún tema trae la tonalidad de un programa de DJ.')
+        return 1
+    menores = sum(1 for k in con if _modo(k) == 'menor')
+    largos = sum(1 for d, k in zip(duraciones, verdad) if k and d > CORTE_DEL_CAMINO_LARGO)
+    print(f'Tu programa: {len(con)} temas, {100 * menores / len(con):.0f} % en menor; '
+          f'{largos} pasan de 4 min (en Render van por trozos)')
+
+    filas_tabla = {n: fila_del_resumen(p, verdad) for n, p in pred.items()}
+
+    def igual(n):
+        d = filas_tabla[n]['todo']
+        return d.get('igual', 0) / d['comparados'] if d['comparados'] else 0.0
+
+    arriba = sorted((n for n in variantes if filas_tabla[n]['todo']['comparados']),
+                    key=igual, reverse=True)[:mejores]
+    elegidas = list(dict.fromkeys([LO_DE_HOY, 'voto + kk', 'hoy en Render', *arriba]))
+    print(f'\n  {"variante":<24} {"igual":>6} {"mezcla":>7} {"en menor":>9} {"en mayor":>9} '
+          f'{"dice menor":>11}')
+    for n in elegidas:
+        if n not in filas_tabla or not filas_tabla[n]['todo']['comparados']:
+            continue
+        f = filas_tabla[n]
+        dm = f['dice_menor']
+        print(f'  {n:<24} {_pct(f["todo"], "igual"):>6} {_pct(f["todo"], *COMPATIBLES):>7} '
+              f'{_pct(f["menor"], "igual"):>9} {_pct(f["mayor"], "igual"):>9} '
+              f'{(f"{100 * dm:7.0f} %") if dm is not None else "      -":>11}')
+    print('  («en menor» / «en mayor»: aciertos exactos entre los temas que tu programa da '
+          'en menor / en mayor)')
+
+    for titulo, dentro in (('Hasta 4 min (Render: el tema entero)', lambda d: d <= CORTE_DEL_CAMINO_LARGO),
+                           ('Más de 4 min (Render: el voto de los trozos)',
+                            lambda d: d > CORTE_DEL_CAMINO_LARGO)):
+        idx = [i for i, d in enumerate(duraciones) if dentro(d) and verdad[i]]
+        if not idx:
+            continue
+        print(f'\n{titulo}: {len(idx)} temas')
+        for n in elegidas:
+            if n not in pred:
+                continue
+            d = contar([pred[n][i] for i in idx], [verdad[i] for i in idx])
+            if d['comparados']:
+                print(f'  {n:<24} {_pct(d, "igual"):>6} {_pct(d, *COMPATIBLES):>7}')
+    print('\nPega desde «=== Tonalidad: el resumen» hasta aquí.')
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('--rekordbox')
@@ -358,7 +468,10 @@ def main(argv=None) -> int:
     ap.add_argument('--procesos', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--semilla', type=int, default=7)
     ap.add_argument('--csv', default=os.path.expanduser('~/medir_tonalidad.csv'))
+    ap.add_argument('--resumen', metavar='CSV')
     args = ap.parse_args(argv)
+    if args.resumen:
+        return resumir_el_csv(args.resumen)
     if not (args.rekordbox or args.traktor or args.virtualdj or args.carpeta):
         ap.error('pasa al menos una fuente: --rekordbox, --traktor, --virtualdj o --carpeta')
 
