@@ -140,8 +140,10 @@ def cabecera_mp3(ruta: str) -> Dict:
         if banderas & bit:
             p += n
     cod = datos[p:p + 9]
+    salida['trama'] = id3 + i
     if cod[:4] in (b'LAME', b'Lavf', b'Lavc', b'GOGO') or cod[:2] == b'L3':
         salida['codificador'] = cod.decode('latin-1').strip('\x00 ')
+        salida['pos_codificador'] = id3 + p
         if p + 24 <= len(datos):
             salida['retardo'] = (datos[p + 21] << 4) | (datos[p + 22] >> 4)
             salida['relleno'] = ((datos[p + 22] & 0x0F) << 8) | datos[p + 23]
