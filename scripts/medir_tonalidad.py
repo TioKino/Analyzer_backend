@@ -366,7 +366,7 @@ def main(argv=None) -> int:
     todos = candidatos(args)
     print(f'[Tonalidad] {len(todos)} temas con fichero y alguna tonalidad que comparar')
     if not todos:
-        print('Ninguno: mira las rutas (¿el disco externo está enchufado?).')
+        print('Ninguno: mira las rutas de arriba (¿el disco externo está enchufado?).')
         return 1
     random.Random(args.semilla).shuffle(todos)
     elegidos = todos[:args.max]

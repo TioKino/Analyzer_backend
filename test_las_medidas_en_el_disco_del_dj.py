@@ -329,3 +329,42 @@ def test_la_medida_de_punta_a_punta(tmp_path, capsys):
     assert '=== Tonalidad' in texto and mt.LO_DE_HOY in texto
     filas = salida_csv.read_text(encoding='utf-8').splitlines()
     assert len(filas) == 2 and 'la menor.wav' in filas[1]
+
+
+# Una biblioteca que no está (el owner no tenía exportado su rekordbox.xml el
+# 2026-11-06, y el script se cortaba con un FileNotFoundError) no corta la
+# medida: se dice cómo conseguirla y se sigue con las demás.
+_NML_DE_UNO = """<?xml version="1.0" encoding="UTF-8"?>
+<NML VERSION="20"><COLLECTION ENTRIES="1">
+ <ENTRY TITLE="Uno" ARTIST="X">
+  <LOCATION DIR="/:Users/:dj/:" FILE="uno.mp3" VOLUME="Macintosh HD"/>
+  <MUSICAL_KEY VALUE="21"/>
+ </ENTRY>
+</COLLECTION><PLAYLISTS/></NML>"""
+
+
+def test_una_biblioteca_que_no_esta_no_corta_la_medida(tmp_path):
+    nml = tmp_path / 'collection.nml'
+    nml.write_text(_NML_DE_UNO, encoding='utf-8')
+    roto = tmp_path / 'database.xml'
+    roto.write_text('<VirtualDJ_Database><Song', encoding='utf-8')
+    avisos, leidas = [], {}
+    por_fichero = bib.leer_bibliotecas(
+        rekordbox=str(tmp_path / 'rekordbox.xml'), traktor=str(nml),
+        virtualdj=str(roto), leidas=leidas, avisar=avisos.append)
+    assert leidas == {'traktor': 1}
+    assert [list(v) for v in por_fichero.values()] == [['traktor']]
+    assert len(avisos) == 2
+    assert 'no está' in avisos[0] and 'Exportar colección en formato xml' in avisos[0]
+    assert 'no se puede leer' in avisos[1]
+
+
+def test_el_desfase_dice_que_hacen_falta_dos_bibliotecas(tmp_path, capsys):
+    nml = tmp_path / 'collection.nml'
+    nml.write_text(_NML_DE_UNO, encoding='utf-8')
+    salida = md.main(['--rekordbox', str(tmp_path / 'rekordbox.xml'),
+                      '--traktor', str(nml), '--csv', str(tmp_path / 'd.csv')])
+    texto = capsys.readouterr().out
+    assert salida == 1
+    assert 'no está' in texto
+    assert 'Hacen falta dos bibliotecas' in texto
