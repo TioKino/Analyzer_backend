@@ -334,10 +334,28 @@ def leer_virtualdj(ruta_xml: str) -> List[TemaDeUnPrograma]:
     return temas
 
 
+#: Dónde está cada biblioteca, para decírselo al DJ cuando la ruta no sirve.
+COMO_CONSEGUIRLA = {
+    'rekordbox': 'Rekordbox no guarda ese fichero solo: en Rekordbox, '
+                 'Archivo → Exportar colección en formato xml, y guárdalo ahí',
+    'traktor': 'es la colección de Traktor: '
+               'Documents/Native Instruments/Traktor <versión>/collection.nml',
+    'virtualdj': 'es la base de datos de VirtualDJ: en el Mac, '
+                 '~/Library/Application Support/VirtualDJ/database.xml',
+}
+
+
 def leer_bibliotecas(rekordbox: Optional[str] = None, traktor: Optional[str] = None,
-                     virtualdj: Optional[str] = None
+                     virtualdj: Optional[str] = None,
+                     leidas: Optional[Dict[str, int]] = None,
+                     avisar=print,
                      ) -> Dict[str, Dict[str, TemaDeUnPrograma]]:
-    """Lo de cada programa por fichero: {clave de la ruta: {programa: tema}}."""
+    """Lo de cada programa por fichero: {clave de la ruta: {programa: tema}}.
+
+    Una biblioteca que no está o no se puede leer NO corta la medida: se dice
+    por qué y cómo conseguirla (`avisar`) y se sigue con las demás. En
+    [leidas] queda cuántos temas salieron de cada programa que sí se leyó.
+    """
     por_fichero: Dict[str, Dict[str, TemaDeUnPrograma]] = {}
     fuentes = (('rekordbox', rekordbox, leer_rekordbox),
                ('traktor', traktor, leer_traktor),
@@ -345,7 +363,19 @@ def leer_bibliotecas(rekordbox: Optional[str] = None, traktor: Optional[str] = N
     for programa, ruta, lector in fuentes:
         if not ruta:
             continue
-        for t in lector(os.path.expanduser(ruta)):
+        ruta = os.path.expanduser(ruta)
+        if not os.path.isfile(ruta):
+            avisar(f'[{programa}] no está {ruta}: {COMO_CONSEGUIRLA[programa]}. '
+                   'Sigo con lo demás.')
+            continue
+        try:
+            temas = lector(ruta)
+        except (ET.ParseError, OSError) as e:
+            avisar(f'[{programa}] {ruta} no se puede leer ({e}). Sigo con lo demás.')
+            continue
+        if leidas is not None:
+            leidas[programa] = len(temas)
+        for t in temas:
             por_fichero.setdefault(clave_de_ruta(t.ruta), {})[programa] = t
     return por_fichero
 

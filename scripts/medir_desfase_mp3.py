@@ -230,7 +230,13 @@ def main(argv=None) -> int:
     if sum(1 for x in (args.rekordbox, args.traktor, args.virtualdj) if x) < 2:
         ap.error('hacen falta al menos dos programas para comparar')
 
-    por_fichero = bib.leer_bibliotecas(args.rekordbox, args.traktor, args.virtualdj)
+    leidas: Dict[str, int] = {}
+    por_fichero = bib.leer_bibliotecas(args.rekordbox, args.traktor, args.virtualdj,
+                                       leidas=leidas)
+    if len(leidas) < 2:
+        print('Hacen falta dos bibliotecas que se puedan leer para comparar '
+              f'(leídas: {", ".join(leidas) or "ninguna"}).')
+        return 1
     en_varios = {k: v for k, v in por_fichero.items() if len(v) >= 2}
     print(f'[Desfase] {len(por_fichero)} ficheros en tus bibliotecas, '
           f'{len(en_varios)} en dos programas o más')
