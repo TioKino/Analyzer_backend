@@ -1778,6 +1778,10 @@ def _telemetry(request: Request):
         # La carpeta vigilada del escritorio (`carpeta_vigilada.dart`, desde el
         # 2026-11-06): cuántos aparatos la tienen y cuántos temas entran por ella.
         "carpeta_vigilada": _carpeta_vigilada(),
+        # El resumen del import en el escritorio («el primer minuto», desde el
+        # 2026-11-10): qué sabía ya la app de lo que se importó, y si el DJ
+        # hace algo con ello (identificar, ver los repetidos).
+        "primer_minuto": _primer_minuto(),
     }
 
 
@@ -2152,6 +2156,14 @@ def _carpeta_vigilada():
         return _get_db().resumen_carpeta_vigilada(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] carpeta vigilada fallo: {e}")
+        return None
+
+
+def _primer_minuto():
+    try:
+        return _get_db().resumen_primer_minuto(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] primer minuto fallo: {e}")
         return None
 
 
