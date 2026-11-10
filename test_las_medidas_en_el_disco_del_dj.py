@@ -642,3 +642,73 @@ def test_la_lectura_de_la_pista_de_punta_a_punta(tmp_path, capsys):
     fila = next(x for x in texto.splitlines() if x.strip().startswith('Info+LAME'))
     assert '+51.0' in fila, fila
     assert 'Lo que hay que restar' in texto
+
+
+# La segunda vuelta de la pista (2026-11-10): el Rekordbox de hoy puso los
+# cuatro MP3 en el mismo sitio (no cuenta la trama Info), y las rejillas que el
+# owner ya tenía dicen que sí la cuenta. Se resuelve con copias de sus propios
+# MP3: el programa las analiza hoy como temas nuevos, y lo que su rejilla se
+# mueve respecto a la que tenía es lo que ha cambiado.
+
+def _rekordbox_con(tmp_path, nombre_xml, pistas, version='6.8.5'):
+    """Un rekordbox.xml con [(ruta, inizio, bpm)]."""
+    cuerpo = ''.join(
+        f' <TRACK Location="file://localhost{str(ruta).replace(" ", "%20")}" AverageBpm="{bpm:.2f}">'
+        f'<TEMPO Inizio="{inizio:.3f}" Bpm="{bpm:.2f}" Metro="4/4" Battito="1"/></TRACK>\n'
+        for ruta, inizio, bpm in pistas)
+    xml = tmp_path / nombre_xml
+    xml.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<DJ_PLAYLISTS Version="1.0.0">'
+                   f'<PRODUCT Name="rekordbox" Version="{version}" Company="AlphaTheta"/>'
+                   f'<COLLECTION>\n{cuerpo}</COLLECTION></DJ_PLAYLISTS>', encoding='utf-8')
+    return str(xml)
+
+
+def test_las_copias_de_la_biblioteca_dicen_lo_que_se_mueve_cada_programa(tmp_path, capsys):
+    biblio, pista = tmp_path / 'biblio', tmp_path / 'pista'
+    biblio.mkdir()
+    pista.mkdir()
+    con = _mp3(biblio, 'con lame.mp3', _info())
+    sin = _mp3(biblio, 'viejo.mp3', _trama_mp3(), id3=False)
+    de_la_pista = _mp3(pista, pp.nombre('info_lame'), _info())
+    antes = _rekordbox_con(tmp_path, 'antes.xml', [(con, 0.551, 128.0), (sin, 0.525, 128.0),
+                                                    (de_la_pista, 0.630, 125.0)])
+    copias = pp.copiar_reales(str(pista), bib.leer_bibliotecas(rekordbox=antes), 5)
+    assert sorted(c['cabecera'] for c in copias) == ['Info+LAME', 'sin cabecera'], \
+        'una de cada cabecera, y los ficheros de la propia pista no son de la biblioteca'
+    assert all((pista / c['copia']).exists() for c in copias)
+    assert {c['cabecera']: c['programas']['rekordbox']['ancla'] for c in copias} == \
+        {'Info+LAME': 0.551, 'sin cabecera': 0.525}
+    # Otra llamada no elige otros: los programas ya tienen analizados esos.
+    assert [c['copia'] for c in pp.copiar_reales(str(pista), {}, 5)] == [c['copia'] for c in copias]
+
+    # Hoy el programa pone la del LAME 26 ms antes (al doble de BPM, que es la
+    # misma rejilla) y la otra donde estaba.
+    por_tipo = {c['cabecera']: str(pista / c['copia']) for c in copias}
+    hoy = _rekordbox_con(tmp_path, 'hoy.xml', [(por_tipo['Info+LAME'], 0.525, 256.0),
+                                                (por_tipo['sin cabecera'], 0.525, 128.0)],
+                         version='7.0.4')
+    movidos = pp.lo_que_se_mueven(copias, bib.leer_bibliotecas(rekordbox=hoy), str(pista))
+    ms = {tipo: v for _, tipo, v in movidos['rekordbox']}
+    assert ms['Info+LAME'] == pytest.approx(-26.0, abs=0.01)
+    assert ms['sin cabecera'] == pytest.approx(0.0, abs=0.01)
+    assert pp.version_de('rekordbox', hoy) == '7.0.4'
+    assert pp.version_de('rekordbox', str(tmp_path / 'no_esta.xml')) is None
+
+    assert pp.leer(str(pista), rekordbox=hoy) == 0
+    texto = capsys.readouterr().out
+    assert 'Versiones: rekordbox 7.0.4' in texto
+    assert 'copias de tu biblioteca' in texto
+    fila = next(x for x in texto.splitlines() if x.strip().startswith('Info+LAME') and 'ms' in x)
+    assert '-26.0 ms' in fila, fila
+
+
+def test_la_pista_no_reescribe_lo_que_ya_esta(tmp_path):
+    """Volver a crearla (para añadir las copias) no toca los ficheros que los
+    programas ya tienen analizados."""
+    ffmpeg = _ffmpeg_con_lame()
+    if not ffmpeg:
+        pytest.skip('sin ffmpeg con libmp3lame')
+    assert pp.crear(str(tmp_path), ffmpeg) == 0
+    antes = {f: os.stat(tmp_path / f).st_mtime_ns for f in os.listdir(tmp_path)}
+    assert pp.crear(str(tmp_path), ffmpeg) == 0
+    assert {f: os.stat(tmp_path / f).st_mtime_ns for f in os.listdir(tmp_path)} == antes
