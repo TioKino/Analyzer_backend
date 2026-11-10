@@ -3929,6 +3929,88 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    # Por dónde se cierra el resumen del import (`AccionDelResumen` en el
+    # cliente). Lo que no esté aquí cuenta como «otra».
+    ACCIONES_DEL_PRIMER_MINUTO = (
+        'cerrar', 'identificar', 'repetidos', 'mezclas', 'fallados')
+    LINEAS_DEL_PRIMER_MINUTO = (
+        'conocidos', 'rejillas', 'del_programa', 'repetidos', 'sin_nombre')
+
+    def resumen_primer_minuto(self, dias: int = 30) -> Dict:
+        """EL PRIMER MINUTO (`el_primer_minuto.dart`, desde el 2026-11-10): al
+        terminar un import en el escritorio, el resumen dice lo que DJ Analyzer
+        ya sabía de esos temas, y al cerrarlo manda `primer_minuto` ({temas,
+        conocidos, rejillas, del_programa, sin_nombre, repetidos, accion}).
+        Para saber cuánto tiene la app que enseñar al que llega —el anzuelo
+        frente a Lexicon, `COMPETENCIA.md` punto 13— y si el DJ hace algo con
+        ello.
+
+          resumenes            resúmenes cerrados en los últimos `dias`
+          aparatos             aparatos que cerraron alguno
+          con_algo             resúmenes con alguna línea
+          temas                temas de esos imports (analizados + ya estaban)
+          lineas               por línea: {resumenes: en cuántos salió,
+                               temas: cuántos suma}
+          repetidos_sin_saber  cerrados sin saber los repetidos (el cliente
+                               manda -1: aún se buscaban, o Render no
+                               contestó). No es «ninguno»
+          acciones             por dónde se cerró
+
+        Recorre el cursor (la trampa del panel)."""
+        salida = {
+            'dias': int(dias), 'resumenes': 0, 'aparatos': 0, 'con_algo': 0,
+            'temas': 0,
+            'lineas': {l: {'resumenes': 0, 'temas': 0}
+                       for l in self.LINEAS_DEL_PRIMER_MINUTO},
+            'repetidos_sin_saber': 0,
+            'acciones': {},
+        }
+        aparatos = set()
+        conn = self._open_conn()
+        try:
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'primer_minuto' AND day >= date('now', ?)",
+                (f"-{int(dias)} days",))
+            for dev, props in cur:
+                try:
+                    p = json.loads(props) if props else {}
+                except (TypeError, ValueError):
+                    p = {}
+                if not isinstance(p, dict):
+                    continue
+
+                def num(clave):
+                    try:
+                        return int(p.get(clave) or 0)
+                    except (TypeError, ValueError):
+                        return 0
+
+                salida['resumenes'] += 1
+                if dev:
+                    aparatos.add(dev)
+                salida['temas'] += max(0, num('temas'))
+                algo = False
+                for linea in self.LINEAS_DEL_PRIMER_MINUTO:
+                    n = num(linea)
+                    if linea == 'repetidos' and n < 0:
+                        salida['repetidos_sin_saber'] += 1
+                        continue
+                    if n > 0:
+                        algo = True
+                        salida['lineas'][linea]['resumenes'] += 1
+                        salida['lineas'][linea]['temas'] += n
+                if algo:
+                    salida['con_algo'] += 1
+                accion = p.get('accion')
+                if accion not in self.ACCIONES_DEL_PRIMER_MINUTO:
+                    accion = 'otra'
+                salida['acciones'][accion] = salida['acciones'].get(accion, 0) + 1
+            salida['aparatos'] = len(aparatos)
+            return salida
+        finally:
+            conn.close()
+
     def resumen_mezclas(self, dias: int = 30) -> Dict:
         """Las MEZCLAS del escritorio (`mezclas.dart`, desde el 2026-11-03):
         un fichero con muchos temas pinchados seguidos, que el import aparta
