@@ -4159,6 +4159,63 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def resumen_desfase_mp3(self, dias: int = 30) -> Dict:
+        """La pasada del DESFASE DE LOS MP3 (`conversion_del_desfase.dart`,
+        desde el 2026-11-11): el escritorio pasa a la base de DJ Analyzer los
+        cues y la rejilla que vinieron de Rekordbox o Traktor (que en un MP3
+        con etiqueta de LAME ponen el golpe ~51 ms más tarde), con copia y
+        DESHACER. El cliente manda `desfase_mp3` ({accion: pasada|deshacer|
+        encender, temas, anclas, cues}). Lo que se quiere saber es si alguien
+        la deshace: eso diría que la medida no vale para su música.
+
+          aparatos      aparatos que convirtieron algo
+          temas         temas convertidos (suma de las pasadas)
+          anclas        rejillas movidas
+          cues          cues movidos
+          deshechas     veces que un DJ la deshizo
+          aparatos_que_deshacen
+          encendidas    veces que la volvió a encender
+
+        Recorre el cursor (la trampa del panel)."""
+        salida = {'dias': int(dias), 'aparatos': 0, 'temas': 0, 'anclas': 0,
+                  'cues': 0, 'deshechas': 0, 'aparatos_que_deshacen': 0,
+                  'encendidas': 0}
+        convierten, deshacen = set(), set()
+        conn = self._open_conn()
+        try:
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'desfase_mp3' AND day >= date('now', ?)",
+                (f"-{int(dias)} days",))
+            for dev, props in cur:
+                try:
+                    p = json.loads(props) if props else {}
+                    if not isinstance(p, dict):
+                        continue
+                    temas = int(p.get('temas') or 0)
+                    anclas = int(p.get('anclas') or 0)
+                    cues = int(p.get('cues') or 0)
+                except (TypeError, ValueError):
+                    continue
+                accion = p.get('accion')
+                if accion == 'pasada':
+                    salida['temas'] += temas
+                    salida['anclas'] += anclas
+                    salida['cues'] += cues
+                    if dev:
+                        convierten.add(dev)
+                elif accion == 'deshacer':
+                    salida['deshechas'] += 1
+                    if dev:
+                        deshacen.add(dev)
+                elif accion == 'encender':
+                    salida['encendidas'] += 1
+            salida['aparatos'] = len(convierten)
+            salida['aparatos_que_deshacen'] = len(deshacen)
+            return salida
+        finally:
+            conn.close()
+
     def resumen_mezclas(self, dias: int = 30) -> Dict:
         """Las MEZCLAS del escritorio (`mezclas.dart`, desde el 2026-11-03):
         un fichero con muchos temas pinchados seguidos, que el import aparta
