@@ -77,7 +77,8 @@ def test_sin_eventos_sale_a_cero():
     r = _db().resumen_primer_minuto(30)
     assert r['resumenes'] == 0 and r['aparatos'] == 0 and r['acciones'] == {}
     assert set(r['lineas']) == {
-        'conocidos', 'rejillas', 'del_programa', 'repetidos', 'sin_nombre'}
+        'conocidos', 'rejillas', 'del_programa', 'repetidos', 'sin_nombre',
+        'copias_exactas'}
 
 
 def test_el_panel_lo_da():
@@ -90,9 +91,10 @@ def test_las_lineas_y_las_acciones_son_las_del_cliente():
     # Espejo de `ElPrimerMinuto.paraElEvento` y `AccionDelResumen`: si el
     # cliente cambia un nombre, aquí dejaría de sumar sin un error.
     assert AnalysisDB.LINEAS_DEL_PRIMER_MINUTO == (
-        'conocidos', 'rejillas', 'del_programa', 'repetidos', 'sin_nombre')
+        'conocidos', 'rejillas', 'del_programa', 'repetidos', 'sin_nombre',
+        'copias_exactas')
     assert AnalysisDB.ACCIONES_DEL_PRIMER_MINUTO == (
-        'cerrar', 'identificar', 'repetidos', 'mezclas', 'fallados')
+        'cerrar', 'identificar', 'repetidos', 'copias', 'mezclas', 'fallados')
 
 
 def test_el_panel_lo_calcula_de_verdad():
@@ -103,3 +105,16 @@ def test_el_panel_lo_calcula_de_verdad():
     r = panel._primer_minuto()
     assert r is not None, 'None = embudo.sh diría que el panel falló'
     assert {'resumenes', 'lineas', 'acciones', 'repetidos_sin_saber'} <= set(r)
+
+
+def test_las_copias_exactas_cuentan_como_una_linea():
+    # Ficheros que eran copias exactas de un tema que ya estaba y el import no
+    # añadió (2026-11-11). Cuentan aparte, y su «Ver» cierra con `copias`.
+    db = _db()
+    _evento(db, 'mac-1', {'temas': 24, 'conocidos': 0, 'rejillas': 0,
+                          'del_programa': 0, 'sin_nombre': 0, 'repetidos': 2,
+                          'copias_exactas': 2, 'accion': 'copias'})
+    r = db.resumen_primer_minuto(30)
+    assert r['lineas']['copias_exactas'] == {'resumenes': 1, 'temas': 2}
+    assert r['acciones'] == {'copias': 1}
+    assert r['con_algo'] == 1
