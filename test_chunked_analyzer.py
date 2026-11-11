@@ -50,63 +50,9 @@ def _click(bpm, secs, amp=0.8):
     return y
 
 
-# ==================== FUSIÓN DE TONALIDAD ====================
-
-class TestFusionDeTonalidad:
-    def test_gana_la_key_con_mas_peso(self, analyzer):
-        chunks = [
-            {'key': 'Am', 'confidence': 0.9},
-            {'key': 'Am', 'confidence': 0.8},
-            {'key': 'C',  'confidence': 0.3},
-        ]
-        r = analyzer.fuse_key_results(chunks)
-        assert r['key'] == 'Am'
-        assert r['scale'] == 'minor'
-        assert r['camelot'] == '8A'
-        assert 0.0 <= r['confidence'] <= 1.0
-
-    def test_los_chunks_con_mas_energia_pesan_mas(self, analyzer):
-        """El drop define la tonalidad mejor que una intro de pads: si el
-        chunk con energía manda, la fusión debe seguirle."""
-        chunks = [
-            {'key': 'C',  'confidence': 0.6},   # intro floja
-            {'key': 'F#m', 'confidence': 0.6},  # drop
-        ]
-        r = analyzer.fuse_key_results(chunks, energy_weights=[0.05, 0.95])
-        assert r['key'] == 'F#m', "la fusión ignoró los pesos de energía"
-
-    def test_key_None_no_revienta(self, analyzer):
-        """REGRESIÓN (panel admin 2026-05-20): chunks degenerados llegaban con
-        `'key': None` literal. `r.get('key', 'C')` no aplica el default cuando
-        el valor existe y es None, así que best_key acababa en None y
-        `best_key.endswith('m')` petaba con AttributeError."""
-        r = analyzer.fuse_key_results([
-            {'key': None, 'confidence': 0.5},
-            {'key': None, 'confidence': 0.5},
-        ])
-        assert r['key'] == 'C'
-        assert r['scale'] == 'major'
-
-    def test_confianza_None_tampoco_revienta(self, analyzer):
-        """REGRESIÓN ENCONTRADA POR ESTE TEST (2026-08-09): el mismo fallo del
-        default de dict que se había corregido para 'key' seguía vivo dos
-        líneas más arriba, en la lista de pesos. Con `'confidence': None`,
-        `sum(energy_weights)` lanzaba TypeError y tumbaba el análisis del track
-        completo, no solo el chunk."""
-        r = analyzer.fuse_key_results([{'key': 'Am', 'confidence': None}])
-        assert r['key'] == 'Am'
-
-    def test_sin_chunks_devuelve_un_default_utilizable(self, analyzer):
-        r = analyzer.fuse_key_results([])
-        assert r['key'] == 'C' and r['camelot'] == '8B'
-        assert r['confidence'] == 0.0
-
-    def test_el_camelot_nunca_contradice_a_la_key(self, analyzer):
-        from chunked_analyzer import KEY_TO_CAMELOT
-
-        for key in ('C', 'Am', 'F#m', 'G', 'D#m'):
-            r = analyzer.fuse_key_results([{'key': key, 'confidence': 0.9}])
-            assert r['camelot'] == KEY_TO_CAMELOT[key], f"{key} -> {r['camelot']}"
+# La FUSIÓN DE TONALIDAD (un voto por trozo) se quitó el 2026-11-10: el de
+# trozos cose la CQT del tema entero y saca la tonalidad con la misma cuenta
+# que el corto (`test_la_tonalidad_log_braw.py`).
 
 
 # ==================== CURVA DE ENERGÍA Y ESTRUCTURA ====================

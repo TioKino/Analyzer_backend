@@ -35,6 +35,10 @@ class AnalysisResult(BaseModel):
     # tonalidad mira. Se guarda para medir otros perfiles contra lo importado
     # sin volver a tener el audio (`tonalidad.py`, #4 de PENDING, 2026-10-07).
     croma: Optional[List[float]] = None
+    # Cómo se sacó la tonalidad y su croma (`tonalidad.METODO`, 'log+braw' desde
+    # el 2026-11-10; vacío = el croma lineal con Krumhansl de antes). La sombra
+    # y la puesta al día no pueden mezclar los dos cromas: son otra medida.
+    tonalidad_metodo: Optional[str] = None
     energy_raw: float
     energy_normalized: float
     energy_dj: int

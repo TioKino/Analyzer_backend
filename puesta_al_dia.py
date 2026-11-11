@@ -10,6 +10,12 @@ así que se rehace en SEGUNDO PLANO desde el ordenador, solo lo que cambia:
 - ``closing``: el tipo salió *closing* con la regla vieja.
 - ``trozos``: más de 4 minutos y NO lo analizó un motor local, o sea que pasó
   por el camino por trozos de Render (energía, tipo, género y graves).
+- ``tonalidad`` (desde el 2026-11-10): la tonalidad la sacó el DSP con el
+  método de antes (croma lineal y Krumhansl; ver `tonalidad.METODO`). No
+  depende de la fecha sino del método guardado: un motor local sin actualizar
+  sigue sacando la de antes después del corte. Solo a un cliente que lo
+  entienda (`entiende`): uno anterior rehacía el tema sin tomar la tonalidad
+  y lo daba por puesto al día.
 
 Quién decide qué entra es ESTE módulo, no el cliente: el cliente no sabe qué
 motor analizó cada tema ni cuándo lo analizó Render, y así la regla se cambia
@@ -38,7 +44,19 @@ TOPE_RENDER_MAXIMO = 200
 # fila y aquí no se lee). El fallback de un análisis fallido se reconoce por
 # el BPM a 0: `analysis_status` vive dentro del JSON, no es columna.
 COLUMNAS = ('id, fingerprint, analyzed_at, engine_source, duration, '
-            'track_type, bpm')
+            'track_type, bpm, '
+            "json_extract(analysis_json, '$.key_source') AS key_source, "
+            "json_extract(analysis_json, '$.tonalidad_metodo') AS tonalidad_metodo")
+
+# Los motivos que entiende un cliente que no dice cuáles (los de antes del
+# 2026-11-10).
+MOTIVOS_DE_SIEMPRE = ('closing', 'trozos')
+
+# Las fuentes de una tonalidad que puso el DSP (la de las etiquetas, la de un
+# programa de DJ o la de la comunidad no se rehacen). Vacío = una fila vieja
+# sin fuente apuntada.
+FUENTES_DE_TONALIDAD_DEL_DSP = ('analysis', 'chunked_analysis', 'local_engine',
+                                'cached', '')
 
 
 def corte() -> Optional[str]:
@@ -56,11 +74,15 @@ def tope_render() -> int:
     return max(0, min(n, TOPE_RENDER_MAXIMO))
 
 
-def motivos(fila: Dict, desde: str, umbral: float = UMBRAL_TROZOS) -> List[str]:
-    """Por qué hay que rehacer esta fila (vacío = nada).
+def motivos(fila: Dict, desde: str, umbral: float = UMBRAL_TROZOS,
+            entiende=MOTIVOS_DE_SIEMPRE) -> List[str]:
+    """Por qué hay que rehacer esta fila (vacío = nada), de los motivos que
+    [entiende] el cliente.
 
-    Solo lo analizado ANTES de `desde`; un análisis fallido (bpm 0) no se
-    rehace: el DSP ya no pudo con ese fichero."""
+    `closing` y `trozos`, solo lo analizado ANTES de `desde`; `tonalidad`, lo
+    que salió con otro método que el de hoy, sea de cuando sea. Un análisis
+    fallido (bpm 0) no se rehace: el DSP ya no pudo con ese fichero."""
+    from tonalidad import METODO
     if fila.get('analysis_status') == 'failed':
         return []
     try:
@@ -68,19 +90,21 @@ def motivos(fila: Dict, desde: str, umbral: float = UMBRAL_TROZOS) -> List[str]:
             return []
     except (TypeError, ValueError):
         return []
-    cuando = fila.get('analyzed_at') or ''
-    if cuando and cuando >= desde:
-        return []
     salida = []
-    if (fila.get('track_type') or '').strip().lower() == 'closing':
-        salida.append('closing')
-    try:
-        dura = float(fila.get('duration') or 0)
-    except (TypeError, ValueError):
-        dura = 0.0
-    if dura > umbral and fila.get('engine_source') != 'local_engine':
-        salida.append('trozos')
-    return salida
+    cuando = fila.get('analyzed_at') or ''
+    if not (cuando and cuando >= desde):
+        if (fila.get('track_type') or '').strip().lower() == 'closing':
+            salida.append('closing')
+        try:
+            dura = float(fila.get('duration') or 0)
+        except (TypeError, ValueError):
+            dura = 0.0
+        if dura > umbral and fila.get('engine_source') != 'local_engine':
+            salida.append('trozos')
+    if ((fila.get('key_source') or '') in FUENTES_DE_TONALIDAD_DEL_DSP
+            and fila.get('tonalidad_metodo') != METODO):
+        salida.append('tonalidad')
+    return [m for m in salida if m in entiende]
 
 
 class TopeDiario:

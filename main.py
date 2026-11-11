@@ -36,7 +36,6 @@ import numpy as np
 # Lo que los dos caminos de /analyze calculan con las mismas cuentas (el corto
 # aqui, el de trozos en `chunked_analyzer`). Se importan con su nombre de
 # siempre: hay tests y llamadas que los piden a `main`.
-from tonalidad import croma_para_guardar
 import analisis_fallido
 from rasgos_del_tema import (try_bpm_double_half, classify_track_type,
                              pulso_de_beats, rasgos_espectrales,
@@ -1240,6 +1239,10 @@ class AnalysisResult(BaseModel):
     # tonalidad mira. Se guarda para medir otros perfiles contra lo importado
     # sin volver a tener el audio (`tonalidad.py`, #4 de PENDING, 2026-10-07).
     croma: Optional[List[float]] = None
+    # Cómo se sacó la tonalidad y su croma (`tonalidad.METODO`, 'log+braw' desde
+    # el 2026-11-10; vacío = el croma lineal con Krumhansl de antes). La sombra
+    # y la puesta al día no pueden mezclar los dos cromas: son otra medida.
+    tonalidad_metodo: Optional[str] = None
     energy_raw: float = 0.0
     energy_normalized: float = 0.0
     energy_dj: int = 5
@@ -2424,75 +2427,36 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         onset_env, sr / HOP_RASGOS, bpm, bpm_del_dsp=(bpm_source == "analysis"),
         graves=bandas[0] if bandas else None)
     
-    # Key - Krumhansl-Kessler profiles (academicamente validados)
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12, n_octaves=7)
-    keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-    
-    # Perfiles Krumhansl-Kessler REALES (no binarios)
-    major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-    minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-    major_profile = major_profile / np.sum(major_profile)
-    minor_profile = minor_profile / np.sum(minor_profile)
-    
-    chroma_mean = np.mean(chroma, axis=1)
-    chroma_mean = chroma_mean / (np.sum(chroma_mean) + 1e-10)
-    
-    # Escanear TODAS las keys (no solo key_idx de argmax)
-    best_key = None
-    best_corr = -1
-    best_scale = None
-    
-    for i, key_name in enumerate(keys):
-        major_rot = np.roll(major_profile, i)
-        minor_rot = np.roll(minor_profile, i)
-        
-        major_corr = np.corrcoef(chroma_mean, major_rot)[0, 1]
-        minor_corr = np.corrcoef(chroma_mean, minor_rot)[0, 1]
-        
-        if not np.isnan(major_corr) and major_corr > best_corr:
-            best_corr = major_corr
-            best_key = key_name
-            best_scale = 'major'
-        if not np.isnan(minor_corr) and minor_corr > best_corr:
-            best_corr = minor_corr
-            best_key = key_name
-            best_scale = 'minor'
-    
-    is_minor = best_scale == 'minor'
-    # Defensa contra audio degenerado: si todos los major_corr y minor_corr
-    # fueron NaN (chroma plano, silencio, archivo corrupto), best_key
-    # se queda en None. Antes la concatenacion `None + 'm'` petaba con
-    # TypeError NoneType+str (visto en panel admin 2026-05-20).
-    # Fallback: marcar como 'C' con confianza minima — el track aun se
-    # analiza, key_confidence=0 indica al cliente "no fiable".
-    if best_key is None:
-        logger.warning(
-            "[Key] best_key=None tras escaneo Krumhansl (audio plano / "
-            "todos NaN). Fallback a 'C' con confidence=0."
-        )
-        best_key = 'C'
-        is_minor = False
-        best_corr = 0.0
-    key = best_key + ('m' if is_minor else '')
+    # Tonalidad: el croma del tema entero con compresión logarítmica y el
+    # perfil `braw` (`tonalidad.tonalidad_del_audio`, desde el 2026-11-10; la
+    # misma función en el camino de trozos y en /identify). Hasta ese día era
+    # el croma lineal con Krumhansl-Kessler: coincidía con el Rekordbox del
+    # owner en un 44 % de 287 temas, y esto en un 63 %, igual en mayor que en
+    # menor (`scripts/medir_tonalidad.py`).
+    from tonalidad import tonalidad_del_audio
+    tono = tonalidad_del_audio(y, sr)
+    # Defensa contra audio degenerado (silencio, croma plano): sin tonalidad
+    # medida, 'C' con confianza 0, que el cliente lee como «no fiable». Antes
+    # de 2026-05-20 un best_key None petaba con `None + 'm'`.
+    if tono is None:
+        logger.warning("[Key] sin tonalidad medible (audio plano). "
+                       "Fallback a 'C' con confidence=0.")
+        tono = {'key': 'C', 'camelot': KEY_TO_CAMELOT['C'], 'confianza': 0.0,
+                'margen_modo': 1.0, 'croma': None, 'metodo': None}
+    key = tono['key']
     key_source = "analysis"
     camelot = KEY_TO_CAMELOT.get(key, '?')
-    key_confidence = float(best_corr) if best_corr > 0 else 0.5
-    
-    # Confianza major/minor: si la diferencia es minima, marcar como baja
+    key_confidence = tono['confianza'] if tono['confianza'] > 0 else 0.5
+    if tono['metodo'] is None:
+        key_confidence = 0.0
+    croma_del_tema = tono['croma']
+    tonalidad_metodo = tono['metodo']
+
+    # Confianza mayor/menor: si la diferencia es minima, marcar como baja
     # para que Beatport/ID3 tengan prioridad
-    major_best = -1
-    minor_best = -1
-    for i in range(12):
-        mc = np.corrcoef(chroma_mean, np.roll(major_profile, i))[0, 1]
-        nc = np.corrcoef(chroma_mean, np.roll(minor_profile, i))[0, 1]
-        if not np.isnan(mc) and mc > major_best:
-            major_best = mc
-        if not np.isnan(nc) and nc > minor_best:
-            minor_best = nc
-    mode_margin = abs(major_best - minor_best)
-    if mode_margin < 0.05:
+    if tono['margen_modo'] < 0.05:
         key_confidence = min(key_confidence, 0.55)  # Baja confianza en modo
-        logger.info(f"   Key: {key} ({camelot}) [modo ambiguo: margen={mode_margin:.3f}]")
+        logger.info(f"   Key: {key} ({camelot}) [modo ambiguo: margen={tono['margen_modo']:.3f}]")
     
     # Usar Key de ID3 solo si existe y es vlido
     # normalize_musical_key traga bemoles (Rekordbox/Mixed In Key escriben
@@ -2694,7 +2658,8 @@ def analyze_audio(file_path: str, fingerprint: str = None, force_audd: bool = Fa
         camelot=camelot,
         key_confidence=key_confidence,
         key_source=key_source,
-        croma=croma_para_guardar(chroma_mean),
+        croma=croma_del_tema,
+        tonalidad_metodo=tonalidad_metodo,
         energy_raw=energy_raw,
         energy_normalized=energy_normalized,
         energy_dj=energy_dj,
@@ -2885,6 +2850,7 @@ def analyze_audio_chunked(file_path: str, fingerprint: str, duration: float, for
         key_confidence=result['key_confidence'],
         key_source=key_source,
         croma=result.get('croma'),
+        tonalidad_metodo=result.get('tonalidad_metodo'),
         energy_raw=result['energy_raw'],
         energy_normalized=result['energy_normalized'],
         energy_dj=result['energy_dj'],
@@ -2982,6 +2948,10 @@ async def analyze_track(
 
 class PeticionDePuestaAlDia(BaseModel):
     fingerprints: List[str]
+    # Los motivos que sabe rehacer el cliente. Sin él, los de siempre
+    # (`closing`, `trozos`): un cliente anterior al 2026-11-10 rehacía un tema
+    # por `tonalidad` sin tomarla y lo daba por puesto al día.
+    entiende: Optional[List[str]] = None
 
 
 _tope_de_la_puesta_al_dia = puesta_al_dia.TopeDiario()
@@ -2990,8 +2960,9 @@ _tope_de_la_puesta_al_dia = puesta_al_dia.TopeDiario()
 @app.post("/puesta-al-dia/candidatos")
 async def candidatos_para_poner_al_dia(peticion: PeticionDePuestaAlDia):
     """De un lote de huellas (500 como mucho), cuáles hay que rehacer y por
-    qué (`closing`, `trozos`). Con el interruptor apagado (`PUESTA_AL_DIA`
-    sin poner) dice `activa: false` y ninguna: el cliente no rehace nada."""
+    qué (`closing`, `trozos`, `tonalidad`: ver `puesta_al_dia.motivos`). Con
+    el interruptor apagado (`PUESTA_AL_DIA` sin poner) dice `activa: false` y
+    ninguna: el cliente no rehace nada."""
     if len(peticion.fingerprints) > 500:
         raise HTTPException(400, "Como mucho 500 huellas por petición")
     desde = puesta_al_dia.corte()
@@ -3008,7 +2979,10 @@ async def candidatos_para_poner_al_dia(peticion: PeticionDePuestaAlDia):
         db.filas_por_huella, huellas, puesta_al_dia.COLUMNAS)
     for h in huellas:
         fila = filas.get(h)
-        m = puesta_al_dia.motivos(fila, desde) if fila else []
+        m = puesta_al_dia.motivos(
+            fila, desde,
+            entiende=peticion.entiende or puesta_al_dia.MOTIVOS_DE_SIEMPRE,
+        ) if fila else []
         if m:
             respuesta['candidatos'][h] = m
     return respuesta
@@ -4157,34 +4131,16 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
                 graves=bandas_re[0] if bandas_re else None)
             logger.info(f"BPM: {bpm} (confianza: {bpm_confidence:.2f})")
             
-            # MEJORA 1: Key con Krumhansl-Kessler (mismo codigo que analisis principal)
-            chroma = librosa.feature.chroma_cqt(y=y_full, sr=sr_full, n_chroma=12, n_octaves=7)
-            key_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            
-            major_profile_re = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-            minor_profile_re = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-            major_profile_re = major_profile_re / np.sum(major_profile_re)
-            minor_profile_re = minor_profile_re / np.sum(minor_profile_re)
-            
-            chroma_mean_re = np.mean(chroma, axis=1)
-            chroma_mean_re = chroma_mean_re / (np.sum(chroma_mean_re) + 1e-10)
-            
-            best_key_re = 'C'
-            best_corr_re = -1
-            best_scale_re = 'minor'
-            
-            for i, kn in enumerate(key_names):
-                mc = np.corrcoef(chroma_mean_re, np.roll(major_profile_re, i))[0, 1]
-                nc = np.corrcoef(chroma_mean_re, np.roll(minor_profile_re, i))[0, 1]
-                if not np.isnan(mc) and mc > best_corr_re:
-                    best_corr_re, best_key_re, best_scale_re = mc, kn, 'major'
-                if not np.isnan(nc) and nc > best_corr_re:
-                    best_corr_re, best_key_re, best_scale_re = nc, kn, 'minor'
-            
-            key = best_key_re + ('m' if best_scale_re == 'minor' else '')
-            camelot = get_camelot(key)
-            key_source = 'analysis'
-            logger.info(f"Key: {key} ({camelot})")
+            # La tonalidad, con la misma función que /analyze
+            # (`tonalidad.tonalidad_del_audio`: croma log y perfil braw desde
+            # el 2026-11-10).
+            from tonalidad import tonalidad_del_audio
+            tono_re = tonalidad_del_audio(y_full, sr_full)
+            if tono_re:
+                key = tono_re['key']
+                camelot = get_camelot(key)
+                key_source = 'analysis'
+                logger.info(f"Key: {key} ({camelot})")
             
             # Energía: la escala de los dos caminos de /analyze.
             rms = librosa.feature.rms(y=y_full)[0]

@@ -198,7 +198,8 @@ def tonalidad_y_correlacion(croma: Sequence[float], perfil: Sequence[Sequence[fl
 def por_voto(trozos: Sequence[Tuple[Sequence[float], float]],
              perfil: Sequence[Sequence[float]]) -> Optional[str]:
     """Un voto por minuto, pesado por su energía y por lo que correla: lo que
-    hace `ChunkedAudioAnalyzer.fuse_key_results` con los temas largos."""
+    hacía `ChunkedAudioAnalyzer.fuse_key_results` con los temas largos hasta
+    el 2026-11-10 (desde ese día cosen la CQT y van como el corto)."""
     votos: Dict[str, float] = defaultdict(float)
     total = sum(e for _, e in trozos) + 1e-10
     for croma, energia in trozos:

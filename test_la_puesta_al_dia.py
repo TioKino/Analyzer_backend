@@ -245,3 +245,67 @@ class TestElPanel:
         from routes import admin_panel
 
         assert isinstance(admin_panel._puesta_al_dia(), dict)
+
+
+# ------------------------------------------------- la tonalidad (2026-11-10)
+
+ENTIENDE_TONALIDAD = ('closing', 'trozos', 'tonalidad')
+
+
+class TestLaTonalidad:
+    """Desde el 2026-11-10 /analyze saca la tonalidad con el croma log y el
+    perfil braw (`tonalidad.METODO`). La puesta al día la rehace en lo que
+    sacó el DSP con el método de antes, se analizara cuando se analizara (un
+    motor local sin actualizar sigue sacando la de antes), y solo a un cliente
+    que diga que lo entiende."""
+
+    def test_la_del_dsp_de_antes_se_rehace(self):
+        from tonalidad import METODO
+        for fuente in ('analysis', 'chunked_analysis', 'local_engine', 'cached', ''):
+            assert pad.motivos(_fila(key_source=fuente), CORTE,
+                               entiende=ENTIENDE_TONALIDAD) == ['tonalidad'], fuente
+        # Aunque sea de después del corte: decide el método, no la fecha.
+        assert pad.motivos(_fila(key_source='analysis',
+                                 analyzed_at='2026-11-20T10:00:00'), CORTE,
+                           entiende=ENTIENDE_TONALIDAD) == ['tonalidad']
+        # La de hoy, no.
+        assert pad.motivos(_fila(key_source='analysis', tonalidad_metodo=METODO),
+                           CORTE, entiende=ENTIENDE_TONALIDAD) == []
+
+    def test_la_del_fichero_o_de_un_programa_no_se_toca(self):
+        for fuente in ('id3', 'rekordbox', 'traktor', 'virtualdj', 'consensus_3',
+                       'collective'):
+            assert pad.motivos(_fila(key_source=fuente), CORTE,
+                               entiende=ENTIENDE_TONALIDAD) == [], fuente
+
+    def test_con_los_demas_motivos(self):
+        assert pad.motivos(_fila(key_source='analysis', track_type='closing',
+                                 duration=400.0), CORTE,
+                           entiende=ENTIENDE_TONALIDAD) == ['closing', 'trozos', 'tonalidad']
+
+    def test_un_cliente_anterior_no_la_recibe(self):
+        # Rehacía el tema sin tomar la tonalidad y lo sellaba como puesto al día.
+        assert pad.motivos(_fila(key_source='analysis'), CORTE) == []
+        assert pad.motivos(_fila(key_source='analysis', track_type='closing'),
+                           CORTE) == ['closing']
+
+    def test_un_fallido_tampoco(self):
+        assert pad.motivos(_fila(key_source='analysis', bpm=0), CORTE,
+                           entiende=ENTIENDE_TONALIDAD) == []
+
+    def test_el_endpoint(self, client, app_mod, monkeypatch):
+        from tonalidad import METODO
+        monkeypatch.setenv('PUESTA_AL_DIA', CORTE)
+        vieja, hoy, etiqueta = (uuid.uuid4().hex for _ in range(3))
+        _guardar(app_mod.db, vieja, duration=200.0, key_source='analysis')
+        _guardar(app_mod.db, hoy, duration=200.0, key_source='analysis',
+                 tonalidad_metodo=METODO)
+        _guardar(app_mod.db, etiqueta, duration=200.0, key_source='id3')
+        huellas = [vieja, hoy, etiqueta]
+        d = client.post('/puesta-al-dia/candidatos', json={
+            'fingerprints': huellas, 'entiende': list(ENTIENDE_TONALIDAD)}).json()
+        assert d['candidatos'] == {vieja: ['tonalidad']}
+        # Sin decir qué entiende (un cliente anterior), ninguno.
+        d = client.post('/puesta-al-dia/candidatos',
+                        json={'fingerprints': huellas}).json()
+        assert d['candidatos'] == {}

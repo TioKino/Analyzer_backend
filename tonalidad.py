@@ -147,17 +147,6 @@ def croma_para_guardar(croma: Optional[Iterable[float]]) -> Optional[List[float]
     return [round(float(x), 4) for x in v]
 
 
-def croma_de_trozos(cromas: Iterable[Sequence[float]]) -> Optional[List[float]]:
-    """El croma del tema entero a partir del de cada trozo (cada uno ya
-    normalizado): la media de los que hay. Los trozos son todos de la misma
-    duración salvo el último, así que pesarlos igual es el croma del tema."""
-    validos = [np.asarray(c, dtype=float) for c in cromas
-               if c is not None and len(c) == 12]
-    if not validos:
-        return None
-    return croma_para_guardar(np.mean(validos, axis=0))
-
-
 def _plantillas(mayor: Sequence[float], menor: Sequence[float]) -> np.ndarray:
     """Las 24 plantillas (12 mayores y 12 menores) centradas y de norma 1,
     para que el producto con un croma centrado y normalizado sea su
@@ -172,8 +161,8 @@ def _plantillas(mayor: Sequence[float], menor: Sequence[float]) -> np.ndarray:
 def tonalidad_desde_croma(croma: Sequence[float], mayor: Sequence[float],
                           menor: Sequence[float]) -> Optional[str]:
     """El Camelot con más correlación entre el croma y las 24 plantillas.
-    Es lo que hace hoy /analyze con Krumhansl-Kessler (`main.analyze_audio`,
-    `ChunkedAudioAnalyzer.analyze_chunk_key`)."""
+    Con `PERFILES['kk']` es lo que hacía /analyze hasta el 2026-11-10; con
+    `PERFIL`, la elección de hoy (`estimar_tonalidad`)."""
     v = np.asarray(croma, dtype=float)
     if v.shape != (12,) or not np.all(np.isfinite(v)):
         return None
@@ -183,6 +172,145 @@ def tonalidad_desde_croma(croma: Sequence[float], mayor: Sequence[float],
     v = v / np.linalg.norm(v)
     i = int(np.argmax(_plantillas(mayor, menor) @ v))
     return camelot_de(i % 12, 'mayor' if i < 12 else 'menor')
+
+
+# --------------------------------------------------------------- la de /analyze
+
+# Lo que hace /analyze desde el 2026-11-10, en los DOS caminos (el corto y el
+# de trozos), en el motor local y en /identify: el croma del tema entero con
+# COMPRESIÓN LOGARÍTMICA y el perfil `braw`. Medido en el disco del owner con
+# `scripts/medir_tonalidad.py` (287 temas contra su Rekordbox, 2026-11-06):
+# coincide en un 63 %, frente al 44-45 % de Krumhansl sobre el croma lineal, y
+# acierta igual en mayor (61 %) que en menor (63 %). `edmm` daba más (65 %)
+# diciendo «menor» a todo: un perfil que tira a menor gana contra una
+# biblioteca de electrónica sin ser mejor. Hasta ese día el corto usaba el
+# croma lineal con Krumhansl y el de trozos votaba trozo a trozo, y los dos
+# coincidían con Rekordbox en un 44 %.
+#
+# Los números de `braw` son los publicados por Faraldo, Jordà y Herrera (AES
+# 2017), tal como los trae Essentia: 24 medianas medidas sobre temas de
+# Beatport. Son el resultado de una medida publicada, no código. Si alguna vez
+# hiciera falta quitarlos, el perfil aprendido de la biblioteca del owner daba
+# un 62 % con validación cruzada (`evaluar_perfiles`) y es nuestro.
+#
+# Cada análisis lleva `tonalidad_metodo` = METODO: la sombra
+# (`tonalidad_en_sombra`) y la puesta al día lo necesitan para no mezclar el
+# croma de antes (lineal, otro algoritmo) con el de ahora.
+METODO = 'log+braw'
+PERFIL = 'braw'
+# La confianza de un tema sin tonalidad medible (silencio, croma plano): 0 es
+# «no medido» para el cliente (`KeyAnalysis.keyMeasured`).
+CONFIANZA_SIN_TONO = 0.0
+COMPRESION = 1000.0
+HOP = 512
+BINS_POR_OCTAVA = 36
+OCTAVAS = 7
+
+
+def cqt_para_tonalidad(y, sr) -> np.ndarray:
+    """Las magnitudes de la CQT que `chroma_cqt` calcula por dentro: 7 octavas
+    desde C1, 36 bins por octava, hop 512 y la afinación ESTIMADA
+    (`tuning=None`: el defecto de `librosa.cqt` es 0,0, y con él el croma ya
+    no es el de `chroma_cqt`). En float32: el camino de trozos la guarda
+    entera."""
+    import librosa
+    return np.abs(librosa.cqt(y, sr=sr, hop_length=HOP,
+                              n_bins=OCTAVAS * BINS_POR_OCTAVA,
+                              bins_per_octave=BINS_POR_OCTAVA,
+                              tuning=None)).astype(np.float32)
+
+
+def croma_log_de_piezas(piezas) -> Optional[np.ndarray]:
+    """El croma por frame (12 × frames) de una CQT de magnitudes partida en
+    [piezas] (frames seguidos; el camino de trozos la cose así), con la
+    compresión logarítmica sobre el máximo del TEMA ENTERO, `log1p(1000 ·
+    C / máx)`: lo suave (el bajo, los pads, la armonía) pesa frente al bombo y
+    los picos, que en electrónica la tapan. Cada frame va por su cuenta una vez
+    se sabe el máximo, así que da lo mismo que `croma_log` de la CQT entera sin
+    tener que juntarla (lo ata el test). None con silencio."""
+    import librosa
+    validas = []
+    for p in piezas or ():
+        if p is None:
+            continue
+        p = np.asarray(p, dtype=np.float32)
+        if p.ndim == 2 and p.shape[1] > 0:
+            validas.append(p)
+    if not validas:
+        return None
+    m = max(float(p.max()) for p in validas)
+    if not np.isfinite(m) or m <= 0:
+        return None
+    return np.concatenate(
+        [librosa.feature.chroma_cqt(C=np.log1p(COMPRESION * p / m), n_chroma=12,
+                                    bins_per_octave=BINS_POR_OCTAVA)
+         for p in validas], axis=1)
+
+
+def croma_log(C) -> Optional[np.ndarray]:
+    """`croma_log_de_piezas` de una CQT entera (el camino corto)."""
+    return croma_log_de_piezas([C])
+
+
+def media_del_croma(ch) -> Optional[np.ndarray]:
+    """La media por frame de un croma (12 × frames), sumando 1. Sin redondear:
+    es lo que se compara con los perfiles (lo guardado se redondea aparte,
+    `croma_para_guardar`)."""
+    if ch is None:
+        return None
+    v = np.asarray(ch, dtype=float)
+    if v.ndim != 2 or v.shape[0] != 12 or v.shape[1] == 0:
+        return None
+    v = v.mean(axis=1)
+    s = float(v.sum())
+    if not np.isfinite(s) or s <= 0:
+        return None
+    return v / s
+
+
+def estimar_tonalidad(croma, perfil: str = PERFIL) -> Optional[Dict]:
+    """La tonalidad del croma medio [croma] con [perfil]: la plantilla (de 24)
+    con más correlación de Pearson, la misma elección que
+    `tonalidad_desde_croma` (lo ata el test). Devuelve `key` ('Am', 'C#', con
+    sostenidos, como `KEY_TO_CAMELOT`), `camelot`, `confianza` (la correlación
+    de la elegida) y `margen_modo` (la mejor mayor frente a la mejor menor:
+    por debajo de 0,05 el modo es dudoso). None si no hay croma."""
+    if croma is None:
+        return None
+    v = np.asarray(croma, dtype=float)
+    if v.shape != (12,) or not np.all(np.isfinite(v)):
+        return None
+    v = v - v.mean()
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        return None
+    corr = _plantillas(*PERFILES[perfil]) @ (v / n)
+    i = int(np.argmax(corr))
+    tonica, modo = i % 12, ('mayor' if i < 12 else 'menor')
+    return {
+        'key': NOMBRES[tonica] + ('m' if modo == 'menor' else ''),
+        'camelot': camelot_de(tonica, modo),
+        'confianza': float(corr[i]),
+        'margen_modo': float(abs(corr[:12].max() - corr[12:].max())),
+    }
+
+
+def tonalidad_del_croma_log(ch) -> Optional[Dict]:
+    """`estimar_tonalidad` del croma log por frame [ch], con el croma medio
+    para guardar (`croma`) y el método (`metodo`)."""
+    media = media_del_croma(ch)
+    t = estimar_tonalidad(media)
+    if t is None:
+        return None
+    t['croma'] = croma_para_guardar(media)
+    t['metodo'] = METODO
+    return t
+
+
+def tonalidad_del_audio(y, sr) -> Optional[Dict]:
+    """La tonalidad de /analyze sobre una señal entera (el camino corto, el
+    motor local y /identify). None con silencio o una señal sin tono."""
+    return tonalidad_del_croma_log(croma_log(cqt_para_tonalidad(y, sr)))
 
 
 # --------------------------------------------------------------- el perfil aprendido
@@ -254,25 +382,26 @@ def evaluar_perfiles(temas: Sequence[Tuple[str, Sequence[float], str]]) -> Dict:
     return salida
 
 
-def guardada_frente_a_kk(temas: Sequence[Tuple[Sequence[float], str, str, Optional[str]]]
-                         ) -> Dict[str, Dict]:
-    """Por camino, la tonalidad GUARDADA y la que da Krumhansl sobre el croma
-    del mismo tema, las dos contra el programa, y en cuántos coinciden.
-    `temas` = [(croma, Camelot del programa, camino, Camelot guardado)].
+def guardada_frente_a_la_de_hoy(temas: Sequence[Tuple[Sequence[float], str, str, Optional[str]]]
+                                 ) -> Dict[str, Dict]:
+    """Por camino, la tonalidad GUARDADA y la que da hoy /analyze (`PERFIL`)
+    sobre el croma del mismo tema, las dos contra el programa, y en cuántos
+    coinciden. `temas` = [(croma, Camelot del programa, camino, Camelot
+    guardado)], solo de temas con el croma de hoy (`METODO`).
 
-    Para dos cosas (lectura 55). En el corto las dos son el mismo cálculo y
-    tienen que coincidir siempre: si no, algo cambia la tonalidad entre que
-    se mide y se guarda. En los trozos son dos algoritmos (el voto de cada
-    trozo frente al croma del tema entero) sobre los mismos temas: dice cuál
-    acierta más sin cambiar nada."""
+    Desde el 2026-11-10 el corto y el de trozos sacan la tonalidad con la misma
+    cuenta, así que en los dos tiene que coincidir el 100 %: si no, algo la
+    cambia entre que se mide y se guarda. (Hasta ese día era Krumhansl, y en
+    los trozos dos algoritmos distintos: lectura 55.) En `etiquetas` no
+    coincide, y está bien: manda la tonalidad del fichero."""
     salida: Dict[str, Dict] = {}
     for croma, verdad, camino, guardada in temas:
         d = salida.setdefault(camino, {'temas': 0, 'guardada': _vacio(),
-                                       'kk': _vacio(), 'kk_igual_que_guardada': 0})
+                                       'hoy': _vacio(), 'hoy_igual_que_guardada': 0})
         d['temas'] += 1
-        kk = tonalidad_desde_croma(croma, *PERFILES['kk'])
+        hoy = tonalidad_desde_croma(croma, *PERFILES[PERFIL])
         _apuntar(d['guardada'], clase_de_tonalidad(guardada, verdad))
-        _apuntar(d['kk'], clase_de_tonalidad(kk, verdad))
-        if kk and partir_camelot(kk) == partir_camelot(guardada):
-            d['kk_igual_que_guardada'] += 1
+        _apuntar(d['hoy'], clase_de_tonalidad(hoy, verdad))
+        if hoy and partir_camelot(hoy) == partir_camelot(guardada):
+            d['hoy_igual_que_guardada'] += 1
     return salida
