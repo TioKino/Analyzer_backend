@@ -1782,6 +1782,11 @@ def _telemetry(request: Request):
         # 2026-11-10): qué sabía ya la app de lo que se importó, y si el DJ
         # hace algo con ello (identificar, ver los repetidos).
         "primer_minuto": _primer_minuto(),
+        # Cuántas veces el móvil abrió la ventana de valorar de la tienda, tras
+        # unos aciertos de Escuchar (`pedir_valoracion.dart`, 2026-11-11).
+        "valoraciones": _valoraciones(),
+        # La pasada de Shazam del Mac desde que la ven todos (2026-11-11).
+        "shazam_pasada": _shazam_pasada(),
     }
 
 
@@ -2164,6 +2169,22 @@ def _primer_minuto():
         return _get_db().resumen_primer_minuto(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] primer minuto fallo: {e}")
+        return None
+
+
+def _shazam_pasada():
+    try:
+        return _get_db().resumen_shazam_pasada(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] shazam pasada fallo: {e}")
+        return None
+
+
+def _valoraciones():
+    try:
+        return _get_db().resumen_valoraciones(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] valoraciones fallo: {e}")
         return None
 
 

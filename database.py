@@ -4021,6 +4021,91 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def resumen_shazam_pasada(self, dias: int = 30) -> Dict:
+        """La pasada de Shazam sobre la biblioteca del Mac, desde que la ven
+        todos (Ajustes → Biblioteca, 2026-11-11; antes, en el Developer
+        Mode). El cliente manda `shazam_pasada` ({accion: empezada, temas} al
+        empezarla, {accion: aplicada, nombres} al aplicar de una vez).
+
+          empezadas  pasadas empezadas en los últimos `dias`
+          aparatos   aparatos que la empezaron
+          temas      temas que se mandaron a mirar
+          aplicadas  veces que se aplicó «de una vez»
+          nombres    nombres puestos así
+
+        Recorre el cursor (la trampa del panel)."""
+        salida = {'dias': int(dias), 'empezadas': 0, 'aparatos': 0, 'temas': 0,
+                  'aplicadas': 0, 'nombres': 0}
+        aparatos = set()
+        conn = self._open_conn()
+        try:
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'shazam_pasada' AND day >= date('now', ?)",
+                (f"-{int(dias)} days",))
+            for dev, props in cur:
+                try:
+                    p = json.loads(props) if props else {}
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    if p.get('accion') == 'empezada':
+                        salida['empezadas'] += 1
+                        salida['temas'] += max(0, int(p.get('temas') or 0))
+                        if dev:
+                            aparatos.add(dev)
+                    elif p.get('accion') == 'aplicada':
+                        salida['aplicadas'] += 1
+                        salida['nombres'] += max(0, int(p.get('nombres') or 0))
+                except (TypeError, ValueError):
+                    continue
+            salida['aparatos'] = len(aparatos)
+            return salida
+        finally:
+            conn.close()
+
+    def resumen_valoraciones(self, dias: int = 30) -> Dict:
+        """Cuántas veces se ha pedido la valoración en la tienda
+        (`pedir_valoracion.dart`, desde el 2026-11-11): el móvil manda
+        `valoracion_pedida` ({aciertos, veces}) cada vez que abre la ventana del
+        sistema, tras unos aciertos de Escuchar. La tienda no dice si salió ni
+        si el DJ valoró: eso se lee en App Store Connect y en Play Console, con
+        estas fechas al lado.
+
+          pedidas        peticiones en los últimos `dias`
+          aparatos       aparatos a los que se les pidió
+          por_plataforma {ios, android, …}: peticiones
+          primera_vez    peticiones que eran la primera de ese aparato
+
+        Recorre el cursor (la trampa del panel)."""
+        salida = {'dias': int(dias), 'pedidas': 0, 'aparatos': 0,
+                  'por_plataforma': {}, 'primera_vez': 0}
+        aparatos = set()
+        conn = self._open_conn()
+        try:
+            cur = conn.execute(
+                "SELECT device_id, platform, props FROM events "
+                "WHERE event_name = 'valoracion_pedida' AND day >= date('now', ?)",
+                (f"-{int(dias)} days",))
+            for dev, plataforma, props in cur:
+                salida['pedidas'] += 1
+                if dev:
+                    aparatos.add(dev)
+                clave = plataforma or 'desconocida'
+                salida['por_plataforma'][clave] = salida['por_plataforma'].get(clave, 0) + 1
+                try:
+                    p = json.loads(props) if props else {}
+                    if isinstance(p, dict) and int(p.get('veces') or 0) == 1:
+                        salida['primera_vez'] += 1
+                except (TypeError, ValueError):
+                    pass
+            salida['aparatos'] = len(aparatos)
+            return salida
+        finally:
+            conn.close()
+
     def resumen_mezclas(self, dias: int = 30) -> Dict:
         """Las MEZCLAS del escritorio (`mezclas.dart`, desde el 2026-11-03):
         un fichero con muchos temas pinchados seguidos, que el import aparta
