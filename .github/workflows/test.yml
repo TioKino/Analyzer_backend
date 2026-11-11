@@ -45,7 +45,18 @@ jobs:
                && timeout 240 sudo apt-get $APT install -y libchromaprint-tools ffmpeg; then
               ok=1; break
             fi
-            echo "apt: el intento $i no terminó; reintento"; sleep 10
+            echo "apt: el intento $i no terminó; reintento"
+            # El mirror de Azure de la imagen puede quedarse sin contestar
+            # horas (2026-11-11, Ubuntu 26.04: `Ign` en cada InRelease y los
+            # tres intentos agotados). apt solo pasa al mirror siguiente de
+            # la lista tras sus propios plazos, más largos que los de aquí:
+            # los reintentos van directos a archive.ubuntu.com.
+            if [ -f /etc/apt/apt-mirrors.txt ] \
+               && grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+              sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+              echo "apt: sin el mirror de Azure:"; cat /etc/apt/apt-mirrors.txt
+            fi
+            sleep 10
           done
           [ "$ok" = 1 ]
 
