@@ -84,6 +84,14 @@ class CueBatchUpload(BaseModel):
     items: List[CueBatchItem]
 
 
+class PuntoDeZona(BaseModel):
+    """Un sitio de la zona donde al menos dos DJs pusieron un cue (ver
+    `puntos_de_la_zona`). Es lo que el DJ puede ADOPTAR como cue suyo."""
+    pos: float  # segundos
+    djs: int
+    fin: Optional[float] = None  # segundos; solo en loops, si coinciden
+
+
 class CommunityZoneResponse(BaseModel):
     type: str
     start: float  # segundos
@@ -91,6 +99,7 @@ class CommunityZoneResponse(BaseModel):
     dj_count: int
     confidence: float
     top_note: Optional[str] = None
+    puntos: List[PuntoDeZona] = []
 
 
 class CommunityResponse(BaseModel):
@@ -159,6 +168,93 @@ def _dj(device_id, cuentas: Optional[dict]) -> str:
     if cuentas and device_id in cuentas:
         return 'u:' + cuentas[device_id]
     return device_id
+
+
+# ---------------------------------------------------------------------------
+# LOS PUNTOS DE UNA ZONA: lo que se puede ADOPTAR (2026-11-11)
+# ---------------------------------------------------------------------------
+# Una zona junta los cues de un tipo encadenados a 5 s unos de otros, con 2 s
+# de margen a cada lado: dice «aquí pasa algo», no DÓNDE. Su centro puede no
+# ser de nadie (un DJ en el compás 33 y otro en el 35 dan una zona cuyo medio
+# no marcó ninguno). Para que un DJ convierta lo de la comunidad en cues suyos
+# con un clic (`COMPETENCIA.md`, punto 4) hace falta otra cosa: los sitios
+# donde al menos DOS DJs pusieron un cue EN EL MISMO SITIO.
+#
+# «El mismo sitio» son [TOLERANCIA_DE_UN_PUNTO_MS]: la zona junta todas las
+# versiones del sonido (el cluster), y la misma muestra no cae en el mismo
+# milisegundo en un MP3 y en un FLAC, ni en Rekordbox y en Traktor (medido: el
+# retardo del codificador y la trama de cabecera mueven hasta ~51 ms). Y dos
+# beats seguidos están a más de 300 ms incluso a 200 BPM, así que con 120 ms no
+# se juntan dos golpes distintos.
+#
+# Cada cuenta cuenta UNA vez (su posición mediana en ese sitio), y el punto es
+# la mediana de las cuentas: tres cues del mismo DJ en un sitio no lo mueven.
+# Lo usa el cliente (`cues_de_la_comunidad.dart`); el cue que se adopta lleva
+# una marca y no se vuelve a subir como un voto más mientras siga en su sitio.
+TOLERANCIA_DE_UN_PUNTO_MS = 120
+MIN_DJS_PUNTO = 2
+
+
+def _mediana(valores) -> float:
+    v = sorted(valores)
+    n = len(v)
+    if n == 0:
+        return 0.0
+    return float(v[n // 2]) if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+
+def puntos_de_la_zona(cues, cuentas: Optional[dict] = None) -> List[dict]:
+    """Los sitios de una zona donde al menos [MIN_DJS_PUNTO] cuentas pusieron
+    un cue a menos de [TOLERANCIA_DE_UN_PUNTO_MS] unos de otros.
+
+    [cues]: los de UNA zona (mismo tipo), dicts con `device_id`,
+    `position_ms` y `end_position_ms`. Devuelve `{pos, djs[, fin]}` en
+    segundos, por orden. Avaro: se elige primero el sitio con más cuentas
+    (y, a igualdad, el más apretado), se quitan sus cues y se repite.
+    `fin` solo sale en un loop cuyas cuentas coinciden también en el final.
+    """
+    quedan = sorted(cues, key=lambda c: c['position_ms'])
+    puntos = []
+    while quedan:
+        mejor = None
+        for i, c in enumerate(quedan):
+            ventana = []
+            for d in quedan[i:]:
+                if d['position_ms'] - c['position_ms'] > TOLERANCIA_DE_UN_PUNTO_MS:
+                    break
+                ventana.append(d)
+            djs = {_dj(d['device_id'], cuentas) for d in ventana}
+            if len(djs) < MIN_DJS_PUNTO:
+                continue
+            apretado = ventana[-1]['position_ms'] - ventana[0]['position_ms']
+            clave = (len(djs), -apretado)
+            if mejor is None or clave > mejor[0]:
+                mejor = (clave, ventana)
+        if mejor is None:
+            break
+        ventana = mejor[1]
+        por_dj = {}
+        for d in ventana:
+            por_dj.setdefault(_dj(d['device_id'], cuentas), []).append(d)
+        pos = _mediana([_mediana([d['position_ms'] for d in ds])
+                        for ds in por_dj.values()])
+        punto = {'pos': round(pos / 1000.0, 3), 'djs': len(por_dj)}
+        # El final de un loop: el de cada cuenta que lo tiene, y solo si todas
+        # dicen el mismo (4 y 8 beats darían de mediana 6, que no es de nadie).
+        finales = []
+        for ds in por_dj.values():
+            fs = [d['end_position_ms'] for d in ds
+                  if d.get('end_position_ms') and d['end_position_ms'] > d['position_ms']]
+            if fs:
+                finales.append(_mediana(fs))
+        if (len(finales) >= MIN_DJS_PUNTO
+                and max(finales) - min(finales) <= TOLERANCIA_DE_UN_PUNTO_MS):
+            punto['fin'] = round(_mediana(finales) / 1000.0, 3)
+        puntos.append(punto)
+        quitar = {id(d) for d in ventana}
+        quedan = [d for d in quedan if id(d) not in quitar]
+    puntos.sort(key=lambda p: p['pos'])
+    return puntos
 
 
 def contribuyentes(rows, cuentas: Optional[dict] = None) -> int:
@@ -260,6 +356,8 @@ def aggregate_cues_into_zones(rows, duration_seconds: float = 0,
                 'dj_count': dj_count,
                 'confidence': round(confidence, 2),
                 'top_note': top_note,
+                # Dónde coinciden de verdad: lo que el DJ puede adoptar.
+                'puntos': puntos_de_la_zona(cluster, cuentas),
             })
 
     # Ordenar por posicion

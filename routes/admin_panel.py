@@ -1787,6 +1787,8 @@ def _telemetry(request: Request):
         "valoraciones": _valoraciones(),
         # La pasada de Shazam del Mac desde que la ven todos (2026-11-11).
         "shazam_pasada": _shazam_pasada(),
+        # Los cues de la comunidad que el DJ adopta en la onda (2026-11-11).
+        "cues_adoptados": _cues_adoptados(),
     }
 
 
@@ -2177,6 +2179,14 @@ def _shazam_pasada():
         return _get_db().resumen_shazam_pasada(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] shazam pasada fallo: {e}")
+        return None
+
+
+def _cues_adoptados():
+    try:
+        return _get_db().resumen_cues_adoptados(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] cues adoptados fallo: {e}")
         return None
 
 
