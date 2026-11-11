@@ -3880,7 +3880,8 @@ class AnalysisDB:
     # Los eventos de las mezclas (`mezclas.dart` en el cliente).
     EVENTOS_DE_MEZCLAS = ('mezclas_apartadas', 'mezcla_identificada',
                           'mezcla_como_tema', 'mezcla_a_mano',
-                          'mezcla_editada', 'mezcla_tramo')
+                          'mezcla_editada', 'mezcla_tramo',
+                          'sesiones_pasadas')
 
     def resumen_carpeta_vigilada(self, dias: int = 30) -> Dict:
         """La CARPETA VIGILADA del escritorio (`carpeta_vigilada.dart`, desde el
@@ -4230,6 +4231,11 @@ class AnalysisDB:
                                marcar un comienzo, quitarla, ponerle nombre;
                                desde el 2026-11-05)
           mezcla_tramo         el DJ pasó un tramo por Shazam (2026-11-05)
+          sesiones_pasadas     sesiones partidas en pistas que estaban como
+                               temas y el DJ pasó a SETS GRABADOS, desde la
+                               búsqueda de Ajustes o el clic derecho en una
+                               carpeta (2026-11-11). Las que aparta el import
+                               van en `apartadas.por_motivo.partes`.
 
         Devuelve:
           dias, aparatos
@@ -4242,6 +4248,8 @@ class AnalysisDB:
           tramos         {total, aparatos, reconocidos, seguros, por_resultado}
                          (`seguros`: el tema que dio avanzaba con la mezcla
                          en dos trozos o más; desde el 2026-11-05)
+          sesiones_pasadas {veces, aparatos, sesiones, pistas, fallidas,
+                         desde} (desde el 2026-11-11)
 
         `temas_por_hora` sale de las que TERMINARON (una parada a medias no
         dice cuántos temas tiene la mezcla) y `segundos_por_hora` de las que
@@ -4269,6 +4277,9 @@ class AnalysisDB:
             tramos = {'total': 0, 'aparatos': 0, 'reconocidos': 0,
                       'seguros': 0, 'por_resultado': {}}
             de_editadas, de_tramos = set(), set()
+            pasadas = {'veces': 0, 'aparatos': 0, 'sesiones': 0, 'pistas': 0,
+                       'fallidas': 0, 'desde': {}}
+            de_pasadas = set()
             temas_hechas = minutos_hechas = 0
             segundos_de_una = minutos_de_una = 0
             marcas = ','.join('?' * len(self.EVENTOS_DE_MEZCLAS))
@@ -4310,6 +4321,16 @@ class AnalysisDB:
                     editadas['total'] += 1
                     q = str(p.get('que') or '?')[:20]
                     editadas['por_que'][q] = editadas['por_que'].get(q, 0) + 1
+                elif nombre == 'sesiones_pasadas':
+                    if dev:
+                        de_pasadas.add(dev)
+                    pasadas['veces'] += 1
+                    pasadas['sesiones'] += _n(p.get('sesiones'))
+                    pasadas['pistas'] += _n(p.get('pistas'))
+                    pasadas['fallidas'] += _n(p.get('fallidas'))
+                    d = str(p.get('desde') or '?')[:16]
+                    pasadas['desde'][d] = (pasadas['desde'].get(d, 0)
+                                           + _n(p.get('sesiones')))
                 elif nombre == 'mezcla_tramo':
                     if dev:
                         de_tramos.add(dev)
@@ -4343,6 +4364,7 @@ class AnalysisDB:
             ident['aparatos'] = len(de_identificadas)
             editadas['aparatos'] = len(de_editadas)
             tramos['aparatos'] = len(de_tramos)
+            pasadas['aparatos'] = len(de_pasadas)
             return {
                 'dias': int(dias),
                 'aparatos': len(aparatos),
@@ -4352,6 +4374,7 @@ class AnalysisDB:
                 'identificadas': ident,
                 'editadas': editadas,
                 'tramos': tramos,
+                'sesiones_pasadas': pasadas,
             }
         finally:
             conn.close()

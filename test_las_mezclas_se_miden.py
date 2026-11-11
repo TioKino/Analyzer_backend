@@ -101,6 +101,23 @@ class TestElResumen:
             'por_resultado': {'reconocido': 2, 'no': 1, 'sin_red': 1}}
         assert r['aparatos'] == 2
 
+    def test_las_sesiones_partidas_en_pistas(self):
+        """Una sesión cortada en pistas es UNA mezcla en partes (2026-11-11):
+        la que aparta el import va en `por_motivo.partes`; la que estaba como
+        temas y el DJ pasa a SETS GRABADOS, en `sesiones_pasadas`."""
+        db = _db()
+        _evento(db, 'mac-1', 'mezclas_apartadas', {
+            'nuevas': 2, 'ya_estaban': 0, 'por_duracion': 1, 'por_partes': 1})
+        _evento(db, 'mac-1', 'sesiones_pasadas', {
+            'desde': 'busqueda', 'sesiones': 3, 'pistas': 31, 'fallidas': 0})
+        _evento(db, 'pc-1', 'sesiones_pasadas', {
+            'desde': 'carpeta', 'sesiones': 1, 'pistas': 12, 'fallidas': 1})
+        r = db.resumen_mezclas(30)
+        assert r['apartadas']['por_motivo']['partes'] == 1
+        assert r['sesiones_pasadas'] == {
+            'veces': 2, 'aparatos': 2, 'sesiones': 4, 'pistas': 43,
+            'fallidas': 1, 'desde': {'busqueda': 3, 'carpeta': 1}}
+
     def test_sin_eventos_dice_cero_y_no_lo_se(self):
         r = _db().resumen_mezclas(30)
         assert r['aparatos'] == 0
