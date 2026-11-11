@@ -4106,6 +4106,55 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def resumen_cues_adoptados(self, dias: int = 30) -> Dict:
+        """Los cues de la comunidad que los DJs ADOPTAN (`cues_de_la_comunidad.dart`,
+        desde el 2026-11-11): en la onda del escritorio, «Adoptar» pone como
+        cues suyos los puntos donde al menos dos DJs pusieron uno. El cliente
+        manda `cues_adoptados` ({accion: adoptar|deshacer, cues, desde:
+        barra|menu}). Lo que se quiere saber es si sirve: cuántos se adoptan y
+        cuántos se deshacen al momento.
+
+          veces         adopciones (pulsaciones)
+          cues          cues adoptados
+          aparatos      aparatos que adoptaron algo
+          desde         {barra, menu}: adopciones por cada puerta
+          deshechas     adopciones deshechas con DESHACER
+          cues_deshechos
+
+        Recorre el cursor (la trampa del panel)."""
+        salida = {'dias': int(dias), 'veces': 0, 'cues': 0, 'aparatos': 0,
+                  'desde': {}, 'deshechas': 0, 'cues_deshechos': 0}
+        aparatos = set()
+        conn = self._open_conn()
+        try:
+            cur = conn.execute(
+                "SELECT device_id, props FROM events "
+                "WHERE event_name = 'cues_adoptados' AND day >= date('now', ?)",
+                (f"-{int(dias)} days",))
+            for dev, props in cur:
+                try:
+                    p = json.loads(props) if props else {}
+                    if not isinstance(p, dict):
+                        continue
+                    n = int(p.get('cues') or 0)
+                except (TypeError, ValueError):
+                    continue
+                accion = p.get('accion')
+                if accion == 'adoptar':
+                    salida['veces'] += 1
+                    salida['cues'] += n
+                    if dev:
+                        aparatos.add(dev)
+                    puerta = str(p.get('desde') or 'otra')
+                    salida['desde'][puerta] = salida['desde'].get(puerta, 0) + 1
+                elif accion == 'deshacer':
+                    salida['deshechas'] += 1
+                    salida['cues_deshechos'] += n
+            salida['aparatos'] = len(aparatos)
+            return salida
+        finally:
+            conn.close()
+
     def resumen_mezclas(self, dias: int = 30) -> Dict:
         """Las MEZCLAS del escritorio (`mezclas.dart`, desde el 2026-11-03):
         un fichero con muchos temas pinchados seguidos, que el import aparta
