@@ -3942,15 +3942,19 @@ class AnalysisDB:
     # Por dónde se cierra el resumen del import (`AccionDelResumen` en el
     # cliente). Lo que no esté aquí cuenta como «otra».
     ACCIONES_DEL_PRIMER_MINUTO = (
-        'cerrar', 'identificar', 'repetidos', 'mezclas', 'fallados')
+        'cerrar', 'identificar', 'repetidos', 'copias', 'mezclas', 'fallados')
     LINEAS_DEL_PRIMER_MINUTO = (
-        'conocidos', 'rejillas', 'del_programa', 'repetidos', 'sin_nombre')
+        'conocidos', 'rejillas', 'del_programa', 'repetidos', 'sin_nombre',
+        'copias_exactas')
 
     def resumen_primer_minuto(self, dias: int = 30) -> Dict:
         """EL PRIMER MINUTO (`el_primer_minuto.dart`, desde el 2026-11-10): al
         terminar un import en el escritorio, el resumen dice lo que DJ Analyzer
         ya sabía de esos temas, y al cerrarlo manda `primer_minuto` ({temas,
-        conocidos, rejillas, del_programa, sin_nombre, repetidos, accion}).
+        conocidos, rejillas, del_programa, sin_nombre, repetidos,
+        copias_exactas, accion}). `copias_exactas` (desde el 2026-11-11) son
+        FICHEROS que eran copias exactas de un tema que ya estaba y no se
+        añadieron; su «Ver» cierra con `copias`.
         Para saber cuánto tiene la app que enseñar al que llega —el anzuelo
         frente a Lexicon, `COMPETENCIA.md` punto 13— y si el DJ hace algo con
         ello.
