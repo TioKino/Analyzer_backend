@@ -13,10 +13,11 @@ distinto según durara 3:59 o 4:01. Medido con un tema sintético de 5 minutos:
     doble/mitad      sí                 no
     BPM              128,00             128,01            (deriva al coser)
 
-Hoy los dos pasan por `rasgos_del_tema`, y desde el 2026-10-07 también la
-energía (antes, ventanas de 2 s en trozos: un nivel más arriba). Lo que NO
-es igual todavía, a propósito, es la tonalidad y la estructura: ver el
-docstring de ese módulo.
+Hoy los dos pasan por `rasgos_del_tema`, desde el 2026-10-07 también la
+energía (antes, ventanas de 2 s en trozos: un nivel más arriba) y desde el
+2026-11-10 la tonalidad (antes, un voto de Krumhansl por trozo frente al croma
+del tema entero). Lo que NO es igual todavía, a propósito, es la estructura:
+ver el docstring de ese módulo.
 
     pytest test_el_chunked_calcula_lo_mismo.py -v
 """
@@ -154,15 +155,28 @@ def test_los_trozos_empiezan_en_un_frame_exacto():
 
 def test_el_croma_se_guarda_en_los_dos_y_es_el_mismo(los_dos):
     """El croma medio del tema va en el análisis por los dos caminos, para
-    medir otros perfiles de tonalidad sin el audio (`tonalidad.py`). El tema
-    sintético lleva La de bajo y La-Do# de acorde: el pico, en La."""
+    medir otros perfiles de tonalidad sin el audio (`tonalidad.py`), y desde
+    el 2026-11-10 es el MISMO: el de trozos cose la CQT y la comprime con el
+    máximo del tema entero, como el corto. (Con compresión logarítmica sale
+    más plano que el lineal de antes: el pico en La de este tema ya no se
+    mira; la tonalidad sí, en el test siguiente.)"""
     corto, trozos = los_dos
     for croma in (corto.croma, trozos['croma']):
         assert len(croma) == 12
         assert abs(sum(croma) - 1) < 1e-3
-        assert int(np.argmax(croma)) == 9, croma
     a, b = np.array(corto.croma), np.array(trozos['croma'])
-    assert a @ b / (np.linalg.norm(a) * np.linalg.norm(b)) > 0.95
+    assert a @ b / (np.linalg.norm(a) * np.linalg.norm(b)) > 0.999
+    assert np.abs(a - b).max() < 0.005
+
+
+def test_la_tonalidad_es_la_misma_en_los_dos(los_dos):
+    """Hasta el 2026-11-10 el de trozos votaba la tonalidad trozo a trozo con
+    Krumhansl, y el corto la sacaba del croma entero: el mismo tema podía
+    salir con otra según durara 3:59 o 4:01. El tema sintético lleva La de
+    bajo y La-Do# de acorde: La mayor (11B)."""
+    corto, trozos = los_dos
+    assert corto.tonalidad_metodo == trozos['tonalidad_metodo'] == 'log+braw'
+    assert (trozos['key'], trozos['camelot']) == (corto.key, corto.camelot) == ('A', '11B')
 
 
 def test_la_energia_es_la_misma_en_los_dos(los_dos):

@@ -29,7 +29,8 @@ from beat_grid import onset_envelope as beat_grid_onset_envelope
 # Lo que este camino tiene que calcular IGUAL que el corto (`main.analyze_audio`):
 # el BPM y su doble/mitad, la rejilla, el groove, el tipo de track, los graves,
 # los pads, la percusion y el genero espectral. Ver el docstring del modulo.
-from tonalidad import croma_de_trozos
+from tonalidad import (CONFIANZA_SIN_TONO, croma_log_de_piezas, cqt_para_tonalidad,
+                       tonalidad_del_croma_log)
 from rasgos_del_tema import (HOP, pulso_de_beats, rasgos_espectrales,
                              rejilla_y_bpm, tempo_y_beats, tempograma,
                              try_bpm_double_half, energia_del_tema,
@@ -72,26 +73,6 @@ CHUNK_OVERLAP = 5
 
 # Sample rate estándar
 SAMPLE_RATE = 44100
-
-# Perfiles para detección de key
-KEY_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-
-MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-
-# Normalizar perfiles
-MAJOR_PROFILE = MAJOR_PROFILE / np.sum(MAJOR_PROFILE)
-MINOR_PROFILE = MINOR_PROFILE / np.sum(MINOR_PROFILE)
-
-KEY_TO_CAMELOT = {
-    'C': '8B', 'C#': '3B', 'Db': '3B', 'D': '10B', 'D#': '5B', 'Eb': '5B',
-    'E': '12B', 'F': '7B', 'F#': '2B', 'Gb': '2B', 'G': '9B', 'G#': '4B', 
-    'Ab': '4B', 'A': '11B', 'A#': '6B', 'Bb': '6B', 'B': '1B',
-    'Cm': '5A', 'C#m': '12A', 'Dbm': '12A', 'Dm': '7A', 'D#m': '2A', 'Ebm': '2A',
-    'Em': '9A', 'Fm': '4A', 'F#m': '11A', 'Gbm': '11A', 'Gm': '6A', 'G#m': '1A', 
-    'Abm': '1A', 'Am': '8A', 'A#m': '3A', 'Bbm': '3A', 'Bm': '10A',
-}
-
 
 class ChunkedAudioAnalyzer:
     """
@@ -199,60 +180,6 @@ class ChunkedAudioAnalyzer:
                     except OSError:
                         pass
     
-    def analyze_chunk_key(self, y: np.ndarray, sr: int) -> Dict:
-        """Analiza key/tonalidad de un chunk."""
-        # Guard contra chunks vacios o demasiado cortos. chroma_cqt necesita
-        # minimo ~2^7 muestras para 7 octavas; con <1 segundo suele fallar
-        # con librosa.ParameterError. Pasa en tracks largos cuando el ultimo
-        # chunk queda partido por el boundary.
-        min_samples = sr  # 1 segundo como minimo razonable
-        if y is None or len(y) < min_samples:
-            logger.warning(
-                f"Chunk key skip: len={len(y) if y is not None else 'None'} "
-                f"< min={min_samples} (sr={sr})"
-            )
-            return {'key': 'C', 'scale': 'major', 'confidence': 0.0, 'chroma_vector': []}
-        try:
-            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12)
-            chroma_mean = np.mean(chroma, axis=1)
-            chroma_mean = chroma_mean / (np.sum(chroma_mean) + 1e-10)
-            
-            best_key = None
-            best_corr = -1
-            best_scale = None
-            
-            for i, key_name in enumerate(KEY_NAMES):
-                major_rot = np.roll(MAJOR_PROFILE, i)
-                minor_rot = np.roll(MINOR_PROFILE, i)
-                
-                major_corr = np.corrcoef(chroma_mean, major_rot)[0, 1]
-                minor_corr = np.corrcoef(chroma_mean, minor_rot)[0, 1]
-                
-                if not np.isnan(major_corr) and major_corr > best_corr:
-                    best_corr = major_corr
-                    best_key = key_name
-                    best_scale = 'major'
-                
-                if not np.isnan(minor_corr) and minor_corr > best_corr:
-                    best_corr = minor_corr
-                    best_key = key_name
-                    best_scale = 'minor'
-            
-            key_str = f"{best_key}m" if best_scale == 'minor' else best_key
-            
-            return {
-                'key': key_str,
-                'scale': best_scale,
-                'confidence': max(0, min(1, best_corr)),
-                'chroma_vector': chroma_mean.tolist()
-            }
-        except Exception as e:
-            # Capturamos generico porque librosa levanta ParameterError
-            # (subclase de Exception) y otras excepciones propias que no
-            # estaban cubiertas por la tripleta original.
-            logger.warning(f"Error Key chunk: {type(e).__name__}: {e}")
-            return {'key': 'C', 'scale': 'major', 'confidence': 0.0, 'chroma_vector': []}
-    
     def analyze_chunk_energy(self, y: np.ndarray, sr: int, chunk_start: float) -> Dict:
         """
         Analiza energía de un chunk y devuelve curva de energía.
@@ -287,80 +214,9 @@ class ChunkedAudioAnalyzer:
                 'energy_std': float(np.std(rms)),
                 'energy_curve': energy_curve
             }
-        except Exception as e:  # generico: ver analyze_chunk_key (ParameterError)
+        except Exception as e:  # genérico: librosa lanza ParameterError (subclase de Exception)
             logger.warning(f"Error Energy chunk: {type(e).__name__}: {e}")
             return {'energy_mean': 0.1, 'energy_curve': []}
-    
-    def fuse_key_results(self, chunk_results: List[Dict], energy_weights: List[float] = None) -> Dict:
-        """
-        Fusiona resultados de key de múltiples chunks.
-        Pondera más los chunks con mayor energía (suelen tener key más clara).
-        """
-        if not chunk_results:
-            return {'key': 'C', 'camelot': '8B', 'confidence': 0.0}
-
-        # Si no hay pesos de energía, usar confianza.
-        #
-        # `r.get('confidence') or 0.5`, NO `r.get('confidence', 0.5)`: el
-        # segundo solo aplica el default si la CLAVE no existe, no si su valor
-        # es None — y los chunks degenerados traen `'confidence': None` literal.
-        # Con el default de dict, `sum(energy_weights)` unas lineas mas abajo
-        # petaba con "TypeError: unsupported operand type(s) for +: 'int' and
-        # 'NoneType'" y se llevaba por delante el analisis del track entero.
-        #
-        # Es EL MISMO fallo que ya se corrigio para 'key' en el bucle de votos
-        # de mas abajo (panel admin 2026-05-20); alli se arreglo y aqui se
-        # quedo a medias. Lo destapo test_chunked_analyzer.py.
-        if energy_weights is None:
-            energy_weights = [(r.get('confidence') or 0.5) for r in chunk_results]
-
-        # Normalizar pesos
-        total_weight = sum(energy_weights) + 1e-10
-        weights = [w / total_weight for w in energy_weights]
-
-        # Contar votos ponderados por key. Usar `r.get('key') or 'C'`
-        # en vez de `r.get('key', 'C')`: el segundo solo aplica default
-        # si la KEY no existe, NO si su valor es None — y en chunks
-        # degenerados algunos r tienen literal `'key': None`, lo que
-        # provocaba que best_key acabara siendo None y la linea
-        # `best_key.endswith('m')` petara con AttributeError
-        # (visto en panel admin 2026-05-20).
-        key_votes = {}
-        for r, w in zip(chunk_results, weights):
-            key = r.get('key') or 'C'
-            if key not in key_votes:
-                key_votes[key] = 0
-            key_votes[key] += w * (r.get('confidence') or 0.5)
-
-        # Defensa contra el caso edge de 0 chunks (key_votes vacio
-        # rompe max() con ValueError).
-        if not key_votes:
-            return {
-                'key': 'C', 'camelot': '8B', 'scale': 'major',
-                'confidence': 0.0, 'source': 'chunked_analysis',
-            }
-
-        # Key ganadora
-        best_key = max(key_votes, key=key_votes.get)
-        camelot = KEY_TO_CAMELOT.get(best_key, '8B')
-
-        # Confianza = voto ganador / total votos
-        total_votes = sum(key_votes.values()) + 1e-10
-        confidence = key_votes[best_key] / total_votes
-
-        # Defensive: best_key garantizado string aqui (vino del dict de
-        # votos, que solo contiene strings tras el `or 'C'` de arriba),
-        # pero protegemos el endswith con cast por si llegan claves no
-        # string en el futuro.
-        scale = 'minor' if str(best_key).endswith('m') else 'major'
-
-        return {
-            'key': best_key,
-            'camelot': camelot,
-            'scale': scale,
-            'confidence': round(confidence, 3),
-            'source': 'chunked_analysis'
-        }
     
     def build_energy_curve(self, chunk_results: List[Dict]) -> List[Dict]:
         """Combina las curvas de energía de todos los chunks."""
@@ -820,8 +676,12 @@ class ChunkedAudioAnalyzer:
         logger.info(f"Procesando {num_chunks} chunks de {self.chunk_duration}s")
         
         # Resultados por chunk
-        key_results = []
         energy_results = []
+        # La CQT del tema entero, cosida como lo demás: la tonalidad sale de
+        # su croma con compresión logarítmica sobre el máximo del TEMA, como
+        # en el camino corto (`tonalidad.tonalidad_del_audio`). Hasta el
+        # 2026-11-10 cada trozo votaba su tonalidad con Krumhansl.
+        cqt_cosida = []
         cosido = {k: [] for k in ('onset', 'onset_med', 'centroid', 'rolloff',
                                   'bass', 'mid', 'treble', 'rms')}
         suma_tg = None
@@ -848,14 +708,18 @@ class ChunkedAudioAnalyzer:
                 continue
 
             # Analizar chunk
-            key_results.append(self.analyze_chunk_key(y, sr))
             energy_results.append(self.analyze_chunk_energy(y, sr, start_time))
+            desde = 0 if i == 0 else medio_solape
+            hasta = None if i == num_chunks - 1 else paso_frames + medio_solape
+            try:
+                cqt_cosida.append(cqt_para_tonalidad(y, sr)[:, desde:hasta])
+            except Exception as e:  # noqa: BLE001 - un trozo malo no tumba el tema
+                logger.warning(f"[Chunk {i+1}] CQT de la tonalidad descartada: "
+                               f"{type(e).__name__}: {e}")
 
             # Lo que se cose: frame a frame, sin el solape repetido.
             try:
                 r = self._rasgos_del_trozo(y, sr)
-                desde = 0 if i == 0 else medio_solape
-                hasta = None if i == num_chunks - 1 else paso_frames + medio_solape
                 for k in cosido:
                     cosido[k].append(np.asarray(r[k])[desde:hasta])
                 tg = r['tg'][:, desde:hasta]
@@ -895,9 +759,18 @@ class ChunkedAudioAnalyzer:
             f['onset'], fps, bpm, bpm_del_dsp=(bpm_source == 'chunked_analysis'),
             graves=f['bass'])
         
-        # Key final (ponderado por energía de cada chunk)
-        energy_weights = [r.get('energy_mean', 0.5) for r in energy_results]
-        key_final = self.fuse_key_results(key_results, energy_weights)
+        # La tonalidad del tema entero (la misma cuenta que el camino corto).
+        tono = tonalidad_del_croma_log(croma_log_de_piezas(cqt_cosida))
+        del cqt_cosida
+        if tono is None:
+            logger.warning("[Key] sin tonalidad medible (audio plano): 'C' con "
+                           "confianza 0")
+            tono = {'key': 'C', 'camelot': '8B', 'confianza': CONFIANZA_SIN_TONO,
+                    'margen_modo': 1.0, 'croma': None, 'metodo': None}
+        key_final = {'key': tono['key'], 'camelot': tono['camelot'],
+                     'confidence': tono['confianza']}
+        if tono['margen_modo'] < 0.05:
+            key_final['confidence'] = min(key_final['confidence'], 0.55)
         
         # Curva de energía completa
         energy_curve = self.build_energy_curve(energy_results)
@@ -947,9 +820,10 @@ class ChunkedAudioAnalyzer:
             'camelot': key_final['camelot'],
             'key_confidence': key_final['confidence'],
             'key_source': 'chunked_analysis',
-            # El croma del tema entero, para medir otros perfiles de
-            # tonalidad (`tonalidad.py`): la media del de cada trozo.
-            'croma': croma_de_trozos(r.get('chroma_vector') for r in key_results),
+            # El croma (log) del tema entero y cómo se sacó, para medir otros
+            # perfiles en sombra sin mezclar los de antes (`tonalidad.py`).
+            'croma': tono['croma'],
+            'tonalidad_metodo': tono['metodo'],
             'energy_raw': energy_mean,
             'energy_normalized': energy_dj / 10,
             'energy_dj': energy_dj,

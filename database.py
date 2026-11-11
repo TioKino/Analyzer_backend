@@ -3737,12 +3737,16 @@ class AnalysisDB:
         esta misma música), medido sobre el croma guardado de los temas
         contra la tonalidad que dice su programa de DJ (#4 de PENDING,
         2026-10-07). Nadie ve nada distinto: es para decidir con números qué
-        perfil usa /analyze. Solo cuentan los temas analizados desde que
-        `/analyze` guarda el croma (`croma` en `analysis_json`), así que al
-        principio son los que alguien haya reanalizado."""
-        from tonalidad import evaluar_perfiles, guardada_frente_a_kk
+        perfil usa /analyze.
+
+        Solo cuentan los temas con el croma de HOY (`tonalidad_metodo` =
+        `tonalidad.METODO`: el croma log desde el 2026-11-10). El de antes
+        (lineal, sin método) es otra medida y mezclarlos no diría nada: se
+        cuentan aparte en `croma_viejo`."""
+        from tonalidad import METODO, evaluar_perfiles, guardada_frente_a_la_de_hoy
         temas = []
         por_camino = []
+        croma_viejo = 0
         marcas = ','.join('?' * len(self.PROGRAMAS_DE_REFERENCIA_TONALIDAD))
         conn = self._open_conn()
         try:
@@ -3764,6 +3768,7 @@ class AnalysisDB:
                 for t in self._tracks_por_huella_o_id(
                         c, "id, fingerprint, camelot, engine_source, "
                            "json_extract(analysis_json, '$.key_source') AS key_source, "
+                           "json_extract(analysis_json, '$.tonalidad_metodo') AS metodo, "
                            "json_extract(analysis_json, '$.croma') AS croma",
                         list(verdad)):
                     clave = t['fingerprint'] if t['fingerprint'] in verdad else t['id']
@@ -3775,6 +3780,9 @@ class AnalysisDB:
                         continue
                     if isinstance(croma, list) and len(croma) == 12:
                         vistos.add(clave)
+                        if t['metodo'] != METODO:
+                            croma_viejo += 1
+                            continue
                         temas.append((clave, croma, verdad[clave]))
                         por_camino.append((croma, verdad[clave],
                                            self._camino_de_la_tonalidad(t),
@@ -3782,7 +3790,9 @@ class AnalysisDB:
         finally:
             conn.close()
         salida = evaluar_perfiles(temas)
-        salida['por_camino'] = guardada_frente_a_kk(por_camino)
+        salida['metodo'] = METODO
+        salida['croma_viejo'] = croma_viejo
+        salida['por_camino'] = guardada_frente_a_la_de_hoy(por_camino)
         return salida
 
     @classmethod

@@ -50,27 +50,17 @@ def test_las_clases_nuevas_salen_de_otra():
     assert AnalysisDB._clase_de_tonalidad('8A', '11B') == 'paralela'
 
 
-def _como_main(croma):
-    """El bucle de `main.analyze_audio`: `np.corrcoef` con Krumhansl-Kessler,
-    mayor antes que menor en cada tónica."""
-    mayor = np.array(t.PERFILES['kk'][0]); menor = np.array(t.PERFILES['kk'][1])
-    mayor, menor = mayor / mayor.sum(), menor / menor.sum()
-    mejor, cual = -2, None
-    for i in range(12):
-        for perfil, modo in ((mayor, 'mayor'), (menor, 'menor')):
-            r = np.corrcoef(croma, np.roll(perfil, i))[0, 1]
-            if r > mejor:
-                mejor, cual = r, (i, modo)
-    return t.camelot_de(*cual)
-
-
-def test_kk_en_sombra_es_lo_que_hace_hoy_analyze():
-    """Si no, comparar «kk» con los demás no diría nada del algoritmo de hoy."""
+def test_la_de_hoy_en_sombra_es_lo_que_hace_analyze():
+    """Desde el 2026-11-10 /analyze saca la tonalidad con `estimar_tonalidad`
+    y el perfil `PERFIL` (braw): tiene que ser la misma elección que el perfil
+    de ese nombre en la sombra, o comparar perfiles no diría nada del de hoy."""
     rnd = np.random.RandomState(7)
     for _ in range(300):
         croma = rnd.rand(12) ** 3
         croma /= croma.sum()
-        assert t.tonalidad_desde_croma(croma, *t.PERFILES['kk']) == _como_main(croma)
+        assert t.estimar_tonalidad(croma)['camelot'] == \
+            t.tonalidad_desde_croma(croma, *t.PERFILES[t.PERFIL])
+    assert t.PERFIL in t.PERFILES
 
 
 def _tema_sintetico(rnd, tonica, modo, perfil):
@@ -114,8 +104,6 @@ def test_el_croma_que_se_guarda():
     assert t.croma_para_guardar([1] * 11) is None
     g = t.croma_para_guardar(np.arange(12, dtype=float))
     assert len(g) == 12 and abs(sum(g) - 1) < 1e-3
-    assert t.croma_de_trozos([[], None]) is None
-    assert t.croma_de_trozos([[1] + [0] * 11, [0, 1] + [0] * 10])[:2] == [0.5, 0.5]
 
 
 # --------------------------------------------------------- en la base de datos
@@ -125,7 +113,7 @@ def db(tmp_path):
     return AnalysisDB(db_path=str(tmp_path / 'analysis.db'))
 
 
-def _tema(db, croma=None, key_source='analysis', camelot='8A'):
+def _tema(db, croma=None, key_source='analysis', camelot='8A', metodo=t.METODO):
     fp = uuid.uuid4().hex
     fila = {
         'id': fp, 'fingerprint': fp, 'filename': f'{fp}.mp3', 'bpm': 128.0,
@@ -136,6 +124,8 @@ def _tema(db, croma=None, key_source='analysis', camelot='8A'):
     }
     if croma is not None:
         fila['croma'] = croma
+    if metodo is not None:
+        fila['tonalidad_metodo'] = metodo
     db.save_track(fila)
     return fp
 
@@ -160,8 +150,15 @@ def test_en_la_bd_cuentan_los_temas_con_croma_y_con_programa_de_fiar(db):
     traktor = _tema(db, croma=_la_menor())
     db.guardar_lo_importado('devA', [{'fingerprint': traktor, 'source': 'traktor',
                                       'key': 'Am', 'camelot': '8A'}])
+    # El croma de antes del 2026-11-10 (lineal, sin método) es otra medida: se
+    # cuenta aparte y no entra en la comparación.
+    viejo = _tema(db, croma=_la_menor(), metodo=None)
+    db.guardar_lo_importado('devA', [{'fingerprint': viejo, 'source': 'rekordbox',
+                                      'key': 'Am', 'camelot': '8A'}])
     r = db.tonalidad_en_sombra()
     assert r['temas'] == 2
+    assert r['croma_viejo'] == 1
+    assert r['metodo'] == t.METODO
     assert r['perfiles']['kk'] == {'comparados': 2, 'igual': 2}
 
 
@@ -190,21 +187,25 @@ def test_analyze_devuelve_el_croma():
     assert 'croma' in models.AnalysisResult.model_fields
 
 
-def test_por_camino_lo_guardado_frente_a_krumhansl(db):
-    """En el corto la tonalidad guardada y Krumhansl sobre el croma son el
-    mismo cálculo y tienen que coincidir; en los trozos son dos algoritmos
-    sobre los mismos temas (lectura 55)."""
-    corto = _tema(db, croma=_la_menor(), camelot='8A')
+def _la_menor_hoy():
+    return t.croma_para_guardar(np.roll(t.PERFILES[t.PERFIL][1], 9))
+
+
+def test_por_camino_lo_guardado_frente_a_la_de_hoy(db):
+    """Desde el 2026-11-10 el corto y el de trozos sacan la tonalidad con la
+    misma cuenta: lo guardado y la de hoy sobre su croma tienen que coincidir
+    en los dos. Si en uno no coincide, algo la cambia antes de guardarla."""
+    corto = _tema(db, croma=_la_menor_hoy(), camelot='8A')
     db.guardar_lo_importado('devA', [{'fingerprint': corto, 'source': 'rekordbox',
                                       'key': 'Am', 'camelot': '8A'}])
-    trozos = _tema(db, croma=_la_menor(), key_source='chunked_analysis',
+    trozos = _tema(db, croma=_la_menor_hoy(), key_source='chunked_analysis',
                    camelot='9A')
     db.guardar_lo_importado('devA', [{'fingerprint': trozos, 'source': 'rekordbox',
                                       'key': 'Am', 'camelot': '8A'}])
     r = db.tonalidad_en_sombra()['por_camino']
     assert r['corto'] == {'temas': 1, 'guardada': {'comparados': 1, 'igual': 1},
-                          'kk': {'comparados': 1, 'igual': 1},
-                          'kk_igual_que_guardada': 1}
+                          'hoy': {'comparados': 1, 'igual': 1},
+                          'hoy_igual_que_guardada': 1}
     assert r['trozos']['guardada'] == {'comparados': 1, 'igual': 0, 'quinta': 1}
-    assert r['trozos']['kk'] == {'comparados': 1, 'igual': 1}
-    assert r['trozos']['kk_igual_que_guardada'] == 0
+    assert r['trozos']['hoy'] == {'comparados': 1, 'igual': 1}
+    assert r['trozos']['hoy_igual_que_guardada'] == 0
