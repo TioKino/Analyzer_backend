@@ -3191,6 +3191,145 @@ class AnalysisDB:
             conn.close()
         return {'retiradas': retiradas, 'isrc_quitados': quitados}
 
+    # Lo que un aparato deja en analysis.db, tabla por tabla. Lo borra
+    # `borrar_lo_de_los_aparatos` («Borrar mis datos de la nube», desde el
+    # 2026-11-12). Una tabla NUEVA con `device_id` (o `voter`) va aquí y en
+    # el borrado: lo exige test_borrar_mis_datos_de_la_nube.py, que recorre el
+    # esquema de verdad.
+    _TABLAS_DEL_BORRADO = (
+        'identidad_verificada', 'imported_values', 'imported_recibido',
+        'community_cues', 'beat_grid_corrections',
+        'community_track_type_overrides', 'community_overrides',
+        'community_vote_sources', 'corrections',
+        'community_notes', 'community_note_upvotes',
+        'track_analyzers', 'track_ratings', 'audd_call_log',
+        'analysis_errors', 'events', 'device_first_seen',
+    )
+    # Las de la lista que no se borran a secas: tienen su propia regla abajo.
+    _BORRADO_CON_REGLA = frozenset({
+        'identidad_verificada', 'community_notes', 'community_note_upvotes',
+        'track_analyzers', 'track_ratings', 'audd_call_log',
+    })
+
+    def borrar_lo_de_los_aparatos(self, device_ids) -> Dict[str, int]:
+        """Borra lo que [device_ids] aportaron a la memoria colectiva y lo que
+        quedó apuntado de ellos: la identidad verificada (con el ISRC que puso
+        en `tracks`, por la regla de `retirar_identidades`), lo importado de
+        su programa de DJ, sus cues, rejillas, votos (también los de
+        `corrections`, el consenso a mano), notas y estrellas, los
+        temas que tenían (la popularidad), sus errores y sus eventos. Rehace lo
+        que se calcula con ello: los DJs de cada tema, la media de estrellas y
+        los votos de las notas de otros. El gasto de AudD se queda, sin el
+        aparato: es la cuenta de lo que costó, no un dato suyo.
+
+        Idempotente: main.py lo repasa al arrancar con los aparatos borrados
+        de los últimos 30 días, por si un aparato de antes mandó algo con su
+        id viejo después del borrado, o si este paso quedó a medias.
+        Devuelve {tabla: filas}."""
+        ids = sorted({str(d) for d in (device_ids or []) if d})
+        if not ids:
+            return {}
+        n: Dict[str, int] = {}
+
+        # 1. La identidad verificada, por la regla de retirar (quita también
+        # el ISRC que puso en `tracks` si el análisis no lo trae).
+        conn = self._open_conn()
+        try:
+            huellas_de = {}
+            for d in ids:
+                try:
+                    huellas_de[d] = [f[0] for f in conn.execute(
+                        'SELECT fingerprint FROM identidad_verificada '
+                        'WHERE device_id = ?', (d,)).fetchall()]
+                except sqlite3.OperationalError:
+                    huellas_de[d] = []
+        finally:
+            conn.close()
+        n['identidad_verificada'] = 0
+        for d, huellas in huellas_de.items():
+            if huellas:
+                n['identidad_verificada'] += self.retirar_identidades(
+                    d, huellas).get('retiradas', 0)
+
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            ph = ','.join('?' * len(ids))
+
+            def borrar(tabla: str, donde: str, args) -> None:
+                try:
+                    n[tabla] = n.get(tabla, 0) + c.execute(
+                        f'DELETE FROM {tabla} WHERE {donde}', args).rowcount
+                except sqlite3.OperationalError:
+                    n.setdefault(tabla, 0)  # tabla que esta BD aún no tiene
+
+            def huellas(tabla: str) -> List[str]:
+                try:
+                    return [f[0] for f in c.execute(
+                        f'SELECT DISTINCT fingerprint FROM {tabla} '
+                        f'WHERE device_id IN ({ph})', ids).fetchall()]
+                except sqlite3.OperationalError:
+                    return []
+
+            # 2. Las notas: las suyas (con sus votos) y sus votos a las de
+            # otros, que bajan su contador.
+            try:
+                suyas = [f[0] for f in c.execute(
+                    f'SELECT id FROM community_notes WHERE device_id IN ({ph})',
+                    ids).fetchall()]
+            except sqlite3.OperationalError:
+                suyas = []
+            if suyas:
+                borrar('community_note_upvotes',
+                       f'note_id IN ({",".join("?" * len(suyas))})', suyas)
+            try:
+                c.execute(
+                    f'UPDATE community_notes SET upvotes = MAX(0, upvotes - ('
+                    f'SELECT COUNT(*) FROM community_note_upvotes u '
+                    f'WHERE u.note_id = community_notes.id '
+                    f'AND u.voter IN ({ph}))) '
+                    f'WHERE id IN (SELECT note_id FROM community_note_upvotes '
+                    f'WHERE voter IN ({ph}))', [*ids, *ids])
+            except sqlite3.OperationalError:
+                pass
+            borrar('community_note_upvotes', f'voter IN ({ph})', ids)
+            borrar('community_notes', f'device_id IN ({ph})', ids)
+
+            # 3. Estrellas y «N DJs lo tienen»: se borran y se rehacen las
+            # cifras de esos temas, con la misma regla que al escribirlas.
+            con_estrellas = huellas('track_ratings')
+            con_analista = huellas('track_analyzers')
+            borrar('track_ratings', f'device_id IN ({ph})', ids)
+            borrar('track_analyzers', f'device_id IN ({ph})', ids)
+            for fp in con_estrellas:
+                media, cuantas = self._media_por_cuenta(c, fp)
+                c.execute('UPDATE track_popularity SET avg_rating = ?, '
+                          'total_ratings = ? WHERE fingerprint = ?',
+                          (media, cuantas, fp))
+            for fp in con_analista:
+                djs = c.execute('SELECT COUNT(*) FROM track_analyzers '
+                                'WHERE fingerprint = ?', (fp,)).fetchone()[0]
+                c.execute('UPDATE track_popularity SET dj_count = ? '
+                          'WHERE fingerprint = ?', (max(1, int(djs or 0)), fp))
+
+            # 4. Lo demás de la lista, tal cual: por eso basta con apuntar en
+            # `_TABLAS_DEL_BORRADO` una tabla nueva para que se borre.
+            for tabla in self._TABLAS_DEL_BORRADO:
+                if tabla not in self._BORRADO_CON_REGLA:
+                    borrar(tabla, f'device_id IN ({ph})', ids)
+
+            # 5. El gasto de AudD se queda, sin el aparato.
+            try:
+                n['audd_call_log'] = c.execute(
+                    f'UPDATE audd_call_log SET device_id = NULL '
+                    f'WHERE device_id IN ({ph})', ids).rowcount
+            except sqlite3.OperationalError:
+                n['audd_call_log'] = 0
+            conn.commit()
+        finally:
+            conn.close()
+        return n
+
     @staticmethod
     def _identidad_de_fila(r, exacta: bool) -> Dict:
         return {'artist': r['artist'], 'title': r['title'], 'isrc': r['isrc'],

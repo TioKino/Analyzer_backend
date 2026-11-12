@@ -24,9 +24,10 @@ import random
 import string
 
 from fastapi import APIRouter, Request, HTTPException, Depends
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 
 # Dias sin que NINGUN compañero suba nada para dejar de llamarlo «al dia» y
@@ -34,7 +35,7 @@ from datetime import datetime, timezone, timedelta
 # o mal —esta app se usa a rafagas, ~6 sesiones al mes— sino el corte que separa
 # dos causas que piden mirar aparatos distintos. Ver el comentario del verdict.
 _DIAS_EMISOR_CALLADO = 3
-import json, hashlib, sqlite3, os
+import json, hashlib, sqlite3, os, threading
 from validation import is_desktop_platform
 
 from config import SYNC_AUTH_SECRET, ADMIN_TOKEN
@@ -196,29 +197,61 @@ async def _verify_sync_auth(request: Request):
     _record_sync_auth(matched_slot, bool(token))
 
 
+async def _rechazar_aparato_borrado(request: Request):
+    """410 a un aparato cuyos datos se borraron a petición de su dueño
+    («Borrar mis datos de la nube», desde el 2026-11-12; ver
+    `sync_borrar_mis_datos`). Va aparte de `_verify_sync_auth` porque esa se
+    sale sin mirar nada cuando no hay `SYNC_AUTH_SECRET` (desarrollo y tests),
+    y esto tiene que valer siempre.
+
+    Sin esto, los OTROS aparatos de la cuenta volvían a subirlo todo: un 403
+    los registra solos con una cuenta nueva y empujan su copia local. Un
+    cliente de antes no entiende el 410 y se queda sin sincronizar, que es
+    justo lo que pidió su dueño; uno de ahora pausa el sync y lo avisa."""
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        return
+    device_id = _device_id_from_request(request, body)
+    if device_id and _aparato_borrado(device_id):
+        raise HTTPException(status_code=410, detail="Device data deleted")
+
+
 sync_router = APIRouter(
     prefix="/sync",
     tags=["sync"],
-    dependencies=[Depends(_verify_sync_auth)],
+    dependencies=[Depends(_verify_sync_auth),
+                  Depends(_rechazar_aparato_borrado)],
 )
 
 # ── SQLite persistente ───────────────────────────────────────
 
 _DB_PATH = os.environ.get("SYNC_DB_PATH", "/data/sync.db")
 _conn: Optional[sqlite3.Connection] = None
+_conn_lock = threading.Lock()
 
 
 def _get_conn() -> sqlite3.Connection:
+    """La conexión de sync.db, creada UNA vez y publicada solo cuando sus
+    tablas ya están (desde el 2026-11-12). Antes se asignaba a `_conn` antes de
+    `_init_tables`, y un hilo que la pidiera a la vez (la pasada de los
+    aparatos borrados que main.py lanza al arrancar, o las cuentas que lee
+    database.py desde el threadpool) la usaba a medias: `no such column:
+    user_id` en el primer registro."""
     global _conn
-    if _conn is None:
-        os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-        _conn = sqlite3.connect(_DB_PATH, check_same_thread=False, timeout=30.0)
-        # journal_mode=WAL una vez (esta conexion singleton es el init de sync.db).
-        _conn.execute("PRAGMA journal_mode=WAL")
-        # busy_timeout FALTABA: sin el, cualquier escritura de /sync/* fallaba al
-        # instante con "database is locked" bajo contienda (fix outage 2026-07-14).
-        _conn.execute("PRAGMA busy_timeout=30000")
-        _init_tables(_conn)
+    if _conn is not None:
+        return _conn
+    with _conn_lock:
+        if _conn is None:
+            os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+            c = sqlite3.connect(_DB_PATH, check_same_thread=False, timeout=30.0)
+            # journal_mode=WAL una vez (esta conexion singleton es el init de sync.db).
+            c.execute("PRAGMA journal_mode=WAL")
+            # busy_timeout FALTABA: sin el, cualquier escritura de /sync/* fallaba al
+            # instante con "database is locked" bajo contienda (fix outage 2026-07-14).
+            c.execute("PRAGMA busy_timeout=30000")
+            _init_tables(c)
+            _conn = c
     return _conn
 
 
@@ -318,6 +351,17 @@ def _init_tables(conn: sqlite3.Connection):
             has_token   INTEGER NOT NULL,
             n           INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (day, secret_slot, has_token)
+        );
+
+        -- «Borrar mis datos de la nube» (2026-11-12): los aparatos de una
+        -- cuenta borrada. Es lo ÚNICO que queda de ella (un id al azar, la
+        -- hora y la petición, que agrupa los aparatos de un mismo borrado), y
+        -- es lo que impide que esos aparatos vuelvan a subirlo todo: el sync
+        -- les contesta 410. NO lo vacía el reset de admin, por lo mismo.
+        CREATE TABLE IF NOT EXISTS aparatos_borrados (
+            device_id   TEXT PRIMARY KEY,
+            borrado_at  TEXT NOT NULL,
+            solicitud   TEXT NOT NULL
         );
     """)
 
@@ -1555,16 +1599,22 @@ def _count_items_in(data_type: str, payload) -> int:
 # ── STATUS ───────────────────────────────────────────────────
 
 @sync_router.get("/status")
-async def sync_status():
+async def sync_status(request: Request):
+    """Totales de sync.db. SOLO para el administrador (desde el 2026-11-12):
+    hasta ese día bastaba la firma del sync —el secreto va dentro de la app y
+    se saca del binario— y devolvía el id de cada aparato de TODOS los
+    usuarios, que es lo que pide `/sync/pull/{device_id}` para leer una
+    biblioteca (a un aparato que aún no manda su token no se le exige). Ni la
+    app ni los scripts lo llamaban. Y cuenta en SQL: antes traía a memoria
+    una fila por cada item de la tabla."""
+    await _verify_admin(request)
     conn = _get_conn()
-    rows = conn.execute(
-        "SELECT data_type, last_device_id FROM sync_items"
-    ).fetchall()
-    by_type: dict[str, int] = {}
-    devices: set[str] = set()
-    for dt, dev in rows:
-        by_type[dt] = by_type.get(dt, 0) + 1
-        devices.add(dev)
+    by_type = {
+        dt: n for dt, n in conn.execute(
+            "SELECT data_type, COUNT(*) FROM sync_items GROUP BY data_type")
+    }
+    devices = [d for (d,) in conn.execute(
+        "SELECT DISTINCT last_device_id FROM sync_items")]
     device_seen_counts = {
         row[0]: row[1]
         for row in conn.execute(
@@ -1574,9 +1624,9 @@ async def sync_status():
     total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     total_registered_devices = conn.execute("SELECT COUNT(*) FROM user_devices").fetchone()[0]
     return {
-        "total_items":    len(rows),
+        "total_items":    sum(by_type.values()),
         "by_type":        by_type,
-        "devices":        list(devices),
+        "devices":        devices,
         "device_seen":    device_seen_counts,
         "total_users":    total_users,
         "total_registered_devices": total_registered_devices,
@@ -1727,6 +1777,166 @@ class DetectedTrackSync(BaseModel):
     title: str
     payload: Any
     detected_at: str
+
+
+# ── BORRAR MIS DATOS DE LA NUBE (2026-11-12) ────────────────
+#
+# La política de privacidad decía que «Borrar todo» de Ajustes borraba también
+# lo del servidor, y no era verdad: ese borrado es solo del aparato (decisión
+# del 2026-07-14) y no había ninguna forma de borrar del servidor la biblioteca
+# de un usuario, tampoco desde el panel. Desde aquí, el usuario lo hace solo:
+# Ajustes → Zona peligrosa → «Borrar mis datos de la nube».
+#
+# Se borra la CUENTA entera, todos sus aparatos: la biblioteca sincronizada,
+# las detecciones y los sets (sync.db), y lo que esos aparatos aportaron a la
+# memoria colectiva (analysis.db, `al_borrar_aparatos`, que pone main.py). Lo
+# que NO es de nadie se queda: el análisis de cada tema, su preescucha y su
+# portada son de la canción, por huella, sin aparato.
+#
+# Una tabla NUEVA de sync.db con `device_id`, `last_device_id` o `user_id` va
+# en `_borrar_la_cuenta` (lo exige test_borrar_mis_datos_de_la_nube.py), como
+# va en `_assign_orphan_data` y `_migrate_abandoned_account`.
+
+# Lo de analysis.db (lo aportado a la memoria colectiva): lo cablea main.py a
+# `AnalysisDB.borrar_lo_de_los_aparatos`. Sin él, solo se borra lo de sync.db.
+al_borrar_aparatos: Optional[Callable[[List[str]], Dict[str, int]]] = None
+
+
+def _aparato_borrado(device_id: str) -> bool:
+    try:
+        return _get_conn().execute(
+            "SELECT 1 FROM aparatos_borrados WHERE device_id = ?",
+            (device_id,)).fetchone() is not None
+    except sqlite3.Error:
+        return False  # mirar nunca tumba un sync
+
+
+def aparatos_borrados(dias: Optional[int] = None) -> List[str]:
+    """Los aparatos de las cuentas borradas; con [dias], solo los de ese
+    tiempo para acá (main.py repasa al arrancar los de los últimos 30 días:
+    un aparato de antes puede haber mandado algo de la comunidad con su id
+    viejo después del borrado)."""
+    conn = _get_conn()
+    if dias is None:
+        filas = conn.execute("SELECT device_id FROM aparatos_borrados")
+    else:
+        desde = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+        filas = conn.execute(
+            "SELECT device_id FROM aparatos_borrados WHERE borrado_at >= ?",
+            (desde,))
+    return [f[0] for f in filas]
+
+
+def resumen_de_borrados(dias: int = 30) -> Dict[str, int]:
+    """Para el panel: cuántas cuentas pidieron borrar sus datos (una petición
+    es una cuenta) y con cuántos aparatos, en [dias] y en total."""
+    conn = _get_conn()
+    desde = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    cuentas, aparatos = conn.execute(
+        "SELECT COUNT(DISTINCT solicitud), COUNT(*) FROM aparatos_borrados "
+        "WHERE borrado_at >= ?", (desde,)).fetchone()
+    total = conn.execute(
+        "SELECT COUNT(DISTINCT solicitud) FROM aparatos_borrados").fetchone()[0]
+    return {"cuentas_30d": int(cuentas or 0), "aparatos_30d": int(aparatos or 0),
+            "cuentas_total": int(total or 0)}
+
+
+def _borrar_la_cuenta(user_id: str, aparatos: List[str],
+                      solicitud: str) -> Dict[str, int]:
+    """Borra de sync.db lo de [user_id] y sus [aparatos], y deja sus lápidas,
+    en UNA transacción: o todo o nada. Con su propia conexión, porque va en
+    un hilo (`run_in_threadpool`) y la del módulo la usa el bucle a la vez."""
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        marcas = ",".join("?" * len(aparatos))
+        ahora = _now_iso()
+        n: Dict[str, int] = {}
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO aparatos_borrados "
+                "(device_id, borrado_at, solicitud) VALUES (?, ?, ?)",
+                [(a, ahora, solicitud) for a in aparatos])
+            # Lo de la cuenta; lo colectivo de antes (`__collective__`) que
+            # escribieron estos aparatos; y lo suyo sin cuenta, de antes de
+            # que existieran las cuentas.
+            n["sync_items"] = conn.execute(
+                "DELETE FROM sync_items WHERE user_id = ?", (user_id,)).rowcount
+            n["sync_items"] += conn.execute(
+                f"DELETE FROM sync_items WHERE (user_id = '__collective__' "
+                f"OR user_id = '' OR user_id IS NULL) "
+                f"AND last_device_id IN ({marcas})", aparatos).rowcount
+            n["device_seen"] = conn.execute(
+                f"DELETE FROM device_seen WHERE device_id IN ({marcas})",
+                aparatos).rowcount
+            for tabla in ("detected_tracks_sync", "listen_sets_sync"):
+                n[tabla] = conn.execute(
+                    f"DELETE FROM {tabla} WHERE user_id = ? "
+                    f"OR device_id IN ({marcas})", [user_id, *aparatos]).rowcount
+            n["link_codes"] = conn.execute(
+                "DELETE FROM link_codes WHERE user_id = ?", (user_id,)).rowcount
+            n["user_devices"] = conn.execute(
+                f"DELETE FROM user_devices WHERE user_id = ? "
+                f"OR device_id IN ({marcas})", [user_id, *aparatos]).rowcount
+            n["users"] = conn.execute(
+                "DELETE FROM users WHERE user_id = ?", (user_id,)).rowcount
+        return n
+    finally:
+        conn.close()
+
+
+class BorrarMisDatos(BaseModel):
+    device_id: str
+    confirmar: bool = False
+
+
+@sync_router.post("/borrar-mis-datos")
+async def sync_borrar_mis_datos(b: BorrarMisDatos, request: Request):
+    """Borra del servidor los datos de la cuenta de este aparato, a petición
+    de su dueño. Exige el `X-Device-Token` del aparato SIEMPRE (aunque aún no
+    se le exija para sincronizar): el secreto de la app se saca del binario, y
+    con él y un device_id cualquiera podría borrar la cuenta de otro.
+
+    Repetirlo (el cliente no supo si llegó) da 410, que el cliente toma por
+    hecho: la lápida ya está."""
+    if not b.confirmar:
+        raise HTTPException(status_code=400, detail="confirmar=true required")
+    conn = _get_conn()
+    fila = conn.execute(
+        "SELECT user_id, device_token FROM user_devices WHERE device_id = ?",
+        (b.device_id,)).fetchone()
+    if not fila:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Device '{b.device_id}' not registered. "
+                   "Call POST /sync/register first.")
+    token = request.headers.get("X-Device-Token", "")
+    guardado = fila[1]
+    if not guardado or not token or not _hmac.compare_digest(token, guardado):
+        raise HTTPException(status_code=401, detail="Device token required")
+
+    user_id = fila[0]
+    aparatos = sorted(set(_get_all_device_ids_for_user(conn, user_id))
+                      | {b.device_id})
+    solicitud = uuid.uuid4().hex
+    sync_n = await run_in_threadpool(
+        _borrar_la_cuenta, user_id, aparatos, solicitud)
+
+    memoria: Dict[str, int] = {}
+    if al_borrar_aparatos is not None:
+        try:
+            memoria = await run_in_threadpool(al_borrar_aparatos, aparatos) or {}
+        except Exception as e:  # noqa: BLE001 - las lápidas ya están
+            # Lo de sync.db y las lápidas ya están: lo que falte de la memoria
+            # lo termina la pasada del arranque (main.py), que repasa los
+            # aparatos borrados de los últimos 30 días.
+            logger.warning(f"[Borrado] la memoria colectiva quedó a medias: {e}")
+    logger.info(
+        f"[Borrado] cuenta borrada a petición: {len(aparatos)} aparatos, "
+        f"sync {sum(sync_n.values())} filas, memoria "
+        f"{sum(memoria.values())} filas")
+    return {"borrado": True, "aparatos": len(aparatos),
+            "sync": sync_n, "memoria": memoria}
 
 
 def _init_detected_table(conn: sqlite3.Connection):

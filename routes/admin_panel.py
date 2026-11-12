@@ -1785,6 +1785,9 @@ def _telemetry(request: Request):
         # Cuántas veces el móvil abrió la ventana de valorar de la tienda, tras
         # unos aciertos de Escuchar (`pedir_valoracion.dart`, 2026-11-11).
         "valoraciones": _valoraciones(),
+        # Las cuentas que borraron sus datos de la nube desde la app
+        # («Borrar mis datos de la nube», 2026-11-12).
+        "borrados": _borrados(),
         # La pasada de Shazam del Mac desde que la ven todos (2026-11-11).
         "shazam_pasada": _shazam_pasada(),
         # Los cues de la comunidad que el DJ adopta en la onda (2026-11-11).
@@ -2204,6 +2207,15 @@ def _valoraciones():
         return _get_db().resumen_valoraciones(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] valoraciones fallo: {e}")
+        return None
+
+
+def _borrados():
+    try:
+        from sync_endpoints import resumen_de_borrados
+        return resumen_de_borrados(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] borrados fallo: {e}")
         return None
 
 
