@@ -15,8 +15,9 @@ Estructura:
 from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, Depends, Form, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import sync_endpoints as _sync_endpoints
 from sync_endpoints import (sync_router, admin_sync_router, cuentas_de_dispositivos,
-                            aparatos_de_la_misma_cuenta,
+                            aparatos_de_la_misma_cuenta, aparatos_borrados,
                             dispositivo_del_token, tipo_de_aparato)
 from routes.admin_panel import admin_panel_router
 from routes.search import search_router, init as init_search, buscar_analizado
@@ -997,6 +998,28 @@ db = AnalysisDB(db_path=DATABASE_PATH)
 db.cuentas_de = cuentas_de_dispositivos
 # Y las estrellas propias se leen por cuenta, no por aparato.
 db.aparatos_de = aparatos_de_la_misma_cuenta
+# «Borrar mis datos de la nube» borra también lo que esos aparatos aportaron a
+# la memoria colectiva, que vive en analysis.db (ver `sync_borrar_mis_datos`).
+_sync_endpoints.al_borrar_aparatos = db.borrar_lo_de_los_aparatos
+
+
+# Lo que un aparato de una cuenta borrada mandó a la comunidad con su id viejo
+# DESPUÉS del borrado (un cliente de antes no se entera del 410 del sync y
+# puede seguir mandando estrellas o notas un rato), o lo que quedó a medias si
+# el borrado se cortó: se repasa al arrancar, con los de los últimos 30 días.
+# En segundo plano, y dice SIEMPRE cuántos, también con 0.
+def _repasar_aparatos_borrados():
+    try:
+        _ids = aparatos_borrados(dias=30)
+        _n = db.borrar_lo_de_los_aparatos(_ids) if _ids else {}
+        logger.info(f"[Borrado] al arrancar: {len(_ids)} aparatos borrados en "
+                    f"30 días, {sum(_n.values())} filas que quedaban")
+    except Exception as _e:  # noqa: BLE001 - best-effort
+        logger.warning(f"[Borrado] repasar los aparatos borrados falló: {_e}")
+
+
+threading.Thread(target=_repasar_aparatos_borrados, daemon=True,
+                 name='repasar-borrados').start()
 
 # Sembrar `device_first_seen` ANTES de purgar, no despues: la purga borra los
 # eventos de los que hay que leer el D0. Al reves, cada deploy tiraria justo lo
@@ -6473,6 +6496,8 @@ async def reset_database(
             imported_recibido
         sync.db: sync_items, device_seen, users, user_devices,
             link_codes, detected_tracks_sync, listen_sets_sync
+        (NO `aparatos_borrados`: es lo que impide que un aparato cuyo dueño
+        pidió borrar sus datos vuelva a subirlos; ver `sync_borrar_mis_datos`)
 
     Borra SOLO con `?wipe_assets=true`:
         Filesystem: ARTWORK_CACHE_DIR, PREVIEWS_DIR (.mp3 cacheados)
