@@ -2800,6 +2800,51 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    def listar_notas_de_la_comunidad(self, limite: int = 100, desde: int = 0) -> Dict:
+        """Las notas públicas, la más nueva primero, para MODERAR desde el
+        panel (2026-11-12, auditoría S2). Hasta ese día no había ninguna forma
+        de verlas todas ni de quitar una: se leían solo tema a tema, y una nota
+        la ve cualquiera que tenga ese tema. Lleva el aparato entero: esto solo
+        lo sirve una ruta de admin."""
+        limite = max(1, min(int(limite), 500))
+        desde = max(0, int(desde))
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            total = c.execute('SELECT COUNT(*) FROM community_notes').fetchone()[0]
+            c.execute('''
+                SELECT id, fingerprint, device_id, display_name, note_text,
+                       note_type, upvotes, created_at
+                FROM community_notes ORDER BY id DESC LIMIT ? OFFSET ?
+            ''', (limite, desde))
+            notas = [{
+                'id': r['id'],
+                'fingerprint': r['fingerprint'],
+                'device_id': r['device_id'],
+                'display_name': r['display_name'],
+                'note_text': r['note_text'],
+                'note_type': r['note_type'],
+                'upvotes': r['upvotes'],
+                'created_at': r['created_at'],
+            } for r in c.fetchall()]
+            return {'total': total, 'notas': notas}
+        finally:
+            conn.close()
+
+    def borrar_nota_de_la_comunidad(self, note_id: int) -> bool:
+        """Quita UNA nota pública y sus votos. Devuelve si existía."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            c.execute('DELETE FROM community_note_upvotes WHERE note_id = ?',
+                      (note_id,))
+            c.execute('DELETE FROM community_notes WHERE id = ?', (note_id,))
+            borrada = c.rowcount > 0
+            conn.commit()
+            return borrada
+        finally:
+            conn.close()
+
     def upvote_community_note(self, note_id: int, voter: str = '') -> dict:
         """Suma un upvote a una nota, UNA VEZ por votante.
 

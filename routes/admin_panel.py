@@ -1395,6 +1395,31 @@ async def resolve_all_errors(request: Request, antes: Optional[str] = None):
     return {"resolved": n}
 
 
+# ── MODERAR LAS NOTAS PÚBLICAS (2026-11-12, auditoría S2) ───────────────────
+# Una nota de la comunidad la ve cualquiera que tenga ese tema, y hasta este
+# día no había forma de verlas todas ni de quitar una. `total` dice cuántas
+# hay, que es lo primero que hace falta para decidir qué se hace con ellas.
+
+@admin_panel_router.get("/notas")
+async def listar_notas(request: Request, limite: int = 100, desde: int = 0):
+    """Las notas públicas de la comunidad, la más nueva primero."""
+    await _verify_admin_secret(request)
+    return await _en_un_hilo(
+        lambda: _get_db().listar_notas_de_la_comunidad(limite, desde))
+
+
+@admin_panel_router.delete("/notas/{note_id}")
+async def borrar_nota(note_id: int, request: Request):
+    """Quita una nota pública (y sus votos). 404 si no existe."""
+    await _verify_admin_secret(request)
+    borrada = await _en_un_hilo(
+        lambda: _get_db().borrar_nota_de_la_comunidad(note_id))
+    if not borrada:
+        raise HTTPException(404, "Nota no encontrada")
+    logger.info(f"[Admin] nota {note_id} borrada")
+    return {"id": note_id, "borrada": True}
+
+
 @admin_panel_router.post("/errors/{error_id}/resolve")
 async def resolve_error(error_id: int, request: Request):
     await _verify_admin_secret(request)

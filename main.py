@@ -3160,7 +3160,12 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
     # Validar para mitigar path traversal: solo aceptamos rutas absolutas
     # normalizadas; si el cliente envia algo raro lo descartamos silenciosamente.
     # Ver AUDIT 2026-04-20 B-H3.
+    # En Render se IGNORA (desde el 2026-11-12, auditoría L4): la app ya no la
+    # manda allí, y quien la mandase estaría eligiendo una ruta del SERVIDOR
+    # para pasarla por ffmpeg en el cache-hit sin preview.
     raw_original_path = request.headers.get("X-Original-Path", "")
+    if os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'):
+        raw_original_path = ""
     original_path = ""
     if raw_original_path:
         try:
@@ -6005,8 +6010,18 @@ class BackfillFingerprintRequest(BaseModel):
 
 
 @app.post("/backfill-fingerprint")
-async def backfill_fingerprint_endpoint(request: BackfillFingerprintRequest):
+async def backfill_fingerprint_endpoint(
+        request: BackfillFingerprintRequest,
+        signed: bool = Depends(verify_write_auth)):
     """Backfill LIGERO de la huella acustica de un track YA analizado.
+
+    Pasa por `verify_write_auth` desde el 2026-11-12 (auditoría, L3): el
+    comentario de «AUTH DE ESCRITURA» lo contaba entre los endpoints con fase
+    1 y no la llevaba, así que no salía en `write_auth_stats` y la decisión de
+    `REQUIRE_WRITE_AUTH=1` no lo veía. En fase 1 nada cambia para quien llega
+    sin firma (el cliente de hoy no firma esta petición): se cuenta y pasa.
+    **Antes de la fase 2, el cliente tiene que firmarla**, o su backfill de
+    huella pasaría a 401; `write_auth_30d.by_path` dice cuándo.
 
     El CLIENTE calcula el chromaprint localmente (fpcalc bundled) y lo manda con
     el fingerprint del track. Aqui resolvemos/creamos el cluster (Hamming) y le
@@ -6200,81 +6215,15 @@ def _backfill_audio_de(tmp_path):
 # init_search(db, CAMELOT_COMPATIBLE) + app.include_router(search_router) arriba.
 
 # ==================== ENDPOINTS SIMILAR TRACKS ====================
-
-if SIMILAR_TRACKS_ENABLED:
-    @app.post("/similar-tracks")
-    async def get_similar_tracks(request: SimilarTracksRequest):
-        """Buscar tracks similares por compatibilidad DJ"""
-        all_tracks = db.get_all_tracks(5000)
-        
-        if not all_tracks:
-            return []
-        
-        results = []
-        
-        for track in all_tracks:
-            score, bpm_match, key_compatible_flag, energy_match, genre_match = calculate_compatibility_score(
-                track,
-                target_bpm=request.bpm,
-                target_camelot=request.camelot,
-                target_energy=request.energy_dj,
-                target_genre=request.genre,
-                bpm_tolerance=request.bpm_tolerance,
-                energy_tolerance=request.energy_tolerance
-            )
-            
-            if request.track_type and track.get('track_type') != request.track_type:
-                score -= 10
-            
-            if request.has_vocals is not None and track.get('has_vocals') != request.has_vocals:
-                score -= 5
-            
-            if request.has_drop is not None and track.get('has_drop') != request.has_drop:
-                score -= 5
-            
-            if score >= 40:
-                results.append(SimilarTrackResult(
-                    id=track.get('id', ''),
-                    filename=track.get('filename', ''),
-                    title=track.get('title'),
-                    artist=track.get('artist'),
-                    bpm=track.get('bpm', 0),
-                    key=track.get('key'),
-                    camelot=track.get('camelot'),
-                    energy_dj=track.get('energy_dj', 5),
-                    genre=track.get('genre', 'unknown'),
-                    track_type=track.get('track_type', 'peak'),
-                    compatibility_score=score,
-                    bpm_match=bpm_match,
-                    key_compatible=key_compatible_flag,
-                    energy_match=energy_match,
-                    genre_match=genre_match,
-                ))
-        
-        results.sort(key=lambda x: x.compatibility_score, reverse=True)
-        return results[:request.limit]
-
-    @app.get("/similar-tracks/{track_id}")
-    async def get_similar_to_track(track_id: str, limit: int = 20):
-        """Buscar tracks similares a uno especfico"""
-        reference = db.get_track_by_id(track_id)
-        
-        if not reference:
-            raise HTTPException(404, "Track no encontrado")
-        
-        request = SimilarTracksRequest(
-            bpm=reference.get('bpm'),
-            camelot=reference.get('camelot'),
-            energy_dj=reference.get('energy_dj'),
-            genre=reference.get('genre'),
-            track_type=reference.get('track_type'),
-            limit=limit + 1
-        )
-        
-        results = await get_similar_tracks(request)
-        results = [r for r in results if r.id != track_id]
-        
-        return results[:limit]
+#
+# `POST /similar-tracks` y `GET /similar-tracks/{id}` se quitaron el 2026-11-12
+# (auditoría, S6). El cliente tuvo `ApiService.searchSimilarTracks` desde el
+# primer commit y no lo llamó nadie nunca: «Suggest» se calcula en el aparato,
+# con la biblioteca del DJ (`SmartSuggestEngine`). Lo que hacía la ruta era
+# cargar 5.000 filas de `tracks` con su `analysis_json` en CADA petición,
+# anónima y dentro del event loop, y devolver nombres de fichero de otros.
+# `similar_tracks_endpoint.py` se queda: su `calculate_compatibility_score`
+# tiene tests y `CAMELOT_COMPATIBLE` sale de ahí.
 
 # ==================== INFO ====================
 
@@ -6307,8 +6256,6 @@ async def root():
             "Artwork extraction (ID3)",
             "Genre detection (ID3/AcousticBrainz/spectral)",
             "Collective memory",
-            "Similar tracks search",
-            "Advanced search filters",
             "Preview snippets (6s streaming)",
         ]
     }

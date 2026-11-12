@@ -1742,27 +1742,38 @@ async def sync_publish(req: PublishLibraryRequest):
 
 @sync_router.delete("/clear")
 async def sync_clear(request: Request, device_id: Optional[str] = None):
-    # Full clear requires valid ADMIN_TOKEN
+    """Vaciar sync.db, entera o lo de un aparato. SOLO admin, en los dos casos.
+
+    Hasta el 2026-11-12 (auditoría, S1) el borrado de UN aparato no pedía la
+    clave de admin: «still protected by sync HMAC auth», decía el comentario.
+    Pero la firma de la app sale del binario, y el `device_id` viajaba por la
+    QUERY, que es justo donde `_device_id_from_request` no mira (solo ruta y
+    cuerpo): no se pedía el `X-Device-Token` ni a un aparato con el token ya
+    exigido. Reproducido: `pull` sin token → 401, `clear?device_id=` sin token
+    → 200 y sus filas borradas de verdad, sin lápida.
+
+    Ningún cliente ha llamado nunca a esta ruta. El borrado que pide un
+    usuario es `POST /sync/borrar-mis-datos`, con su token y con lápidas. Esto
+    se queda como herramienta de mantenimiento del owner.
+    """
     admin_key = request.headers.get("X-Admin-Key", "")
 
     # Constant-time comparison to prevent timing attacks on the admin key.
     admin_ok = bool(admin_key and ADMIN_TOKEN and _hmac.compare_digest(admin_key, ADMIN_TOKEN))
-    if not device_id and not admin_ok:
+    if not admin_ok:
         raise HTTPException(
             status_code=403,
-            detail="Full clear requires valid X-Admin-Key header. Per-device clear requires device_id param."
+            detail="Requires valid X-Admin-Key header."
         )
 
     conn = _get_conn()
 
     if device_id:
-        # Only clear data for a specific device (still protected by sync HMAC auth)
         conn.execute("DELETE FROM sync_items WHERE last_device_id = ?", (device_id,))
         conn.execute("DELETE FROM device_seen WHERE device_id = ?", (device_id,))
         conn.commit()
         return {"cleared": True, "scope": f"device:{device_id}"}
 
-    # Full clear (admin only — verified above)
     conn.execute("DELETE FROM sync_items")
     conn.execute("DELETE FROM device_seen")
     conn.commit()
