@@ -30,6 +30,123 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+# ==================== UNA SOLA PUERTA A AudD ====================
+#
+# Desde el 2026-11-13 (auditoría S3) el motor local NO lleva el token de AudD:
+# iba compilado en el EXE de Windows y en el DMG, se sacaba con `strings` y con
+# él cualquiera gastaba la cuenta sin los cupos (que los ponía el propio motor).
+# Hoy, sin token propio, el motor le pide la llamada a Render
+# (`/audd/motor-local/identificar`) con el `X-Device-Token` del aparato, y Render
+# la hace con SU token y con sus cupos. Un motor con token propio (el que el DJ
+# escribe en Ajustes, o una build anterior) sigue yendo directo.
+#
+# Toda llamada a AudD pasa por `post_a_audd`: las tres vías del motor
+# (`call_audd` de /analyze, /identify y /recognize) mandaban su propio
+# `requests.post` a api.audd.io. Lo ata `test_el_motor_pide_audd_a_render.py`.
+
+AUDD_URL = 'https://api.audd.io/'
+VIAS_POR_RENDER = ('analyze', 'identify', 'recognize')
+SERVICIOS_DE_AUDD = ('spotify', 'deezer', 'apple_music', 'musicbrainz')
+
+# El token del aparato de este ordenador (solo el motor local). Llega al
+# arrancar por la variable `DJA_DEVICE_TOKEN` (`LocalEngineService`) y se
+# refresca con cada petición de la app que lo trae (`apuntar_token_del_aparato`,
+# desde el middleware de `main.py`): el aparato puede recibirlo después de
+# arrancar el motor.
+_token_del_aparato = os.getenv('DJA_DEVICE_TOKEN', '').strip()
+
+
+# Hasta cuándo dice Render que el cupo del día está lleno (un 429). Sin esto, un
+# «Limpiar metadata» con el cupo gastado contaría cada tema como «AudD no lo
+# conoce»: dos causas que piden cosas opuestas en el mismo contador.
+_cupo_de_render_lleno_hasta = 0.0
+
+
+def cupo_de_render_lleno() -> bool:
+    import time
+    return time.time() < _cupo_de_render_lleno_hasta
+
+
+def es_motor_local() -> bool:
+    return os.environ.get('LOCAL_ENGINE', 'false').lower() == 'true'
+
+
+def apuntar_token_del_aparato(token: Optional[str]) -> None:
+    global _token_del_aparato
+    token = (token or '').strip()
+    if token and token != _token_del_aparato:
+        _token_del_aparato = token
+
+
+def token_del_aparato() -> str:
+    return _token_del_aparato
+
+
+def hay_audd(api_token: Optional[str]) -> bool:
+    """¿Se puede llamar a AudD desde aquí? Con token propio, o desde un motor
+    local (por Render)."""
+    return bool(api_token) or es_motor_local()
+
+
+def _url_de_render() -> str:
+    return os.environ.get('RENDER_BACKEND_URL',
+                          'https://dj-analyzer-api.onrender.com').rstrip('/')
+
+
+def _respuesta(status: int, cuerpo: str) -> requests.Response:
+    r = requests.models.Response()
+    r.status_code = status
+    r._content = cuerpo.encode('utf-8')
+    r.headers['Content-Type'] = 'application/json'
+    return r
+
+
+def post_a_audd(path: str, data: Dict, timeout: float,
+                via: str) -> requests.Response:
+    """Manda [path] a AudD y devuelve la respuesta HTTP, con el mismo cuerpo
+    que da AudD (`status`, `result`, `error`). Con `api_token` en [data], a
+    AudD directo; sin él y en un motor local, por Render. Sin token y fuera
+    de un motor local, un 503 (nadie a quien pedírselo)."""
+    token = (data or {}).get('api_token') or ''
+    if token:
+        with open(path, 'rb') as f:
+            return requests.post(AUDD_URL, data=data, files={'file': f},
+                                 timeout=timeout)
+    if not es_motor_local():
+        return _respuesta(503, '{"detail": "sin token de AudD"}')
+    if cupo_de_render_lleno():
+        # Ya dijo que no: no se sube otro trozo para oír lo mismo.
+        return _respuesta(429, '{"detail": "cupo lleno", "cupo": "recordado"}')
+    aparato = token_del_aparato()
+    if not aparato:
+        logger.warning('[AudD→Render] sin token del aparato: no se identifica')
+        return _respuesta(401, '{"detail": "sin token del aparato"}')
+    pedidos = [x for x in str((data or {}).get('return', '')).split(',')
+               if x in SERVICIOS_DE_AUDD]
+    with open(path, 'rb') as f:
+        r = requests.post(
+            f'{_url_de_render()}/audd/motor-local/identificar',
+            headers={'X-Device-Token': aparato},
+            data={'via': via if via in VIAS_POR_RENDER else 'analyze',
+                  'return': ','.join(pedidos)},
+            files={'file': (os.path.basename(path), f)},
+            # Render sube el fichero a AudD después de recibirlo.
+            timeout=timeout + 15,
+        )
+    if r.status_code == 429:
+        import time
+        global _cupo_de_render_lleno_hasta
+        try:
+            espera = float(r.headers.get('Retry-After') or 3600)
+        except ValueError:
+            espera = 3600.0
+        _cupo_de_render_lleno_hasta = time.time() + min(max(espera, 60.0), 86400.0)
+    if r.status_code != 200:
+        logger.warning(f'[AudD→Render] {via}: HTTP {r.status_code} '
+                       f'{r.text[:120]}')
+    return r
+
+
 GARBAGE_ARTIST_PATTERNS = (
     r'^unknown(\s+artist)?$',
     r'^various(\s+artists)?$',
@@ -140,7 +257,7 @@ def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dic
 
     Devuelve track_data crudo o None si no se identifica.
     """
-    if not api_token:
+    if not hay_audd(api_token):
         # Antes silencioso — el operador podia tener AUDD_AUTO_ENABLED=true
         # y este module saltando sin que apareciera nada en logs. WARNING
         # visible para diagnosticar configuracion incompleta en Render.
@@ -208,16 +325,11 @@ def call_audd(file_path: str, api_token: str, timeout: int = 30) -> Optional[Dic
             fragment_path = tmp.name
         sf.write(fragment_path, y, sr)
 
-        with open(fragment_path, 'rb') as audio_file:
-            response = requests.post(
-                'https://api.audd.io/',
-                data={
-                    'api_token': api_token,
-                    'return': 'spotify,deezer,apple_music,musicbrainz',
-                },
-                files={'file': audio_file},
-                timeout=timeout,
-            )
+        response = post_a_audd(
+            fragment_path,
+            {'api_token': api_token,
+             'return': 'spotify,deezer,apple_music,musicbrainz'},
+            timeout, via='analyze')
 
         if response.status_code != 200:
             logger.warning(f"[AudD-auto] HTTP {response.status_code}")
@@ -333,7 +445,7 @@ def enrich_with_audd_if_needed(
 
     Returns: track_data dict (con artist/title/label/release_date/...) o None.
     """
-    if not api_token:
+    if not hay_audd(api_token):
         return None
 
     should, reason = should_trigger_audd(

@@ -1395,6 +1395,31 @@ async def resolve_all_errors(request: Request, antes: Optional[str] = None):
     return {"resolved": n}
 
 
+# ── MODERAR LAS NOTAS PÚBLICAS (2026-11-12, auditoría S2) ───────────────────
+# Una nota de la comunidad la ve cualquiera que tenga ese tema, y hasta este
+# día no había forma de verlas todas ni de quitar una. `total` dice cuántas
+# hay, que es lo primero que hace falta para decidir qué se hace con ellas.
+
+@admin_panel_router.get("/notas")
+async def listar_notas(request: Request, limite: int = 100, desde: int = 0):
+    """Las notas públicas de la comunidad, la más nueva primero."""
+    await _verify_admin_secret(request)
+    return await _en_un_hilo(
+        lambda: _get_db().listar_notas_de_la_comunidad(limite, desde))
+
+
+@admin_panel_router.delete("/notas/{note_id}")
+async def borrar_nota(note_id: int, request: Request):
+    """Quita una nota pública (y sus votos). 404 si no existe."""
+    await _verify_admin_secret(request)
+    borrada = await _en_un_hilo(
+        lambda: _get_db().borrar_nota_de_la_comunidad(note_id))
+    if not borrada:
+        raise HTTPException(404, "Nota no encontrada")
+    logger.info(f"[Admin] nota {note_id} borrada")
+    return {"id": note_id, "borrada": True}
+
+
 @admin_panel_router.post("/errors/{error_id}/resolve")
 async def resolve_error(error_id: int, request: Request):
     await _verify_admin_secret(request)
@@ -1774,6 +1799,10 @@ def _telemetry(request: Request):
         # Las mezclas del escritorio (`mezclas.dart`, desde el 2026-11-03):
         # cuántas aparta el import, cuántas se identifican y cuántas eran un
         # tema («Analizar como tema»: lo que la regla falla).
+        # Clics de descarga de la web por tienda frente a las altas de esa
+        # plataforma (auditoría P1, 2026-11-13): ¿se pierde gente en Windows
+        # entre el clic y la primera apertura?
+        "descargas_web": _descargas_web(),
         "mezclas": _resumen_mezclas(),
         # La carpeta vigilada del escritorio (`carpeta_vigilada.dart`, desde el
         # 2026-11-06): cuántos aparatos la tienen y cuántos temas entran por ella.
@@ -2219,6 +2248,14 @@ def _borrados():
         return None
 
 
+def _descargas_web():
+    try:
+        return _get_db().descargas_web_frente_a_altas(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] descargas web fallo: {e}")
+        return None
+
+
 def _resumen_mezclas():
     try:
         return _get_db().resumen_mezclas(30)
@@ -2279,6 +2316,9 @@ def _resumen_lo_importado():
 # cliente emita `device_linked` / `library_synced`, meterlos en _FUNNEL_MOBILE.
 _FUNNEL_DEFAULT = [
     ("app_opened", "Abrio la app"),
+    # Mismo motivo que en movil: sin este paso, la finalizacion se mide contra
+    # dispositivos que nunca llegaron a ver el onboarding.
+    ("onboarding_shown", "Vio el onboarding"),
     ("onboarding_completed", "Completo onboarding"),
     ("import_started", "Empezo a importar"),
     ("import_completed", "Importo musica"),
@@ -2292,6 +2332,19 @@ _FUNNEL_DEFAULT = [
 # con gente ya actualizada.
 _FUNNEL_MOBILE = [
     ("app_opened", "Abrio la app"),
+    # `onboarding_shown` es el DENOMINADOR de verdad del paso siguiente, y
+    # faltaba. Sin el, «Completo onboarding / Abrio la app» daba 46,5% en la
+    # lectura del 2026-08-27 y se leia como «la mitad abandona» — pero
+    # `app_opened` se emite una vez por dispositivo PARA SIEMPRE, asi que el
+    # denominador incluye a todo el que ya tenia la app instalada y por tanto
+    # NUNCA vio el onboarding (se muestra una sola vez, flag en prefs).
+    #
+    # Es el mismo fallo que el «2 de 141» de `device_linked`, dos pasos mas
+    # abajo en esta misma lista: medir un paso contra gente que no podia
+    # darlo. Con el paso intermedio, `app_opened -> onboarding_shown` dice
+    # cuantos son nuevos y `onboarding_shown -> onboarding_completed` es la
+    # finalizacion REAL.
+    ("onboarding_shown", "Vio el onboarding"),
     ("onboarding_completed", "Completo onboarding"),
     ("device_linked", "Vinculo el dispositivo"),
     ("library_synced", "Recibio su biblioteca"),
@@ -2616,6 +2669,39 @@ def _funnel(request: Request, platform: str = None):
         })
         prev = devices
 
+    # Los que VIERON el onboarding y no lo terminaron, repartidos por lo que
+    # hicieron. Son dos causas distintas y piden cosas opuestas:
+    #
+    #   skipped    -> le dio a saltar. Lo vio, decidio, y siguio. Arreglarlo es
+    #                 hacer el contenido mas util, o aceptar que hay gente que
+    #                 no quiere tutoriales.
+    #   abandoned  -> lo abrio y cerro la app a medias. Eso si es una fuga: se
+    #                 atasco, no entendio, o algo no funciono.
+    #
+    # Sin separarlas, «la mitad no completa» mezcla a quien tomo una decision
+    # con quien se perdio, que es el mismo error que tenia `failedAudd`.
+    #
+    # `abandoned` es derivado, no medido: shown - completed - skipped. Se acota
+    # a 0 porque los tres son conteos independientes de dispositivos unicos en
+    # la ventana y pueden descuadrar en los bordes (un aparato que vio el
+    # onboarding hace 31 dias y lo completo hace 29).
+    _ob_shown = counts.get("onboarding_shown", 0)
+    _ob_done = counts.get("onboarding_completed", 0)
+    _ob_skip = counts.get("onboarding_skipped", 0)
+    onboarding = {
+        "shown": _ob_shown,
+        "completed": _ob_done,
+        "skipped": _ob_skip,
+        "abandoned": max(_ob_shown - _ob_done - _ob_skip, 0),
+        # El porcentaje que importa: sobre los que LO VIERON, no sobre los que
+        # abrieron la app. `app_opened` se emite una vez por dispositivo para
+        # siempre, asi que incluye a quien ya tenia la app instalada y nunca
+        # llego a ver el onboarding.
+        "completion_pct": (
+            round(100.0 * _ob_done / _ob_shown, 1) if _ob_shown else None
+        ),
+    }
+
     return {
         "window_days": 30,
         "platform": platform or "all",  # que subconjunto se esta mirando
@@ -2625,6 +2711,7 @@ def _funnel(request: Request, platform: str = None):
         "basis": "cohort",
         "cohort_size": cohort_size,
         "steps": steps,
+        "onboarding": onboarding,
         # Que import_* no salga en `steps` del movil NO significa que no se mida:
         # sigue en `raw`, que lleva TODOS los eventos. Lo que cambia es que deja
         # de contarse como paso obligatorio del camino.

@@ -1,8 +1,8 @@
 """
 Search, library and single-track endpoints for DJ Analyzer Pro API.
 
-PASO 2 del troceo de main.py (review 2026-06-29). Estos 15 endpoints
-(/search/*, /search-analyzed, /library/*, /track/{id}) eran inline en
+PASO 2 del troceo de main.py (review 2026-06-29). Estos endpoints
+(/search-analyzed, /library/all, /track/{id}) eran inline en
 main.py; aqui se mueven VERBATIM (mismo comportamiento, sin cambio de
 logica) a un router montado con `include_router`. Las dependencias que
 antes eran globales de main.py se inyectan via `init(database, camelot_compatible)`:
@@ -28,17 +28,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from validation import (
-    ValidationError,
-    sanitize_string,
-    validate_bpm_range,
-    validate_camelot,
-    validate_energy_range,
-    validate_genre,
-    validate_key,
-    validate_limit,
-    validate_track_type,
-)
+from validation import sanitize_string, validate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -80,96 +70,30 @@ def init(database, camelot_compatible=None):
         CAMELOT_COMPATIBLE = camelot_compatible
 
 
-# ── Modelo de request ────────────────────────────────────────
-
-class SearchRequest(BaseModel):
-    artist: Optional[str] = None
-    genre: Optional[str] = None
-    min_bpm: Optional[float] = None
-    max_bpm: Optional[float] = None
-    min_energy: Optional[int] = None
-    max_energy: Optional[int] = None
-    key: Optional[str] = None
-    track_type: Optional[str] = None
-    limit: int = 100
-
-
 # ── Router ───────────────────────────────────────────────────
 
 search_router = APIRouter(tags=["search"])
 
 
 # ==================== ENDPOINTS DE BUSQUEDA ====================
+#
+# Aquí vivían doce rutas PÚBLICAS más, quitadas el 2026-11-12 (auditoría, S6):
+# `/search/artist|genre|bpm|energy|key|compatible|track-type`,
+# `/search/advanced`, `/library/artists|genres|stats` y `GET /track/{id}`.
+# Ninguna versión del cliente las llamó nunca (comprobado en el historial
+# entero de `lib/`, desde el primer commit), ni la web, ni los scripts, ni el
+# motor local. Lo que sí hacían: dar a cualquiera, sin credencial, las huellas,
+# los artistas y los nombres de fichero de la memoria colectiva (lo mismo por
+# lo que se cerró `/library/all` en agosto, por trozos), y hacerlo con SQLite
+# dentro del event loop del único proceso. Con esas huellas se escribía en lo
+# que aún acepta escrituras sin acreditar (notas, previews).
+#
+# **No las resucites para una función nueva sin credencial y sin threadpool.**
+# Lo que el cliente usa de verdad para buscar es `/search-analyzed` (uno) y
+# `/search-analyzed/batch` (lote), abajo. Lo ata
+# `test_las_rutas_sin_uso_no_vuelven.py`.
 
-@search_router.get("/search/artist/{artist}")
-async def search_by_artist(artist: str, limit: int = Query(50, ge=1, le=200)):
-    """Buscar tracks por artista"""
-    artist = sanitize_string(artist, max_length=200, allow_empty=False, field_name="artist")
-    limit = validate_limit(limit, max_limit=200)
-    results = db.search_by_artist(artist, limit)
-    return {"query": artist, "count": len(results), "tracks": results}
 
-@search_router.get("/search/genre/{genre}")
-async def search_by_genre(genre: str, limit: int = Query(100, ge=1, le=500)):
-    #  Sanitizar g(c)nero
-    genre = validate_genre(genre)
-    limit = validate_limit(limit, max_limit=500)
-
-    return {"tracks": db.search_by_genre(genre, limit)}
-
-@search_router.get("/search/bpm")
-async def search_by_bpm(
-    request: Request,
-    min_bpm: Optional[float] = None,
-    max_bpm: Optional[float] = None,
-    limit: int = Query(100, ge=1, le=500)
-):
-    #  Validar rangos
-    min_bpm, max_bpm = validate_bpm_range(min_bpm, max_bpm)
-    limit = validate_limit(limit, max_limit=500)
-
-    return {"tracks": db.search_by_bpm_range(min_bpm, max_bpm, limit)}
-
-@search_router.get("/search/energy")
-async def search_by_energy(
-    request: Request,
-    min_energy: Optional[int] = None,
-    max_energy: Optional[int] = None,
-    limit: int = Query(100, ge=1, le=500)
-):
-    #  Validar rangos
-    min_energy, max_energy = validate_energy_range(min_energy, max_energy)
-    limit = validate_limit(limit, max_limit=500)
-
-    return {"tracks": db.search_by_energy(min_energy, max_energy, limit)}
-
-@search_router.get("/search/key/{key}")
-async def search_by_key(key: str, limit: int = Query(100, ge=1, le=500)):
-    #  Validar tonalidad
-    try:
-        key = validate_key(key)
-    except ValidationError:
-        # Si no es vlido como key, intentar como est
-        key = sanitize_string(key, max_length=10)
-
-    limit = validate_limit(limit, max_limit=500)
-
-    return {"tracks": db.search_by_key(key, limit)}
-
-@search_router.get("/search/compatible/{camelot}")
-async def search_compatible_keys(camelot: str, limit: int = Query(50, ge=1, le=200)):
-    #  Validar Camelot
-    camelot = validate_camelot(camelot)
-    limit = validate_limit(limit, max_limit=200)
-
-    # Obtener keys compatibles
-    compatible = CAMELOT_COMPATIBLE.get(camelot, [camelot])
-
-    return {
-        "camelot": camelot,
-        "compatible_keys": compatible,
-        "tracks": db.search_compatible_keys(camelot, limit)
-    }
 # ── La ficha por nombre: el mismo TEMA y la misma VERSION ──
 # Cada fuente escribe el titulo a su manera: Shazam «The Age Of Love (Jam &
 # Spoon Watch Out For Stella Mix)», un tag «The Age of Love - Jam and Spoon
@@ -530,49 +454,6 @@ async def search_analyzed_batch(lote: LoteDeFichas):
     return {"fichas": fichas}
 
 
-@search_router.get("/search/track-type/{track_type}")
-async def search_by_track_type(track_type: str, limit: int = Query(100, ge=1, le=500)):
-    #  Validar tipo de track
-    track_type = validate_track_type(track_type)
-    limit = validate_limit(limit, max_limit=500)
-
-    return {"tracks": db.search_by_track_type(track_type, limit)}
-
-@search_router.post("/search/advanced")
-async def search_advanced(search_request: SearchRequest):
-    #  Validar y sanitizar todos los campos
-    filters = {}
-
-    if search_request.artist:
-        filters['artist'] = sanitize_string(search_request.artist, max_length=100)
-
-    if search_request.genre:
-        filters['genre'] = validate_genre(search_request.genre)
-
-    if search_request.min_bpm is not None or search_request.max_bpm is not None:
-        filters['min_bpm'], filters['max_bpm'] = validate_bpm_range(
-            search_request.min_bpm,
-            search_request.max_bpm
-        )
-
-    if search_request.min_energy is not None or search_request.max_energy is not None:
-        filters['min_energy'], filters['max_energy'] = validate_energy_range(
-            search_request.min_energy,
-            search_request.max_energy
-        )
-
-    if search_request.key:
-        try:
-            filters['key'] = validate_key(search_request.key)
-        except ValidationError:
-            filters['key'] = sanitize_string(search_request.key, max_length=10)
-
-    if search_request.track_type:
-        filters['track_type'] = validate_track_type(search_request.track_type)
-
-    filters['limit'] = validate_limit(search_request.limit, max_limit=500)
-
-    return {"tracks": db.search_advanced(**filters)}
 
 # ==================== ENDPOINTS DE BIBLIOTECA ====================
 
@@ -586,37 +467,13 @@ async def get_all_tracks(request: Request, limit: int = Query(1000, ge=1, le=500
     cebar el fallback online de /artwork (auditoría 2026-08-09, SEC-13).
     Ningún cliente lo consume —el catálogo del panel admin es /admin/catalogo— así que
     cerrarlo no rompe nada. Las agregaciones (/library/artists, /genres,
-    /stats) siguen abiertas: no exponen la biblioteca fila a fila.
+    /stats) se quitaron el 2026-11-12: tampoco las llamaba nadie.
     """
     _require_admin(request)
     limit = validate_limit(limit, max_limit=5000)
 
     return {"tracks": db.get_all_tracks(limit)}
 
-@search_router.get("/library/artists")
-async def get_unique_artists():
-    """Obtener lista de artistas nicos"""
-    artists = db.get_unique_artists()
-    return {"count": len(artists), "artists": artists}
-
-@search_router.get("/library/genres")
-async def get_unique_genres():
-    """Obtener lista de g(c)neros nicos"""
-    genres = db.get_unique_genres()
-    return {"count": len(genres), "genres": genres}
-
-@search_router.get("/library/stats")
-async def get_library_stats():
-    """Obtener estadsticas de la biblioteca"""
-    return db.get_stats()
-
-@search_router.get("/track/{track_id}")
-async def get_track(track_id: str):
-    """Obtener informacin de un track especfico"""
-    track = db.get_track_by_id(track_id)
-    if not track:
-        raise HTTPException(404, "Track no encontrado")
-    return track
 
 @search_router.delete("/track/{track_id}")
 async def delete_track(track_id: str, request: Request):

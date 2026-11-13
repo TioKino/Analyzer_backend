@@ -233,62 +233,12 @@ class TestAnalyzeEndpoint:
 
 
 # ============================================================================
-# TESTS DE ENDPOINTS - SEARCH
-# ============================================================================
-
-class TestSearchEndpoints:
-    """Tests para endpoints de búsqueda"""
-    
-    def test_search_by_artist_returns_data(self, client):
-        response = client.get("/search/artist/Deadmau5")
-        assert response.status_code == 200
-        assert isinstance(response.json(), (list, dict))
-    
-    def test_search_by_genre_returns_data(self, client):
-        response = client.get("/search/genre/Techno")
-        assert response.status_code == 200
-    
-    def test_search_by_energy_validates_range(self, client):
-        response = client.get("/search/energy?min_energy=5&max_energy=8")
-        assert response.status_code == 200
-    
-    def test_search_by_key_returns_data(self, client):
-        response = client.get("/search/key/Am")
-        assert response.status_code == 200
-    
-    def test_search_by_track_type(self, client):
-        response = client.get("/search/track-type/peak")
-        assert response.status_code == 200
-
-
-class TestAdvancedSearch:
-    """Tests para búsqueda avanzada"""
-    
-    def test_advanced_search_empty_filters(self, client):
-        response = client.post("/search/advanced", json={})
-        assert response.status_code == 200
-    
-    def test_advanced_search_with_bpm_range(self, client):
-        response = client.post("/search/advanced", json={
-            "min_bpm": 125,
-            "max_bpm": 130
-        })
-        assert response.status_code == 200
-    
-    def test_advanced_search_with_multiple_filters(self, client):
-        response = client.post("/search/advanced", json={
-            "genre": "Techno",
-            "min_bpm": 130,
-            "max_bpm": 140,
-            "min_energy": 7,
-            "track_type": "peak"
-        })
-        assert response.status_code == 200
-
-
-# ============================================================================
 # TESTS DE ENDPOINTS - LIBRARY
 # ============================================================================
+#
+# Aquí había tests de `/search/*`, `/search/advanced` y `/library/artists|
+# genres|stats`: esas rutas se quitaron el 2026-11-12 (ningún cliente las
+# llamó nunca). Que no vuelvan lo ata `test_las_rutas_sin_uso_no_vuelven.py`.
 
 class TestLibraryEndpoints:
     """Tests para endpoints de biblioteca"""
@@ -302,20 +252,6 @@ class TestLibraryEndpoints:
         response = client.get("/library/all?limit=100")
         assert response.status_code == 200
     
-    def test_get_unique_artists(self, client):
-        response = client.get("/library/artists")
-        assert response.status_code == 200
-    
-    def test_get_unique_genres(self, client):
-        response = client.get("/library/genres")
-        assert response.status_code == 200
-    
-    def test_get_library_stats(self, client):
-        response = client.get("/library/stats")
-        assert response.status_code == 200
-        assert 'total_tracks' in response.json()
-
-
 # ============================================================================
 # TESTS DE VALIDACIÓN DE ENTRADA
 # ============================================================================

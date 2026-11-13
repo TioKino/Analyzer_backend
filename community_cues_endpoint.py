@@ -634,113 +634,12 @@ def register_community_endpoints(app, db):
             last_updated=last,
         )
 
-    @app.get("/community-cues/{fingerprint}/raw")
-    async def get_raw_community_cues(fingerprint: str):
-        """
-        Devuelve todos los cues individuales (sin agregar) para debug.
-        """
-        conn = db.conn
-        c = conn.cursor()
-        c.execute(
-            'SELECT cue_type, position_ms, end_position_ms, note, device_id, created_at '
-            'FROM community_cues WHERE fingerprint = ? ORDER BY position_ms',
-            (fingerprint,)
-        )
-        rows = c.fetchall()
-        return {
-            "fingerprint": fingerprint,
-            "total_cues": len(rows),
-            "cues": [
-                {
-                    "type": r['cue_type'],
-                    "position_ms": r['position_ms'],
-                    "end_position_ms": r['end_position_ms'],
-                    "note": r['note'],
-                    "device_id": r['device_id'][:8] + "...",  # anonimizar
-                    "created_at": r['created_at'],
-                }
-                for r in rows
-            ],
-        }
-
-    # ==================== USER CUES (PERSONAL SYNC) ====================
-
-    @app.get("/user-cues/{device_id}/{fingerprint}")
-    async def get_user_cues_for_track(device_id: str, fingerprint: str):
-        """
-        Devuelve los cues de un DJ especifico para un track.
-        El movil usa esto para mostrar los cues que el usuario puso en desktop.
-        """
-        conn = db.conn
-        c = conn.cursor()
-        c.execute(
-            'SELECT cue_type, position_ms, end_position_ms, note, created_at '
-            'FROM community_cues WHERE device_id = ? AND fingerprint = ? '
-            'ORDER BY position_ms',
-            (device_id, fingerprint)
-        )
-        rows = c.fetchall()
-        return {
-            "fingerprint": fingerprint,
-            "device_id": device_id,
-            "cues": [
-                {
-                    "type": r['cue_type'],
-                    "position_ms": r['position_ms'],
-                    "end_position_ms": r['end_position_ms'],
-                    "note": r['note'],
-                    "created_at": r['created_at'],
-                }
-                for r in rows
-            ],
-            "total": len(rows),
-        }
-
-    @app.get("/user-cues/{device_id}")
-    async def get_all_user_cues(device_id: str, since: Optional[str] = None):
-        """
-        Devuelve TODOS los cues de un DJ (todos los tracks).
-        El movil usa esto para sincronizar todo de una vez.
-        Parametro 'since' (ISO datetime) para sync incremental.
-        """
-        conn = db.conn
-        c = conn.cursor()
-        if since:
-            c.execute(
-                'SELECT fingerprint, cue_type, position_ms, end_position_ms, note, created_at '
-                'FROM community_cues WHERE device_id = ? AND created_at > ? '
-                'ORDER BY fingerprint, position_ms',
-                (device_id, since)
-            )
-        else:
-            c.execute(
-                'SELECT fingerprint, cue_type, position_ms, end_position_ms, note, created_at '
-                'FROM community_cues WHERE device_id = ? '
-                'ORDER BY fingerprint, position_ms',
-                (device_id,)
-            )
-        rows = c.fetchall()
-
-        # Agrupar por fingerprint
-        from collections import defaultdict
-        by_track = defaultdict(list)
-        for r in rows:
-            by_track[r['fingerprint']].append({
-                "type": r['cue_type'],
-                "position_ms": r['position_ms'],
-                "end_position_ms": r['end_position_ms'],
-                "note": r['note'],
-                "created_at": r['created_at'],
-            })
-
-        return {
-            "device_id": device_id,
-            "tracks": [
-                {"fingerprint": fp, "cues": cues}
-                for fp, cues in by_track.items()
-            ],
-            "total_tracks": len(by_track),
-            "total_cues": len(rows),
-        }
+    # Aquí vivían tres rutas más, quitadas el 2026-11-12 (auditoría, S6):
+    # `/community-cues/{huella}/raw` («para debug»: cada cue de cada aparato,
+    # con su nota) y `/user-cues/{device_id}[/{huella}]` (los cues y las notas
+    # de UN aparato, a quien supiera su id). Sin credencial las tres, y ningún
+    # cliente las llamó nunca: los cues del DJ viajan entre sus aparatos por
+    # `/sync` (`all_cues`), no por aquí. No las resucites sin el
+    # `X-Device-Token` del aparato.
 
     logger.info("Community cues endpoints registered")

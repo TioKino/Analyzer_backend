@@ -194,7 +194,102 @@ async def _verify_sync_auth(request: Request):
             raise HTTPException(
                 status_code=401, detail="Device token required")
 
+    if device_id:
+        _apuntar_visto(device_id)
     _record_sync_auth(matched_slot, bool(token))
+
+
+# Un aparato se apunta como visto como mucho una vez al día por proceso: el
+# sync hace muchas peticiones seguidas y esto no puede escribir en cada una.
+_visto_hoy: Dict[str, str] = {}
+
+
+def _apuntar_visto(device_id: str) -> None:
+    hoy = _now_iso()[:10]
+    if _visto_hoy.get(device_id) == hoy:
+        return
+    try:
+        conn = _get_conn()
+        conn.execute("UPDATE user_devices SET visto_at = ? WHERE device_id = ?",
+                     (_now_iso(), device_id))
+        conn.commit()
+        _visto_hoy[device_id] = hoy
+    except sqlite3.Error:
+        pass  # best-effort: nunca tumba un sync
+
+
+def cuentas_sin_ver_desde(antes_de: str, limite: int = 200) -> List[Dict]:
+    """Las cuentas cuyos aparatos llevan TODOS sin verse desde [antes_de]
+    (ISO), con sus aparatos. Una cuenta sin aparatos no sale: no hay a quién
+    poner la lápida."""
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    try:
+        filas = conn.execute(
+            "SELECT user_id, GROUP_CONCAT(device_id) FROM user_devices "
+            "WHERE device_id NOT IN (SELECT device_id FROM aparatos_borrados) "
+            "GROUP BY user_id "
+            "HAVING MAX(COALESCE(visto_at, linked_at)) < ? LIMIT ?",
+            (antes_de, limite)).fetchall()
+        return [{"user_id": u, "aparatos": (a or "").split(",")}
+                for u, a in filas if a]
+    finally:
+        conn.close()
+
+
+# Prefijo de la `solicitud` de las lápidas de una cuenta CADUCADA. Lo que
+# lleva este prefijo NO es un «Borrar mis datos de la nube»: no se cuenta como
+# tal en el panel ni lo repasa el borrado de la memoria colectiva al arrancar.
+SOLICITUD_CADUCADA = "caducada:"
+
+
+def caducar_cuenta(user_id: str, aparatos: List[str]) -> Dict[str, int]:
+    """Vacía la NUBE PERSONAL de una cuenta abandonada (auditoría S8; owner,
+    2026-11-13: «lo que interesa es que la base de datos de los análisis y
+    todo se mantenga por siempre para que crezca el efecto comunidad»).
+
+    Se va lo que es SUYO y solo le sirve a él: su biblioteca sincronizada, lo
+    que vio cada aparato, sus detecciones, sus sets y sus códigos de vincular.
+    **Se queda TODO lo de la memoria colectiva** (analysis.db: análisis, cues
+    compartidos, rejillas, lo importado de su programa de DJ, la identidad
+    verificada, estrellas, notas, «N DJs lo tienen»): por eso NO llama a
+    `al_borrar_aparatos`, que es el borrado que pide el dueño con «Borrar mis
+    datos de la nube». Y se quedan `users` y `user_devices` (sin el nombre del
+    aparato): son los que dicen qué aparatos son una misma cuenta, y sin ellos
+    lo que votó desde tres aparatos contaría por tres.
+
+    Deja lápidas: si un aparato vuelve, el 410 le dice que su nube está vacía
+    y la app le ofrece volver a subirla como una cuenta nueva."""
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        marcas = ",".join("?" * len(aparatos))
+        ahora = _now_iso()
+        n: Dict[str, int] = {}
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO aparatos_borrados "
+                "(device_id, borrado_at, solicitud) VALUES (?, ?, ?)",
+                [(a, ahora, SOLICITUD_CADUCADA + user_id) for a in aparatos])
+            n["sync_items"] = conn.execute(
+                "DELETE FROM sync_items WHERE user_id = ?", (user_id,)).rowcount
+            n["sync_items"] += conn.execute(
+                f"DELETE FROM sync_items WHERE (user_id = '' OR user_id IS NULL) "
+                f"AND last_device_id IN ({marcas})", aparatos).rowcount
+            n["device_seen"] = conn.execute(
+                f"DELETE FROM device_seen WHERE device_id IN ({marcas})",
+                aparatos).rowcount
+            for tabla in ("detected_tracks_sync", "listen_sets_sync"):
+                n[tabla] = conn.execute(
+                    f"DELETE FROM {tabla} WHERE user_id = ? "
+                    f"OR device_id IN ({marcas})", [user_id, *aparatos]).rowcount
+            n["link_codes"] = conn.execute(
+                "DELETE FROM link_codes WHERE user_id = ?", (user_id,)).rowcount
+            conn.execute(
+                f"UPDATE user_devices SET device_name = '' "
+                f"WHERE device_id IN ({marcas})", aparatos)
+        return n
+    finally:
+        conn.close()
 
 
 async def _rechazar_aparato_borrado(request: Request):
@@ -397,6 +492,17 @@ def _init_tables(conn: sqlite3.Connection):
     # peticiones de sync todavia llegan sin token.
     try:
         conn.execute("ALTER TABLE user_devices ADD COLUMN token_seen_at TEXT")
+    except sqlite3.OperationalError:
+        pass  # Already exists
+
+    # Cuándo se vio por última vez a cada aparato (auditoría S8, 2026-11-13),
+    # para que una cuenta abandonada caduque (`mantenimiento.py`). Lo de antes
+    # de existir la columna cuenta como visto HOY: nadie caduca por no tener
+    # fecha.
+    try:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN visto_at TEXT")
+        conn.execute("UPDATE user_devices SET visto_at = ? WHERE visto_at IS NULL",
+                     (_now_iso(),))
     except sqlite3.OperationalError:
         pass  # Already exists
 
@@ -1244,134 +1350,127 @@ async def sync_pull(
     de pedir la siguiente. Así el pico de RAM es ~200 items en vez de ~5000.
     has_more=true en la respuesta indica que quedan páginas por descargar.
     """
-    conn = _get_conn()
-    user_id = _require_user_id(conn, device_id)
-
+    user_id = _require_user_id(_get_conn(), device_id)
     type_list = (
         [t.strip() for t in types.split(",") if t.strip()] if types else None
     )
+    # Fuera del event loop (auditoría S7, 2026-11-13): Render corre UN proceso
+    # de uvicorn, y esto lee y escribe sync.db y decodifica cada payload.
+    return await run_in_threadpool(
+        _pull_de, device_id, user_id, full, type_list, limit, offset)
 
-    # Orden por rowid garantiza paginación estable (rowid no cambia para
-    # rows existentes en SQLite; nuevas inserciones van al final).
-    # El filtro `last_device_id != ?` evita el eco: en un pull normal no tiene
-    # sentido devolverle a un dispositivo lo que acaba de subir el.
+
+def _conexion_para_un_hilo() -> sqlite3.Connection:
+    """Una conexión propia de sync.db para trabajar en un hilo: la del módulo
+    la usa el bucle a la vez. Si la del módulo no está en un fichero (una BD
+    en memoria), se usa esa."""
+    principal = _get_conn()
+    ruta = ""
+    try:
+        for _, nombre, fichero in principal.execute("PRAGMA database_list"):
+            if nombre == "main":
+                ruta = fichero or ""
+    except sqlite3.Error:
+        ruta = ""
+    if not ruta:
+        return principal
+    c = sqlite3.connect(ruta, timeout=30.0)
+    c.execute("PRAGMA busy_timeout=30000")
+    return c
+
+
+def _pull_de(device_id: str, user_id: str, full: bool,
+             type_list: Optional[List[str]], limit: int, offset: int) -> dict:
+    """El cuerpo de `/sync/pull`. Hasta el 2026-11-13 leía TODAS las filas de
+    la cuenta con su payload, hacía `json.loads` de todas y solo entonces
+    recortaba la página: el primer pull de un móvil con 10.000 elementos eran
+    50 páginas que releían la cuenta entera (6,9 s medidos, creciendo con el
+    cuadrado). Hoy la página la recorta SQLite y solo se decodifica lo que
+    sale. Lo atan `test_sync_pagination.py` y `test_el_pull_pagina_en_sql.py`."""
+    conn = _conexion_para_un_hilo()
+    propia = conn is not _get_conn()
+    try:
+        return _pull_con(conn, device_id, user_id, full, type_list,
+                         limit, offset)
+    finally:
+        if propia:
+            conn.close()
+
+
+def _pull_con(conn, device_id, user_id, full, type_list, limit, offset):
+    # Orden por rowid: paginación estable (rowid no cambia para las filas que
+    # ya existen; las nuevas van al final).
     #
-    # Con full=true hay que QUITARLO, y esa es justo la razon de ser de este
-    # endpoint. `full=true` lo pide un dispositivo que perdio sus datos en
-    # local y quiere recuperarlos de la nube. Si ademas excluimos lo que subio
-    # el mismo, al PC —que es la fuente de la verdad y por tanto quien subio
-    # casi todo— se le devuelve CERO: el unico caso para el que existe
-    # "Restaurar desde la nube" era el unico que no funcionaba. Reportado con
-    # un Mac formateado que pidio full=true sobre 5.000 tracks y recibio 0,
-    # mientras el movil seguia enseñandolos porque los tenia de un pull viejo.
+    # El filtro `last_device_id != ?` evita el eco en un pull normal. Con
+    # full=true hay que QUITARLO: lo pide un aparato que perdió sus datos, y
+    # el PC —que subió casi todo— recibiría CERO (un Mac formateado pidió
+    # full=true sobre 5.000 temas y recibió 0). Y se devuelve
+    # `last_device_id` para que el cliente reconozca su propio eco y no lo
+    # aplique encima de datos más nuevos (`_esEcoPropioSobreDatos`): los
+    # bloques de organización se aplican por SUSTITUCIÓN completa. Ese filtro
+    # NO se puede hacer aquí.
     #
-    # Sin riesgo de eco en el PUSH: al aplicar un pull el cliente NO marca dirty
-    # (escribe a disco y recarga por replaceFromDisk/loadFromDisk), asi que
-    # recibir lo propio no genera un push de vuelta.
-    #
-    # Si hay riesgo de eco al APLICARLO, y costo una carpeta: devolver lo que
-    # subio este mismo dispositivo significa devolverle una FOTO VIEJA DE SI
-    # MISMO. Los bloques de organizacion (all_folders, all_collections…) se
-    # aplican por sustitucion completa, asi que un aparato que subio "0
-    # carpetas", creo una despues y luego pidio full=true, se pisaba su propia
-    # carpeta con el vacio de antes. Por eso ahora se devuelve `last_device_id`:
-    # el cliente necesita poder reconocer su propio eco y no aplicarlo encima de
-    # datos que ya tiene. El filtro NO se puede hacer aqui — sin lo propio, el
-    # PC formateado vuelve a recibir cero, que es el bug de arriba.
+    # Sin full, lo que este aparato ya conoce con ese mismo hash
+    # (`device_seen`) no sale: lo filtra el JOIN, no Python.
     sql = (
         "SELECT si.key, si.data_type, si.item_key, si.payload, si.deleted, "
         "       si.updated_at, si.device_type, si.hash, si.last_device_id "
         "FROM sync_items si "
-        "WHERE (si.user_id = ? OR si.user_id = '__collective__')"
     )
-    params: list = [user_id]
+    params: list = []
     if not full:
-        sql += " AND si.last_device_id != ?"
+        sql += ("LEFT JOIN device_seen ds ON ds.device_id = ? "
+                "AND ds.item_key = si.key ")
+        params.append(device_id)
+    sql += "WHERE (si.user_id = ? OR si.user_id = '__collective__')"
+    params.append(user_id)
+    if not full:
+        sql += " AND si.last_device_id != ? AND ds.hash IS NOT si.hash"
         params.append(device_id)
     if type_list:
         placeholders = ",".join("?" for _ in type_list)
         sql += f" AND si.data_type IN ({placeholders})"
         params.extend(type_list)
     sql += " ORDER BY si.rowid"
-    rows = conn.execute(sql, params).fetchall()
-
-    # Pre-cargar lo que este dispositivo ya conoce en UNA query (en vez de un
-    # SELECT por item dentro del loop). Lookup O(1) en memoria.
-    seen_map: dict = {}
-    if not full:
-        for ik, h in conn.execute(
-            "SELECT item_key, hash FROM device_seen WHERE device_id = ?",
-            (device_id,),
-        ):
-            seen_map[ik] = h
-
-    # Construir lista completa de cambios (con o sin filtro device_seen)
-    all_items: list = []  # list of (change_dict, (key, hash, payload_json))
-
-    for row in rows:
-        (key, data_type, item_key, payload_json, deleted, updated_at,
-         device_type, item_hash, last_device_id) = row
-
-        # Verificar si el dispositivo ya conoce este hash (salvo full=true)
-        if not full and seen_map.get(key) == item_hash:
-            continue
-
-        all_items.append((
-            {
-                "data_type":   data_type,
-                "item_key":    item_key,
-                "payload":     json.loads(payload_json),
-                "deleted":     bool(deleted),
-                "updated_at":  updated_at,
-                "device_type": device_type,
-                # Quien lo subio. El cliente lo usa para no aplicarse su propio
-                # eco encima de datos mas nuevos (ver la nota del SELECT).
-                "last_device_id": last_device_id,
-            },
-            (key, item_hash, payload_json),
-        ))
 
     # Paginación. Los dos modos usan cursores DISTINTOS y mezclarlos pierde
     # items en silencio (SYNC-01 de la auditoría 2026-08-09):
-    #
-    #   full=true  -> NO se filtra por device_seen, así que `all_items` es
-    #                 estable entre páginas y `offset` ES el cursor correcto.
-    #                 Es la ruta que usa hoy _paginatedPullMobile (solo se
-    #                 pagina cuando _forceFullPull), y funciona bien.
-    #
-    #   full=false -> `device_seen` YA actúa de cursor: cada página entregada
-    #                 se marca como vista, así que la siguiente petición
-    #                 arranca donde acabó la anterior. Honrar ADEMÁS el
-    #                 `offset` suma dos avances y salta `limit` items por
-    #                 página. Medido: 5000 tracks paginados de 200 en 200
-    #                 entregaban 2600. Por eso aquí el offset se IGNORA.
-    #
-    # Hoy ningún llamador combina full=false con offset, así que esto es
-    # blindaje: deja el endpoint correcto sea cual sea el modo, para que un
-    # cambio futuro en el cliente (o un script) no reabra el agujero.
-    #
-    # `has_more` sale además del `if` interior: antes vivía dentro de
-    # `limit < len(all_items)`, así que cuando quedaban menos items que el
-    # `limit` el recorte NO se aplicaba y se devolvía la lista entera desde
-    # el principio, ignorando el offset.
+    #   full=true  -> la lista es estable entre páginas y `offset` ES el cursor.
+    #   full=false -> `device_seen` YA es el cursor (cada página entregada se
+    #                 marca como vista); honrar además el `offset` saltaba
+    #                 `limit` items por página (5.000 paginados de 200 en 200
+    #                 entregaban 2.600). Aquí el offset se IGNORA.
+    # Se pide una fila de más para saber si quedan (`has_more`).
     effective_offset = offset if full else 0
-    has_more = False
     if limit > 0:
-        has_more = len(all_items) > effective_offset + limit
-        all_items = all_items[effective_offset:effective_offset + limit]
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([limit + 1, max(0, effective_offset)])
+    rows = conn.execute(sql, params).fetchall()
+    has_more = False
+    if limit > 0 and len(rows) > limit:
+        has_more = True
+        rows = rows[:limit]
 
-    changes = [item[0] for item in all_items]
-    update_seen = [item[1] for item in all_items]
+    changes = []
+    for (key, data_type, item_key, payload_json, deleted, updated_at,
+         device_type, item_hash, last_device_id) in rows:
+        changes.append({
+            "data_type":   data_type,
+            "item_key":    item_key,
+            "payload":     json.loads(payload_json),
+            "deleted":     bool(deleted),
+            "updated_at":  updated_at,
+            "device_type": device_type,
+            "last_device_id": last_device_id,
+        })
 
-    # Marcar como vistos reutilizando el payload ya leído arriba (antes se
-    # re-consultaba sync_items una vez por item).
-    for key, h, payload_to_save in update_seen:
-        conn.execute(
-            """INSERT INTO device_seen (device_id, item_key, hash, payload)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(device_id, item_key) DO UPDATE SET hash = ?, payload = ?""",
-            (device_id, key, h, payload_to_save, h, payload_to_save),
-        )
+    # Marcar como vistos, reutilizando el payload ya leído.
+    conn.executemany(
+        """INSERT INTO device_seen (device_id, item_key, hash, payload)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(device_id, item_key) DO UPDATE SET hash = ?, payload = ?""",
+        [(device_id, r[0], r[7], r[3], r[7], r[3]) for r in rows],
+    )
     conn.commit()
 
     return {
@@ -1742,27 +1841,38 @@ async def sync_publish(req: PublishLibraryRequest):
 
 @sync_router.delete("/clear")
 async def sync_clear(request: Request, device_id: Optional[str] = None):
-    # Full clear requires valid ADMIN_TOKEN
+    """Vaciar sync.db, entera o lo de un aparato. SOLO admin, en los dos casos.
+
+    Hasta el 2026-11-12 (auditoría, S1) el borrado de UN aparato no pedía la
+    clave de admin: «still protected by sync HMAC auth», decía el comentario.
+    Pero la firma de la app sale del binario, y el `device_id` viajaba por la
+    QUERY, que es justo donde `_device_id_from_request` no mira (solo ruta y
+    cuerpo): no se pedía el `X-Device-Token` ni a un aparato con el token ya
+    exigido. Reproducido: `pull` sin token → 401, `clear?device_id=` sin token
+    → 200 y sus filas borradas de verdad, sin lápida.
+
+    Ningún cliente ha llamado nunca a esta ruta. El borrado que pide un
+    usuario es `POST /sync/borrar-mis-datos`, con su token y con lápidas. Esto
+    se queda como herramienta de mantenimiento del owner.
+    """
     admin_key = request.headers.get("X-Admin-Key", "")
 
     # Constant-time comparison to prevent timing attacks on the admin key.
     admin_ok = bool(admin_key and ADMIN_TOKEN and _hmac.compare_digest(admin_key, ADMIN_TOKEN))
-    if not device_id and not admin_ok:
+    if not admin_ok:
         raise HTTPException(
             status_code=403,
-            detail="Full clear requires valid X-Admin-Key header. Per-device clear requires device_id param."
+            detail="Requires valid X-Admin-Key header."
         )
 
     conn = _get_conn()
 
     if device_id:
-        # Only clear data for a specific device (still protected by sync HMAC auth)
         conn.execute("DELETE FROM sync_items WHERE last_device_id = ?", (device_id,))
         conn.execute("DELETE FROM device_seen WHERE device_id = ?", (device_id,))
         conn.commit()
         return {"cleared": True, "scope": f"device:{device_id}"}
 
-    # Full clear (admin only — verified above)
     conn.execute("DELETE FROM sync_items")
     conn.execute("DELETE FROM device_seen")
     conn.commit()
@@ -1816,14 +1926,18 @@ def aparatos_borrados(dias: Optional[int] = None) -> List[str]:
     tiempo para acá (main.py repasa al arrancar los de los últimos 30 días:
     un aparato de antes puede haber mandado algo de la comunidad con su id
     viejo después del borrado)."""
+    # Sin los de una cuenta CADUCADA: su aportación a la memoria colectiva se
+    # queda para siempre (`caducar_cuenta`), y main.py la borraría al arrancar.
     conn = _get_conn()
+    no_caducada = "solicitud NOT LIKE 'caducada:%'"
     if dias is None:
-        filas = conn.execute("SELECT device_id FROM aparatos_borrados")
+        filas = conn.execute(
+            f"SELECT device_id FROM aparatos_borrados WHERE {no_caducada}")
     else:
         desde = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
         filas = conn.execute(
-            "SELECT device_id FROM aparatos_borrados WHERE borrado_at >= ?",
-            (desde,))
+            f"SELECT device_id FROM aparatos_borrados WHERE borrado_at >= ? "
+            f"AND {no_caducada}", (desde,))
     return [f[0] for f in filas]
 
 
@@ -1832,13 +1946,21 @@ def resumen_de_borrados(dias: int = 30) -> Dict[str, int]:
     es una cuenta) y con cuántos aparatos, en [dias] y en total."""
     conn = _get_conn()
     desde = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    pedidas = "solicitud NOT LIKE 'caducada:%'"
     cuentas, aparatos = conn.execute(
         "SELECT COUNT(DISTINCT solicitud), COUNT(*) FROM aparatos_borrados "
-        "WHERE borrado_at >= ?", (desde,)).fetchone()
+        f"WHERE borrado_at >= ? AND {pedidas}", (desde,)).fetchone()
     total = conn.execute(
-        "SELECT COUNT(DISTINCT solicitud) FROM aparatos_borrados").fetchone()[0]
+        f"SELECT COUNT(DISTINCT solicitud) FROM aparatos_borrados WHERE {pedidas}"
+    ).fetchone()[0]
+    # Las cuentas caducadas (24 meses sin uso) van aparte: no las pidió nadie.
+    caducadas = conn.execute(
+        "SELECT COUNT(DISTINCT solicitud) FROM aparatos_borrados "
+        "WHERE solicitud LIKE 'caducada:%' AND borrado_at >= ?",
+        (desde,)).fetchone()[0]
     return {"cuentas_30d": int(cuentas or 0), "aparatos_30d": int(aparatos or 0),
-            "cuentas_total": int(total or 0)}
+            "cuentas_total": int(total or 0),
+            "caducadas_30d": int(caducadas or 0)}
 
 
 def _borrar_la_cuenta(user_id: str, aparatos: List[str],

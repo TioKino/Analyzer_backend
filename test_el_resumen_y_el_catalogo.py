@@ -380,7 +380,9 @@ def test_el_endpoint_del_catalogo(bd):
 
 def test_all_tracks_ya_no_existe():
     import main
-    rutas = {getattr(r, 'path', '') for r in main.app.routes}
+    from rutas_montadas import paths_montados
+
+    rutas = paths_montados(main.app)
     assert '/admin/all-tracks' not in rutas
     assert '/admin/catalogo' in rutas and '/admin/resumen' in rutas
 

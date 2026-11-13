@@ -40,7 +40,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, Response
 
-from validation import artwork_online_allowed, get_client_ip
+from validation import artwork_online_allowed, get_client_ip, hay_sitio_en_disco
 from pydantic import BaseModel
 from sync_endpoints import dispositivo_del_token
 import analisis_fallido
@@ -740,6 +740,14 @@ async def upload_artwork(fingerprint: str, request: Request,
     else:
         # No reconocido — rechazar para no llenar el disco con basura.
         raise HTTPException(400, "formato no soportado (sólo JPEG/PNG/WEBP/GIF)")
+
+    # Una portada NUEVA no se guarda sin sitio en el disco: el id es cualquier
+    # cadena hexadecimal y `/data` es también el disco de las bases de datos
+    # (ver `validation.hay_sitio_en_disco`). El cliente trata un 5xx como
+    # «luego», no como un fallo del fichero.
+    if not habia and not hay_sitio_en_disco(ARTWORK_CACHE_DIR):
+        logger.warning(f"[Artwork] sin sitio en el disco: {safe_fp[:8]} no se guarda")
+        raise HTTPException(507, "Sin espacio para portadas nuevas")
 
     # Eliminar versiones previas con otra extensión para evitar dos
     # archivos del mismo fingerprint en el cache.

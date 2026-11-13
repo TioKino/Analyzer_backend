@@ -127,11 +127,81 @@ class TestEndpointsAdmin:
         monkeypatch.setenv("ADMIN_TOKEN", "tok-secreto")
         assert client.get("/library/all?limit=5000").status_code == 401
 
-    def test_library_agregados_siguen_abiertos(self, client, monkeypatch):
-        """Cerrar el volcado no debe cerrar las agregaciones."""
+    def test_las_agregaciones_ya_no_existen(self, client, monkeypatch):
+        """En agosto se dejaron abiertas («cerrar el volcado no debe cerrar las
+        agregaciones»). El 2026-11-12 se quitaron: ningún cliente las llamó
+        nunca, y daban a cualquiera los artistas y los géneros de todos."""
         monkeypatch.setenv("ADMIN_TOKEN", "tok-secreto")
-        assert client.get("/library/genres").status_code == 200
-        assert client.get("/library/stats").status_code == 200
+        assert client.get("/library/genres").status_code == 404
+        assert client.get("/library/stats").status_code == 404
+        assert client.get("/library/artists").status_code == 404
+
+
+# ── Auditoría 2026-11-12: L3 y L4 ───────────────────────────────────────
+
+class TestBackfillFingerprintEntraEnLaMedida:
+    """El comentario de «AUTH DE ESCRITURA» contaba `/backfill-fingerprint`
+    entre los endpoints con fase 1 y no la llevaba: no salía en
+    `write_auth_stats`, que es con lo que se decide `REQUIRE_WRITE_AUTH=1`."""
+
+    def _contadas(self, app_mod, firmada):
+        import sqlite3
+        conn = sqlite3.connect(app_mod.DATABASE_PATH)
+        try:
+            fila = conn.execute(
+                "SELECT COALESCE(SUM(n), 0) FROM write_auth_stats "
+                "WHERE path = '/backfill-fingerprint' AND signed = ?",
+                (1 if firmada else 0,)).fetchone()
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+        return fila[0]
+
+    def test_sin_firma_pasa_y_se_cuenta(self, client, app_mod):
+        antes = self._contadas(app_mod, firmada=False)
+
+        r = client.post("/backfill-fingerprint", json={
+            "fingerprint": _fp(), "chromaprint": "AAAA", "duration": 200})
+
+        assert r.status_code == 200, "fase 1: sin firma se deja pasar"
+        assert self._contadas(app_mod, firmada=False) == antes + 1
+
+    def test_una_firma_mala_es_401(self, client, app_mod, monkeypatch):
+        monkeypatch.setattr(app_mod, "_WRITE_AUTH_SECRET", "test-write-secret")
+        r = client.post(
+            "/backfill-fingerprint",
+            content=b'{"fingerprint":"ab","chromaprint":"AAAA","duration":200}',
+            headers={"Content-Type": "application/json",
+                     "X-Signature": "deadbeef"})
+        assert r.status_code == 401
+
+    def test_con_la_fase_2_sin_firma_es_401(self, client, app_mod, monkeypatch):
+        """Lo que pasará el día de `REQUIRE_WRITE_AUTH=1`: por eso el cliente
+        tiene que firmar esta petición ANTES de encenderla."""
+        monkeypatch.setattr(app_mod, "_WRITE_AUTH_SECRET", "test-write-secret")
+        monkeypatch.setattr(app_mod, "REQUIRE_WRITE_AUTH", True)
+        r = client.post("/backfill-fingerprint", json={
+            "fingerprint": _fp(), "chromaprint": "AAAA", "duration": 200})
+        assert r.status_code == 401
+
+
+class TestXOriginalPathSoloEnElMotorLocal:
+    """`X-Original-Path` es para un motor que corre en el mismo equipo que la
+    app. En Render, quien la mande elige una ruta del SERVIDOR para pasarla
+    por ffmpeg (en el cache-hit sin preview): se ignora."""
+
+    def test_en_render_se_ignora_antes_de_mirarla(self, app_mod):
+        import inspect
+
+        fuente = inspect.getsource(app_mod._analizar)
+        i_cabecera = fuente.index('request.headers.get("X-Original-Path"')
+        i_render = fuente.index("os.getenv('RENDER')", i_cabecera)
+        i_uso = fuente.index("os.path.abspath(raw_original_path)")
+        assert i_cabecera < i_render < i_uso, (
+            "la guarda de RENDER tiene que ir entre leer la cabecera y usarla")
+        tramo = fuente[i_render:i_uso]
+        assert 'raw_original_path = ""' in tramo
 
 
 # ── SEC-07: la blacklist de IPs no se salta con una cabecera ────────────

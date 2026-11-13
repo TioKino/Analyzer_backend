@@ -15,6 +15,7 @@ routes/search.py (paso 2): este router SI se monta y los endpoints inline
 se BORRAN -> sin duplicacion stale.
 """
 
+import re
 import logging
 import os
 from typing import List, Optional
@@ -22,6 +23,8 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
+
+from validation import RateLimiter, get_client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -436,52 +439,11 @@ async def delete_community_override(field: str, fingerprint: str, device_id: str
         raise HTTPException(500, "Error interno")
 
 
-# ==================== COMMUNITY TRACK TYPE (Fase 2 backwards-compat) ====================
-# Mantenidos para no romper clientes Fase 2 que no se actualizaron al
-# endpoint generico. Internamente delegan al generico via DB.
-
-class TrackTypeOverrideRequest(BaseModel):
-    fingerprint: str
-    device_id: str
-    track_type: str
-
-@community_router.post("/community/track-type")
-async def submit_track_type_override(request: TrackTypeOverrideRequest, http: Request = None):
-    """Legacy Fase 2: voto de track_type. Delega al endpoint generico.
-
-    OJO: `http` se propaga al generico A PROPOSITO. Sin ello este endpoint era
-    un BYPASS COMPLETO del guard SEC-12: el generico solo llama a
-    `_guard_vote_source` si recibe la Request, y aqui se delegaba con
-    `http=None`, asi que bastaba apuntar el curl a /community/track-type en vez
-    de a /community/override para fabricar consenso de track_type sin limite.
-    """
-    proxy = CommunityOverrideRequest(
-        fingerprint=request.fingerprint,
-        device_id=request.device_id,
-        field='track_type',
-        value=request.track_type,
-    )
-    result = await submit_community_override(proxy, http)
-    # Shape Fase 2: 'consensus' string (no objeto con field).
-    return {
-        "status": result.get("status", "ok"),
-        "votes": result.get("votes", {}),
-        "consensus": result.get("consensus"),
-        "consensus_votes": result.get("consensus_votes", 0),
-    }
-
-@community_router.get("/community/track-type/{fingerprint}")
-async def get_community_track_type(fingerprint: str):
-    """Legacy Fase 2: consensus de track_type."""
-    r = _community_override_response(fingerprint, 'track_type')
-    # Shape Fase 2.
-    return {
-        "fingerprint": fingerprint,
-        "consensus": r["consensus"],
-        "consensus_votes": r["consensus_votes"],
-        "votes": r["votes"],
-        "total_voters": r["total_voters"],
-    }
+# Aquí vivían `POST` y `GET /community/track-type`, «para no romper clientes
+# Fase 2». Quitados el 2026-11-12 (auditoría, S6): el cliente solo los llamó
+# entre el 10 y el 11 de mayo, con la 2.8.0 en desarrollo, y la versión más
+# vieja que sigue en uso es la 2.9.7. El voto del tipo de track va por
+# `/community/override` (campo `track_type`), que es el que pasa por el guard.
 
 
 # ==================== COMMUNITY NOTES / RATINGS / POPULARITY ====================
@@ -504,26 +466,62 @@ class TrackRatingRequest(BaseModel):
     rating: int  # 1-5
 
 
+# Una nota es TEXTO PÚBLICO: la ve cualquiera que tenga ese tema. Hasta el
+# 2026-11-12 (auditoría, S2) esta ruta no tenía ni el guard de procedencia de
+# los votos ni tope ninguno: un curl en bucle, con el nombre y el aparato que
+# quisiera, dejaba lo que quisiera en cualquier huella. Hoy pasa por el mismo
+# guard (identidades por IP y tema) y por un tope por IP y hora, holgado para
+# una persona —nadie escribe veinte notas en una hora— y corto para un bucle.
+# Sigue sin pedir credencial: los clientes publicados no mandan el
+# `X-Device-Token` aquí, y exigirlo es una decisión del owner (`PENDING.md`).
+# Lo que entra se modera desde el panel: `GET /admin/notas` y
+# `DELETE /admin/notas/{id}`.
+NOTES_MAX_PER_HOUR = int(os.getenv('NOTES_MAX_PER_HOUR', '20'))
+_limite_de_notas = RateLimiter(max_requests=NOTES_MAX_PER_HOUR,
+                               window_seconds=3600)
+_TIPOS_DE_NOTA = {'general', 'technique', 'mixing', 'warning'}
+
+
 @community_router.post("/community/notes")
-async def post_community_note(req: CommunityNoteRequest):
+async def post_community_note(req: CommunityNoteRequest, http: Request = None):
     """Un DJ deja una nota publica en un track (visible para todos)."""
     if not req.note_text.strip():
         raise HTTPException(400, "note_text vacio")
     if len(req.note_text) > 500:
         raise HTTPException(400, "Nota demasiado larga (max 500 chars)")
+    if lleva_un_enlace(req.note_text) or lleva_un_enlace(req.display_name):
+        raise HTTPException(400, "Las notas no llevan enlaces")
+    if (not req.fingerprint or len(req.fingerprint) > 128
+            or not req.device_id or len(req.device_id) > 128):
+        raise HTTPException(400, "fingerprint o device_id no validos")
+    if http is not None:
+        _guard_vote_source(http, req.fingerprint, req.device_id)
+        try:
+            ip = get_client_ip(http)
+        except Exception:  # noqa: BLE001 - sin IP no hay tope, pero la nota entra
+            ip = None
+        if ip and not _limite_de_notas.is_allowed(ip):
+            logger.warning("[Community] tope de notas por hora alcanzado")
+            raise HTTPException(
+                status_code=429,
+                detail="Demasiadas notas seguidas. Prueba dentro de un rato.",
+                headers={"Retry-After": "3600"},
+            )
     try:
         note_id = db.save_community_note(
             fingerprint=req.fingerprint,
             device_id=req.device_id,
             note_text=req.note_text.strip(),
             display_name=req.display_name.strip()[:30] or "DJ",
-            note_type=req.note_type,
+            note_type=(req.note_type if req.note_type in _TIPOS_DE_NOTA
+                       else 'general'),
         )
-        logger.info(f"[Community] Nota guardada: fp={req.fingerprint[:8]}... by {req.display_name}")
+        logger.info(f"[Community] Nota guardada: fp={req.fingerprint[:8]}... by {req.display_name[:30]}")
         return {"status": "ok", "note_id": note_id}
     except Exception as e:
         logger.error(f"[Community] Error guardando nota: {e}")
-        raise HTTPException(500, str(e))
+        # El texto de la excepción no viaja a un cliente anónimo.
+        raise HTTPException(500, "Error interno")
 
 
 @community_router.get("/community/notes/{fingerprint}")
@@ -535,6 +533,43 @@ async def get_community_notes(fingerprint: str):
     except Exception as e:
         logger.error(f"[Community] Error leyendo notas: {e}")
         return {"fingerprint": fingerprint, "notes": [], "total": 0}
+
+
+# Un enlace en una nota pública solo sirve para el spam (auditoría S2,
+# 2026-11-13): una nota de DJ habla del tema, no manda a otra web. Se rechaza
+# al escribir; el cliente tampoco los pinta como enlace.
+_ENLACE = re.compile(
+    r'(https?://|www\.|\b[a-z0-9-]+\.(com|net|org|io|me|ly|gg|xyz|info|biz|ru|top|site|shop|link|club|app)\b)',
+    re.IGNORECASE)
+
+
+def lleva_un_enlace(texto) -> bool:
+    return bool(texto) and _ENLACE.search(str(texto)) is not None
+
+
+@community_router.post("/community/notes/{note_id}/denunciar")
+async def denunciar_nota(note_id: int, device_id: str = "", http: Request = None):
+    """Denuncia una nota pública (auditoría S2, 2026-11-13). Una por
+    denunciante —el aparato si lo manda, el hash de la IP si no—, y con
+    `NOTA_OCULTA_CON_DENUNCIAS` distintos la nota deja de servirse. Quien la
+    denuncia ya no la ve en su app desde el primer toque (lo hace el cliente).
+    El panel las lista con su cuenta (`GET /admin/notas`)."""
+    voter = (device_id or "").strip()
+    if not voter and http is not None:
+        try:
+            voter = db.hash_ip(get_client_ip(http))
+        except Exception:  # noqa: BLE001
+            voter = ""
+    try:
+        r = db.denunciar_nota(note_id, voter)
+    except Exception as e:
+        logger.error(f"[Community] Error denunciando la nota {note_id}: {e}")
+        raise HTTPException(500, "Error interno")
+    if not r['existe']:
+        raise HTTPException(404, "No existe esa nota")
+    logger.info(f"[Community] nota {note_id} denunciada "
+                f"({r['denuncias']}{', oculta' if r['oculta'] else ''})")
+    return {"status": "ok", **r}
 
 
 @community_router.post("/community/notes/{note_id}/upvote")
@@ -595,21 +630,9 @@ async def get_popularity(fingerprint: str, device_id: str = ""):
         return {"analysis_count": 0, "dj_count": 0, "avg_rating": 0, "total_ratings": 0, "my_rating": 0}
 
 
-class PopularityBatchRequest(BaseModel):
-    fingerprints: List[str]
-
-
-@community_router.post("/community/popularity/batch")
-async def get_popularity_batch(req: PopularityBatchRequest):
-    """Popularidad de varios tracks en UNA llamada. Lo usa la columna de
-    popularidad de la libreria desktop (evita N peticiones por-track).
-    Devuelve {fingerprint: {analysis_count, dj_count, avg_rating, total_ratings}}.
-    Los fingerprints sin datos no aparecen (el cliente asume 0)."""
-    try:
-        return db.get_track_popularity_batch(req.fingerprints)
-    except Exception as e:
-        logger.error(f"[Community] Error popularity batch: {e}")
-        return {}
+# Aquí vivía `POST /community/popularity/batch`: nació y se revirtió el mismo
+# día en el cliente (2026-06-21), no llegó a ninguna versión publicada. Quitado
+# el 2026-11-12 (auditoría, S6).
 
 
 class MyRatingsBatchRequest(BaseModel):

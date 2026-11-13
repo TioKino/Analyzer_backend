@@ -143,6 +143,8 @@ if _os_log.getenv('QUIET_ASSET_LOGS', '1') not in ('0', 'false', 'False'):
 from pydantic import BaseModel
 from audio_helpers import silence_native_stderr, beat_track_seguro
 from spectral_genre_classifier import classify_genre_advanced  # noqa: F401 (compat)
+from audd_helper import (hay_audd, post_a_audd, apuntar_token_del_aparato,
+                         VIAS_POR_RENDER, SERVICIOS_DE_AUDD)
 from config import (
     AUDD_API_TOKEN,
     AUDD_AUTO_ENABLED,
@@ -862,6 +864,16 @@ async def block_abusive_ips(request: Request, call_next):
         raise
 
 
+if IS_LOCAL_ENGINE:
+    @app.middleware("http")
+    async def apuntar_el_token_del_aparato(request: Request, call_next):
+        """El motor local no lleva el token de AudD: se lo pide a Render con el
+        `X-Device-Token` del aparato (ver `audd_helper.post_a_audd`). La app lo
+        manda en sus peticiones al motor; aquí se apunta el último."""
+        apuntar_token_del_aparato(request.headers.get("X-Device-Token"))
+        return await call_next(request)
+
+
 # ==================== TELEMETRIA: ERRORES DEL CLIENTE ====================
 #
 # Endpoint para que Flutter reporte sus propios errores (network, parsing,
@@ -1020,6 +1032,22 @@ def _repasar_aparatos_borrados():
 
 threading.Thread(target=_repasar_aparatos_borrados, daemon=True,
                  name='repasar-borrados').start()
+
+# El mantenimiento diario (auditoría S8, 2026-11-13): una copia semanal de las
+# dos bases de datos en /data/copias, la nube PERSONAL de las cuentas sin usar
+# en 24 meses fuera (la memoria colectiva se queda: `caducar_cuenta`) y
+# los errores de más de 180 días podados. Solo en Render: un motor local no
+# guarda cuentas ni es la memoria colectiva.
+if os.environ.get("RENDER") and not IS_LOCAL_ENGINE:
+    import mantenimiento as _mantenimiento
+    _mantenimiento.arrancar(
+        bases={"analysis": DATABASE_PATH, "sync": _sync_endpoints._DB_PATH},
+        dir_copias=os.path.join(
+            os.path.dirname(os.path.abspath(DATABASE_PATH)), "copias"),
+        db=db,
+        sin_ver_desde=_sync_endpoints.cuentas_sin_ver_desde,
+        caducar=_sync_endpoints.caducar_cuenta,
+    )
 
 # Sembrar `device_first_seen` ANTES de purgar, no despues: la purga borra los
 # eventos de los que hay que leer el D0. Al reves, cada deploy tiraria justo lo
@@ -1857,7 +1885,7 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
         logger.info(f"[AudD-skip] identidad verificada "
                     f"({'este fichero' if verificada.get('exacta') else 'su cluster'}): "
                     f"{artist_name} - {title_name}")
-        if con_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+        if con_audd and AUDD_AUTO_ENABLED and hay_audd(AUDD_API_TOKEN):
             _audd_no_hizo_falta('limpiar' if force_audd else 'identidad')
 
     # AHORRO AudD (memoria colectiva por SONIDO): si otra copia del mismo audio
@@ -1873,7 +1901,7 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
                 logger.info(
                     f"[AudD-skip] identidad heredada del cluster: "
                     f"{artist_name} - {title_name}")
-                if con_audd and AUDD_API_TOKEN:
+                if con_audd and hay_audd(AUDD_API_TOKEN):
                     _audd_no_hizo_falta('cluster')
 
     # AudD como ultimo recurso si la identidad sigue siendo basura (con
@@ -1881,7 +1909,7 @@ def _identidad_y_genero(file_path: str, fingerprint: Optional[str],
     # Beatport iba por aqui y se elimino (WAF de Cloudflare).
     audd_artwork = None  # portada exacta del match AudD (apple_music/deezer/spotify)
     audd_isrc = None  # el ISRC de la grabacion que AudD identifico (`isrc_de_audd`)
-    if con_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN and not ya_se_sabe:
+    if con_audd and AUDD_AUTO_ENABLED and hay_audd(AUDD_API_TOKEN) and not ya_se_sabe:
         try:
             from audd_helper import (enrich_with_audd_if_needed,
                                      download_artwork_from_audd, isrc_de_audd)
@@ -3160,7 +3188,12 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
     # Validar para mitigar path traversal: solo aceptamos rutas absolutas
     # normalizadas; si el cliente envia algo raro lo descartamos silenciosamente.
     # Ver AUDIT 2026-04-20 B-H3.
+    # En Render se IGNORA (desde el 2026-11-12, auditoría L4): la app ya no la
+    # manda allí, y quien la mandase estaría eligiendo una ruta del SERVIDOR
+    # para pasarla por ffmpeg en el cache-hit sin preview.
     raw_original_path = request.headers.get("X-Original-Path", "")
+    if os.getenv('RENDER') or os.getenv('RAILWAY_ENVIRONMENT'):
+        raw_original_path = ""
     original_path = ""
     if raw_original_path:
         try:
@@ -3541,14 +3574,23 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
         # Pro" hay que mover el cap de GLOBAL a per-device_id (hoy
         # count_audd_calls_today() es global y lo comparten todos). Ver
         # should_trigger_audd() en audd_helper.py y CLAUDE.md > "AudD: tiers".
-        if force_audd and AUDD_AUTO_ENABLED and AUDD_API_TOKEN:
+        if force_audd and AUDD_AUTO_ENABLED and hay_audd(AUDD_API_TOKEN):
             try:
                 from audd_helper import is_garbage_metadata, should_trigger_audd
                 # El guard de metadata-basura se queda: si el track SI acabo
                 # identificado, AudD hizo su trabajo y no hay nada que excusar.
                 # Sin el, un track recien identificado por la llamada que agoto
                 # el cap se reportaria como "no corrio", que es falso.
-                if is_garbage_metadata(result.artist, result.title) and db is not None:
+                from audd_helper import cupo_de_render_lleno
+                if (IS_LOCAL_ENGINE and not AUDD_API_TOKEN
+                        and cupo_de_render_lleno()):
+                    # El motor sin token: el cupo es el que pone Render, y con
+                    # él lleno AudD no ha mirado el tema, tenga el nombre que
+                    # tenga. Sin esto, uno con nombre limpio salía como «ya
+                    # estaba bien» y el cliente lo silenciaba para siempre.
+                    result.audd_skipped_reason = 'daily cap reached (Render)'
+                    result.audd_daily_cap_reached = True
+                elif is_garbage_metadata(result.artist, result.title) and db is not None:
                     _corrio, _motivo = should_trigger_audd(
                         result.artist,
                         result.title,
@@ -3966,7 +4008,7 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
     except ImportError:
         AUDD_API_TOKEN = None
 
-    if not AUDD_API_TOKEN:
+    if not hay_audd(AUDD_API_TOKEN):
         raise HTTPException(500, "AudD API token no configurado")
     
     tmp_path = None
@@ -4020,17 +4062,13 @@ async def identify_track(request: Request, file: UploadFile = File(...)):
             logger.info(f"No se pudo extraer fragmento, usando archivo completo: {e}")
 
         def _post_to_audd(path):
-            """POST a AudD (30 s de timeout) — red sincrona, al threadpool."""
-            with open(path, 'rb') as audio_file:
-                return requests.post(
-                    'https://api.audd.io/',
-                    data={
-                        'api_token': AUDD_API_TOKEN,
-                        'return': 'spotify,deezer,apple_music,musicbrainz',
-                    },
-                    files={'file': audio_file},
-                    timeout=30,
-                )
+            """POST a AudD (30 s de timeout) — red sincrona, al threadpool.
+            Un motor local sin token propio la pide a Render (`post_a_audd`)."""
+            return post_a_audd(
+                path,
+                {'api_token': AUDD_API_TOKEN,
+                 'return': 'spotify,deezer,apple_music,musicbrainz'},
+                30, via='identify')
 
         audd_response = await run_in_threadpool(_post_to_audd, audio_to_send)
         
@@ -4508,19 +4546,15 @@ def _send_to_audd(audio_path: str, api_token: str, timeout: int = 30):
         pass
 
     try:
-        with open(send_path, 'rb') as audio_file:
-            audd_response = requests.post(
-                'https://api.audd.io/',
-                data={
-                    'api_token': api_token,
-                    # Sin 'musicbrainz': /recognize no lo usa y lo pediamos en
-                    # cada llamada (cada servicio extra es metadata que AudD
-                    # tiene que ir a buscar antes de contestar).
-                    'return': 'spotify,deezer,apple_music',
-                },
-                files={'file': audio_file},
-                timeout=timeout
-            )
+        # Un motor local sin token propio la pide a Render (`post_a_audd`).
+        audd_response = post_a_audd(
+            send_path,
+            {'api_token': api_token,
+             # Sin 'musicbrainz': /recognize no lo usa y lo pediamos en
+             # cada llamada (cada servicio extra es metadata que AudD
+             # tiene que ir a buscar antes de contestar).
+             'return': 'spotify,deezer,apple_music'},
+            timeout, via='recognize')
     finally:
         if clip_path and os.path.exists(clip_path):
             try:
@@ -5126,7 +5160,7 @@ async def recognize_audio(
     except ImportError:
         AUDD_API_TOKEN = None
 
-    if not AUDD_API_TOKEN:
+    if not hay_audd(AUDD_API_TOKEN):
         raise HTTPException(500, "AudD API token no configurado en api_config.py")
 
     origen = _origen_de_recognize(origen, device_id)
@@ -5998,6 +6032,99 @@ async def audd_motor_local(req: UsoAuddMotorLocal, request: Request,
             "descartados": len(req.dias) - len(validos)}
 
 
+# ==================== AudD PARA UN MOTOR LOCAL ====================
+#
+# Desde el 2026-11-13 (auditoría S3) el motor local no lleva el token de AudD
+# (iba compilado en el EXE y el DMG y se sacaba con `strings`): manda aquí el
+# trozo que antes mandaba a api.audd.io, con el `X-Device-Token` del aparato, y
+# Render lo pasa a AudD con su token. Los cupos los pone Render: por cuenta, por
+# IP y en total, al día. La respuesta es la de AudD tal cual, para que las tres
+# vías del motor (`call_audd`, /identify y /recognize) no cambien.
+
+AUDD_MOTOR_LOCAL_CUENTA_DIA = int(os.getenv('AUDD_MOTOR_LOCAL_CUENTA_DIA', '300'))
+AUDD_MOTOR_LOCAL_IP_DIA = int(os.getenv('AUDD_MOTOR_LOCAL_IP_DIA', '500'))
+AUDD_MOTOR_LOCAL_TOTAL_DIA = int(os.getenv('AUDD_MOTOR_LOCAL_TOTAL_DIA', '3000'))
+_MAX_TROZO_PARA_AUDD = 10 * 1024 * 1024   # lo que acepta AudD
+
+
+def _cupo_del_motor_local(device: str, ip: str) -> Optional[str]:
+    """El primer cupo del día que ya está lleno, o None."""
+    desde = time.time() - 86400
+    aparatos = db._aparatos(device)   # los de su cuenta (o él solo)
+    if device not in aparatos:
+        aparatos.append(device)
+    if db.cuenta_audd_por_render(desde, aparatos=aparatos) >= AUDD_MOTOR_LOCAL_CUENTA_DIA:
+        return 'cuenta'
+    if db.cuenta_audd_por_render(desde, ip=ip) >= AUDD_MOTOR_LOCAL_IP_DIA:
+        return 'ip'
+    if db.cuenta_audd_por_render(desde) >= AUDD_MOTOR_LOCAL_TOTAL_DIA:
+        return 'total'
+    return None
+
+
+@app.post("/audd/motor-local/identificar")
+async def audd_para_el_motor_local(request: Request,
+                                   file: UploadFile = File(...),
+                                   via: str = Form('analyze'),
+                                   servicios: str = Form('', alias='return')):
+    if IS_LOCAL_ENGINE:
+        raise HTTPException(404, "Solo en Render")
+    device = dispositivo_del_token(request.headers.get("X-Device-Token", ""))
+    if not device:
+        raise HTTPException(401, "Device token required")
+    if not AUDD_API_TOKEN:
+        raise HTTPException(503, "AudD no configurado")
+    if via not in VIAS_POR_RENDER:
+        raise HTTPException(400, "Vía desconocida")
+    ip = get_client_ip(request)
+    lleno = await run_in_threadpool(_cupo_del_motor_local, device, ip)
+    if lleno:
+        logger.info(f"[AudD←motor] cupo de {lleno} lleno ({device[:8]}…)")
+        return JSONResponse(status_code=429,
+                            content={"detail": "Cupo de identificaciones lleno",
+                                     "cupo": lleno},
+                            headers={"Retry-After": "3600"})
+    pedidos = ','.join(x for x in servicios.split(',') if x in SERVICIOS_DE_AUDD)
+
+    tmp_path = None
+    try:
+        total = 0
+        sufijo = os.path.splitext(file.filename or '')[1][:8] or '.wav'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=sufijo) as tmp:
+            tmp_path = tmp.name
+            while True:
+                bloque = await file.read(1024 * 1024)
+                if not bloque:
+                    break
+                total += len(bloque)
+                if total > _MAX_TROZO_PARA_AUDD:
+                    raise HTTPException(400, "Trozo demasiado grande")
+                tmp.write(bloque)
+        if total < 1024:
+            raise HTTPException(400, "Trozo vacío")
+
+        r = await run_in_threadpool(
+            post_a_audd, tmp_path,
+            {'api_token': AUDD_API_TOKEN, 'return': pedidos}, 30, via)
+        if r.status_code != 200:
+            raise HTTPException(502, f"AudD: HTTP {r.status_code}")
+        try:
+            cuerpo = r.json()
+        except ValueError:
+            raise HTTPException(502, "AudD: respuesta no es JSON")
+        acierto = cuerpo.get('status') == 'success' and bool(cuerpo.get('result'))
+        await run_in_threadpool(db.apuntar_audd_por_render, device, ip, via, acierto)
+        return JSONResponse(content=cuerpo)
+    except requests.RequestException as e:
+        raise HTTPException(502, f"AudD: {type(e).__name__}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 class BackfillFingerprintRequest(BaseModel):
     fingerprint: str            # id/fingerprint del track existente en la BD
     chromaprint: str            # huella acustica (encode_raw base64) calculada por el CLIENTE
@@ -6005,8 +6132,18 @@ class BackfillFingerprintRequest(BaseModel):
 
 
 @app.post("/backfill-fingerprint")
-async def backfill_fingerprint_endpoint(request: BackfillFingerprintRequest):
+async def backfill_fingerprint_endpoint(
+        request: BackfillFingerprintRequest,
+        signed: bool = Depends(verify_write_auth)):
     """Backfill LIGERO de la huella acustica de un track YA analizado.
+
+    Pasa por `verify_write_auth` desde el 2026-11-12 (auditoría, L3): el
+    comentario de «AUTH DE ESCRITURA» lo contaba entre los endpoints con fase
+    1 y no la llevaba, así que no salía en `write_auth_stats` y la decisión de
+    `REQUIRE_WRITE_AUTH=1` no lo veía. En fase 1 nada cambia para quien llega
+    sin firma (el cliente de hoy no firma esta petición): se cuenta y pasa.
+    **Antes de la fase 2, el cliente tiene que firmarla**, o su backfill de
+    huella pasaría a 401; `write_auth_30d.by_path` dice cuándo.
 
     El CLIENTE calcula el chromaprint localmente (fpcalc bundled) y lo manda con
     el fingerprint del track. Aqui resolvemos/creamos el cluster (Hamming) y le
@@ -6200,81 +6337,15 @@ def _backfill_audio_de(tmp_path):
 # init_search(db, CAMELOT_COMPATIBLE) + app.include_router(search_router) arriba.
 
 # ==================== ENDPOINTS SIMILAR TRACKS ====================
-
-if SIMILAR_TRACKS_ENABLED:
-    @app.post("/similar-tracks")
-    async def get_similar_tracks(request: SimilarTracksRequest):
-        """Buscar tracks similares por compatibilidad DJ"""
-        all_tracks = db.get_all_tracks(5000)
-        
-        if not all_tracks:
-            return []
-        
-        results = []
-        
-        for track in all_tracks:
-            score, bpm_match, key_compatible_flag, energy_match, genre_match = calculate_compatibility_score(
-                track,
-                target_bpm=request.bpm,
-                target_camelot=request.camelot,
-                target_energy=request.energy_dj,
-                target_genre=request.genre,
-                bpm_tolerance=request.bpm_tolerance,
-                energy_tolerance=request.energy_tolerance
-            )
-            
-            if request.track_type and track.get('track_type') != request.track_type:
-                score -= 10
-            
-            if request.has_vocals is not None and track.get('has_vocals') != request.has_vocals:
-                score -= 5
-            
-            if request.has_drop is not None and track.get('has_drop') != request.has_drop:
-                score -= 5
-            
-            if score >= 40:
-                results.append(SimilarTrackResult(
-                    id=track.get('id', ''),
-                    filename=track.get('filename', ''),
-                    title=track.get('title'),
-                    artist=track.get('artist'),
-                    bpm=track.get('bpm', 0),
-                    key=track.get('key'),
-                    camelot=track.get('camelot'),
-                    energy_dj=track.get('energy_dj', 5),
-                    genre=track.get('genre', 'unknown'),
-                    track_type=track.get('track_type', 'peak'),
-                    compatibility_score=score,
-                    bpm_match=bpm_match,
-                    key_compatible=key_compatible_flag,
-                    energy_match=energy_match,
-                    genre_match=genre_match,
-                ))
-        
-        results.sort(key=lambda x: x.compatibility_score, reverse=True)
-        return results[:request.limit]
-
-    @app.get("/similar-tracks/{track_id}")
-    async def get_similar_to_track(track_id: str, limit: int = 20):
-        """Buscar tracks similares a uno especfico"""
-        reference = db.get_track_by_id(track_id)
-        
-        if not reference:
-            raise HTTPException(404, "Track no encontrado")
-        
-        request = SimilarTracksRequest(
-            bpm=reference.get('bpm'),
-            camelot=reference.get('camelot'),
-            energy_dj=reference.get('energy_dj'),
-            genre=reference.get('genre'),
-            track_type=reference.get('track_type'),
-            limit=limit + 1
-        )
-        
-        results = await get_similar_tracks(request)
-        results = [r for r in results if r.id != track_id]
-        
-        return results[:limit]
+#
+# `POST /similar-tracks` y `GET /similar-tracks/{id}` se quitaron el 2026-11-12
+# (auditoría, S6). El cliente tuvo `ApiService.searchSimilarTracks` desde el
+# primer commit y no lo llamó nadie nunca: «Suggest» se calcula en el aparato,
+# con la biblioteca del DJ (`SmartSuggestEngine`). Lo que hacía la ruta era
+# cargar 5.000 filas de `tracks` con su `analysis_json` en CADA petición,
+# anónima y dentro del event loop, y devolver nombres de fichero de otros.
+# `similar_tracks_endpoint.py` se queda: su `calculate_compatibility_score`
+# tiene tests y `CAMELOT_COMPATIBLE` sale de ahí.
 
 # ==================== INFO ====================
 
@@ -6307,8 +6378,6 @@ async def root():
             "Artwork extraction (ID3)",
             "Genre detection (ID3/AcousticBrainz/spectral)",
             "Collective memory",
-            "Similar tracks search",
-            "Advanced search filters",
             "Preview snippets (6s streaming)",
         ]
     }

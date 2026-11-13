@@ -113,15 +113,30 @@ class TestQueNingunaViaSeSalteElGuard:
         """REGRESIÓN (auditoría 2026-08-10): `/community/track-type` delegaba en
         el endpoint genérico con `http=None`, y el genérico solo llama al guard
         si recibe la Request. O sea que la mitigación se saltaba entera
-        cambiando la URL. Escribe en la MISMA tabla que `/community/override`."""
+        cambiando la URL. Escribía en la MISMA tabla que `/community/override`.
+
+        Desde el 2026-11-12 la ruta no existe (ningún cliente publicado la
+        usa): la mejor forma de que no sea un atajo."""
+        r = client.post(
+            "/community/track-type",
+            json={"fingerprint": _fp(), "device_id": "legacy-0",
+                  "track_type": "peak_time"},
+            headers={"X-Forwarded-For": "203.0.113.31"},
+        )
+        assert r.status_code in (404, 405)
+
+    def test_las_notas_tambien_pasan_por_el_guard(self, client):
+        """Una nota es texto público: con ids inventados se llenaba cualquier
+        tema. Hasta el 2026-11-12 era la única escritura de la comunidad que
+        no pasaba por aquí."""
         fp = _fp()
         aceptados = 0
         for i in range(8):
             r = client.post(
-                "/community/track-type",
-                json={"fingerprint": fp, "device_id": f"legacy-{i}",
-                      "track_type": "peak_time"},
-                headers={"X-Forwarded-For": "203.0.113.31"},
+                "/community/notes",
+                json={"fingerprint": fp, "device_id": f"nota-{i}",
+                      "note_text": f"nota {i}"},
+                headers={"X-Forwarded-For": "203.0.113.33"},
             )
             if r.status_code == 200:
                 aceptados += 1
@@ -129,7 +144,7 @@ class TestQueNingunaViaSeSalteElGuard:
                 assert r.status_code == 429
                 break
         assert aceptados <= 3, (
-            f"{aceptados} identidades por la ruta legacy: sigue siendo un bypass"
+            f"{aceptados} identidades dejando notas en el mismo tema"
         )
 
     def test_las_valoraciones_tambien_estan_capadas(self, client):

@@ -384,3 +384,48 @@ def test_status_ya_no_da_los_aparatos_de_todos(client, monkeypatch):
                    headers={"Authorization": "Bearer admin-de-prueba"})
     assert r.status_code == 200, r.text
     assert r.json()["total_items"] == sum(r.json()["by_type"].values())
+
+
+def test_caducar_una_cuenta_no_toca_la_memoria_colectiva(client):
+    """Una cuenta sin usar en 24 meses (`mantenimiento.py`) pierde su NUBE
+    PERSONAL, no lo que aportó a la comunidad (owner, 2026-11-13: «lo que
+    interesa es que la base de datos de los análisis y todo se mantenga por
+    siempre»). Y la pasada del arranque, que repasa los aparatos borrados, no
+    se la lleva después."""
+    import main
+    import sync_endpoints as se
+
+    rutas = _rutas()
+    analysis = rutas[1]
+    cuenta, pc, movil, _ = _cuenta_de_dos(client)
+    _sembrar(rutas, [pc, movil], cuenta)
+    antes = _contar(rutas, [pc, movil], cuenta)
+
+    se.caducar_cuenta(cuenta, [pc, movil])
+    # La pasada del arranque (borra lo de la comunidad de los BORRADOS).
+    main.db.borrar_lo_de_los_aparatos(se.aparatos_borrados(dias=30))
+    despues = _contar(rutas, [pc, movil], cuenta)
+
+    conn = sqlite3.connect(analysis)
+    try:
+        de_la_comunidad = set(_tablas_con_dueno(conn))
+    finally:
+        conn.close()
+    perdidas = {t: (antes[t], despues[t]) for t in de_la_comunidad
+                if despues[t] < antes[t]}
+    assert not perdidas, f"la caducidad se llevó memoria colectiva: {perdidas}"
+
+    for tabla in ("sync_items", "device_seen", "detected_tracks_sync",
+                  "listen_sets_sync", "link_codes"):
+        assert despues.get(tabla, 0) == 0, tabla
+    # Qué aparatos son una misma cuenta se queda: sin eso, lo que votó desde
+    # dos aparatos contaría por dos.
+    assert despues["user_devices"] == antes["user_devices"]
+    assert se.cuentas_de_dispositivos([pc, movil]) == {pc: cuenta, movil: cuenta}
+
+    # Si vuelve, su nube está vacía y el 410 se lo dice.
+    assert client.get(f"/sync/pull/{pc}").status_code == 410
+    # No cuenta como un «Borrar mis datos» en el panel, y no caduca dos veces.
+    assert se.resumen_de_borrados()["caducadas_30d"] >= 1
+    assert all(c["user_id"] != cuenta
+               for c in se.cuentas_sin_ver_desde("9999-01-01T00:00:00"))

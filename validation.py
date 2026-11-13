@@ -19,6 +19,7 @@ from fastapi import HTTPException, Request
 from typing import Optional, Tuple
 import re
 import os
+import shutil
 
 # ============================================================================
 # CONSTANTES DE VALIDACIÓN
@@ -502,6 +503,28 @@ def artwork_online_allowed(client_ip: str) -> bool:
     por que ser visible para quien solo esta mirando su biblioteca.
     """
     return artwork_online_limiter.is_allowed(client_ip)
+
+
+# ── El margen de disco de lo que se sube sin credencial ──────────────────
+#
+# Previews (`/preview/upload`) y portadas (`/artwork/upload`) se guardan con un
+# id que es cualquier cadena hexadecimal, sin acreditar a nadie: se pueden
+# subir sin fin (500 KB y 5 MB cada uno). Y van a `/data`, el MISMO disco donde
+# viven `sync.db` y `analysis.db`: lleno, deja de escribir todo el mundo
+# (auditoría 2026-11-12, S4). Por debajo de este margen no se guarda ninguno
+# NUEVO; lo que ya está se sigue sirviendo y las bases de datos tienen su aire.
+MIN_FREE_DISK_MB = int(os.getenv('MIN_FREE_DISK_MB', '500'))
+
+
+def hay_sitio_en_disco(directorio: str) -> bool:
+    """¿Le queda al disco de [directorio] más del margen? Si no se puede saber
+    (el directorio aún no existe, un sistema de ficheros raro), se deja pasar:
+    esto protege de un abuso, no puede tumbar las subidas normales."""
+    try:
+        libre = shutil.disk_usage(directorio).free
+    except OSError:
+        return True
+    return libre >= MIN_FREE_DISK_MB * 1024 * 1024
 
 
 def check_rate_limit(client_ip: str) -> None:

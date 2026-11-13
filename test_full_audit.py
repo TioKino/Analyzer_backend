@@ -119,33 +119,6 @@ class TestA002_AnalyzeTrack:
         assert r.status_code == 422
 
 
-class TestA004_CompatibleKeysSearch:
-    """A-004: GET /search/compatible/8A — devuelve tracks compatibles, no crash"""
-
-    def test_returns_200(self, client, seed_track):
-        r = client.get("/search/compatible/8A")
-        assert r.status_code == 200
-
-    def test_returns_compatible_keys_field(self, client, seed_track):
-        data = client.get("/search/compatible/8A").json()
-        assert "compatible_keys" in data
-        assert "tracks" in data
-        assert "camelot" in data
-        assert data["camelot"] == "8A"
-
-    def test_compatible_keys_list_correct(self, client, seed_track):
-        data = client.get("/search/compatible/8A").json()
-        # 8A compatible: 7A, 8A, 9A, 8B
-        compat = data["compatible_keys"]
-        assert "8A" in compat
-
-    def test_no_type_error(self, client):
-        """Regression: antes crasheaba con TypeError (pasaba lista en vez de string)"""
-        r = client.get("/search/compatible/5B")
-        assert r.status_code == 200
-        assert isinstance(r.json().get("tracks"), list)
-
-
 class TestA005_Artwork:
     """A-005: GET /artwork/{id} — 404 si no existe, con headers de cache si existe"""
 
@@ -198,63 +171,6 @@ class TestA007_Correction:
         assert r.status_code == 422
 
 
-class TestA008_SearchByArtist:
-    """A-008: GET /search/artist/{name}"""
-
-    def test_returns_200(self, client, seed_track):
-        r = client.get("/search/artist/Deadmau5")
-        assert r.status_code == 200
-
-    def test_returns_matching_tracks(self, client, seed_track):
-        data = client.get("/search/artist/Deadmau5").json()
-        assert "tracks" in data
-        assert isinstance(data["tracks"], list)
-
-
-class TestA009_SearchByBPM:
-    """A-009: GET /search/bpm?min_bpm=120&max_bpm=130"""
-
-    def test_returns_200(self, client, seed_track):
-        r = client.get("/search/bpm?min_bpm=120&max_bpm=130")
-        assert r.status_code == 200
-
-    def test_returns_tracks_in_range(self, client, seed_track):
-        data = client.get("/search/bpm?min_bpm=120&max_bpm=130").json()
-        assert "tracks" in data
-        for t in data["tracks"]:
-            assert 120 <= t["bpm"] <= 130
-
-
-class TestA010_SearchByEnergy:
-    """A-010: GET /search/energy?min_energy=7&max_energy=10"""
-
-    def test_returns_200(self, client, seed_track):
-        r = client.get("/search/energy?min_energy=7&max_energy=10")
-        assert r.status_code == 200
-
-    def test_returns_high_energy(self, client, seed_track):
-        data = client.get("/search/energy?min_energy=7&max_energy=10").json()
-        assert "tracks" in data
-        for t in data["tracks"]:
-            assert 7 <= t["energy_dj"] <= 10
-
-
-class TestA011_AdvancedSearch:
-    """A-011: POST /search/advanced"""
-
-    def test_empty_filters(self, client):
-        r = client.post("/search/advanced", json={})
-        assert r.status_code == 200
-
-    def test_multi_filter(self, client, seed_track):
-        r = client.post("/search/advanced", json={
-            "min_bpm": 125, "max_bpm": 135,
-            "min_energy": 5,
-            "genre": "Progressive House"
-        })
-        assert r.status_code == 200
-
-
 class TestA013_CommunityBeatGrid:
     """A-013: POST /community/beat-grid"""
 
@@ -276,10 +192,6 @@ class TestA013_CommunityBeatGrid:
 
 class TestA014_ArtistWithApostrophe:
     """A-014: Buscar "Guns N' Roses" — no debe dar error de validación"""
-
-    def test_apostrophe_in_search(self, client, seed_track_special_name):
-        r = client.get("/search/artist/Guns N' Roses")
-        assert r.status_code == 200
 
     def test_apostrophe_not_blocked(self):
         """Regression: antes, single quote era bloqueada por SQL injection regex"""
@@ -418,22 +330,6 @@ class TestR001_TodoElRepoParsea:
                 culpables.append(os.path.relpath(
                     path, os.path.dirname(os.path.abspath(__file__))))
         assert not culpables, f"comillas tipogr\u00e1ficas en: {', '.join(culpables)}"
-
-
-class TestR002_CompatibleKeysEndpoint:
-    """R-002: GET /search/compatible/5B → array, no TypeError"""
-
-    def test_no_crash(self, client):
-        r = client.get("/search/compatible/5B")
-        assert r.status_code == 200
-        data = r.json()
-        assert isinstance(data["tracks"], list)
-
-    def test_all_camelot_values(self, client):
-        """Probar varias notaciones Camelot"""
-        for cam in ["1A", "5B", "8A", "12B"]:
-            r = client.get(f"/search/compatible/{cam}")
-            assert r.status_code == 200, f"Failed for {cam}"
 
 
 class TestR003_CollectiveDBSearch:
