@@ -226,6 +226,7 @@ def cuentas_sin_ver_desde(antes_de: str, limite: int = 200) -> List[Dict]:
     try:
         filas = conn.execute(
             "SELECT user_id, GROUP_CONCAT(device_id) FROM user_devices "
+            "WHERE device_id NOT IN (SELECT device_id FROM aparatos_borrados) "
             "GROUP BY user_id "
             "HAVING MAX(COALESCE(visto_at, linked_at)) < ? LIMIT ?",
             (antes_de, limite)).fetchall()
@@ -235,17 +236,60 @@ def cuentas_sin_ver_desde(antes_de: str, limite: int = 200) -> List[Dict]:
         conn.close()
 
 
+# Prefijo de la `solicitud` de las lápidas de una cuenta CADUCADA. Lo que
+# lleva este prefijo NO es un «Borrar mis datos de la nube»: no se cuenta como
+# tal en el panel ni lo repasa el borrado de la memoria colectiva al arrancar.
+SOLICITUD_CADUCADA = "caducada:"
+
+
 def caducar_cuenta(user_id: str, aparatos: List[str]) -> Dict[str, int]:
-    """Borra una cuenta abandonada como «Borrar mis datos de la nube», con
-    sus lápidas (si un aparato vuelve, el 410 le dice que empiece de cero) y
-    lo aportado a la memoria colectiva."""
-    n = _borrar_la_cuenta(user_id, aparatos, solicitud="caducada")
-    if al_borrar_aparatos is not None:
-        try:
-            n.update(al_borrar_aparatos(aparatos))
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[Caducidad] la comunidad de {user_id}: {e}")
-    return n
+    """Vacía la NUBE PERSONAL de una cuenta abandonada (auditoría S8; owner,
+    2026-11-13: «lo que interesa es que la base de datos de los análisis y
+    todo se mantenga por siempre para que crezca el efecto comunidad»).
+
+    Se va lo que es SUYO y solo le sirve a él: su biblioteca sincronizada, lo
+    que vio cada aparato, sus detecciones, sus sets y sus códigos de vincular.
+    **Se queda TODO lo de la memoria colectiva** (analysis.db: análisis, cues
+    compartidos, rejillas, lo importado de su programa de DJ, la identidad
+    verificada, estrellas, notas, «N DJs lo tienen»): por eso NO llama a
+    `al_borrar_aparatos`, que es el borrado que pide el dueño con «Borrar mis
+    datos de la nube». Y se quedan `users` y `user_devices` (sin el nombre del
+    aparato): son los que dicen qué aparatos son una misma cuenta, y sin ellos
+    lo que votó desde tres aparatos contaría por tres.
+
+    Deja lápidas: si un aparato vuelve, el 410 le dice que su nube está vacía
+    y la app le ofrece volver a subirla como una cuenta nueva."""
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        marcas = ",".join("?" * len(aparatos))
+        ahora = _now_iso()
+        n: Dict[str, int] = {}
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO aparatos_borrados "
+                "(device_id, borrado_at, solicitud) VALUES (?, ?, ?)",
+                [(a, ahora, SOLICITUD_CADUCADA + user_id) for a in aparatos])
+            n["sync_items"] = conn.execute(
+                "DELETE FROM sync_items WHERE user_id = ?", (user_id,)).rowcount
+            n["sync_items"] += conn.execute(
+                f"DELETE FROM sync_items WHERE (user_id = '' OR user_id IS NULL) "
+                f"AND last_device_id IN ({marcas})", aparatos).rowcount
+            n["device_seen"] = conn.execute(
+                f"DELETE FROM device_seen WHERE device_id IN ({marcas})",
+                aparatos).rowcount
+            for tabla in ("detected_tracks_sync", "listen_sets_sync"):
+                n[tabla] = conn.execute(
+                    f"DELETE FROM {tabla} WHERE user_id = ? "
+                    f"OR device_id IN ({marcas})", [user_id, *aparatos]).rowcount
+            n["link_codes"] = conn.execute(
+                "DELETE FROM link_codes WHERE user_id = ?", (user_id,)).rowcount
+            conn.execute(
+                f"UPDATE user_devices SET device_name = '' "
+                f"WHERE device_id IN ({marcas})", aparatos)
+        return n
+    finally:
+        conn.close()
 
 
 async def _rechazar_aparato_borrado(request: Request):
@@ -1882,14 +1926,18 @@ def aparatos_borrados(dias: Optional[int] = None) -> List[str]:
     tiempo para acá (main.py repasa al arrancar los de los últimos 30 días:
     un aparato de antes puede haber mandado algo de la comunidad con su id
     viejo después del borrado)."""
+    # Sin los de una cuenta CADUCADA: su aportación a la memoria colectiva se
+    # queda para siempre (`caducar_cuenta`), y main.py la borraría al arrancar.
     conn = _get_conn()
+    no_caducada = "solicitud NOT LIKE 'caducada:%'"
     if dias is None:
-        filas = conn.execute("SELECT device_id FROM aparatos_borrados")
+        filas = conn.execute(
+            f"SELECT device_id FROM aparatos_borrados WHERE {no_caducada}")
     else:
         desde = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
         filas = conn.execute(
-            "SELECT device_id FROM aparatos_borrados WHERE borrado_at >= ?",
-            (desde,))
+            f"SELECT device_id FROM aparatos_borrados WHERE borrado_at >= ? "
+            f"AND {no_caducada}", (desde,))
     return [f[0] for f in filas]
 
 
@@ -1898,13 +1946,21 @@ def resumen_de_borrados(dias: int = 30) -> Dict[str, int]:
     es una cuenta) y con cuántos aparatos, en [dias] y en total."""
     conn = _get_conn()
     desde = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    pedidas = "solicitud NOT LIKE 'caducada:%'"
     cuentas, aparatos = conn.execute(
         "SELECT COUNT(DISTINCT solicitud), COUNT(*) FROM aparatos_borrados "
-        "WHERE borrado_at >= ?", (desde,)).fetchone()
+        f"WHERE borrado_at >= ? AND {pedidas}", (desde,)).fetchone()
     total = conn.execute(
-        "SELECT COUNT(DISTINCT solicitud) FROM aparatos_borrados").fetchone()[0]
+        f"SELECT COUNT(DISTINCT solicitud) FROM aparatos_borrados WHERE {pedidas}"
+    ).fetchone()[0]
+    # Las cuentas caducadas (24 meses sin uso) van aparte: no las pidió nadie.
+    caducadas = conn.execute(
+        "SELECT COUNT(DISTINCT solicitud) FROM aparatos_borrados "
+        "WHERE solicitud LIKE 'caducada:%' AND borrado_at >= ?",
+        (desde,)).fetchone()[0]
     return {"cuentas_30d": int(cuentas or 0), "aparatos_30d": int(aparatos or 0),
-            "cuentas_total": int(total or 0)}
+            "cuentas_total": int(total or 0),
+            "caducadas_30d": int(caducadas or 0)}
 
 
 def _borrar_la_cuenta(user_id: str, aparatos: List[str],

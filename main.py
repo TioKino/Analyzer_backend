@@ -1034,7 +1034,8 @@ threading.Thread(target=_repasar_aparatos_borrados, daemon=True,
                  name='repasar-borrados').start()
 
 # El mantenimiento diario (auditoría S8, 2026-11-13): una copia semanal de las
-# dos bases de datos en /data/copias, las cuentas sin usar en 24 meses fuera y
+# dos bases de datos en /data/copias, la nube PERSONAL de las cuentas sin usar
+# en 24 meses fuera (la memoria colectiva se queda: `caducar_cuenta`) y
 # los errores de más de 180 días podados. Solo en Render: un motor local no
 # guarda cuentas ni es la memoria colectiva.
 if os.environ.get("RENDER") and not IS_LOCAL_ENGINE:

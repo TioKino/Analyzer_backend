@@ -5,7 +5,9 @@ Hasta ese día:
   * no había copia propia de `sync.db` ni de `analysis.db` (solo el snapshot
     del disco de Render, que no se ve desde aquí), y la memoria colectiva es lo
     único del producto que no se puede rehacer;
-  * una cuenta que subió 5.000 análisis y no volvió se quedaba para siempre;
+  * la nube personal de una cuenta que no volvió se quedaba para siempre (lo
+    que aportó a la memoria colectiva SÍ se queda para siempre, a propósito:
+    ver `sync_endpoints.caducar_cuenta`);
   * `prune_old_errors` solo borraba los errores RESUELTOS.
 
 Una pasada al arrancar y luego una al día, en un hilo. Cada parte es
@@ -115,8 +117,8 @@ def caducar_cuentas(
         sin_ver_desde: Callable[[str, int], List[Dict]],
         caducar: Callable[[str, List[str]], Dict[str, int]],
         ahora: Optional[datetime] = None) -> int:
-    """Borra las cuentas sin ningún aparato visto en `MESES_SIN_USO` meses.
-    Devuelve cuántas."""
+    """Vacía la nube personal de las cuentas sin ningún aparato visto en
+    `MESES_SIN_USO` meses (la memoria colectiva no se toca). Devuelve cuántas."""
     corte = ((ahora or _ahora()) - timedelta(days=30 * MESES_SIN_USO)
              ).isoformat()
     n = 0
@@ -151,7 +153,8 @@ def pasada(bases: Dict[str, str], dir_copias: str, db,
     try:
         r["caducadas"] = caducar_cuentas(sin_ver_desde, caducar)
         logger.info(f"[Caducidad] {r['caducadas']} cuentas sin usar en "
-                    f"{MESES_SIN_USO} meses borradas")
+                    f"{MESES_SIN_USO} meses: nube personal vaciada, memoria "
+                    f"colectiva intacta")
     except Exception as e:  # noqa: BLE001
         r["caducidad_error"] = str(e)
         logger.error(f"[Caducidad] falló: {e}")

@@ -105,6 +105,8 @@ def test_las_cuentas_sin_ver_se_buscan_en_sync_db(tmp_path, monkeypatch):
     conn = sqlite3.connect(ruta)
     conn.execute("CREATE TABLE user_devices (device_id TEXT PRIMARY KEY, "
                   "user_id TEXT, linked_at TEXT, visto_at TEXT)")
+    conn.execute("CREATE TABLE aparatos_borrados (device_id TEXT PRIMARY KEY, "
+                  "borrado_at TEXT, solicitud TEXT)")
     viejo = "2024-01-01T00:00:00"
     nuevo = "2026-11-01T00:00:00"
     conn.executemany("INSERT INTO user_devices VALUES (?,?,?,?)", [
