@@ -74,13 +74,13 @@ jobs:
       - name: Run pytest
         run: pytest -q --tb=short
 
-      # Informativo: no bloquea el merge por una CVE recién publicada en una
-      # dependencia transitoria, pero deja el aviso a la vista. requests 2.31.0
-      # y fastapi 0.109.0 (starlette 0.35.x, multipart sin límite) ya arrastran
-      # avisos conocidos.
-      - name: Auditoría de dependencias (informativo)
-        if: always()
-        continue-on-error: true
+      # OBLIGATORIO desde el 2026-11-13 (auditoría S5). Mientras fue
+      # informativo nadie lo miró: el 12-nov daba 47 avisos en fastapi,
+      # starlette, python-multipart, requests y cryptography. Mira solo
+      # requirements.txt (lo que corre en Render), no lo de los tests.
+      # Si una CVE recién publicada lo pone rojo, se sube esa dependencia en
+      # un PR aparte; no se apaga el paso.
+      - name: Auditoría de dependencias
         run: |
           pip install pip-audit
-          pip-audit --progress-spinner off || true
+          pip-audit --progress-spinner off -r requirements.txt

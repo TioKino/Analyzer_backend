@@ -151,18 +151,14 @@ _DE_LA_DOCUMENTACION = ("/docs", "/redoc", "/openapi.json")
 
 
 def _montadas(app):
-    rutas = set()
-    for r in app.routes:
-        path = getattr(r, "path", None)
-        metodos = getattr(r, "methods", None)
-        if not path or not metodos:
-            continue
-        if path.startswith(_DE_ADMIN) or path.startswith(_DE_LA_DOCUMENTACION):
-            continue
-        for m in metodos:
-            if m not in ("HEAD", "OPTIONS"):
-                rutas.add(f"{m} {path}")
-    return rutas
+    from rutas_montadas import rutas_montadas
+
+    return {
+        f"{metodo} {path}"
+        for metodo, path in rutas_montadas(app)
+        if not path.startswith(_DE_ADMIN)
+        and not path.startswith(_DE_LA_DOCUMENTACION)
+    }
 
 
 def test_no_hay_rutas_publicas_de_mas(app_mod):

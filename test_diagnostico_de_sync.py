@@ -296,7 +296,9 @@ def test_el_router_admin_de_sync_ESTA_MONTADO(client):
     import main
     import sync_endpoints
 
-    montadas = {getattr(r, 'path', None) for r in main.app.routes}
+    from rutas_montadas import paths_montados
+
+    montadas = paths_montados(main.app)
     # `.routes` ya trae el prefijo aplicado: concatenarlo daba
     # `/sync/admin/sync/admin/...` y el test fallaba por su propia cuenta.
     declaradas = {r.path for r in sync_endpoints.admin_sync_router.routes}
