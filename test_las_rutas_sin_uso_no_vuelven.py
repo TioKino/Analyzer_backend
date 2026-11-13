@@ -80,6 +80,7 @@ RUTAS_PUBLICAS = {
     "POST /community/notes",
     "GET /community/notes/{fingerprint}",
     "POST /community/notes/{note_id}/upvote",
+    "POST /community/notes/{note_id}/denunciar",
     "POST /community/override",
     "DELETE /community/override/{field}/{fingerprint}",
     "GET /community/override/{field}/{fingerprint}",

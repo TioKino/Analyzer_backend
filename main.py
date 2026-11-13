@@ -1033,6 +1033,21 @@ def _repasar_aparatos_borrados():
 threading.Thread(target=_repasar_aparatos_borrados, daemon=True,
                  name='repasar-borrados').start()
 
+# El mantenimiento diario (auditoría S8, 2026-11-13): una copia semanal de las
+# dos bases de datos en /data/copias, las cuentas sin usar en 24 meses fuera y
+# los errores de más de 180 días podados. Solo en Render: un motor local no
+# guarda cuentas ni es la memoria colectiva.
+if os.environ.get("RENDER") and not IS_LOCAL_ENGINE:
+    import mantenimiento as _mantenimiento
+    _mantenimiento.arrancar(
+        bases={"analysis": DATABASE_PATH, "sync": _sync_endpoints._DB_PATH},
+        dir_copias=os.path.join(
+            os.path.dirname(os.path.abspath(DATABASE_PATH)), "copias"),
+        db=db,
+        sin_ver_desde=_sync_endpoints.cuentas_sin_ver_desde,
+        caducar=_sync_endpoints.caducar_cuenta,
+    )
+
 # Sembrar `device_first_seen` ANTES de purgar, no despues: la purga borra los
 # eventos de los que hay que leer el D0. Al reves, cada deploy tiraria justo lo
 # que veniamos a rescatar.

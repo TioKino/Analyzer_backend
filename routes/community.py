@@ -15,6 +15,7 @@ routes/search.py (paso 2): este router SI se monta y los endpoints inline
 se BORRAN -> sin duplicacion stale.
 """
 
+import re
 import logging
 import os
 from typing import List, Optional
@@ -488,6 +489,8 @@ async def post_community_note(req: CommunityNoteRequest, http: Request = None):
         raise HTTPException(400, "note_text vacio")
     if len(req.note_text) > 500:
         raise HTTPException(400, "Nota demasiado larga (max 500 chars)")
+    if lleva_un_enlace(req.note_text) or lleva_un_enlace(req.display_name):
+        raise HTTPException(400, "Las notas no llevan enlaces")
     if (not req.fingerprint or len(req.fingerprint) > 128
             or not req.device_id or len(req.device_id) > 128):
         raise HTTPException(400, "fingerprint o device_id no validos")
@@ -530,6 +533,43 @@ async def get_community_notes(fingerprint: str):
     except Exception as e:
         logger.error(f"[Community] Error leyendo notas: {e}")
         return {"fingerprint": fingerprint, "notes": [], "total": 0}
+
+
+# Un enlace en una nota pública solo sirve para el spam (auditoría S2,
+# 2026-11-13): una nota de DJ habla del tema, no manda a otra web. Se rechaza
+# al escribir; el cliente tampoco los pinta como enlace.
+_ENLACE = re.compile(
+    r'(https?://|www\.|\b[a-z0-9-]+\.(com|net|org|io|me|ly|gg|xyz|info|biz|ru|top|site|shop|link|club|app)\b)',
+    re.IGNORECASE)
+
+
+def lleva_un_enlace(texto) -> bool:
+    return bool(texto) and _ENLACE.search(str(texto)) is not None
+
+
+@community_router.post("/community/notes/{note_id}/denunciar")
+async def denunciar_nota(note_id: int, device_id: str = "", http: Request = None):
+    """Denuncia una nota pública (auditoría S2, 2026-11-13). Una por
+    denunciante —el aparato si lo manda, el hash de la IP si no—, y con
+    `NOTA_OCULTA_CON_DENUNCIAS` distintos la nota deja de servirse. Quien la
+    denuncia ya no la ve en su app desde el primer toque (lo hace el cliente).
+    El panel las lista con su cuenta (`GET /admin/notas`)."""
+    voter = (device_id or "").strip()
+    if not voter and http is not None:
+        try:
+            voter = db.hash_ip(get_client_ip(http))
+        except Exception:  # noqa: BLE001
+            voter = ""
+    try:
+        r = db.denunciar_nota(note_id, voter)
+    except Exception as e:
+        logger.error(f"[Community] Error denunciando la nota {note_id}: {e}")
+        raise HTTPException(500, "Error interno")
+    if not r['existe']:
+        raise HTTPException(404, "No existe esa nota")
+    logger.info(f"[Community] nota {note_id} denunciada "
+                f"({r['denuncias']}{', oculta' if r['oculta'] else ''})")
+    return {"status": "ok", **r}
 
 
 @community_router.post("/community/notes/{note_id}/upvote")

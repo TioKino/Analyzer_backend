@@ -194,7 +194,58 @@ async def _verify_sync_auth(request: Request):
             raise HTTPException(
                 status_code=401, detail="Device token required")
 
+    if device_id:
+        _apuntar_visto(device_id)
     _record_sync_auth(matched_slot, bool(token))
+
+
+# Un aparato se apunta como visto como mucho una vez al día por proceso: el
+# sync hace muchas peticiones seguidas y esto no puede escribir en cada una.
+_visto_hoy: Dict[str, str] = {}
+
+
+def _apuntar_visto(device_id: str) -> None:
+    hoy = _now_iso()[:10]
+    if _visto_hoy.get(device_id) == hoy:
+        return
+    try:
+        conn = _get_conn()
+        conn.execute("UPDATE user_devices SET visto_at = ? WHERE device_id = ?",
+                     (_now_iso(), device_id))
+        conn.commit()
+        _visto_hoy[device_id] = hoy
+    except sqlite3.Error:
+        pass  # best-effort: nunca tumba un sync
+
+
+def cuentas_sin_ver_desde(antes_de: str, limite: int = 200) -> List[Dict]:
+    """Las cuentas cuyos aparatos llevan TODOS sin verse desde [antes_de]
+    (ISO), con sus aparatos. Una cuenta sin aparatos no sale: no hay a quién
+    poner la lápida."""
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    try:
+        filas = conn.execute(
+            "SELECT user_id, GROUP_CONCAT(device_id) FROM user_devices "
+            "GROUP BY user_id "
+            "HAVING MAX(COALESCE(visto_at, linked_at)) < ? LIMIT ?",
+            (antes_de, limite)).fetchall()
+        return [{"user_id": u, "aparatos": (a or "").split(",")}
+                for u, a in filas if a]
+    finally:
+        conn.close()
+
+
+def caducar_cuenta(user_id: str, aparatos: List[str]) -> Dict[str, int]:
+    """Borra una cuenta abandonada como «Borrar mis datos de la nube», con
+    sus lápidas (si un aparato vuelve, el 410 le dice que empiece de cero) y
+    lo aportado a la memoria colectiva."""
+    n = _borrar_la_cuenta(user_id, aparatos, solicitud="caducada")
+    if al_borrar_aparatos is not None:
+        try:
+            n.update(al_borrar_aparatos(aparatos))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Caducidad] la comunidad de {user_id}: {e}")
+    return n
 
 
 async def _rechazar_aparato_borrado(request: Request):
@@ -397,6 +448,17 @@ def _init_tables(conn: sqlite3.Connection):
     # peticiones de sync todavia llegan sin token.
     try:
         conn.execute("ALTER TABLE user_devices ADD COLUMN token_seen_at TEXT")
+    except sqlite3.OperationalError:
+        pass  # Already exists
+
+    # Cuándo se vio por última vez a cada aparato (auditoría S8, 2026-11-13),
+    # para que una cuenta abandonada caduque (`mantenimiento.py`). Lo de antes
+    # de existir la columna cuenta como visto HOY: nadie caduca por no tener
+    # fecha.
+    try:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN visto_at TEXT")
+        conn.execute("UPDATE user_devices SET visto_at = ? WHERE visto_at IS NULL",
+                     (_now_iso(),))
     except sqlite3.OperationalError:
         pass  # Already exists
 

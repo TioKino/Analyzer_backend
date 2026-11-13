@@ -230,6 +230,12 @@ def _grupo_que_coincide(correcciones):
     return mejor
 
 
+
+# Con cuántos denunciantes distintos una nota pública deja de servirse
+# (auditoría S2, 2026-11-13). Tres, como el cambio a mano: uno puede
+# equivocarse o tener manía a alguien; tres que no se conocen, no.
+NOTA_OCULTA_CON_DENUNCIAS = 3
+
 class AnalysisDB:
     # Resuelve device_id -> user_id (vive en sync.db, otra base: lo inyecta
     # main.py). Sin él cada aparato cuenta como un votante, que es como se
@@ -735,6 +741,20 @@ class AnalysisDB:
         # votante (device_id si el cliente lo manda, hash de IP si no).
         conn.execute('''
             CREATE TABLE IF NOT EXISTS community_note_upvotes (
+                note_id    INTEGER NOT NULL,
+                voter      TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (note_id, voter)
+            )
+        ''')
+
+        # Quién ha DENUNCIADO cada nota (auditoría S2, 2026-11-13). Una nota es
+        # texto público, y las tiendas piden poder denunciar lo que escribe
+        # otro: con `NOTA_OCULTA_CON_DENUNCIAS` denunciantes distintos deja de
+        # servirse a nadie, sin esperar a que el panel la mire. Una por
+        # denunciante, como los votos.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_note_denuncias (
                 note_id    INTEGER NOT NULL,
                 voter      TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -2805,9 +2825,11 @@ class AnalysisDB:
             c = conn.cursor()
             c.execute('''
                 SELECT id, device_id, display_name, note_text, note_type, upvotes, created_at
-                FROM community_notes WHERE fingerprint = ?
+                FROM community_notes n WHERE fingerprint = ?
+                  AND (SELECT COUNT(*) FROM community_note_denuncias d
+                       WHERE d.note_id = n.id) < ?
                 ORDER BY upvotes DESC, created_at DESC
-            ''', (fingerprint,))
+            ''', (fingerprint, NOTA_OCULTA_CON_DENUNCIAS))
             results = [{
                 'id': r['id'],
                 'device_id': r['device_id'][:8] + '...',
@@ -2835,8 +2857,10 @@ class AnalysisDB:
             total = c.execute('SELECT COUNT(*) FROM community_notes').fetchone()[0]
             c.execute('''
                 SELECT id, fingerprint, device_id, display_name, note_text,
-                       note_type, upvotes, created_at
-                FROM community_notes ORDER BY id DESC LIMIT ? OFFSET ?
+                       note_type, upvotes, created_at,
+                       (SELECT COUNT(*) FROM community_note_denuncias d
+                        WHERE d.note_id = n.id) AS denuncias
+                FROM community_notes n ORDER BY id DESC LIMIT ? OFFSET ?
             ''', (limite, desde))
             notas = [{
                 'id': r['id'],
@@ -2847,6 +2871,8 @@ class AnalysisDB:
                 'note_type': r['note_type'],
                 'upvotes': r['upvotes'],
                 'created_at': r['created_at'],
+                'denuncias': r['denuncias'],
+                'oculta': r['denuncias'] >= NOTA_OCULTA_CON_DENUNCIAS,
             } for r in c.fetchall()]
             return {'total': total, 'notas': notas}
         finally:
@@ -2859,10 +2885,34 @@ class AnalysisDB:
             c = conn.cursor()
             c.execute('DELETE FROM community_note_upvotes WHERE note_id = ?',
                       (note_id,))
+            c.execute('DELETE FROM community_note_denuncias WHERE note_id = ?',
+                      (note_id,))
             c.execute('DELETE FROM community_notes WHERE id = ?', (note_id,))
             borrada = c.rowcount > 0
             conn.commit()
             return borrada
+        finally:
+            conn.close()
+
+    def denunciar_nota(self, note_id: int, voter: str) -> dict:
+        """Apunta la denuncia de [voter] a una nota, una vez por denunciante.
+        Devuelve {existe, denuncias, oculta}."""
+        from datetime import datetime
+        voter = (voter or '').strip()[:128] or 'anon'
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            if c.execute('SELECT 1 FROM community_notes WHERE id = ?',
+                         (note_id,)).fetchone() is None:
+                return {'existe': False, 'denuncias': 0, 'oculta': False}
+            c.execute('INSERT OR IGNORE INTO community_note_denuncias '
+                      '(note_id, voter, created_at) VALUES (?, ?, ?)',
+                      (note_id, voter, datetime.utcnow().isoformat()))
+            conn.commit()
+            n = c.execute('SELECT COUNT(*) FROM community_note_denuncias '
+                          'WHERE note_id = ?', (note_id,)).fetchone()[0]
+            return {'existe': True, 'denuncias': n,
+                    'oculta': n >= NOTA_OCULTA_CON_DENUNCIAS}
         finally:
             conn.close()
 
@@ -3267,14 +3317,14 @@ class AnalysisDB:
         'community_cues', 'beat_grid_corrections',
         'community_track_type_overrides', 'community_overrides',
         'community_vote_sources', 'corrections',
-        'community_notes', 'community_note_upvotes',
+        'community_notes', 'community_note_upvotes', 'community_note_denuncias',
         'track_analyzers', 'track_ratings', 'audd_call_log',
         'analysis_errors', 'events', 'device_first_seen', 'audd_por_render',
     )
     # Las de la lista que no se borran a secas: tienen su propia regla abajo.
     _BORRADO_CON_REGLA = frozenset({
         'identidad_verificada', 'community_notes', 'community_note_upvotes',
-        'track_analyzers', 'track_ratings', 'audd_call_log', 'audd_por_render',
+        'community_note_denuncias', 'track_analyzers', 'track_ratings', 'audd_call_log', 'audd_por_render',
     })
 
     def borrar_lo_de_los_aparatos(self, device_ids) -> Dict[str, int]:
@@ -3348,6 +3398,9 @@ class AnalysisDB:
             if suyas:
                 borrar('community_note_upvotes',
                        f'note_id IN ({",".join("?" * len(suyas))})', suyas)
+                borrar('community_note_denuncias',
+                       f'note_id IN ({",".join("?" * len(suyas))})', suyas)
+            borrar('community_note_denuncias', f'voter IN ({ph})', ids)
             try:
                 c.execute(
                     f'UPDATE community_notes SET upvotes = MAX(0, upvotes - ('
@@ -6180,6 +6233,46 @@ class AnalysisDB:
             return 0
         finally:
             conn.close()
+
+    # A qué plataforma de alta corresponde cada botón de descarga de la web.
+    # Las tiendas (Play, App Store) no se casan: entre el clic y la apertura
+    # está la tienda, que pierde gente por su cuenta.
+    _ALTA_DE_LA_TIENDA = {
+        'windows': ('windows',),
+        'dmg': ('macos-dmg',),
+        'play': ('android',),
+        'appstore_ios': ('ios',),
+        'appstore_mac': ('macos-mas',),
+    }
+
+    def descargas_web_frente_a_altas(self, dias: int = 30) -> Dict[str, Any]:
+        """Clics de descarga de la web por tienda frente a las ALTAS de esa
+        plataforma en los mismos días (auditoría P1, 2026-11-13): si de 100
+        clics en Windows salen 30 altas y de 100 en el DMG salen 70, la caída
+        es el aviso de Windows de «editor desconocido», y eso es lo que decide
+        si pagar la firma. Son VECES el clic (la web no lleva identidad) frente
+        a APARATOS nuevos: el cociente orienta, no es una tasa exacta."""
+        desde = (datetime.now(timezone.utc) - timedelta(days=dias)).strftime('%Y-%m-%d')
+        conn = self._open_conn()
+        try:
+            clics = {r[0] or 'unknown': r[1] for r in conn.execute(
+                "SELECT json_extract(props, '$.store'), COUNT(*) FROM events "
+                "WHERE event_name = 'web_download_click' AND day >= ? "
+                "GROUP BY 1", (desde,)).fetchall()}
+            altas = {r[0] or 'unknown': r[1] for r in conn.execute(
+                "SELECT first_platform, COUNT(*) FROM device_first_seen "
+                "WHERE first_day >= ? GROUP BY 1", (desde,)).fetchall()}
+        finally:
+            conn.close()
+        por_tienda = {}
+        for tienda, n in sorted(clics.items()):
+            plataformas = self._ALTA_DE_LA_TIENDA.get(tienda, ())
+            a = sum(altas.get(p, 0) for p in plataformas) if plataformas else None
+            por_tienda[tienda] = {
+                'clics': n, 'altas': a,
+                'altas_por_clic': round(a / n, 3) if a is not None and n else None,
+            }
+        return {'dias': dias, 'por_tienda': por_tienda, 'altas': altas}
 
     def prune_old_errors(self, days: int = 180, only_resolved: bool = True) -> int:
         """Borra errores viejos para que la tabla no crezca sin limite.

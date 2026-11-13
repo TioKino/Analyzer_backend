@@ -1799,6 +1799,10 @@ def _telemetry(request: Request):
         # Las mezclas del escritorio (`mezclas.dart`, desde el 2026-11-03):
         # cuántas aparta el import, cuántas se identifican y cuántas eran un
         # tema («Analizar como tema»: lo que la regla falla).
+        # Clics de descarga de la web por tienda frente a las altas de esa
+        # plataforma (auditoría P1, 2026-11-13): ¿se pierde gente en Windows
+        # entre el clic y la primera apertura?
+        "descargas_web": _descargas_web(),
         "mezclas": _resumen_mezclas(),
         # La carpeta vigilada del escritorio (`carpeta_vigilada.dart`, desde el
         # 2026-11-06): cuántos aparatos la tienen y cuántos temas entran por ella.
@@ -2241,6 +2245,14 @@ def _borrados():
         return resumen_de_borrados(30)
     except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
         logger.warning(f"[Admin] borrados fallo: {e}")
+        return None
+
+
+def _descargas_web():
+    try:
+        return _get_db().descargas_web_frente_a_altas(30)
+    except Exception as e:  # noqa: BLE001 - el panel no se cae por esto
+        logger.warning(f"[Admin] descargas web fallo: {e}")
         return None
 
 

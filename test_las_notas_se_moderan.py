@@ -152,7 +152,7 @@ class TestModerarDesdeElPanel:
         monkeypatch.setenv("ADMIN_TOKEN", "tok-secreto")
         admin = {"X-Admin-Secret": "tok-secreto"}
         fp = _fp()
-        mala = _nota(client, fp, "COMPRA SEGUIDORES en http://spam.example",
+        mala = _nota(client, fp, "COMPRA SEGUIDORES BARATOS",
                      aparato="spammer", nombre="Carl Cox",
                      ip="203.0.113.59").json()["note_id"]
         buena = _nota(client, fp, "el breakdown es largo", aparato="un-dj",
@@ -193,3 +193,50 @@ class TestModerarDesdeElPanel:
 
         assert len(una) == 1 and len(otra) == 1
         assert una[0]["id"] > otra[0]["id"]
+
+
+class TestSeDenuncianYNoLlevanEnlaces:
+    """Auditoría S2 (2026-11-13): una nota pública se puede denunciar, con
+    tres denunciantes distintos deja de servirse, y no lleva enlaces."""
+
+    def test_un_enlace_no_entra(self, client):
+        for texto in ("compra en http://spam.example", "mira www.spam.es",
+                      "seguidores en spam.com ya"):
+            r = _nota(client, _fp(), texto, ip="203.0.113.70")
+            assert r.status_code == 400, texto
+        r = _nota(client, _fp(), "ojo", nombre="www.spam.com", ip="203.0.113.70")
+        assert r.status_code == 400
+
+    def test_lo_normal_entra(self, client):
+        # Un punto entre palabras no es un enlace.
+        r = _nota(client, _fp(), "Mezcla bien.Con el 8A sube", ip="203.0.113.71")
+        assert r.status_code == 200, r.text
+
+    def test_tres_denunciantes_la_ocultan_y_uno_solo_no(self, client):
+        fp = _fp()
+        nid = _nota(client, fp, "nota fea", ip="203.0.113.72").json()["note_id"]
+
+        r = client.post(f"/community/notes/{nid}/denunciar?device_id=a1")
+        assert r.status_code == 200 and r.json()["oculta"] is False
+        # El mismo denunciante dos veces cuenta una.
+        client.post(f"/community/notes/{nid}/denunciar?device_id=a1")
+        client.post(f"/community/notes/{nid}/denunciar?device_id=a2")
+        assert len(client.get(f"/community/notes/{fp}").json()["notes"]) == 1
+
+        r = client.post(f"/community/notes/{nid}/denunciar?device_id=a3")
+        assert r.json() == {"status": "ok", "existe": True, "denuncias": 3,
+                            "oculta": True}
+        assert client.get(f"/community/notes/{fp}").json()["notes"] == []
+
+    def test_el_panel_las_ve_con_sus_denuncias(self, client, monkeypatch):
+        monkeypatch.setenv("ADMIN_TOKEN", "tok-secreto")
+        fp = _fp()
+        nid = _nota(client, fp, "otra fea", ip="203.0.113.73").json()["note_id"]
+        client.post(f"/community/notes/{nid}/denunciar?device_id=b1")
+        notas = client.get("/admin/notas?limite=5",
+                           headers={"X-Admin-Secret": "tok-secreto"}).json()["notas"]
+        mia = next(n for n in notas if n["id"] == nid)
+        assert mia["denuncias"] == 1 and mia["oculta"] is False
+
+    def test_denunciar_una_que_no_existe_es_404(self, client):
+        assert client.post("/community/notes/987654/denunciar?device_id=x").status_code == 404
