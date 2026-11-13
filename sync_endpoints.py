@@ -1244,134 +1244,127 @@ async def sync_pull(
     de pedir la siguiente. Así el pico de RAM es ~200 items en vez de ~5000.
     has_more=true en la respuesta indica que quedan páginas por descargar.
     """
-    conn = _get_conn()
-    user_id = _require_user_id(conn, device_id)
-
+    user_id = _require_user_id(_get_conn(), device_id)
     type_list = (
         [t.strip() for t in types.split(",") if t.strip()] if types else None
     )
+    # Fuera del event loop (auditoría S7, 2026-11-13): Render corre UN proceso
+    # de uvicorn, y esto lee y escribe sync.db y decodifica cada payload.
+    return await run_in_threadpool(
+        _pull_de, device_id, user_id, full, type_list, limit, offset)
 
-    # Orden por rowid garantiza paginación estable (rowid no cambia para
-    # rows existentes en SQLite; nuevas inserciones van al final).
-    # El filtro `last_device_id != ?` evita el eco: en un pull normal no tiene
-    # sentido devolverle a un dispositivo lo que acaba de subir el.
+
+def _conexion_para_un_hilo() -> sqlite3.Connection:
+    """Una conexión propia de sync.db para trabajar en un hilo: la del módulo
+    la usa el bucle a la vez. Si la del módulo no está en un fichero (una BD
+    en memoria), se usa esa."""
+    principal = _get_conn()
+    ruta = ""
+    try:
+        for _, nombre, fichero in principal.execute("PRAGMA database_list"):
+            if nombre == "main":
+                ruta = fichero or ""
+    except sqlite3.Error:
+        ruta = ""
+    if not ruta:
+        return principal
+    c = sqlite3.connect(ruta, timeout=30.0)
+    c.execute("PRAGMA busy_timeout=30000")
+    return c
+
+
+def _pull_de(device_id: str, user_id: str, full: bool,
+             type_list: Optional[List[str]], limit: int, offset: int) -> dict:
+    """El cuerpo de `/sync/pull`. Hasta el 2026-11-13 leía TODAS las filas de
+    la cuenta con su payload, hacía `json.loads` de todas y solo entonces
+    recortaba la página: el primer pull de un móvil con 10.000 elementos eran
+    50 páginas que releían la cuenta entera (6,9 s medidos, creciendo con el
+    cuadrado). Hoy la página la recorta SQLite y solo se decodifica lo que
+    sale. Lo atan `test_sync_pagination.py` y `test_el_pull_pagina_en_sql.py`."""
+    conn = _conexion_para_un_hilo()
+    propia = conn is not _get_conn()
+    try:
+        return _pull_con(conn, device_id, user_id, full, type_list,
+                         limit, offset)
+    finally:
+        if propia:
+            conn.close()
+
+
+def _pull_con(conn, device_id, user_id, full, type_list, limit, offset):
+    # Orden por rowid: paginación estable (rowid no cambia para las filas que
+    # ya existen; las nuevas van al final).
     #
-    # Con full=true hay que QUITARLO, y esa es justo la razon de ser de este
-    # endpoint. `full=true` lo pide un dispositivo que perdio sus datos en
-    # local y quiere recuperarlos de la nube. Si ademas excluimos lo que subio
-    # el mismo, al PC —que es la fuente de la verdad y por tanto quien subio
-    # casi todo— se le devuelve CERO: el unico caso para el que existe
-    # "Restaurar desde la nube" era el unico que no funcionaba. Reportado con
-    # un Mac formateado que pidio full=true sobre 5.000 tracks y recibio 0,
-    # mientras el movil seguia enseñandolos porque los tenia de un pull viejo.
+    # El filtro `last_device_id != ?` evita el eco en un pull normal. Con
+    # full=true hay que QUITARLO: lo pide un aparato que perdió sus datos, y
+    # el PC —que subió casi todo— recibiría CERO (un Mac formateado pidió
+    # full=true sobre 5.000 temas y recibió 0). Y se devuelve
+    # `last_device_id` para que el cliente reconozca su propio eco y no lo
+    # aplique encima de datos más nuevos (`_esEcoPropioSobreDatos`): los
+    # bloques de organización se aplican por SUSTITUCIÓN completa. Ese filtro
+    # NO se puede hacer aquí.
     #
-    # Sin riesgo de eco en el PUSH: al aplicar un pull el cliente NO marca dirty
-    # (escribe a disco y recarga por replaceFromDisk/loadFromDisk), asi que
-    # recibir lo propio no genera un push de vuelta.
-    #
-    # Si hay riesgo de eco al APLICARLO, y costo una carpeta: devolver lo que
-    # subio este mismo dispositivo significa devolverle una FOTO VIEJA DE SI
-    # MISMO. Los bloques de organizacion (all_folders, all_collections…) se
-    # aplican por sustitucion completa, asi que un aparato que subio "0
-    # carpetas", creo una despues y luego pidio full=true, se pisaba su propia
-    # carpeta con el vacio de antes. Por eso ahora se devuelve `last_device_id`:
-    # el cliente necesita poder reconocer su propio eco y no aplicarlo encima de
-    # datos que ya tiene. El filtro NO se puede hacer aqui — sin lo propio, el
-    # PC formateado vuelve a recibir cero, que es el bug de arriba.
+    # Sin full, lo que este aparato ya conoce con ese mismo hash
+    # (`device_seen`) no sale: lo filtra el JOIN, no Python.
     sql = (
         "SELECT si.key, si.data_type, si.item_key, si.payload, si.deleted, "
         "       si.updated_at, si.device_type, si.hash, si.last_device_id "
         "FROM sync_items si "
-        "WHERE (si.user_id = ? OR si.user_id = '__collective__')"
     )
-    params: list = [user_id]
+    params: list = []
     if not full:
-        sql += " AND si.last_device_id != ?"
+        sql += ("LEFT JOIN device_seen ds ON ds.device_id = ? "
+                "AND ds.item_key = si.key ")
+        params.append(device_id)
+    sql += "WHERE (si.user_id = ? OR si.user_id = '__collective__')"
+    params.append(user_id)
+    if not full:
+        sql += " AND si.last_device_id != ? AND ds.hash IS NOT si.hash"
         params.append(device_id)
     if type_list:
         placeholders = ",".join("?" for _ in type_list)
         sql += f" AND si.data_type IN ({placeholders})"
         params.extend(type_list)
     sql += " ORDER BY si.rowid"
-    rows = conn.execute(sql, params).fetchall()
-
-    # Pre-cargar lo que este dispositivo ya conoce en UNA query (en vez de un
-    # SELECT por item dentro del loop). Lookup O(1) en memoria.
-    seen_map: dict = {}
-    if not full:
-        for ik, h in conn.execute(
-            "SELECT item_key, hash FROM device_seen WHERE device_id = ?",
-            (device_id,),
-        ):
-            seen_map[ik] = h
-
-    # Construir lista completa de cambios (con o sin filtro device_seen)
-    all_items: list = []  # list of (change_dict, (key, hash, payload_json))
-
-    for row in rows:
-        (key, data_type, item_key, payload_json, deleted, updated_at,
-         device_type, item_hash, last_device_id) = row
-
-        # Verificar si el dispositivo ya conoce este hash (salvo full=true)
-        if not full and seen_map.get(key) == item_hash:
-            continue
-
-        all_items.append((
-            {
-                "data_type":   data_type,
-                "item_key":    item_key,
-                "payload":     json.loads(payload_json),
-                "deleted":     bool(deleted),
-                "updated_at":  updated_at,
-                "device_type": device_type,
-                # Quien lo subio. El cliente lo usa para no aplicarse su propio
-                # eco encima de datos mas nuevos (ver la nota del SELECT).
-                "last_device_id": last_device_id,
-            },
-            (key, item_hash, payload_json),
-        ))
 
     # Paginación. Los dos modos usan cursores DISTINTOS y mezclarlos pierde
     # items en silencio (SYNC-01 de la auditoría 2026-08-09):
-    #
-    #   full=true  -> NO se filtra por device_seen, así que `all_items` es
-    #                 estable entre páginas y `offset` ES el cursor correcto.
-    #                 Es la ruta que usa hoy _paginatedPullMobile (solo se
-    #                 pagina cuando _forceFullPull), y funciona bien.
-    #
-    #   full=false -> `device_seen` YA actúa de cursor: cada página entregada
-    #                 se marca como vista, así que la siguiente petición
-    #                 arranca donde acabó la anterior. Honrar ADEMÁS el
-    #                 `offset` suma dos avances y salta `limit` items por
-    #                 página. Medido: 5000 tracks paginados de 200 en 200
-    #                 entregaban 2600. Por eso aquí el offset se IGNORA.
-    #
-    # Hoy ningún llamador combina full=false con offset, así que esto es
-    # blindaje: deja el endpoint correcto sea cual sea el modo, para que un
-    # cambio futuro en el cliente (o un script) no reabra el agujero.
-    #
-    # `has_more` sale además del `if` interior: antes vivía dentro de
-    # `limit < len(all_items)`, así que cuando quedaban menos items que el
-    # `limit` el recorte NO se aplicaba y se devolvía la lista entera desde
-    # el principio, ignorando el offset.
+    #   full=true  -> la lista es estable entre páginas y `offset` ES el cursor.
+    #   full=false -> `device_seen` YA es el cursor (cada página entregada se
+    #                 marca como vista); honrar además el `offset` saltaba
+    #                 `limit` items por página (5.000 paginados de 200 en 200
+    #                 entregaban 2.600). Aquí el offset se IGNORA.
+    # Se pide una fila de más para saber si quedan (`has_more`).
     effective_offset = offset if full else 0
-    has_more = False
     if limit > 0:
-        has_more = len(all_items) > effective_offset + limit
-        all_items = all_items[effective_offset:effective_offset + limit]
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([limit + 1, max(0, effective_offset)])
+    rows = conn.execute(sql, params).fetchall()
+    has_more = False
+    if limit > 0 and len(rows) > limit:
+        has_more = True
+        rows = rows[:limit]
 
-    changes = [item[0] for item in all_items]
-    update_seen = [item[1] for item in all_items]
+    changes = []
+    for (key, data_type, item_key, payload_json, deleted, updated_at,
+         device_type, item_hash, last_device_id) in rows:
+        changes.append({
+            "data_type":   data_type,
+            "item_key":    item_key,
+            "payload":     json.loads(payload_json),
+            "deleted":     bool(deleted),
+            "updated_at":  updated_at,
+            "device_type": device_type,
+            "last_device_id": last_device_id,
+        })
 
-    # Marcar como vistos reutilizando el payload ya leído arriba (antes se
-    # re-consultaba sync_items una vez por item).
-    for key, h, payload_to_save in update_seen:
-        conn.execute(
-            """INSERT INTO device_seen (device_id, item_key, hash, payload)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(device_id, item_key) DO UPDATE SET hash = ?, payload = ?""",
-            (device_id, key, h, payload_to_save, h, payload_to_save),
-        )
+    # Marcar como vistos, reutilizando el payload ya leído.
+    conn.executemany(
+        """INSERT INTO device_seen (device_id, item_key, hash, payload)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(device_id, item_key) DO UPDATE SET hash = ?, payload = ?""",
+        [(device_id, r[0], r[7], r[3], r[7], r[3]) for r in rows],
+    )
     conn.commit()
 
     return {
