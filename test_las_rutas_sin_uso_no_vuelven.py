@@ -56,6 +56,7 @@ RUTAS_PUBLICAS = {
     "GET /artwork/{track_id}",
     "POST /artworks/check",
     "POST /audd/motor-local",
+    "POST /audd/motor-local/identificar",  # el motor sin token de AudD (S3)
     "POST /backfill-audio",
     "POST /backfill-fingerprint",
     "POST /cache-analysis",

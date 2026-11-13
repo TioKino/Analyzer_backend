@@ -864,6 +864,27 @@ class AnalysisDB:
             )
         ''')
 
+        # Las llamadas a AudD que Render hace POR un motor local (desde el
+        # 2026-11-13, auditoría S3): el motor ya no lleva el token de AudD y
+        # se las pide a Render con el `X-Device-Token` del aparato
+        # (`/audd/motor-local/identificar`). Aquí se cuentan los cupos (por
+        # cuenta, por IP y en total al día). NO van a `audd_call_log`: el
+        # motor sigue apuntando sus llamadas en su BD y mandando los totales
+        # (`audd_motor_local`), y contarlas también allí partiría la serie de
+        # `by_source_30d` y sumaría dos veces la misma llamada.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS audd_por_render (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT,
+                ip        TEXT,
+                via       TEXT NOT NULL,
+                success   INTEGER NOT NULL DEFAULT 0,
+                called_at REAL NOT NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_audd_por_render_at '
+                     'ON audd_por_render(called_at)')
+
         # Tabla de errores de analisis (privacy-first: filename hasheado).
         # Captura fallos de /analyze y /identify para diagnostico operacional
         # desde el panel admin. NO se guarda el filename real, solo su MD5;
@@ -3248,12 +3269,12 @@ class AnalysisDB:
         'community_vote_sources', 'corrections',
         'community_notes', 'community_note_upvotes',
         'track_analyzers', 'track_ratings', 'audd_call_log',
-        'analysis_errors', 'events', 'device_first_seen',
+        'analysis_errors', 'events', 'device_first_seen', 'audd_por_render',
     )
     # Las de la lista que no se borran a secas: tienen su propia regla abajo.
     _BORRADO_CON_REGLA = frozenset({
         'identidad_verificada', 'community_notes', 'community_note_upvotes',
-        'track_analyzers', 'track_ratings', 'audd_call_log',
+        'track_analyzers', 'track_ratings', 'audd_call_log', 'audd_por_render',
     })
 
     def borrar_lo_de_los_aparatos(self, device_ids) -> Dict[str, int]:
@@ -3370,6 +3391,12 @@ class AnalysisDB:
                     f'WHERE device_id IN ({ph})', ids).rowcount
             except sqlite3.OperationalError:
                 n['audd_call_log'] = 0
+            try:
+                n['audd_por_render'] = c.execute(
+                    f'UPDATE audd_por_render SET device_id = NULL, ip = NULL '
+                    f'WHERE device_id IN ({ph})', ids).rowcount
+            except sqlite3.OperationalError:
+                n['audd_por_render'] = 0
             conn.commit()
         finally:
             conn.close()
@@ -5278,8 +5305,50 @@ class AnalysisDB:
             motores = conn.execute(
                 'SELECT COUNT(DISTINCT motor_id) FROM audd_motor_local '
                 'WHERE dia >= ?', (desde,)).fetchone()[0]
+            # Las que ya no paga el motor con su token: Render por él.
+            try:
+                por_render = int(conn.execute(
+                    'SELECT COUNT(*) FROM audd_por_render WHERE called_at >= ?',
+                    (time.time() - int(dias) * 86400,)).fetchone()[0])
+            except sqlite3.OperationalError:
+                por_render = 0
             return {'by_source': por_via, 'total': sum(por_via.values()),
-                    'aciertos': aciertos, 'motores': int(motores or 0)}
+                    'aciertos': aciertos, 'motores': int(motores or 0),
+                    'por_render': por_render}
+        finally:
+            conn.close()
+
+    def apuntar_audd_por_render(self, device_id: str, ip: Optional[str],
+                                via: str, success: bool) -> None:
+        """Una llamada a AudD hecha por Render para un motor local."""
+        conn = self._open_conn()
+        try:
+            conn.execute(
+                'INSERT INTO audd_por_render '
+                '(device_id, ip, via, success, called_at) VALUES (?, ?, ?, ?, ?)',
+                (device_id, ip, via, 1 if success else 0, time.time()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def cuenta_audd_por_render(self, desde_ts: float,
+                               aparatos: Optional[List[str]] = None,
+                               ip: Optional[str] = None) -> int:
+        """Cuántas desde [desde_ts]: de esos aparatos, de esa IP o en total."""
+        donde, args = ['called_at >= ?'], [desde_ts]
+        if aparatos is not None:
+            if not aparatos:
+                return 0
+            donde.append(f'device_id IN ({",".join("?" * len(aparatos))})')
+            args.extend(aparatos)
+        if ip is not None:
+            donde.append('ip = ?')
+            args.append(ip)
+        conn = self._open_conn()
+        try:
+            return int(conn.execute(
+                f'SELECT COUNT(*) FROM audd_por_render WHERE {" AND ".join(donde)}',
+                args).fetchone()[0])
         finally:
             conn.close()
 
