@@ -305,3 +305,33 @@ class TestElCupoLlenoNoEsNoLoConoce:
         bloque = fuente.split("if force_audd and AUDD_AUTO_ENABLED and hay_audd(AUDD_API_TOKEN):")[1][:1500]
         assert "cupo_de_render_lleno()" in bloque
         assert "result.audd_daily_cap_reached = True" in bloque
+
+
+class TestConElCupoLlenoNoSeSubeNada:
+    def test_mientras_dure_no_sale_otra_peticion(self, monkeypatch, tmp_path):
+        import time
+        import audd_helper
+        monkeypatch.setenv("LOCAL_ENGINE", "true")
+        monkeypatch.setattr(audd_helper, "_token_del_aparato", "tok")
+        monkeypatch.setattr(audd_helper, "_cupo_de_render_lleno_hasta",
+                            time.time() + 600)
+        llamadas = []
+        monkeypatch.setattr(audd_helper.requests, "post",
+                            lambda *a, **k: llamadas.append(1))
+        trozo = tmp_path / "t.wav"
+        trozo.write_bytes(_trozo())
+
+        r = audd_helper.post_a_audd(str(trozo), {"api_token": ""}, 30, via="analyze")
+
+        assert r.status_code == 429
+        assert llamadas == []
+
+    def test_limpiar_lo_dice_tambien_con_un_nombre_limpio(self):
+        """Con el cupo lleno AudD no miró el tema: si el nombre ya era limpio,
+        el cliente lo daría por «ya estaba bien» y no lo volvería a intentar."""
+        import inspect
+        import main
+        bloque = inspect.getsource(main).split(
+            "if force_audd and AUDD_AUTO_ENABLED and hay_audd(AUDD_API_TOKEN):")[1][:900]
+        condicion = bloque.split("cupo_de_render_lleno()):")[0]
+        assert "is_garbage_metadata" not in condicion.split("from audd_helper import cupo_de_render_lleno")[1]

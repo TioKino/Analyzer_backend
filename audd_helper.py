@@ -114,6 +114,9 @@ def post_a_audd(path: str, data: Dict, timeout: float,
                                  timeout=timeout)
     if not es_motor_local():
         return _respuesta(503, '{"detail": "sin token de AudD"}')
+    if cupo_de_render_lleno():
+        # Ya dijo que no: no se sube otro trozo para oír lo mismo.
+        return _respuesta(429, '{"detail": "cupo lleno", "cupo": "recordado"}')
     aparato = token_del_aparato()
     if not aparato:
         logger.warning('[AudD→Render] sin token del aparato: no se identifica')

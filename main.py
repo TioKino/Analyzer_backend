@@ -3567,9 +3567,11 @@ async def _analizar(request: Request, file: UploadFile, force: bool,
                 # el cap se reportaria como "no corrio", que es falso.
                 from audd_helper import cupo_de_render_lleno
                 if (IS_LOCAL_ENGINE and not AUDD_API_TOKEN
-                        and is_garbage_metadata(result.artist, result.title)
                         and cupo_de_render_lleno()):
-                    # El motor sin token: el cupo es el que pone Render.
+                    # El motor sin token: el cupo es el que pone Render, y con
+                    # él lleno AudD no ha mirado el tema, tenga el nombre que
+                    # tenga. Sin esto, uno con nombre limpio salía como «ya
+                    # estaba bien» y el cliente lo silenciaba para siempre.
                     result.audd_skipped_reason = 'daily cap reached (Render)'
                     result.audd_daily_cap_reached = True
                 elif is_garbage_metadata(result.artist, result.title) and db is not None:
