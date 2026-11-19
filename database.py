@@ -4152,7 +4152,7 @@ class AnalysisDB:
     EVENTOS_DE_MEZCLAS = ('mezclas_apartadas', 'mezcla_identificada',
                           'mezcla_como_tema', 'mezcla_a_mano',
                           'mezcla_editada', 'mezcla_tramo',
-                          'sesiones_pasadas')
+                          'sesiones_pasadas', 'sesiones_aviso')
 
     def resumen_carpeta_vigilada(self, dias: int = 30) -> Dict:
         """La CARPETA VIGILADA del escritorio (`carpeta_vigilada.dart`, desde el
@@ -4507,6 +4507,11 @@ class AnalysisDB:
                                búsqueda de Ajustes o el clic derecho en una
                                carpeta (2026-11-11). Las que aparta el import
                                van en `apartadas.por_motivo.partes`.
+          sesiones_aviso       el aviso de la biblioteca «Hay N sesiones
+                               partidas en pistas» ({accion: visto | revisar
+                               | ahora_no, n}; desde el 2026-11-19). Lo que
+                               se pasa desde él sale en `sesiones_pasadas`
+                               con `desde: aviso`.
 
         Devuelve:
           dias, aparatos
@@ -4521,6 +4526,8 @@ class AnalysisDB:
                          en dos trozos o más; desde el 2026-11-05)
           sesiones_pasadas {veces, aparatos, sesiones, pistas, fallidas,
                          desde} (desde el 2026-11-11)
+          sesiones_aviso {visto, revisar, ahora_no, aparatos_visto,
+                         aparatos_revisar} (desde el 2026-11-19)
 
         `temas_por_hora` sale de las que TERMINARON (una parada a medias no
         dice cuántos temas tiene la mezcla) y `segundos_por_hora` de las que
@@ -4551,6 +4558,9 @@ class AnalysisDB:
             pasadas = {'veces': 0, 'aparatos': 0, 'sesiones': 0, 'pistas': 0,
                        'fallidas': 0, 'desde': {}}
             de_pasadas = set()
+            aviso = {'visto': 0, 'revisar': 0, 'ahora_no': 0,
+                     'aparatos_visto': 0, 'aparatos_revisar': 0}
+            de_aviso_visto, de_aviso_revisar = set(), set()
             temas_hechas = minutos_hechas = 0
             segundos_de_una = minutos_de_una = 0
             marcas = ','.join('?' * len(self.EVENTOS_DE_MEZCLAS))
@@ -4602,6 +4612,14 @@ class AnalysisDB:
                     d = str(p.get('desde') or '?')[:16]
                     pasadas['desde'][d] = (pasadas['desde'].get(d, 0)
                                            + _n(p.get('sesiones')))
+                elif nombre == 'sesiones_aviso':
+                    acc = str(p.get('accion') or '')
+                    if acc in ('visto', 'revisar', 'ahora_no'):
+                        aviso[acc] += 1
+                    if dev and acc == 'visto':
+                        de_aviso_visto.add(dev)
+                    if dev and acc == 'revisar':
+                        de_aviso_revisar.add(dev)
                 elif nombre == 'mezcla_tramo':
                     if dev:
                         de_tramos.add(dev)
@@ -4636,6 +4654,8 @@ class AnalysisDB:
             editadas['aparatos'] = len(de_editadas)
             tramos['aparatos'] = len(de_tramos)
             pasadas['aparatos'] = len(de_pasadas)
+            aviso['aparatos_visto'] = len(de_aviso_visto)
+            aviso['aparatos_revisar'] = len(de_aviso_revisar)
             return {
                 'dias': int(dias),
                 'aparatos': len(aparatos),
@@ -4646,6 +4666,7 @@ class AnalysisDB:
                 'editadas': editadas,
                 'tramos': tramos,
                 'sesiones_pasadas': pasadas,
+                'sesiones_aviso': aviso,
             }
         finally:
             conn.close()
