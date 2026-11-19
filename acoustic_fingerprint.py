@@ -292,6 +292,39 @@ _MAX_ALIGN_SHIFT = 3
 # espurio: se devuelve distancia maxima.
 _MIN_OVERLAP = 8
 
+# Una huella que NO DICE NADA no se agrupa con otras (2026-11-19). El
+# diagnóstico de la limpieza encontró 282 grupos con temas de nombres
+# distintos bajo la misma huella: notas de piano, kicks, hi-hats y sonidos de
+# un juego (un segundo de audio son ~8 valores, y con `_MIN_OVERLAP` = 8 casan
+# entre sí), y canciones que no tenían nada que ver entre ellas, con la huella
+# de un fichero mudo o truncado (siempre el mismo valor). Juntas compartían
+# cues, rejilla y notas. Por debajo de `MIN_VALORES_PARA_AGRUPAR` (unos 25 s
+# de audio), de `MIN_SEGUNDOS_PARA_AGRUPAR`, o con menos de una cuarta parte
+# de valores distintos, el tema se queda en su propio grupo.
+MIN_VALORES_PARA_AGRUPAR = 200
+MIN_SEGUNDOS_PARA_AGRUPAR = 30.0
+MIN_PARTE_DISTINTA = 0.25
+
+
+def huella_que_no_dice_nada(ints, duration=None):
+    """¿Es demasiado corta, o casi siempre el mismo valor (silencio, un
+    fichero roto)? Entonces no se agrupa con nadie."""
+    n = 0 if ints is None else len(ints)
+    if n == 0:
+        return True
+    if n < MIN_VALORES_PARA_AGRUPAR:
+        return True
+    if duration is not None and 0 < duration < MIN_SEGUNDOS_PARA_AGRUPAR:
+        return True
+    try:
+        if _np is not None and isinstance(ints, _np.ndarray):
+            distintos = len(_np.unique(ints))
+        else:
+            distintos = len(set(int(x) for x in ints))
+    except (TypeError, ValueError):
+        return True
+    return distintos < MIN_PARTE_DISTINTA * n
+
 
 def _fpcalc_una_pasada(fpcalc_bin, file_path, timeout):
     """Una invocación de fpcalc. Devuelve `(ints, motivo)`.

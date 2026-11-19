@@ -136,6 +136,9 @@ def test_los_nombres_de_prueba_no_pillan_temas_de_verdad():
     assert limpieza.es_nombre_de_prueba(None, 'pista_de_prueba_lame.mp3')
     assert not limpieza.es_nombre_de_prueba('Testarossa', 'Contest')
     assert not limpieza.es_nombre_de_prueba('Jamie Jones', 'Panic')
+    for de_verdad in ('A Test of Patience', 'I Love You, You Big Dummy',
+                      'Beep Me 911', 'Di Rigori Armato Il Seno'):
+        assert not limpieza.es_nombre_de_prueba(de_verdad), de_verdad
 
 
 def test_la_palabra_de_sesion_es_la_del_cliente():
@@ -154,3 +157,24 @@ def test_la_ruta_pide_el_secreto_y_esta_montada():
     assert 'await _verify_admin_secret(request)' in cuerpo
     assert 'solo_lectura=True' in cuerpo, 'el diagnóstico abre la base en solo lectura'
     assert '_pesado(' in cuerpo, 'recorre la tabla entera: de uno en uno'
+
+
+def test_el_borrado_solo_se_lleva_lo_decidido(tmp_path):
+    import time
+    conn = _base(tmp_path)
+    prev, art = _carpetas(tmp_path)
+    viejo = os.path.join(prev, 'viejo.mp3.tmp')
+    open(viejo, 'wb').write(b'x')
+    os.utime(viejo, (time.time() - 7200, time.time() - 7200))
+    plan = limpieza.plan_de_borrado(conn, prev, art)
+    assert plan['temas_sin_datos'] == 1
+    assert plan['temas_de_sesiones'] == 4
+    assert plan['previews_vacias'] == 2, 'el vacío y el .tmp viejo'
+    hecho = limpieza.borrar(conn, prev, art)
+    assert hecho['filas_borradas'] == 5 and hecho['ficheros_borrados'] == 2
+    quedan = {r[0] for r in conn.execute('SELECT id FROM tracks')}
+    assert 'vacia' not in quedan and not any(q.startswith('spinning') for q in quedan)
+    for sigue in ('ilegible', 'error', 'escuchar', 'album1', 'corto', 'prueba'):
+        assert sigue in quedan, sigue
+    assert os.path.exists(os.path.join(prev, 'a.mp3.tmp')), 'un .tmp reciente se queda'
+    assert os.path.exists(os.path.join(prev, 'nadie.mp3')), 'los huérfanos se quedan'

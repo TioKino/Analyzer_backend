@@ -27,6 +27,7 @@ from starlette.concurrency import run_in_threadpool
 
 import catalogo
 import limpieza
+import portadas
 import resumen_diario
 from validation import DESKTOP_PLATFORMS, is_desktop_platform, is_mobile_platform
 
@@ -4007,6 +4008,120 @@ async def limpieza_diagnostico(request: Request):
             conn.close()
 
     return await _pesado(mirar)
+
+
+_reduccion_de_portadas = None
+
+
+def _la_reduccion():
+    global _reduccion_de_portadas
+    if _reduccion_de_portadas is None:
+        _reduccion_de_portadas = portadas.Reduccion(_ARTWORK_CACHE_DIR)
+    return _reduccion_de_portadas
+
+
+@admin_panel_router.get("/limpieza/portadas/medir")
+async def portadas_medir(request: Request,
+                         muestra: int = Query(400, ge=10, le=3000)):
+    """Cuánto ocuparían las portadas reducidas (`portadas.py`): reduce en
+    memoria una muestra al azar y lo extrapola. No escribe nada."""
+    await _verify_admin_secret(request)
+    return await _pesado(portadas.medir, _ARTWORK_CACHE_DIR, muestra)
+
+
+@admin_panel_router.post("/limpieza/portadas/reducir")
+async def portadas_reducir(request: Request, confirmar: str = Query("")):
+    """Lanza (o para, con `confirmar=PARAR`) la pasada que reduce las
+    portadas que ya hay. Va en su propio hilo, una a una y con pausas; se
+    sigue con `GET /admin/limpieza/portadas/estado`."""
+    await _verify_admin_secret(request)
+    r = _la_reduccion()
+    if confirmar == "PARAR":
+        r.parar()
+        return {"parando": True, "estado": r.estado}
+    if confirmar != "REDUCIR":
+        raise HTTPException(400, "Falta confirmar=REDUCIR")
+    return {"empezada": r.empezar(), "estado": r.estado}
+
+
+@admin_panel_router.get("/limpieza/portadas/estado")
+async def portadas_estado(request: Request):
+    await _verify_admin_secret(request)
+    r = _la_reduccion()
+    return {"en_marcha": r.en_marcha(), "estado": r.estado}
+
+
+@admin_panel_router.get("/limpieza/huellas")
+async def huellas_plan(request: Request):
+    """Las huellas compartidas por temas distintos y cómo se separarían
+    (`limpieza.plan_de_separacion`). Solo lee."""
+    await _verify_admin_secret(request)
+
+    def mirar():
+        conn = _conn_analysis(solo_lectura=True)
+        try:
+            plan = limpieza.plan_de_separacion(conn)
+            plan.pop('_cambios', None)
+            return plan
+        finally:
+            conn.close()
+
+    return await _pesado(mirar)
+
+
+@admin_panel_router.post("/limpieza/huellas")
+async def huellas_separar(request: Request, confirmar: str = Query("")):
+    """Separa esas huellas (`limpieza.separar`): cambia el `acoustic_id` de
+    los temas que no se llaman como el grupo. No borra nada."""
+    await _verify_admin_secret(request)
+    if confirmar != "SEPARAR":
+        raise HTTPException(400, "Falta confirmar=SEPARAR")
+
+    def hacer():
+        conn = _conn_analysis()
+        try:
+            return limpieza.separar(conn)
+        finally:
+            conn.close()
+
+    return await _pesado(hacer)
+
+
+@admin_panel_router.get("/limpieza/borrar")
+async def limpieza_plan_de_borrado(request: Request):
+    """Lo que se borraría (`limpieza.plan_de_borrado`). Solo lee."""
+    await _verify_admin_secret(request)
+
+    def mirar():
+        conn = _conn_analysis(solo_lectura=True)
+        try:
+            plan = limpieza.plan_de_borrado(
+                conn, _PREVIEWS_DIR, _ARTWORK_CACHE_DIR)
+            plan.pop('_ids', None)
+            plan.pop('_ficheros', None)
+            return plan
+        finally:
+            conn.close()
+
+    return await _pesado(mirar)
+
+
+@admin_panel_router.post("/limpieza/borrar")
+async def limpieza_borrar(request: Request, confirmar: str = Query("")):
+    """Borra la fila sin datos, las sesiones subidas pista a pista y los
+    ficheros vacíos (`limpieza.borrar`)."""
+    await _verify_admin_secret(request)
+    if confirmar != "BORRAR":
+        raise HTTPException(400, "Falta confirmar=BORRAR")
+
+    def hacer():
+        conn = _conn_analysis()
+        try:
+            return limpieza.borrar(conn, _PREVIEWS_DIR, _ARTWORK_CACHE_DIR)
+        finally:
+            conn.close()
+
+    return await _pesado(hacer)
 
 
 @admin_panel_router.get("/catalogo")
