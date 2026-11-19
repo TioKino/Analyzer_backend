@@ -13,6 +13,7 @@ Exporta:
 - ARTWORK_CACHE_DIR
 """
 from config import LASTFM_API_KEY, ARTWORK_CACHE_DIR
+import portadas
 import logging
 import os
 import base64
@@ -425,17 +426,10 @@ def save_artwork_to_cache(fingerprint: str, artwork_data: bytes, mime_type: str)
     sirviendose la vieja (GET mira `jpg` antes que `png`).
     """
     ext = _EXTENSIONES.get(mime_de(artwork_data), 'jpg')
-    for otra in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
-        if otra != ext:
-            vieja = os.path.join(ARTWORK_CACHE_DIR, f"{fingerprint}.{otra}")
-            if os.path.exists(vieja):
-                try:
-                    os.unlink(vieja)
-                except OSError:
-                    pass
-    filename = f"{fingerprint}.{ext}"
-    with open(os.path.join(ARTWORK_CACHE_DIR, filename), 'wb') as f:
-        f.write(artwork_data)
+    # Reducida a un tamaño razonable si es grande (`portadas.py`, desde el
+    # 2026-11-19: 49 GB de portadas a resolución completa llenaban /data).
+    filename, _ = portadas.guardar(ARTWORK_CACHE_DIR, fingerprint,
+                                   artwork_data, ext)
     return filename
 
 

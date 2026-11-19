@@ -30,6 +30,7 @@ Como pasos 2-4: el router SI se monta (init + include_router) y los endpoints
 inline se BORRAN -> sin duplicacion stale.
 """
 
+import portadas
 import json
 import logging
 import os
@@ -749,21 +750,12 @@ async def upload_artwork(fingerprint: str, request: Request,
         logger.warning(f"[Artwork] sin sitio en el disco: {safe_fp[:8]} no se guarda")
         raise HTTPException(507, "Sin espacio para portadas nuevas")
 
-    # Eliminar versiones previas con otra extensión para evitar dos
-    # archivos del mismo fingerprint en el cache.
-    for prev_ext in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
-        prev = os.path.join(ARTWORK_CACHE_DIR, f"{safe_fp}.{prev_ext}")
-        if os.path.exists(prev):
-            try:
-                os.unlink(prev)
-            except OSError:
-                pass
-
-    cache_path = os.path.join(ARTWORK_CACHE_DIR, f"{safe_fp}.{ext}")
-    with open(cache_path, 'wb') as f:
-        f.write(content)
+    # Reducida a un tamaño razonable si es grande, y sin dejar otra
+    # extensión de la misma huella (`portadas.guardar`, desde el 2026-11-19).
+    _, tam = await run_in_threadpool(
+        portadas.guardar, ARTWORK_CACHE_DIR, safe_fp, content, ext)
     _SIN_PORTADA.pop(safe_fp, None)
     if habia:
         logger.info(f"[Artwork] {safe_fp} pisada por {quien}")
 
-    return {"status": "ok", "fingerprint": safe_fp, "size": len(content), "ext": ext}
+    return {"status": "ok", "fingerprint": safe_fp, "size": tam, "ext": ext}
