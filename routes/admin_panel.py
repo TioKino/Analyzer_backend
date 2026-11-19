@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 import catalogo
+import limpieza
 import resumen_diario
 from validation import DESKTOP_PLATFORMS, is_desktop_platform, is_mobile_platform
 
@@ -3985,6 +3986,27 @@ async def resumen_recalcular(request: Request):
     await _pesado(_hacer_foto_de_hoy)
     fotos = await run_in_threadpool(_leer_fotos)
     return _respuesta_del_resumen(fotos, False)
+
+
+@admin_panel_router.get("/limpieza")
+async def limpieza_diagnostico(request: Request):
+    """La BASURA de la base de datos y del disco, contada y con ejemplos
+    (`limpieza.py`). Solo LEE: el borrado se decide con estos números delante
+    (owner, 2026-11-19). Recorre `tracks` entera y las carpetas de previews y
+    portadas: va de uno en uno con lo pesado del panel. Lo lanza
+    `scripts/limpieza.sh` del cliente."""
+    await _verify_admin_secret(request)
+
+    def mirar():
+        conn = _conn_analysis(solo_lectura=True)
+        try:
+            return limpieza.diagnostico(
+                conn, _PREVIEWS_DIR, _ARTWORK_CACHE_DIR,
+                database_path=_ruta_analysis_db())
+        finally:
+            conn.close()
+
+    return await _pesado(mirar)
 
 
 @admin_panel_router.get("/catalogo")
