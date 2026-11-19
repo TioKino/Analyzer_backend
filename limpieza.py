@@ -29,6 +29,14 @@ Las clases, de más segura a más dudosa:
                         cosas que no se parecen (ver «Duplicados» del cliente).
   nombres_de_prueba     el nombre dice prueba, test, tono, sintético…: las
                         pistas de las mediciones (desfase, tonalidad).
+  partes_de_sesion      una SESIÓN partida en pistas que se subió tema a
+                        tema: el mismo artista y títulos iguales salvo el
+                        número («Pista 1», «Pista 2»…), tres o más, y algo
+                        dice sesión (session, set, mix, live, @…). Es la
+                        regla de `sesion_en_partes.dart` del cliente, que
+                        desde la 2.11.0 las aparta sin subirlas; lo de antes
+                        sigue aquí. Sin la palabra de sesión van aparte
+                        (`partes_posibles`): pueden ser un álbum sin nombres.
 
 No se cuentan aparte las detecciones que siembra Escuchar
 (`analysis_status: recognize_only`): son a propósito.
@@ -54,6 +62,37 @@ CLUSTER_MIN_FILAS = 4
 CLUSTER_MIN_NOMBRES = 3
 
 EJEMPLOS = 10
+
+# Las partes de una sesión (la regla del cliente, `sesion_en_partes.dart`).
+MIN_PARTES = 3
+_SESION = re.compile(
+    r'\b(sesion(?:es)?|sessions?|(?<!box )sets?|dj set|live|directo|en vivo'
+    r'|mix(?:es|ed)?|megamix|minimix|mixtape|podcast|radio ?show|spinn?ing'
+    r'|b2b)\b|(@)')
+_DIGITOS = re.compile(r'\d+')
+_NO_LETRAS = re.compile(r'[^a-z0-9#]+')
+_ARTISTA_VACIO = {
+    '', 'unknown', 'unknown artist', 'artista desconocido', 'desconocido',
+    'various', 'various artists', 'varios', 'varios artistas', 'va',
+}
+
+
+def _sin_acentos(s: Optional[str]) -> str:
+    s = unicodedata.normalize('NFKD', s or '')
+    return ''.join(c for c in s if not unicodedata.combining(c)).lower()
+
+
+def dice_que_es_una_sesion(*textos: Optional[str]) -> bool:
+    return any(t and _SESION.search(_sin_acentos(t)) for t in textos)
+
+
+def patron_numerado(titulo: Optional[str]) -> Optional[str]:
+    """El título con los números como «#», o None si no lleva número."""
+    t = _sin_acentos(titulo)
+    if not _DIGITOS.search(t):
+        return None
+    p = re.sub(r'\s+', ' ', _NO_LETRAS.sub(' ', _DIGITOS.sub('#', t))).strip()
+    return p or None
 
 _PRUEBA = re.compile(
     r'(pista[ _-]?de[ _-]?prueba|\bprueba\b|\btest\b|\btesting\b|test[ _-]?tone|'
@@ -139,6 +178,7 @@ def diagnostico_de_tracks(filas: Iterable[Dict[str, Any]]) -> Tuple[Dict[str, An
         'muy_largos', 'nombres_de_prueba')}
     claves = set()
     clusters: Dict[str, Dict[str, Any]] = {}
+    numeradas: Dict[Tuple[str, str], Dict[str, Any]] = {}
     total = 0
     detecciones = 0
     for f in filas:
@@ -170,6 +210,18 @@ def diagnostico_de_tracks(filas: Iterable[Dict[str, Any]]) -> Tuple[Dict[str, An
             clases['muy_largos'].suma(ej)
         if es_nombre_de_prueba(artista, titulo, f.get('filename')):
             clases['nombres_de_prueba'].suma(ej)
+        patron = patron_numerado(titulo)
+        artista_n = _normal(artista)
+        if patron and artista_n not in _ARTISTA_VACIO:
+            g = numeradas.setdefault((artista_n, patron), {
+                'filas': 0, 'numeros': set(), 'sesion': False, 'ejemplos': []})
+            g['filas'] += 1
+            g['numeros'].add(tuple(int(x) for x in _DIGITOS.findall(
+                _sin_acentos(titulo))))
+            if dice_que_es_una_sesion(titulo, f.get('filename'), artista):
+                g['sesion'] = True
+            if len(g['ejemplos']) < 5:
+                g['ejemplos'].append(ej)
         cid = f.get('acoustic_id')
         if cid:
             g = clusters.setdefault(cid, {'filas': 0, 'nombres': set(),
@@ -197,6 +249,22 @@ def diagnostico_de_tracks(filas: Iterable[Dict[str, Any]]) -> Tuple[Dict[str, An
             for cid, g in sospechosos[:EJEMPLOS]
         ],
     }
+    for clase, segura in (('partes_de_sesion', True),
+                          ('partes_posibles', False)):
+        grupos = [
+            (k, g) for k, g in numeradas.items()
+            if g['sesion'] == segura and len(g['numeros']) >= MIN_PARTES
+        ]
+        grupos.sort(key=lambda x: -x[1]['filas'])
+        salida[clase] = {
+            'n': sum(g['filas'] for _, g in grupos),
+            'sesiones': len(grupos),
+            'ejemplos': [
+                {'artista': g['ejemplos'][0].get('artista'),
+                 'patron': k[1], 'pistas': g['filas'], 'temas': g['ejemplos']}
+                for k, g in grupos[:EJEMPLOS]
+            ],
+        }
     salida['total_tracks'] = total
     salida['detecciones_de_escuchar'] = detecciones
     return salida, claves

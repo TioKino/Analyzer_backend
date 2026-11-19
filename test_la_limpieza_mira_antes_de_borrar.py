@@ -31,7 +31,8 @@ def _base(tmp_path):
              cluster=None, fichero=None):
         conn.execute(
             'INSERT INTO tracks VALUES (?,?,?,?,?,?,?,?,?,?)',
-            (fp, fichero or f'{fp}.mp3', artista, titulo or f'Tema {fp}', dur,
+            (fp, fichero or f'{fp}.mp3', artista,
+             titulo or f'Tema {fp.rstrip("0123456789")}', dur,
              bpm, '2026-05-01T10:00:00', fp, cluster,
              json.dumps(js or {'bpm': bpm})))
 
@@ -47,6 +48,13 @@ def _base(tmp_path):
     fila('prueba', titulo='Pista de prueba desfase', fichero='pista_de_prueba.mp3')
     for i, nombre in enumerate(['Uno', 'Dos', 'Tres', 'Cuatro']):
         fila(f'silencio{i}', titulo=nombre, cluster='c-silencio')
+    # Una sesión subida pista a pista, y un álbum sin nombres (posible).
+    for i in range(1, 5):
+        fila(f'spinning{i}', artista='DJ Toni', titulo=f'Sesion Spinning Pista {i}')
+        fila(f'album{i}', artista='Grupo', titulo=f'Track {i:02d}')
+    # Con número pero solo dos: no es nada.
+    fila('rmx1', artista='X', titulo='Tema 1')
+    fila('rmx2', artista='X', titulo='Tema 2')
     conn.commit()
     return conn
 
@@ -89,7 +97,7 @@ def test_cada_clase_cae_donde_toca_y_no_se_escribe_nada(tmp_path):
     def huellas(clase):
         return {e['huella'] for e in t[clase]['ejemplos']}
 
-    assert t['total_tracks'] == 14
+    assert t['total_tracks'] == 24
     assert t['detecciones_de_escuchar'] == 1
     assert huellas('fallidos_ilegibles') == {'ilegible'}
     assert huellas('fallidos_otros') == {'error'}
@@ -100,6 +108,11 @@ def test_cada_clase_cae_donde_toca_y_no_se_escribe_nada(tmp_path):
     hc = t['huella_compartida']
     assert hc['clusters'] == 1 and hc['n'] == 4
     assert hc['ejemplos'][0]['cluster'] == 'c-silencio'
+    ps = t['partes_de_sesion']
+    assert ps['sesiones'] == 1 and ps['n'] == 4
+    assert ps['ejemplos'][0]['artista'] == 'DJ Toni'
+    pp = t['partes_posibles']
+    assert pp['sesiones'] == 1 and pp['n'] == 4, 'el álbum sin nombres va aparte'
     for clase in ('fallidos_ilegibles', 'fallidos_otros', 'sin_datos',
                   'muy_cortos', 'muy_largos', 'nombres_de_prueba'):
         assert not (huellas(clase) & {'bueno1', 'bueno2', 'bueno3', 'escuchar'})
@@ -123,6 +136,15 @@ def test_los_nombres_de_prueba_no_pillan_temas_de_verdad():
     assert limpieza.es_nombre_de_prueba(None, 'pista_de_prueba_lame.mp3')
     assert not limpieza.es_nombre_de_prueba('Testarossa', 'Contest')
     assert not limpieza.es_nombre_de_prueba('Jamie Jones', 'Panic')
+
+
+def test_la_palabra_de_sesion_es_la_del_cliente():
+    assert limpieza.dice_que_es_una_sesion('Sesión de spinning')
+    assert limpieza.dice_que_es_una_sesion('Live @ Fabric')
+    assert not limpieza.dice_que_es_una_sesion('Tema (Remix)')
+    assert not limpieza.dice_que_es_una_sesion('Box Set')
+    assert limpieza.patron_numerado('Pista 03') == 'pista #'
+    assert limpieza.patron_numerado('Panic') is None
 
 
 def test_la_ruta_pide_el_secreto_y_esta_montada():
