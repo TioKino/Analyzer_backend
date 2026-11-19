@@ -118,6 +118,24 @@ class TestElResumen:
             'veces': 2, 'aparatos': 2, 'sesiones': 4, 'pistas': 43,
             'fallidas': 1, 'desde': {'busqueda': 3, 'carpeta': 1}}
 
+    def test_el_aviso_de_las_sesiones_partidas(self):
+        """El aviso de la biblioteca (2026-11-19): cuántos lo ven, cuántos
+        van a revisar y cuántos dicen «ahora no». Lo que se pasa desde él va
+        en `sesiones_pasadas` con `desde: aviso`."""
+        db = _db()
+        _evento(db, 'mac-1', 'sesiones_aviso', {'accion': 'visto', 'n': 4})
+        _evento(db, 'mac-1', 'sesiones_aviso', {'accion': 'revisar', 'n': 4})
+        _evento(db, 'pc-1', 'sesiones_aviso', {'accion': 'visto', 'n': 1})
+        _evento(db, 'pc-1', 'sesiones_aviso', {'accion': 'ahora_no', 'n': 1})
+        _evento(db, 'pc-1', 'sesiones_aviso', {'accion': 'raro'})
+        _evento(db, 'mac-1', 'sesiones_pasadas', {
+            'desde': 'aviso', 'sesiones': 3, 'pistas': 30, 'fallidas': 0})
+        r = db.resumen_mezclas(30)
+        assert r['sesiones_aviso'] == {
+            'visto': 2, 'revisar': 1, 'ahora_no': 1,
+            'aparatos_visto': 2, 'aparatos_revisar': 1}
+        assert r['sesiones_pasadas']['desde'] == {'aviso': 3}
+
     def test_sin_eventos_dice_cero_y_no_lo_se(self):
         r = _db().resumen_mezclas(30)
         assert r['aparatos'] == 0
