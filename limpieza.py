@@ -94,10 +94,12 @@ def patron_numerado(titulo: Optional[str]) -> Optional[str]:
     p = re.sub(r'\s+', ' ', _NO_LETRAS.sub(' ', _DIGITOS.sub('#', t))).strip()
     return p or None
 
+# Solo lo que dice ser una prueba técnica: la primera versión pillaba «A Test
+# of Patience», «Big Dummy», «Beep Me 911» y «Il Seno» (lectura del 19-nov).
 _PRUEBA = re.compile(
-    r'(pista[ _-]?de[ _-]?prueba|\bprueba\b|\btest\b|\btesting\b|test[ _-]?tone|'
-    r'\bsine\b|\bseno\b|sint[eé]tic|\bbeep\b|\bdummy\b|\bplaceholder\b|'
-    r'\bclick[ _-]?track\b|\bdja[ _-]?test)', re.IGNORECASE)
+    r'(pista[ _-]?de[ _-]?prueba|tono[ _-]?de[ _-]?prueba|test[ _-]?tone|'
+    r'sine[ _-]?(wave|sweep)|pink[ _-]?noise|white[ _-]?noise|'
+    r'sint[eé]tic[ao]|\bdja[ _-]?test)', re.IGNORECASE)
 
 
 def _normal(s: Optional[str]) -> str:
@@ -170,7 +172,9 @@ class _Clase:
         return d
 
 
-def diagnostico_de_tracks(filas: Iterable[Dict[str, Any]]) -> Tuple[Dict[str, Any], set]:
+def diagnostico_de_tracks(filas: Iterable[Dict[str, Any]],
+                          ids: Optional[Dict[str, List[str]]] = None
+                          ) -> Tuple[Dict[str, Any], set]:
     """Las clases de `tracks`. Devuelve también las claves (huellas e ids)
     que existen, para saber qué ficheros son huérfanos."""
     clases = {k: _Clase() for k in (
@@ -204,6 +208,8 @@ def diagnostico_de_tracks(filas: Iterable[Dict[str, Any]]) -> Tuple[Dict[str, An
         dur = f.get('duration') or 0
         if not artista and not titulo and not bpm:
             clases['sin_datos'].suma(ej)
+            if ids is not None:
+                ids.setdefault('sin_datos', []).append(f['id'])
         if 0 < dur < CORTO_S:
             clases['muy_cortos'].suma(ej)
         elif dur > LARGO_S:
@@ -214,7 +220,9 @@ def diagnostico_de_tracks(filas: Iterable[Dict[str, Any]]) -> Tuple[Dict[str, An
         artista_n = _normal(artista)
         if patron and artista_n not in _ARTISTA_VACIO:
             g = numeradas.setdefault((artista_n, patron), {
-                'filas': 0, 'numeros': set(), 'sesion': False, 'ejemplos': []})
+                'filas': 0, 'numeros': set(), 'sesion': False, 'ejemplos': [],
+                'ids': []})
+            g['ids'].append(f['id'])
             g['filas'] += 1
             g['numeros'].add(tuple(int(x) for x in _DIGITOS.findall(
                 _sin_acentos(titulo))))
@@ -249,6 +257,12 @@ def diagnostico_de_tracks(filas: Iterable[Dict[str, Any]]) -> Tuple[Dict[str, An
             for cid, g in sospechosos[:EJEMPLOS]
         ],
     }
+    if ids is not None:
+        ids['partes_de_sesion'] = [
+            tid for g in numeradas.values()
+            if g['sesion'] and len(g['numeros']) >= MIN_PARTES
+            for tid in g['ids']
+        ]
     for clase, segura in (('partes_de_sesion', True),
                           ('partes_posibles', False)):
         grupos = [
@@ -432,4 +446,82 @@ def separar(conn) -> Dict[str, Any]:
         conn.executemany('UPDATE tracks SET acoustic_id = ? WHERE id = ?',
                          [(nuevo, tid) for tid, nuevo in cambios])
     plan['hecho'] = True
+    return plan
+
+
+# ── Borrar lo poco que es basura segura (2026-11-19) ────────────────────────
+# Decidido con la primera lectura delante (owner): la fila sin datos, las
+# sesiones subidas pista a pista (`partes_de_sesion`: el cliente ya no las
+# sube) y los ficheros de previews y portadas VACÍOS o temporales a medias de
+# hace más de una hora (uno reciente puede estar escribiéndose). Nada más: ni
+# los fallidos (evitan que se vuelva a subir un fichero roto), ni los
+# huérfanos (las apps los siguen pidiendo por la huella), ni los dudosos.
+
+TMP_VIEJO_S = 3600
+
+
+def _ficheros_a_borrar(carpeta: Optional[str], ahora: float) -> List[str]:
+    if not carpeta or not os.path.isdir(carpeta):
+        return []
+    rutas = []
+    with os.scandir(carpeta) as it:
+        for e in it:
+            if not e.is_file():
+                continue
+            try:
+                st = e.stat()
+            except OSError:
+                continue
+            if st.st_size == 0 or (e.name.endswith('.tmp')
+                                   and ahora - st.st_mtime > TMP_VIEJO_S):
+                rutas.append(e.path)
+    return rutas
+
+
+def plan_de_borrado(conn, previews_dir: Optional[str],
+                    artwork_dir: Optional[str],
+                    ahora: Optional[float] = None) -> Dict[str, Any]:
+    """Qué se borraría. Solo LEE."""
+    import time as _t
+    ahora = _t.time() if ahora is None else ahora
+    cur = conn.cursor()
+    cur.row_factory = _como_dict
+    ids: Dict[str, List[str]] = {}
+    diagnostico_de_tracks(cur.execute(
+        'SELECT id, fingerprint, filename, artist, title, bpm, duration,'
+        ' analyzed_at, acoustic_id, NULL AS estado, NULL AS fallo'
+        ' FROM tracks WHERE analysis_json IS NULL OR ('
+        "instr(analysis_json, '\"analysis_status\": \"failed\"') = 0 AND"
+        " instr(analysis_json, '\"analysis_status\":\"failed\"') = 0 AND"
+        " instr(analysis_json, '\"analysis_status\": \"recognize_only\"') = 0"
+        " AND instr(analysis_json, '\"analysis_status\":\"recognize_only\"') = 0)"),
+        ids)
+    previews = _ficheros_a_borrar(previews_dir, ahora)
+    portadas_ = _ficheros_a_borrar(artwork_dir, ahora)
+    return {
+        'temas_sin_datos': len(ids.get('sin_datos', [])),
+        'temas_de_sesiones': len(ids.get('partes_de_sesion', [])),
+        'previews_vacias': len(previews),
+        'portadas_vacias': len(portadas_),
+        '_ids': ids.get('sin_datos', []) + ids.get('partes_de_sesion', []),
+        '_ficheros': previews + portadas_,
+    }
+
+
+def borrar(conn, previews_dir: Optional[str],
+           artwork_dir: Optional[str]) -> Dict[str, Any]:
+    """Aplica `plan_de_borrado`."""
+    plan = plan_de_borrado(conn, previews_dir, artwork_dir)
+    ids = plan.pop('_ids')
+    ficheros = plan.pop('_ficheros')
+    with conn:
+        conn.executemany('DELETE FROM tracks WHERE id = ?', [(i,) for i in ids])
+    borrados = 0
+    for ruta in ficheros:
+        try:
+            os.unlink(ruta)
+            borrados += 1
+        except OSError:
+            pass
+    plan.update(hecho=True, filas_borradas=len(ids), ficheros_borrados=borrados)
     return plan

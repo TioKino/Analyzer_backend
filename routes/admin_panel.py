@@ -4087,6 +4087,43 @@ async def huellas_separar(request: Request, confirmar: str = Query("")):
     return await _pesado(hacer)
 
 
+@admin_panel_router.get("/limpieza/borrar")
+async def limpieza_plan_de_borrado(request: Request):
+    """Lo que se borraría (`limpieza.plan_de_borrado`). Solo lee."""
+    await _verify_admin_secret(request)
+
+    def mirar():
+        conn = _conn_analysis(solo_lectura=True)
+        try:
+            plan = limpieza.plan_de_borrado(
+                conn, _PREVIEWS_DIR, _ARTWORK_CACHE_DIR)
+            plan.pop('_ids', None)
+            plan.pop('_ficheros', None)
+            return plan
+        finally:
+            conn.close()
+
+    return await _pesado(mirar)
+
+
+@admin_panel_router.post("/limpieza/borrar")
+async def limpieza_borrar(request: Request, confirmar: str = Query("")):
+    """Borra la fila sin datos, las sesiones subidas pista a pista y los
+    ficheros vacíos (`limpieza.borrar`)."""
+    await _verify_admin_secret(request)
+    if confirmar != "BORRAR":
+        raise HTTPException(400, "Falta confirmar=BORRAR")
+
+    def hacer():
+        conn = _conn_analysis()
+        try:
+            return limpieza.borrar(conn, _PREVIEWS_DIR, _ARTWORK_CACHE_DIR)
+        finally:
+            conn.close()
+
+    return await _pesado(hacer)
+
+
 @admin_panel_router.get("/catalogo")
 async def catalogo_de_todo(
     request: Request,
