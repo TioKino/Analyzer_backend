@@ -379,3 +379,57 @@ def diagnostico(conn, previews_dir: Optional[str], artwork_dir: Optional[str],
 
 def _como_dict(cursor, fila):
     return {d[0]: fila[i] for i, d in enumerate(cursor.description)}
+
+
+# ── Separar las huellas compartidas por temas distintos (2026-11-19) ─────────
+# Un grupo acústico (`acoustic_id`) con temas de nombres distintos no es el
+# mismo audio: es la huella de un sample corto, del silencio o de un fichero
+# truncado (ver `acoustic_fingerprint.huella_que_no_dice_nada`, que desde
+# ese día impide que vuelva a pasar). Se separa por NOMBRE: los que se llaman
+# igual siguen juntos (son copias), el nombre con más temas se queda con el
+# grupo de siempre —y con lo que la comunidad guardó bajo él— y cada otro
+# nombre pasa a un grupo propio, con la huella de su primer tema como id.
+# No se borra ningún tema.
+
+def plan_de_separacion(conn) -> Dict[str, Any]:
+    """Qué cambiaría: los grupos sospechosos y, por tema, su grupo nuevo.
+    Solo LEE."""
+    grupos: Dict[str, Dict[str, List[Tuple[str, str]]]] = {}
+    cur = conn.cursor()
+    cur.row_factory = _como_dict
+    for f in cur.execute(
+            'SELECT id, fingerprint, artist, title, filename, acoustic_id'
+            ' FROM tracks WHERE acoustic_id IS NOT NULL'):
+        nombre = (_normal(f'{f.get("artist") or ""} {f.get("title") or ""}')
+                  or _normal(f.get('filename')) or f['id'])
+        grupos.setdefault(f['acoustic_id'], {}).setdefault(
+            nombre, []).append((f['id'], f.get('fingerprint') or f['id']))
+    cambios: List[Tuple[str, str]] = []  # (id del tema, acoustic_id nuevo)
+    resumen = []
+    for cid, por_nombre in grupos.items():
+        filas = sum(len(v) for v in por_nombre.values())
+        if filas < CLUSTER_MIN_FILAS or len(por_nombre) < CLUSTER_MIN_NOMBRES:
+            continue
+        nombres = sorted(por_nombre.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        for nombre, temas in nombres[1:]:
+            nuevo = temas[0][1]
+            for tid, _ in temas:
+                cambios.append((tid, nuevo))
+        resumen.append({'cluster': cid, 'temas': filas,
+                        'nombres': len(por_nombre),
+                        'se_queda': nombres[0][0],
+                        'separados': filas - len(nombres[0][1])})
+    resumen.sort(key=lambda r: -r['temas'])
+    return {'grupos': len(resumen), 'temas_que_cambian': len(cambios),
+            'ejemplos': resumen[:EJEMPLOS], '_cambios': cambios}
+
+
+def separar(conn) -> Dict[str, Any]:
+    """Aplica `plan_de_separacion`, en una transacción."""
+    plan = plan_de_separacion(conn)
+    cambios = plan.pop('_cambios')
+    with conn:
+        conn.executemany('UPDATE tracks SET acoustic_id = ? WHERE id = ?',
+                         [(nuevo, tid) for tid, nuevo in cambios])
+    plan['hecho'] = True
+    return plan

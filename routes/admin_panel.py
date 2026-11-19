@@ -4051,6 +4051,42 @@ async def portadas_estado(request: Request):
     return {"en_marcha": r.en_marcha(), "estado": r.estado}
 
 
+@admin_panel_router.get("/limpieza/huellas")
+async def huellas_plan(request: Request):
+    """Las huellas compartidas por temas distintos y cómo se separarían
+    (`limpieza.plan_de_separacion`). Solo lee."""
+    await _verify_admin_secret(request)
+
+    def mirar():
+        conn = _conn_analysis(solo_lectura=True)
+        try:
+            plan = limpieza.plan_de_separacion(conn)
+            plan.pop('_cambios', None)
+            return plan
+        finally:
+            conn.close()
+
+    return await _pesado(mirar)
+
+
+@admin_panel_router.post("/limpieza/huellas")
+async def huellas_separar(request: Request, confirmar: str = Query("")):
+    """Separa esas huellas (`limpieza.separar`): cambia el `acoustic_id` de
+    los temas que no se llaman como el grupo. No borra nada."""
+    await _verify_admin_secret(request)
+    if confirmar != "SEPARAR":
+        raise HTTPException(400, "Falta confirmar=SEPARAR")
+
+    def hacer():
+        conn = _conn_analysis()
+        try:
+            return limpieza.separar(conn)
+        finally:
+            conn.close()
+
+    return await _pesado(hacer)
+
+
 @admin_panel_router.get("/catalogo")
 async def catalogo_de_todo(
     request: Request,

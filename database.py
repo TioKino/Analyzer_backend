@@ -1312,8 +1312,13 @@ class AnalysisDB:
         """
         from acoustic_fingerprint import (
             MATCH_THRESHOLD, decode_raw, decode_raw_np, hamming_distance,
+            huella_que_no_dice_nada,
         )
         if not raw_ints:
+            return None
+        # Ni se busca grupo para una huella que no dice nada (ver
+        # `huella_que_no_dice_nada`), ni se entra en el de una de ellas.
+        if huella_que_no_dice_nada(raw_ints, duration):
             return None
 
         conn = self._open_conn()
@@ -1358,6 +1363,8 @@ class AnalysisDB:
             if cand is None:
                 cand = decode_raw(row['chromaprint'])
             if cand is None or len(cand) == 0:
+                continue
+            if huella_que_no_dice_nada(cand):
                 continue
             d = hamming_distance(query, cand)
             if d < best_dist:
