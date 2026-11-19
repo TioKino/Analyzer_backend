@@ -117,7 +117,9 @@ def test_el_cluster_acustico_no_recorre_la_tabla(monkeypatch):
         return conn
 
     monkeypatch.setattr(main.db, '_open_conn', con_traza)
-    main.db.find_acoustic_cluster([1, 2, 3] * 40, 300.0)
+    # Una huella que dice algo (`huella_que_no_dice_nada` corta antes las cortas).
+    main.db.find_acoustic_cluster(
+        [((i * 2654435761) & 0xFFFFFFFF) for i in range(300)], 300.0)
     sql = next(s for s in vistas if 'chromaprint, acoustic_id' in s)
     # La traza trae los parámetros ya puestos.
     plan = _plan(sql, ())
