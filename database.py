@@ -4525,7 +4525,9 @@ class AnalysisDB:
                          (`seguros`: el tema que dio avanzaba con la mezcla
                          en dos trozos o más; desde el 2026-11-05)
           sesiones_pasadas {veces, aparatos, sesiones, pistas, fallidas,
-                         desde} (desde el 2026-11-11)
+                         largos, desde} (desde el 2026-11-11; `largos`, los
+                         temas de 20 min o más que pasaron, desde el
+                         2026-11-20)
           sesiones_aviso {visto, revisar, ahora_no, aparatos_visto,
                          aparatos_revisar} (desde el 2026-11-19)
 
@@ -4556,7 +4558,7 @@ class AnalysisDB:
                       'seguros': 0, 'por_resultado': {}}
             de_editadas, de_tramos = set(), set()
             pasadas = {'veces': 0, 'aparatos': 0, 'sesiones': 0, 'pistas': 0,
-                       'fallidas': 0, 'desde': {}}
+                       'fallidas': 0, 'largos': 0, 'desde': {}}
             de_pasadas = set()
             aviso = {'visto': 0, 'revisar': 0, 'ahora_no': 0,
                      'aparatos_visto': 0, 'aparatos_revisar': 0}
@@ -4609,6 +4611,9 @@ class AnalysisDB:
                     pasadas['sesiones'] += _n(p.get('sesiones'))
                     pasadas['pistas'] += _n(p.get('pistas'))
                     pasadas['fallidas'] += _n(p.get('fallidas'))
+                    # Los temas de 20 min o más pasados a mezcla (2026-11-20).
+                    # `sesiones` los cuenta ya: es el total de mezclas.
+                    pasadas['largos'] += _n(p.get('largos'))
                     d = str(p.get('desde') or '?')[:16]
                     pasadas['desde'][d] = (pasadas['desde'].get(d, 0)
                                            + _n(p.get('sesiones')))
