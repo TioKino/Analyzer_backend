@@ -2935,6 +2935,15 @@ def _retention(request: Request):
         returns = _get_db().get_return_rates()
     except Exception:  # noqa: BLE001
         returns = {}
+    # `returns_recientes`: la rolling de las cohortes de los ultimos ~3 meses,
+    # por plataforma. La de arriba baja sola (los eventos de «volvio» se
+    # purgan a los 90 dias y el D0 no): ver `get_return_rates_recientes`.
+    # `None` = fallo; ausente = servidor anterior.
+    try:
+        returns_recientes = _get_db().get_return_rates_recientes()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Retention] returns_recientes no disponible: {e}")
+        returns_recientes = None
     # `tool`: metricas de HERRAMIENTA, no de app social. DJ Analyzer se usa a
     # rafagas (importas la biblioteca y no vuelves hasta que compras temas o
     # preparas un bolo); la app sigue instalada. D1/D7 pintan como fracaso ese
@@ -3000,6 +3009,7 @@ def _retention(request: Request):
     return {
         "cohorts": cohorts,
         "returns": returns,
+        "returns_recientes": returns_recientes,
         "tool": tool,
         "investment": investment,
         "stalled": stalled,

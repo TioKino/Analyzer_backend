@@ -1846,6 +1846,136 @@ class AnalysisDB:
         finally:
             conn.close()
 
+    # Las plataformas de cada grupo, como `_PLATFORM_GROUPS` del panel. El Mac
+    # tiene TRES nombres (`macos` es el cliente anterior a la 2.9.11).
+    _GRUPO_DE_PLATAFORMA = {
+        'ios': 'movil', 'android': 'movil',
+        'macos': 'escritorio', 'macos-mas': 'escritorio',
+        'macos-dmg': 'escritorio', 'windows': 'escritorio',
+        'linux': 'escritorio',
+    }
+
+    def get_return_rates_recientes(self, *, ventana_dias: int = 89) -> dict:
+        """RETENCION ROLLING de las cohortes RECIENTES, por plataforma.
+
+        La de `get_return_rates` mezcla TODA la historia, y eso tiene un sesgo
+        que la hace bajar sola: el D0 sale de `device_first_seen`, que no se
+        purga, pero el «volvio» sale de `events`, que se purga a los 90 dias.
+        Un veterano que volvio a los tres dias de instalar deja de contar como
+        retenido en cuanto esos eventos caducan, y sigue en el denominador.
+        Cada dia caen mas, asi que la serie de `retention.csv` baja aunque el
+        producto no cambie (lectura 61: D7 21,1 → 17,5 en 19 dias, con ~220
+        aparatos nuevos en la cohorte y la cuenta de retenidos clavada).
+
+        Aqui solo entran las cohortes cuyo D0+1 todavia tiene sus eventos:
+        `D0 >= hoy - ventana_dias` (89, uno menos que la purga), y ademas
+        `D0 <= hoy - N` para poder medir DN. Los numeros son de los aparatos
+        que llegaron en los ultimos ~3 meses, no de todos.
+
+        Y POR PLATAFORMA (`device_first_seen.first_platform`): si los que
+        llegan son cada vez mas de movil, la retencion global puede bajar sin
+        que baje en ninguna plataforma.
+
+        Devuelve {'ventana_dias', 'total': {d1,d7,d28}, 'por_grupo':
+        {movil, escritorio, sin}, 'por_plataforma': {ios, android, ...},
+        'd7_por_semana': [{'semana', 'cohort', 'returned', 'rate'}]}.
+        Best-effort: {} si las tablas no existen."""
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            ventanas = (('d1', 1), ('d7', 7), ('d28', 28))
+            total, por_plat = {}, {}
+            for label, n in ventanas:
+                if n >= ventana_dias:
+                    continue
+                c.execute(
+                    """
+                    SELECT LOWER(COALESCE(f.first_platform, '')) AS plat,
+                           COUNT(*) AS cohort,
+                           COALESCE(SUM(
+                               CASE WHEN EXISTS (
+                                   SELECT 1 FROM events e
+                                   WHERE e.device_id = f.device_id
+                                     AND e.event_name IN ('app_opened', 'session_start')
+                                     AND e.day > f.first_day
+                                     AND e.day <= date(f.first_day, ?)
+                               ) THEN 1 ELSE 0 END
+                           ), 0) AS returned
+                    FROM device_first_seen f
+                    WHERE f.device_id IS NOT NULL
+                      AND f.first_day >= date('now', ?)
+                      AND f.first_day <= date('now', ?)
+                    GROUP BY 1
+                    """,
+                    (f'+{n} days', f'-{ventana_dias} days', f'-{n} days'),
+                )
+                for row in c.fetchall():
+                    plat = row['plat'] or 'sin'
+                    d = por_plat.setdefault(plat, {}).setdefault(
+                        label, {'cohort': 0, 'returned': 0})
+                    d['cohort'] += int(row['cohort'] or 0)
+                    d['returned'] += int(row['returned'] or 0)
+                total[label] = {'cohort': 0, 'returned': 0}
+
+            def _tasa(d):
+                d['rate'] = (round(100.0 * d['returned'] / d['cohort'], 1)
+                             if d['cohort'] else 0.0)
+                return d
+
+            por_grupo = {}
+            for plat, medidas in por_plat.items():
+                grupo = self._GRUPO_DE_PLATAFORMA.get(plat, 'sin')
+                for label, d in medidas.items():
+                    g = por_grupo.setdefault(grupo, {}).setdefault(
+                        label, {'cohort': 0, 'returned': 0})
+                    for k in ('cohort', 'returned'):
+                        g[k] += d[k]
+                        total[label][k] += d[k]
+            for medidas in list(por_plat.values()) + list(por_grupo.values()):
+                for d in medidas.values():
+                    _tasa(d)
+            for d in total.values():
+                _tasa(d)
+
+            # El D7 por semana de alta: la tendencia sin el sesgo de la purga.
+            # La semana es la del lunes del D0.
+            c.execute(
+                """
+                SELECT date(f.first_day, '-' || ((CAST(strftime('%w', f.first_day) AS INTEGER) + 6) % 7) || ' days') AS semana,
+                       COUNT(*) AS cohort,
+                       COALESCE(SUM(
+                           CASE WHEN EXISTS (
+                               SELECT 1 FROM events e
+                               WHERE e.device_id = f.device_id
+                                 AND e.event_name IN ('app_opened', 'session_start')
+                                 AND e.day > f.first_day
+                                 AND e.day <= date(f.first_day, '+7 days')
+                           ) THEN 1 ELSE 0 END
+                       ), 0) AS returned
+                FROM device_first_seen f
+                WHERE f.device_id IS NOT NULL
+                  AND f.first_day >= date('now', ?)
+                  AND f.first_day <= date('now', '-7 days')
+                GROUP BY 1 ORDER BY 1
+                """,
+                (f'-{ventana_dias} days',),
+            )
+            semanas = [_tasa({'semana': r['semana'],
+                              'cohort': int(r['cohort'] or 0),
+                              'returned': int(r['returned'] or 0)})
+                       for r in c.fetchall()]
+            return {
+                'ventana_dias': ventana_dias,
+                'total': total,
+                'por_grupo': por_grupo,
+                'por_plataforma': por_plat,
+                'd7_por_semana': semanas,
+            }
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
     def get_tool_usage_metrics(self) -> dict:
         """METRICAS DE HERRAMIENTA (no de app social).
 
