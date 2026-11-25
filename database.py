@@ -4,9 +4,15 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import re
 import statistics
 from typing import List, Dict, Optional, Any
+
+# Como en los demás módulos: `main.py` configura el raíz y esto sale en el log
+# de Render. Sin él, el `except` que lo usa revienta con un NameError en vez de
+# decir qué falló (lo vigila `test_ningun_nombre_sin_definir.py`).
+logger = logging.getLogger(__name__)
 
 
 def _scrub_volatile_tokens(text: str) -> str:
