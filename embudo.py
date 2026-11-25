@@ -327,6 +327,13 @@ def calcular(conn: sqlite3.Connection, hoy: Optional[date] = None,
         a["lejos"] = paso_mas_lejano(directos)
         por_grupo[g].append(a)
 
+    return _salida(desde, hasta, plataforma, excluidos, len(sin_plataforma),
+                   por_grupo)
+
+
+def _salida(desde: str, hasta: str, plataforma: Optional[str],
+            excluidos: Dict[str, int], sin_plataforma: int,
+            por_grupo: Dict[str, List[dict]]) -> dict:
     salida = {
         "definicion": DEFINICION,
         "descripcion": DESCRIPCION,
@@ -335,7 +342,7 @@ def calcular(conn: sqlite3.Connection, hoy: Optional[date] = None,
         "dias_para_madurar": DIAS_PARA_MADURAR,
         "plataforma": plataforma or None,
         "excluidos": excluidos,
-        "sin_plataforma": len(sin_plataforma),
+        "sin_plataforma": sin_plataforma,
         "grupos": {
             g: _resumen_de(por_grupo[g], ETIQUETAS_DEL_GRUPO[g])
             for g in GRUPOS
@@ -344,6 +351,20 @@ def calcular(conn: sqlite3.Connection, hoy: Optional[date] = None,
     salida["todos"] = _resumen_de(
         por_grupo["escritorio"] + por_grupo["movil"], ETIQUETAS_DEL_GRUPO["todos"])
     return salida
+
+
+def vacio(hoy: Optional[date] = None) -> dict:
+    """El embudo sin nadie: los mismos pasos, todos a cero.
+
+    Para cuando no hay base de datos (o el calculo fallo): un paso sin datos
+    sale a 0, no desaparece. Sin pasos, «no hay datos» se leeria como «el
+    embudo no tiene pasos», y los clientes que pintan `steps` se quedan en
+    blanco (paso en el CI el 2026-11-25: una ruta de base borrada por otro
+    test dejaba el embudo sin pasos).
+    """
+    desde, hasta = ventana(hoy)
+    return _salida(desde, hasta, None, {"prueba": 0, "reidentificado": 0}, 0,
+                   {g: [] for g in GRUPOS})
 
 
 def vista(embudo: dict, grupo: Optional[str]) -> dict:

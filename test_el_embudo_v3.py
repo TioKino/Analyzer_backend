@@ -363,3 +363,32 @@ def test_el_panel_no_tiene_listas_de_pasos_propias():
     assert '_FUNNEL_DEFAULT = [' not in src
     assert '_FUNNEL_MOBILE = [' not in src
     assert 'embudo.calcular(' in src
+
+
+def test_sin_base_de_datos_salen_los_seis_pasos_a_cero(monkeypatch):
+    """Un paso sin datos sale a 0, no desaparece. El CI lo cazó el 25-nov:
+    un test anterior dejaba `DATABASE_PATH` en una base ya borrada y el
+    embudo nuevo contestaba sin pasos (el de antes daba los seis a cero)."""
+    from main import app
+    monkeypatch.setenv('DATABASE_PATH', '/no/existe/analysis.db')
+    monkeypatch.setenv('ADMIN_TOKEN', _SECRET)
+    for plataforma in (None, 'desktop', 'mobile'):
+        params = {'platform': plataforma} if plataforma else {}
+        b = TestClient(app).get('/admin/funnel', params=params,
+                                headers={'X-Admin-Secret': _SECRET}).json()
+        assert [s['event'] for s in b['steps']] == list(embudo.PASOS), plataforma
+        assert all(s['devices'] == 0 for s in b['steps'])
+        assert b['cohort_size'] == 0
+        assert b['embudo']['todos']['cohorte'] == 0, 'sin base: vacio, no fallo'
+
+
+def test_si_el_calculo_falla_los_pasos_salen_y_el_fallo_se_dice(monkeypatch, panel):
+    from main import app
+
+    def _revienta(*a, **kw):
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(embudo, 'calcular', _revienta)
+    b = TestClient(app).get('/admin/funnel', headers={'X-Admin-Secret': _SECRET}).json()
+    assert len(b['steps']) == len(embudo.PASOS)
+    assert b['embudo'] is None, '«no esta» y «fallo» no dicen lo mismo'

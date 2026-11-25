@@ -2552,14 +2552,18 @@ def _funnel(request: Request, platform: str = None):
         finally:
             adb.close()
 
-    # La vista que se pide: un grupo, una plataforma concreta o el total.
-    if emb is not None:
-        bloque = emb.get("vista") or embudo.vista(emb, grupo)
-        steps = embudo.pasos_para_el_panel(bloque)
-        cohort_size = bloque["cohorte"]
-        bienvenida = bloque["bienvenida"]
     else:
-        steps, cohort_size, bienvenida = [], 0, {}
+        # Sin base de datos no hay nadie: el embudo vacio, con sus pasos a 0.
+        emb = embudo.vacio()
+
+    # La vista que se pide: un grupo, una plataforma concreta o el total. Si
+    # el calculo FALLO (`emb` None), los pasos salen igual, a cero: un paso
+    # sin datos no desaparece. El fallo lo dice `embudo: None`.
+    bloque = (emb.get("vista") or embudo.vista(emb, grupo)) if emb is not None \
+        else embudo.vista(embudo.vacio(), grupo)
+    steps = embudo.pasos_para_el_panel(bloque)
+    cohort_size = bloque["cohorte"]
+    bienvenida = bloque["bienvenida"]
 
     # La bienvenida medida contra los que LA VIERON, en la misma cohorte que
     # el embudo. Saltar (movil) es una decision; abandonar, una fuga.
