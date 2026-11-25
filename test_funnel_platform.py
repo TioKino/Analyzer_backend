@@ -57,9 +57,19 @@ class TestPlatformFilter:
 
 
 # ── Integracion: /admin/funnel?platform= con BD temporal ───────────────
+#
+# Desde el 2026-11-25 (embudo v3, `embudo.py`) el embudo es la cohorte MADURA:
+# altas de hace 8 a 37 dias, cada paso dado en los 7 dias siguientes. Por eso
+# los aparatos se dan de alta hace 10 dias, no hoy: un alta de hoy aun no ha
+# tenido tiempo de dar ningun paso, y medirla bajaba la conversion cuando
+# llegaba mas gente (el fallo 1 de la cabecera de `embudo.py`).
+import embudo  # noqa: E402
+
+
 @pytest.fixture
 def seeded_db(monkeypatch):
-    """BD temporal con eventos app_opened de 3 devices en 3 plataformas."""
+    """BD temporal: 3 aparatos de hace 10 dias en 3 plataformas, con
+    app_opened, y uno de hoy que aun no cuenta."""
     fd, path = tempfile.mkstemp(suffix='.db')
     os.close(fd)
     conn = sqlite3.connect(path)
@@ -67,25 +77,21 @@ def seeded_db(monkeypatch):
         "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, "
         "device_id TEXT, event_name TEXT, platform TEXT)"
     )
-    # El embudo es por COHORTE: se sigue a los dispositivos dados de alta en la
-    # ventana. Sin esta tabla el JOIN no encuentra a nadie y todos los pasos
-    # salen a 0 — que es justo lo que pasaba cuando este fixture se quedo con
-    # el esquema de antes.
     conn.execute(
         "CREATE TABLE device_first_seen (device_id TEXT PRIMARY KEY, "
         "first_day TEXT NOT NULL, first_platform TEXT, first_app_version TEXT)"
     )
-    # 2 desktop (macos + windows), 1 mobile (ios). Todos app_opened, recientes.
-    for dev, plat in (('d_mac', 'macos'), ('d_win', 'windows'), ('d_ios', 'ios')):
+    for dev, plat, dias in (('d_mac', 'macos', 10), ('d_win', 'windows', 10),
+                            ('d_ios', 'ios', 10), ('d_hoy', 'ios', 0)):
         conn.execute(
             "INSERT INTO events (timestamp, device_id, event_name, platform) "
-            "VALUES (datetime('now'), ?, 'app_opened', ?)",
-            (dev, plat),
+            "VALUES (datetime('now', ?), ?, 'app_opened', ?)",
+            (f'-{dias} days', dev, plat),
         )
         conn.execute(
             "INSERT INTO device_first_seen (device_id, first_day, first_platform) "
-            "VALUES (?, date('now'), ?)",
-            (dev, plat),
+            "VALUES (?, date('now', ?), ?)",
+            (dev, f'-{dias} days', plat),
         )
     conn.commit()
     conn.close()
@@ -109,7 +115,7 @@ def _funnel(client, platform=None):
 def test_all_platforms_counts_everyone(seeded_db):
     body = _funnel(TestClient(app))
     assert body['platform'] == 'all'
-    assert body['steps'][0]['devices'] == 3   # mac + win + ios
+    assert body['steps'][0]['devices'] == 3   # mac + win + ios, NO el de hoy
 
 
 def test_desktop_excludes_mobile(seeded_db):
@@ -120,7 +126,7 @@ def test_desktop_excludes_mobile(seeded_db):
 
 def test_mobile_only(seeded_db):
     body = _funnel(TestClient(app), 'mobile')
-    assert body['steps'][0]['devices'] == 1   # solo ios
+    assert body['steps'][0]['devices'] == 1   # solo ios (el de hoy no madura)
 
 
 def test_specific_platform(seeded_db):
@@ -128,93 +134,41 @@ def test_specific_platform(seeded_db):
     assert body['steps'][0]['devices'] == 1   # solo mac
 
 
-# ── Pasos POR PLATAFORMA (2026-08-19) ──────────────────────────────────
-#
-# El embudo aplicaba los MISMOS cinco pasos a desktop y movil, con
-# `import_completed` como paso clave. En movil eso mide contra un objetivo que
-# no es el suyo: el DJ tiene la musica en el PC y al movil le llega por SYNC
-# (el propio cliente lo dice en mobile_onboarding.dart: "CTA PRINCIPAL en movil
-# = Escuchar; importar = secundario"). El sintoma que lo delataba: en movil
-# `first_track_viewed` (15) superaba a `import_completed` (12) — usuarios que
-# llegan a su biblioteca SIN importar. Un paso que supera al anterior no es una
-# fuga, es una secuencia mal planteada.
-from routes.admin_panel import _funnel_steps_for  # noqa: E402
-
-
-class TestFunnelStepsPorPlataforma:
-    def test_desktop_conserva_los_pasos_de_import(self):
-        names = [n for n, _ in _funnel_steps_for('desktop')]
-        assert 'import_started' in names
-        assert 'import_completed' in names
-
-    def test_movil_no_mide_import_como_paso(self):
-        names = [n for n, _ in _funnel_steps_for('mobile')]
-        assert 'import_started' not in names
-        assert 'import_completed' not in names
-
-    def test_movil_mide_vinculacion_y_sync(self):
-        """Fase B: el camino real del movil es vincular + recibir biblioteca.
-        Los emite el cliente desde 2.9.10; hasta entonces salen a 0."""
-        names = [n for n, _ in _funnel_steps_for('mobile')]
-        assert names == ['app_opened', 'onboarding_shown',
-                         'onboarding_completed',
-                         'device_linked', 'library_synced',
-                         'first_track_viewed']
-
-    def test_desktop_no_mide_vinculacion(self):
-        # En desktop la biblioteca es local: vincular no es un paso del embudo.
-        names = [n for n, _ in _funnel_steps_for('desktop')]
-        assert 'device_linked' not in names
-        assert 'library_synced' not in names
-
-    def test_ios_y_android_sueltos_cuentan_como_movil(self):
-        for p in ('ios', 'android', 'IOS', 'Android'):
-            names = [n for n, _ in _funnel_steps_for(p)]
-            assert 'import_completed' not in names, p
-
-    def test_sin_plataforma_y_desktop_sueltos_usan_el_completo(self):
-        for p in (None, 'macos', 'windows', 'linux'):
-            names = [n for n, _ in _funnel_steps_for(p)]
-            assert 'import_completed' in names, p
-
-    def test_plataforma_desconocida_no_pierde_pasos(self):
-        # Defensivo: un valor raro no debe silenciar pasos del embudo.
-        names = [n for n, _ in _funnel_steps_for('web')]
-        assert 'import_completed' in names
+def test_la_respuesta_dice_que_mide(seeded_db):
+    body = _funnel(TestClient(app))
+    assert body['basis'] == 'cohorte_madura'
+    assert body['definicion'] == embudo.DEFINICION
+    assert body['cohort_size'] == 3
+    assert body['embudo']['grupos']['escritorio']['cohorte'] == 2
+    assert body['embudo']['grupos']['movil']['cohorte'] == 1
 
 
 class TestFunnelStepsEnLaRespuesta:
-    def test_movil_devuelve_sus_pasos_y_nota(self, seeded_db):
-        body = _funnel(TestClient(app), 'mobile')
-        events = [s['event'] for s in body['steps']]
-        assert 'import_completed' not in events
-        assert events == ['app_opened', 'onboarding_shown',
-                          'onboarding_completed',
-                          'device_linked', 'library_synced',
-                          'first_track_viewed']
-        assert body['steps_note']
+    def test_los_pasos_son_los_mismos_en_las_dos_plataformas(self, seeded_db):
+        for p in ('mobile', 'desktop', None):
+            body = _funnel(TestClient(app), p)
+            assert [s['event'] for s in body['steps']] == list(embudo.PASOS), p
 
-    def test_pasos_sin_instrumentar_salen_a_cero_no_desaparecen(self, seeded_db):
-        """La BD sembrada solo tiene app_opened. Los pasos que aun no emite
-        ningun cliente deben salir con devices=0, NO omitirse: si se omitieran,
-        el embudo parecería completo cuando en realidad falta instrumentar."""
+    def test_la_nota_es_solo_del_movil(self, seeded_db):
+        assert _funnel(TestClient(app), 'mobile')['steps_note']
+        assert _funnel(TestClient(app), 'desktop')['steps_note'] is None
+
+    def test_pasos_sin_eventos_salen_a_cero_no_desaparecen(self, seeded_db):
+        """La BD sembrada solo tiene app_opened. Los pasos que nadie ha dado
+        salen con devices=0, NO se omiten: si se omitieran, el embudo pareceria
+        completo cuando en realidad falta instrumentar."""
         body = _funnel(TestClient(app), 'mobile')
         by_event = {s['event']: s['devices'] for s in body['steps']}
-        assert by_event['device_linked'] == 0
-        assert by_event['library_synced'] == 0
-        assert by_event['app_opened'] == 1
+        assert by_event['alta'] == 1
+        assert by_event['abrio'] == 1
+        assert by_event['bienvenida_vista'] == 0
+        assert by_event['valor'] == 0
 
-    def test_desktop_devuelve_sus_pasos_sin_nota(self, seeded_db):
-        # Seis desde el 2026-08-27: `onboarding_shown` se metio DELANTE de
-        # `onboarding_completed` porque era el denominador que faltaba —
-        # `app_opened` se emite una vez por dispositivo para siempre, asi que
-        # medir la finalizacion contra el incluia a gente que nunca vio la
-        # pantalla. La nota sigue siendo solo de movil.
-        body = _funnel(TestClient(app), 'desktop')
-        assert len(body['steps']) == 6
-        assert body['steps_note'] is None
+    def test_ningun_paso_supera_al_anterior(self, seeded_db):
+        body = _funnel(TestClient(app))
+        n = [s['devices'] for s in body['steps']]
+        assert n == sorted(n, reverse=True)
 
     def test_raw_sigue_trayendo_todos_los_eventos(self, seeded_db):
-        # Quitar import_* de `steps` NO puede dejar de medirlos: siguen en raw.
         body = _funnel(TestClient(app), 'mobile')
         assert 'raw' in body and isinstance(body['raw'], dict)

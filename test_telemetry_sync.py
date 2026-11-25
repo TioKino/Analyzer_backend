@@ -26,7 +26,10 @@ def _make_sync_db():
             device_type TEXT,
             data_type TEXT,
             item_key TEXT NOT NULL DEFAULT '',
-            payload TEXT
+            payload TEXT,
+            -- Como en produccion (`sync_endpoints`): un tema borrado es una
+            -- fila con `deleted = 1`, y el panel no lo cuenta (2026-11-25).
+            deleted INTEGER DEFAULT 0
         )
     ''')
     return conn, path

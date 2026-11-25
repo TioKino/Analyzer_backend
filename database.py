@@ -970,6 +970,18 @@ class AnalysisDB:
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_dfs_day ON device_first_seen(first_day)')
+        # Los aparatos que NO son altas (embudo v3, 2026-11-25; ver
+        # `embudo.py`): `prueba` = una build de desarrollo (`flutter run`,
+        # `run_device.*`), `reidentificado` = el mismo aparato con un id
+        # nuevo tras «Borrar mis datos de la nube». Los pone la app en cada
+        # evento y se quedan puestos; el embudo, la retención y las altas los
+        # dejan fuera.
+        for _col in ('prueba', 'reidentificado'):
+            try:
+                conn.execute(f'ALTER TABLE device_first_seen ADD COLUMN '
+                             f'{_col} INTEGER DEFAULT 0')
+            except sqlite3.OperationalError:
+                pass  # ya existe
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_name ON events(event_name)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id)')
@@ -1841,6 +1853,109 @@ class AnalysisDB:
                     'rate': rate,
                 }
             return out
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+
+    def get_return_rates_recientes(self, *, hoy=None) -> dict:
+        """RETENCION ROLLING de las cohortes RECIENTES, por plataforma.
+
+        La de `get_return_rates` mezcla TODA la historia, y eso tiene un sesgo
+        que la hace bajar sola: el D0 sale de `device_first_seen`, que no se
+        purga, pero el «volvio» sale de `events`, que se purga a los 90 dias.
+        Un veterano que volvio a los tres dias de instalar deja de contar como
+        retenido en cuanto esos eventos caducan, y sigue en el denominador.
+        Cada dia caen mas, asi que la serie de `retention.csv` baja aunque el
+        producto no cambie (lectura 61: D7 21,1 -> 17,5 en 19 dias, con ~220
+        aparatos nuevos en la cohorte y la cuenta de retenidos clavada).
+
+        Aqui, para cada DN, los 30 dias de altas que ya han tenido N dias
+        enteros (`embudo.ventana`): D1 = altas de hace 2 a 31 dias, D7 = de 8
+        a 37 (la MISMA cohorte que el embudo, asi que su D7 es la «vuelta en
+        7 dias» del embudo) y D28 = de 29 a 58. Todo dentro de la purga.
+        Sin aparatos de prueba ni reidentificados, y cada aparato en el grupo
+        de la plataforma de su alta (`embudo.grupo_de`).
+
+        Devuelve {'ventana_dias', 'total': {d1,d7,d28}, 'por_grupo':
+        {movil, escritorio, sin}, 'por_plataforma': {ios, android, ...},
+        'd7_por_semana': [{'semana', 'cohort', 'returned', 'rate'}]}.
+        Best-effort: {} si las tablas no existen."""
+        import embudo as _embudo
+        from datetime import date as _date
+        if hoy is None:
+            hoy = datetime.now(timezone.utc).date()
+        elif isinstance(hoy, str):
+            hoy = _date.fromisoformat(hoy)
+        conn = self._open_conn()
+        try:
+            c = conn.cursor()
+            marcados = _embudo.excluir_marcados(
+                _embudo._columnas(conn, 'device_first_seen'), 'f')
+
+            def _tasa(d):
+                d['rate'] = (round(100.0 * d['returned'] / d['cohort'], 1)
+                             if d['cohort'] else 0.0)
+                return d
+
+            def _filas(desde, hasta, n):
+                # Un aparato por fila: su plataforma y si volvio en (D0, D0+N].
+                return c.execute(
+                    """
+                    SELECT LOWER(COALESCE(f.first_platform, '')) AS plat,
+                           EXISTS (
+                               SELECT 1 FROM events e
+                               WHERE e.device_id = f.device_id
+                                 AND e.event_name IN ('app_opened', 'session_start')
+                                 AND substr(e.timestamp, 1, 10) > f.first_day
+                                 AND substr(e.timestamp, 1, 10) <= date(f.first_day, ?)
+                           ) AS volvio,
+                           f.first_day AS d0
+                    FROM device_first_seen f
+                    WHERE f.device_id IS NOT NULL
+                      AND f.first_day >= ? AND f.first_day <= ?""" + marcados,
+                    (f'+{n} days', desde, hasta)).fetchall()
+
+            total, por_plat, por_grupo = {}, {}, {}
+            for label, n in (('d1', 1), ('d7', 7), ('d28', 28)):
+                desde, hasta = _embudo.ventana(hoy, n)
+                total[label] = {'cohort': 0, 'returned': 0}
+                for row in _filas(desde, hasta, n):
+                    plat = row['plat'] or 'sin'
+                    grupo = _embudo.grupo_de(row['plat']) or 'sin'
+                    for d in (total[label],
+                              por_plat.setdefault(plat, {}).setdefault(
+                                  label, {'cohort': 0, 'returned': 0}),
+                              por_grupo.setdefault(grupo, {}).setdefault(
+                                  label, {'cohort': 0, 'returned': 0})):
+                        d['cohort'] += 1
+                        d['returned'] += 1 if row['volvio'] else 0
+            for medidas in list(por_plat.values()) + list(por_grupo.values()):
+                for d in medidas.values():
+                    _tasa(d)
+            for d in total.values():
+                _tasa(d)
+
+            # El D7 por semana de alta (lunes): la tendencia sin mezclar
+            # cohortes. Las semanas de los ultimos ~3 meses con D0+7 ya pasado.
+            hasta7 = (hoy - timedelta(days=8)).isoformat()
+            desde7 = (hoy - timedelta(days=89)).isoformat()
+            semanas_d = {}
+            for row in _filas(desde7, hasta7, 7):
+                d0 = _date.fromisoformat(row['d0'])
+                lunes = (d0 - timedelta(days=d0.weekday())).isoformat()
+                s = semanas_d.setdefault(lunes, {'semana': lunes,
+                                                 'cohort': 0, 'returned': 0})
+                s['cohort'] += 1
+                s['returned'] += 1 if row['volvio'] else 0
+            semanas = [_tasa(semanas_d[k]) for k in sorted(semanas_d)]
+            return {
+                'ventana_dias': _embudo.VENTANA_DE_ALTAS,
+                'total': total,
+                'por_grupo': por_grupo,
+                'por_plataforma': por_plat,
+                'd7_por_semana': semanas,
+            }
         except sqlite3.OperationalError:
             return {}
         finally:
@@ -5822,11 +5937,17 @@ class AnalysisDB:
         props: Optional[str] = None,
         platform: Optional[str] = None,
         app_version: Optional[str] = None,
+        prueba: bool = False,
+        reidentificado: bool = False,
     ) -> int:
         """Registra un evento de producto (embudo onboarding/retencion).
 
         `props` es un string JSON ya serializado (o None). Best-effort: si la
-        tabla no existe en una BD muy antigua, devuelve 0 sin lanzar."""
+        tabla no existe en una BD muy antigua, devuelve 0 sin lanzar — y
+        `/client-event` lee ese 0 como «no se guardó» (`logged: false`).
+
+        `prueba` y `reidentificado` marcan el aparato para siempre en
+        `device_first_seen` (ver `embudo.py`): no es un alta."""
         conn = self._open_conn()
         try:
             c = conn.cursor()
@@ -5842,6 +5963,9 @@ class AnalysisDB:
                     (app_version or None) and app_version[:20],
                 ),
             )
+            # El id del EVENTO, ahora: los INSERT de abajo (el D0) cambian
+            # `lastrowid` o no según inserten, y el 0 es «no se guardó».
+            event_id = c.lastrowid or 0
             # Sellar el D0 real. `INSERT OR IGNORE` -> solo la primera vez;
             # a partir de ahi la fila no se toca por mucho que el device siga
             # mandando eventos. Best-effort dentro del best-effort: si esta
@@ -5889,8 +6013,20 @@ class AnalysisDB:
                     )
                 except sqlite3.OperationalError:
                     pass
+                # Las marcas se quedan puestas: un aparato de prueba no deja
+                # de serlo porque un evento llegue sin la marca.
+                for _col, _si in (('prueba', prueba),
+                                  ('reidentificado', reidentificado)):
+                    if not _si:
+                        continue
+                    try:
+                        c.execute(f'UPDATE device_first_seen SET {_col} = 1 '
+                                  f'WHERE device_id = ? AND '
+                                  f'COALESCE({_col}, 0) = 0', (device_id,))
+                    except sqlite3.OperationalError:
+                        pass
             conn.commit()
-            return c.lastrowid or 0
+            return event_id
         except sqlite3.OperationalError:
             return 0
         finally:
@@ -6292,9 +6428,15 @@ class AnalysisDB:
                 "SELECT json_extract(props, '$.store'), COUNT(*) FROM events "
                 "WHERE event_name = 'web_download_click' AND day >= ? "
                 "GROUP BY 1", (desde,)).fetchall()}
+            # Las altas de verdad: sin aparatos de prueba ni reidentificados
+            # (`embudo.py`).
+            import embudo as _embudo
+            marcados = _embudo.excluir_marcados(
+                _embudo._columnas(conn, 'device_first_seen'))
             altas = {r[0] or 'unknown': r[1] for r in conn.execute(
                 "SELECT first_platform, COUNT(*) FROM device_first_seen "
-                "WHERE first_day >= ? GROUP BY 1", (desde,)).fetchall()}
+                "WHERE first_day >= ?" + marcados + " GROUP BY 1",
+                (desde,)).fetchall()}
         finally:
             conn.close()
         por_tienda = {}

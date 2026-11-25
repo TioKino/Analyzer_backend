@@ -955,6 +955,11 @@ class ClientEventPayload(BaseModel):
     # que si sale, asi que da igual cuantos informes se caigan por el camino.
     # Ver `EventReporter._perdidosPendientes` en el cliente.
     losses: Optional[dict] = None
+    # Los aparatos que NO son altas (embudo v3, `embudo.py`): una build de
+    # desarrollo (`prueba`) o el mismo aparato con id nuevo tras «Borrar mis
+    # datos de la nube» (`reidentificado`). Un cliente de antes no los manda.
+    prueba: Optional[bool] = None
+    reidentificado: Optional[bool] = None
 
 
 @app.post("/client-event")
@@ -990,15 +995,23 @@ async def report_client_event(payload: ClientEventPayload, request: Request):
             props_json = None
 
     try:
-        db.log_event(
+        guardado = db.log_event(
             device_id=request.headers.get('X-Device-Id'),
             event_name=event_name,
             props=props_json,
             platform=platform,
             app_version=app_version,
+            prueba=bool(payload.prueba),
+            reidentificado=bool(payload.reidentificado),
         )
     except Exception as e:
         logger.warning(f"[ClientEvent] log fallo: {e}")
+        return JSONResponse(status_code=202, content={"ok": False, "logged": False})
+    # `log_event` se traga el `OperationalError` (una BD bloqueada) y devuelve
+    # 0. Hasta el 2026-11-25 eso salía como `logged: true`: el evento no se
+    # guardaba y el cliente no lo contaba como perdido (`rechazado`).
+    if not guardado:
+        logger.warning(f"[ClientEvent] no se guardo «{event_name}»")
         return JSONResponse(status_code=202, content={"ok": False, "logged": False})
 
     return JSONResponse(status_code=202, content={"ok": True, "logged": True})

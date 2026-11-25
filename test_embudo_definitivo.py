@@ -356,18 +356,32 @@ def test_convertir_TARDE_sigue_siendo_convertir(tmp_path):
 
 
 def test_la_respuesta_DICE_que_esta_midiendo():
-    """Para no tener que acordarse de cual de las dos cuentas es cual."""
+    """Para no tener que acordarse de cual de las dos cuentas es cual. Desde
+    el 2026-11-25 (v3, `embudo.py`) la cohorte es la MADURA."""
     src = _src('routes/admin_panel.py')
-    assert '"basis": "cohort",' in src
+    assert '"basis": "cohorte_madura",' in src
+    assert '"definicion": embudo.DEFINICION,' in src
     assert '"cohort_size": cohort_size,' in src
     assert '"window_devices": window,' in src
 
 
-def test_el_denominador_es_la_cohorte_no_el_primer_paso():
+def test_el_denominador_es_la_cohorte_no_el_primer_paso(tmp_path):
     """Un dispositivo dado de alta que nunca llega a mandar `app_opened` (red)
-    tiene que contar como el abandono que es, no desaparecer del embudo."""
-    src = _src('routes/admin_panel.py')
-    assert 'top = cohort_size or (' in src
+    tiene que contar como el abandono que es, no desaparecer del embudo: el
+    primer paso del embudo v3 es el ALTA, y «abrio» va detras."""
+    import embudo
+    conn = _bd(tmp_path)
+    try:
+        conn.execute(
+            'INSERT INTO device_first_seen (device_id, first_day, first_platform) '
+            "VALUES ('sin_abrir', date('now', '-10 days'), 'windows')")
+        conn.commit()
+        e = embudo.calcular(conn)
+    finally:
+        conn.close()
+    pasos = {p['paso']: p['llegaron'] for p in e['grupos']['escritorio']['pasos']}
+    assert pasos['alta'] == 1
+    assert pasos['abrio'] == 0
 
 
 # ============================================================================

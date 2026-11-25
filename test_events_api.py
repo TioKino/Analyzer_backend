@@ -67,8 +67,11 @@ class TestAdminFunnelEndpoint:
         # `onboarding_completed`. Era el denominador que faltaba — `app_opened`
         # se emite una vez por dispositivo para siempre, asi que medir la
         # finalizacion contra el incluia a gente que nunca vio la pantalla.
+        # Desde el 2026-11-25 (v3, `embudo.py`): los seis pasos de la cohorte
+        # madura, y el primero es el ALTA (la cohorte entera), no `app_opened`.
         assert len(body['steps']) == 6
-        assert body['steps'][0]['event'] == 'app_opened'
+        assert body['steps'][0]['event'] == 'alta'
+        assert body['steps'][1]['event'] == 'abrio'
 
 
 class TestAdminRetentionEndpoint:

@@ -25,15 +25,24 @@ TABLA = "admin_resumen_diario"
 # Qué se guarda, en el orden en que se enseña. La dirección buena vive en el
 # cliente (es presentación); aquí solo los nombres, para que el test vea que
 # el cálculo los da todos.
+#
+# Desde el 2026-11-25 (embudo v3, `embudo.py`): la vuelta en 7 días y el valor
+# por plataforma, de las cohortes recientes, y las bibliotecas POR CUENTA y sin
+# borrados. Claves nuevas a propósito: las de antes (`d7_rolling_pct`,
+# `volvio_alguna_vez_pct`, `con_biblioteca`, `mediana_temas`, `gte_500`)
+# medían otra cosa, y con la misma clave la flecha contra la foto anterior
+# habría enseñado un cambio que no es del producto.
 METRICAS = (
     "activos_7d",
     "activos_30d",
     "altas_30d",
-    "d7_rolling_pct",
-    "volvio_alguna_vez_pct",
-    "con_biblioteca",
-    "mediana_temas",
-    "gte_500",
+    "valor_escritorio_pct",
+    "valor_movil_pct",
+    "d7_escritorio_pct",
+    "d7_movil_pct",
+    "cuentas_con_biblioteca",
+    "mediana_temas_cuenta",
+    "cuentas_gte_500",
     "cobertura_huella_pct",
     "audd_30d_render",
     "audd_30d_motor_local",
