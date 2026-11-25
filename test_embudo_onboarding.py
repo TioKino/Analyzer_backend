@@ -24,59 +24,61 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from routes.admin_panel import (  # noqa: E402
-    _FUNNEL_DEFAULT,
-    _FUNNEL_MOBILE,
-    _funnel_steps_for,
-)
+import embudo  # noqa: E402
 
-
-def _eventos(pasos):
-    return [e for e, _ in pasos]
+# Desde el 2026-11-25 los pasos viven en `embudo.py` (v3) y son los MISMOS
+# para las dos plataformas: cada aparato los da con los eventos de la suya.
+# Lo que estos tests guardaban se sigue guardando: la bienvenida se mide
+# contra quien LA VIO, las dos plataformas son comparables y en el movil
+# importar no es obligatorio.
 
 
 # ============================================================================
 # EL DENOMINADOR
 # ============================================================================
 
-def test_onboarding_shown_va_ANTES_de_completed_en_los_dos_embudos():
-    for pasos in (_FUNNEL_DEFAULT, _FUNNEL_MOBILE):
-        ev = _eventos(pasos)
-        assert 'onboarding_shown' in ev, 'falta el denominador real'
-        assert ev.index('onboarding_shown') < ev.index('onboarding_completed')
+def test_la_bienvenida_vista_va_ANTES_de_la_pasada():
+    assert 'bienvenida_vista' in embudo.PASOS, 'falta el denominador real'
+    assert (embudo.PASOS.index('bienvenida_vista')
+            < embudo.PASOS.index('bienvenida_pasada'))
 
 
-def test_el_paso_anterior_a_completed_es_shown_y_no_app_opened():
-    """Lo que hace que el porcentaje signifique algo: `drop_from_prev` se
-    calcula contra el paso ANTERIOR, asi que con `app_opened` delante medias
-    la finalizacion contra gente que nunca vio la pantalla."""
-    for pasos in (_FUNNEL_DEFAULT, _FUNNEL_MOBILE):
-        ev = _eventos(pasos)
-        i = ev.index('onboarding_completed')
-        assert ev[i - 1] == 'onboarding_shown'
+def test_el_paso_anterior_a_pasarla_es_verla_y_no_abrir():
+    """`caen_pct` se calcula contra el paso ANTERIOR: con «abrio» delante se
+    mediria la finalizacion contra gente que nunca vio la pantalla."""
+    i = embudo.PASOS.index('bienvenida_pasada')
+    assert embudo.PASOS[i - 1] == 'bienvenida_vista'
 
 
-def test_movil_y_desktop_comparten_el_arranque():
-    # Si solo se arregla uno, los dos porcentajes dejan de ser comparables y
-    # la conclusion «movil va peor que desktop» pasa a no significar nada.
-    assert _eventos(_FUNNEL_MOBILE)[:3] == _eventos(_FUNNEL_DEFAULT)[:3]
+def test_movil_y_escritorio_comparten_los_pasos():
+    # Si cada uno tuviera los suyos, «el movil va peor que el escritorio»
+    # dejaria de significar nada. Los nombres son comunes; lo que cambia son
+    # los eventos con que se da cada uno (`pasos_directos`).
+    for g in embudo.GRUPOS:
+        assert set(embudo.pasos_directos(g, set())) == set(embudo.PASOS)
 
 
-def test_el_selector_de_plataforma_sigue_funcionando():
-    assert _funnel_steps_for('mobile') is _FUNNEL_MOBILE
-    assert _funnel_steps_for('ios') is _FUNNEL_MOBILE
-    assert _funnel_steps_for('android') is _FUNNEL_MOBILE
-    assert _funnel_steps_for('macos') is _FUNNEL_DEFAULT
-    assert _funnel_steps_for(None) is _FUNNEL_DEFAULT
+def test_el_grupo_sale_de_la_plataforma():
+    assert embudo.grupo_de('ios') == 'movil'
+    assert embudo.grupo_de('android') == 'movil'
+    for p in ('macos', 'macos-mas', 'macos-dmg', 'windows', 'linux'):
+        assert embudo.grupo_de(p) == 'escritorio', p
+    assert embudo.grupo_de(None) is None
+    assert embudo.grupo_de('web') is None, 'lo que no se sabe no cae en un grupo'
 
 
-def test_movil_sigue_sin_import_como_paso_obligatorio():
-    """Se corrigio el 2026-08-19: en movil la musica llega por sync, y medir
-    import como paso pintaba como fuga a gente haciendo lo correcto. Añadir un
-    paso no puede haberlo deshecho."""
-    ev = _eventos(_FUNNEL_MOBILE)
-    assert 'import_started' not in ev
-    assert 'import_completed' not in ev
+def test_en_el_movil_importar_no_es_obligatorio():
+    """Se corrigio el 2026-08-19: en movil la musica llega por sync o se usa
+    Escuchar. Quien solo identifico un tema llega al valor sin importar."""
+    d = embudo.pasos_directos('movil', {'abrio', 'escucho', 'identifico'})
+    assert d['empezo'] and d['valor']
+    lejos = embudo.paso_mas_lejano(d)
+    assert embudo.PASOS[lejos] == 'valor'
+
+
+def test_en_el_movil_saltar_la_bienvenida_tambien_es_pasarla():
+    d = embudo.pasos_directos('movil', {'onboarding_shown', 'onboarding_skipped'})
+    assert d['bienvenida_pasada']
 
 
 # ============================================================================

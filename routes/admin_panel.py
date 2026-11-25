@@ -28,6 +28,7 @@ from starlette.concurrency import run_in_threadpool
 import catalogo
 import limpieza
 import portadas
+import embudo
 import resumen_diario
 from validation import DESKTOP_PLATFORMS, is_desktop_platform, is_mobile_platform
 
@@ -180,7 +181,7 @@ def _compute_telemetry_from_sync(conn) -> dict:
     # sqlite3 devuelve un cursor iterable que trae las filas por lotes, asi que
     # el pico pasa a ser una fila.
     rows = conn.execute(
-        "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
+        "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis' AND deleted = 0"
     )
     tracks_by_id, _no_id = _dedupe_analysis_tracks(rows)
     for t in tracks_by_id.values():
@@ -740,7 +741,7 @@ def _list_users(request: Request):
             # los CAMPOS de un unico track). _count_unique_tracks dedup-ea por id
             # y maneja blob legacy + incremental por igual.
             analysis_rows = conn.execute(
-                "SELECT item_key, payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ?",
+                "SELECT item_key, payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ? AND deleted = 0",
                 (device_id,),
             ).fetchall()
             u_ids, u_prev, u_noid = _count_unique_tracks(analysis_rows)
@@ -782,7 +783,7 @@ async def user_tracks(device_id: str, request: Request):
         # Get analysis data — could be uploaded by this device or by any device
         # We search all analysis items and look for tracks belonging to this device
         row = conn.execute(
-            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ?",
+            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ? AND deleted = 0",
             (device_id,),
         ).fetchone()
 
@@ -839,7 +840,7 @@ async def user_previews(device_id: str, request: Request):
     conn = _get_sync_conn()
     try:
         row = conn.execute(
-            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ?",
+            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ? AND deleted = 0",
             (device_id,),
         ).fetchone()
 
@@ -914,7 +915,7 @@ async def all_previews(request: Request):
     try:
         # Cursor sin fetchall(): ver la nota en _compute_telemetry_from_sync.
         analysis_rows = conn.execute(
-            "SELECT last_device_id, payload FROM sync_items WHERE data_type = 'analysis'"
+            "SELECT last_device_id, payload FROM sync_items WHERE data_type = 'analysis' AND deleted = 0"
         )
 
         base_url = os.environ.get("BASE_URL", "").rstrip("/")
@@ -988,7 +989,7 @@ def _global_stats(request: Request):
         # por track.id (chromaprint MD5, identico cross-device). Ver su docstring.
         # Cursor sin fetchall(): ver la nota en _compute_telemetry_from_sync.
         analysis_rows = conn.execute(
-            "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
+            "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis' AND deleted = 0"
         )
         seen_ids, preview_fps, no_id_tracks = _count_unique_tracks(analysis_rows)
         total_tracks = len(seen_ids) + no_id_tracks
@@ -1041,7 +1042,7 @@ def _user_summary(device_id: str, request: Request):
     try:
         def _count_payload(data_type: str, key: str = "") -> int:
             row = conn.execute(
-                "SELECT payload FROM sync_items WHERE +data_type = ? AND last_device_id = ?",
+                "SELECT payload FROM sync_items WHERE +data_type = ? AND last_device_id = ? AND deleted = 0",
                 (data_type, device_id),
             ).fetchone()
             if not row:
@@ -1074,7 +1075,7 @@ def _user_summary(device_id: str, request: Request):
         # Previews: contar fingerprints del usuario que tienen .mp3 cacheado
         previews = 0
         arow = conn.execute(
-            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ?",
+            "SELECT payload FROM sync_items WHERE +data_type = 'analysis' AND last_device_id = ? AND deleted = 0",
             (device_id,),
         ).fetchone()
         if arow:
@@ -1557,7 +1558,7 @@ def _telemetry(request: Request):
         artwork_dir_exists = os.path.isdir(artwork_dir)
         # Cursor sin fetchall(): ver la nota en _compute_telemetry_from_sync.
         arows = conn.execute(
-            "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis'"
+            "SELECT item_key, payload FROM sync_items WHERE data_type = 'analysis' AND deleted = 0"
         )
         cov_tracks, cov_no_id = _dedupe_analysis_tracks(arows)
         total_tracks = len(cov_tracks) + cov_no_id
@@ -2295,79 +2296,26 @@ def _resumen_lo_importado():
 # como uno. Para un evento sin identidad "dispositivos unicos" no esta definido;
 # lo unico medible es cuantas veces paso, que es justo lo que la web quiere.
 
-# Orden canonico del embudo de adquisicion. Los eventos que existan se pintan;
-# los que falten salen a 0 (aun no instrumentados / nadie llego).
-#
-# EL EMBUDO NO ES EL MISMO EN LAS DOS PLATAFORMAS (corregido 2026-08-19).
-# Hasta hoy los cinco pasos se aplicaban por igual a desktop y movil, y el paso
-# clave era `import_completed`. Eso medía el movil contra un objetivo que NO es
-# el suyo: el DJ tiene la musica en el PC/Mac y al movil le llega por SYNC. El
-# propio cliente ya lo tiene decidido (mobile_onboarding.dart: "CTA PRINCIPAL en
-# movil = Escuchar; importar musica = secundario"), pero el embudo no lo
-# reflejaba y pintaba como fuga lo que era gente haciendo lo correcto.
-#
-# El dato que lo delataba estaba a la vista y se leyo mal durante dos snapshots:
-# en movil `first_track_viewed` (15) es MAYOR que `import_completed` (12) — hay
-# usuarios que llegan a su biblioteca SIN importar nada en el telefono. En
-# desktop es al reves (43 -> 30). Un embudo donde un paso supera al anterior no
-# es una fuga: es que la secuencia esta mal planteada.
-#
-# PENDIENTE (fase B, necesita cliente): no existe evento para el camino real del
-# movil —vincular dispositivo y recibir la biblioteca por sync—, asi que aqui
-# solo se puede QUITAR el paso que no aplica, no añadir el que falta. Cuando el
-# cliente emita `device_linked` / `library_synced`, meterlos en _FUNNEL_MOBILE.
-_FUNNEL_DEFAULT = [
-    ("app_opened", "Abrio la app"),
-    # Mismo motivo que en movil: sin este paso, la finalizacion se mide contra
-    # dispositivos que nunca llegaron a ver el onboarding.
-    ("onboarding_shown", "Vio el onboarding"),
-    ("onboarding_completed", "Completo onboarding"),
-    ("import_started", "Empezo a importar"),
-    ("import_completed", "Importo musica"),
-    ("first_track_viewed", "Vio su 1er track"),
-]
-
-# `device_linked` y `library_synced` los emite el cliente desde 2.9.10 (fase B).
-# Hasta que haya releases con esos eventos en la calle saldran a 0, que es el
-# comportamiento normal de un paso no instrumentado — NO es una fuga. Ojo al
-# leerlo las primeras semanas: convivira gente en 2.9.9 (que nunca los emite)
-# con gente ya actualizada.
-_FUNNEL_MOBILE = [
-    ("app_opened", "Abrio la app"),
-    # `onboarding_shown` es el DENOMINADOR de verdad del paso siguiente, y
-    # faltaba. Sin el, «Completo onboarding / Abrio la app» daba 46,5% en la
-    # lectura del 2026-08-27 y se leia como «la mitad abandona» — pero
-    # `app_opened` se emite una vez por dispositivo PARA SIEMPRE, asi que el
-    # denominador incluye a todo el que ya tenia la app instalada y por tanto
-    # NUNCA vio el onboarding (se muestra una sola vez, flag en prefs).
-    #
-    # Es el mismo fallo que el «2 de 141» de `device_linked`, dos pasos mas
-    # abajo en esta misma lista: medir un paso contra gente que no podia
-    # darlo. Con el paso intermedio, `app_opened -> onboarding_shown` dice
-    # cuantos son nuevos y `onboarding_shown -> onboarding_completed` es la
-    # finalizacion REAL.
-    ("onboarding_shown", "Vio el onboarding"),
-    ("onboarding_completed", "Completo onboarding"),
-    ("device_linked", "Vinculo el dispositivo"),
-    ("library_synced", "Recibio su biblioteca"),
-    ("first_track_viewed", "Vio su 1er track"),
-]
-
-# Compat: algun sitio externo podria seguir importando el nombre viejo.
-_FUNNEL_STEPS = _FUNNEL_DEFAULT
+# LOS PASOS DEL EMBUDO viven en `embudo.py` desde el 2026-11-25 (v3): una
+# cohorte MADURA (altas de hace 8 a 37 dias, cada paso en los 7 dias
+# siguientes), contada por el paso mas lejano al que llego cada aparato y con
+# los pasos de SU plataforma. Hasta ese dia estaban aqui, en dos listas de
+# eventos sueltos (`_FUNNEL_DEFAULT`, `_FUNNEL_MOBILE`), y cada paso contaba sus
+# aparatos por su cuenta: un paso superaba al anterior, el escritorio tenia un
+# paso que su app no emitia y el total aplicaba los pasos del escritorio al
+# movil. Ver la cabecera de `embudo.py`.
 
 
-def _funnel_steps_for(platform):
-    """Pasos del embudo aplicables a `platform`. Solo el movil difiere: alli
-    importar es secundario (la musica llega por sync), asi que medirlo como
-    paso obligatorio da una fuga que no existe. `?platform=ios` y
-    `?platform=android` cuentan como movil, igual que el grupo."""
+def _grupo_de_la_peticion(platform):
+    """(`escritorio`|`movil`|None, plataforma concreta o None)."""
     if not platform:
-        return _FUNNEL_DEFAULT
-    p = platform.lower()
-    if p == "mobile" or p in _PLATFORM_GROUPS.get("mobile", ()):
-        return _FUNNEL_MOBILE
-    return _FUNNEL_DEFAULT
+        return None, None
+    p = platform.strip().lower()
+    if p in ("mobile", "movil"):
+        return "movil", None
+    if p in ("desktop", "escritorio"):
+        return "escritorio", None
+    return embudo.grupo_de(p), p
 
 
 # Grupos de plataforma: la mayoria de DJs tienen la musica en PC/discos, no en
@@ -2506,57 +2454,41 @@ def _funnel(request: Request, platform: str = None):
         "DATABASE_PATH",
         os.environ.get("ANALYSIS_DB_PATH", "analysis.db"),
     )
+    grupo, plataforma = _grupo_de_la_peticion(platform)
     plat_sql, plat_params = _platform_filter(platform)
     counts = {}
     window = {}
     versions = {}
     vinculacion = None
     puertas = None
-    cohort_size = 0
+    emb = None
     if os.path.exists(analysis_db_path):
         adb = sqlite3.connect(f"file:{analysis_db_path}?mode=ro", uri=True)
         try:
-            # ── EL EMBUDO DE VERDAD: UNA cohorte, seguida por los pasos ──
+            # ── EL EMBUDO: `embudo.py`, la misma definicion para todos ──
             #
-            # Antes esto contaba, por cada paso, los dispositivos que lo
-            # dispararon en los ultimos 30 dias. Eso NO es un embudo: son
-            # poblaciones distintas puestas en fila.
-            #
-            # El caso que lo rompe es el normal, no uno raro. `app_opened`
-            # salta en cada arranque, asi que el primer paso son TODOS los
-            # activos del mes. `onboarding_completed` solo salta la primera
-            # vez en la vida del dispositivo (la pantalla se marca vista en
-            # prefs), asi que el segundo paso son SOLO los que se instalaron
-            # este mes. Lo mismo con `import_*`: la biblioteca se importa una
-            # vez y ya. O sea que la "caida" entre el paso 1 y el 2 era, en su
-            # mayor parte, gente que ya habia pasado por ahi hace meses.
-            #
-            # Cuanto mas veterano el parque, peor pintaba el embudo — justo al
-            # reves de la realidad. Y como el numero se movia solo, cada
-            # lectura invitaba a "arreglar el onboarding" sobre un abandono
-            # que no existia.
-            #
-            # Ahora: se fija la cohorte (dispositivos cuyo D0 cae en la
-            # ventana) y se miran SUS eventos, sin limite de fecha para el
-            # evento. Un usuario que se instalo el dia 28 y completo el import
-            # el 32 cuenta como convertido, que es lo correcto: el embudo mide
-            # si llega, no si corre.
-            #
-            # Los eventos ANONIMOS (los de la web, sin device_id) NO pueden
-            # estar en una cohorte: el JOIN exige identidad y no hay a quien
-            # seguir. O sea que `raw` ya no los trae — y quien los quiera
-            # (visitas de la web, clics de descarga) tiene que leer
-            # `window_devices`, que sigue contandolos uno por fila via el
-            # COALESCE. La primera lectura tras este cambio los dio a CERO y
-            # parecio que la web habia dejado de recibir visitas.
-            # El D0 sale de `device_first_seen`, con respaldo en `events` para
-            # los dispositivos que aun no tienen fila ahi (datos anteriores a
-            # que la tabla existiera). Misma regla que en retencion: ver
-            # `get_return_rates`.
+            # Con su propio except: si falla, se queda vacio el embudo y el
+            # resto (actividad, versiones, vinculacion) sigue.
+            try:
+                emb = embudo.calcular(adb)
+                if plataforma:
+                    emb_vista = embudo.calcular(adb, plataforma=plataforma)
+                    emb["vista"] = embudo.vista(emb_vista, grupo)
+            except sqlite3.Error as e:  # noqa: BLE001
+                logger.warning(f"[Funnel] el embudo no se pudo calcular: {e}")
+                emb = None
+
+            # Las cuentas de abajo son las de la COHORTE ABIERTA (altas de los
+            # ultimos 30 dias, sin madurar, eventos sin limite): ya no son el
+            # embudo. Siguen por la vinculacion y las puertas del movil, que
+            # cuentan su propia cohorte en su linea, y por `raw`, que lee
+            # algun cliente viejo. Sin aparatos de prueba ni reidentificados.
+            marcados = embudo.excluir_marcados(
+                embudo._columnas(adb, "device_first_seen"))
             FIRSTS = (
                 "WITH firsts AS ("
                 " SELECT device_id, first_day AS d0 FROM device_first_seen"
-                " WHERE device_id IS NOT NULL"
+                " WHERE device_id IS NOT NULL" + marcados +
                 " UNION"
                 " SELECT device_id, MIN(substr(timestamp,1,10)) FROM events"
                 " WHERE event_name = 'app_opened' AND device_id IS NOT NULL"
@@ -2576,23 +2508,12 @@ def _funnel(request: Request, platform: str = None):
             ).fetchall()
             counts = {r[0]: int(r[1] or 0) for r in rows}
 
-            # La cohorte se cuenta con el MISMO filtro de plataforma que los
-            # pasos. Sin eso, `?platform=mobile` dividiria los pasos de movil
-            # entre la cohorte de todo el parque y daria porcentajes ridiculos.
-            cohort_size = int(adb.execute(
-                FIRSTS +
-                "SELECT COUNT(DISTINCT f.device_id) FROM firsts f "
-                "WHERE f.d0 >= date('now','-30 days')" +
-                ("" if not plat_sql else
-                 " AND EXISTS (SELECT 1 FROM events e2 WHERE e2.device_id = f.device_id"
-                 + plat_sql.replace(" AND LOWER(platform)", " AND LOWER(e2.platform)")
-                 + ")"),
-                plat_params,
-            ).fetchone()[0] or 0)
-
-            # La cuenta VIEJA, conservada aparte y con nombre honesto. Sigue
-            # sirviendo para "cuanta gente hizo X este mes", que es una
-            # pregunta legitima — pero no es un embudo y no se lee como tal.
+            # La cuenta del mes por evento, sin cohorte: «cuanta gente hizo X
+            # este mes». Los eventos ANONIMOS (los de la web, sin device_id)
+            # no tienen alta, asi que no estan en ninguna cohorte (ni en el
+            # embudo ni en `raw`): se cuentan aqui, en `window_devices`, uno
+            # por fila (`COUNT(DISTINCT device_id)` ignora los NULL). La
+            # primera lectura que los busco en `raw` dio «79 visitas -> 0».
             wrows = adb.execute(
                 "SELECT event_name, "
                 "       COUNT(DISTINCT COALESCE(device_id, 'anon:' || id)) AS devices "
@@ -2603,19 +2524,8 @@ def _funnel(request: Request, platform: str = None):
             ).fetchall()
             window = {r[0]: int(r[1] or 0) for r in wrows}
 
-            # Adopcion por version. Va DENTRO del mismo try/finally para no
-            # abrir una segunda conexion a la misma BD por una agregacion mas,
-            # pero con SU PROPIO except, y ese detalle no es cosmetico.
-            #
-            # Sin el, este agregado se colgaba del `except sqlite3.OperationalError`
-            # de abajo, que pone `counts = {}`: o sea que si esta consulta
-            # fallaba —una `analysis.db` antigua sin la columna `app_version`, por
-            # ejemplo— NO se perdia la tabla de versiones, se perdia EL EMBUDO
-            # ENTERO, con todos los pasos a cero y sin un solo error visible. Se
-            # vio en CI el 2026-09-12 con cinco tests en rojo por esto.
-            #
-            # Un agregado que se añade no puede ampliar el radio de lo que se
-            # rompe. Si falla, se queda vacio el suyo y el resto sigue.
+            # Adopcion por version. Su propio except: un agregado que se añade
+            # no puede ampliar el radio de lo que se rompe (2026-09-12).
             try:
                 versions = _reparto_por_version(adb, 30, plat_sql, plat_params)
             except sqlite3.Error as e:  # noqa: BLE001
@@ -2623,16 +2533,13 @@ def _funnel(request: Request, platform: str = None):
                 versions = {}
 
             # La vinculacion del movil, contada donde vive de verdad: sync.db.
-            # Mismo criterio que el bloque de arriba — con SU PROPIO except, para
-            # que un fallo aqui no se lleve el embudo por delante.
-            if _funnel_steps_for(platform) is _FUNNEL_MOBILE:
+            if grupo == "movil":
                 try:
                     vinculacion = _vinculacion_segun_sync(
                         adb, FIRSTS, plat_sql, plat_params)
                 except sqlite3.Error as e:  # noqa: BLE001
                     logger.debug(f"[Funnel] vinculacion segun sync no disponible: {e}")
                     vinculacion = None
-                # Por que puerta se llega a vincular. Su propio except, igual.
                 try:
                     puertas = _puertas_de_vinculacion(
                         adb, FIRSTS, plat_sql, plat_params)
@@ -2645,99 +2552,58 @@ def _funnel(request: Request, platform: str = None):
         finally:
             adb.close()
 
-    # Construir el embudo ordenado con drop-off relativo al primer paso.
-    # Los pasos dependen de la plataforma: ver _funnel_steps_for.
-    funnel_steps = _funnel_steps_for(platform)
-    # El denominador es la COHORTE, no el primer paso. Si un dispositivo se dio
-    # de alta y nunca llego a mandar `app_opened` (evento perdido por red), con
-    # el primer paso de denominador desaparecia del embudo entero en vez de
-    # contar como el abandono que es.
-    top = cohort_size or (counts.get(funnel_steps[0][0], 0) or 0)
-    steps = []
-    prev = None
-    for name, label in funnel_steps:
-        devices = counts.get(name, 0)
-        pct_of_top = round(100.0 * devices / top, 1) if top else 0.0
-        drop_from_prev = (
-            round(100.0 * (prev - devices) / prev, 1)
-            if prev not in (None, 0) else 0.0
-        )
-        steps.append({
-            "event": name,
-            "label": label,
-            "devices": devices,
-            "pct_of_top": pct_of_top,       # % que llega respecto a los que abrieron
-            "drop_from_prev": drop_from_prev,  # % que se cae desde el paso anterior
-        })
-        prev = devices
+    # La vista que se pide: un grupo, una plataforma concreta o el total.
+    if emb is not None:
+        bloque = emb.get("vista") or embudo.vista(emb, grupo)
+        steps = embudo.pasos_para_el_panel(bloque)
+        cohort_size = bloque["cohorte"]
+        bienvenida = bloque["bienvenida"]
+    else:
+        steps, cohort_size, bienvenida = [], 0, {}
 
-    # Los que VIERON el onboarding y no lo terminaron, repartidos por lo que
-    # hicieron. Son dos causas distintas y piden cosas opuestas:
-    #
-    #   skipped    -> le dio a saltar. Lo vio, decidio, y siguio. Arreglarlo es
-    #                 hacer el contenido mas util, o aceptar que hay gente que
-    #                 no quiere tutoriales.
-    #   abandoned  -> lo abrio y cerro la app a medias. Eso si es una fuga: se
-    #                 atasco, no entendio, o algo no funciono.
-    #
-    # Sin separarlas, «la mitad no completa» mezcla a quien tomo una decision
-    # con quien se perdio, que es el mismo error que tenia `failedAudd`.
-    #
-    # `abandoned` es derivado, no medido: shown - completed - skipped. Se acota
-    # a 0 porque los tres son conteos independientes de dispositivos unicos en
-    # la ventana y pueden descuadrar en los bordes (un aparato que vio el
-    # onboarding hace 31 dias y lo completo hace 29).
-    _ob_shown = counts.get("onboarding_shown", 0)
-    _ob_done = counts.get("onboarding_completed", 0)
-    _ob_skip = counts.get("onboarding_skipped", 0)
+    # La bienvenida medida contra los que LA VIERON, en la misma cohorte que
+    # el embudo. Saltar (movil) es una decision; abandonar, una fuga.
+    _ob_shown = bienvenida.get("vista", 0)
+    _ob_done = bienvenida.get("completada", 0)
+    _ob_skip = bienvenida.get("saltada", 0)
     onboarding = {
         "shown": _ob_shown,
         "completed": _ob_done,
         "skipped": _ob_skip,
         "abandoned": max(_ob_shown - _ob_done - _ob_skip, 0),
-        # El porcentaje que importa: sobre los que LO VIERON, no sobre los que
-        # abrieron la app. `app_opened` se emite una vez por dispositivo para
-        # siempre, asi que incluye a quien ya tenia la app instalada y nunca
-        # llego a ver el onboarding.
         "completion_pct": (
             round(100.0 * _ob_done / _ob_shown, 1) if _ob_shown else None
         ),
     }
 
     return {
-        "window_days": 30,
-        "platform": platform or "all",  # que subconjunto se esta mirando
-        # Que mide `steps`, dicho en la propia respuesta para que nadie tenga
-        # que acordarse: una COHORTE (altas de los ultimos 30 dias) seguida por
-        # los pasos, sin limite de fecha para el evento.
-        "basis": "cohort",
+        # Dias de ALTAS que entran (la cohorte), no una ventana de eventos.
+        "window_days": embudo.VENTANA_DE_ALTAS,
+        "platform": platform or "all",
+        # Que mide `steps`, dicho en la propia respuesta: la cohorte madura de
+        # `embudo.py`, contada por el paso mas lejano al que llego cada aparato.
+        "basis": "cohorte_madura",
+        "definicion": embudo.DEFINICION,
         "cohort_size": cohort_size,
         "steps": steps,
         "onboarding": onboarding,
-        # Que import_* no salga en `steps` del movil NO significa que no se mida:
-        # sigue en `raw`, que lleva TODOS los eventos. Lo que cambia es que deja
-        # de contarse como paso obligatorio del camino.
         "steps_note": (
-            "movil sin import_*: alli la musica llega por sync, no se importa"
-            if _funnel_steps_for(platform) is _FUNNEL_MOBILE else None
+            "movil: empezar = escuchar, importar o vincular; valor = "
+            "identificar un tema o ver su musica"
+            if grupo == "movil" else None
         ),
-        # Actividad del mes por evento: cuanta gente hizo X en los ultimos 30
-        # dias, sin cohorte. Es la cuenta que `steps` usaba antes. Pregunta
-        # legitima, pero NO es un embudo: los pasos son poblaciones distintas
-        # y restarlos da abandonos inventados.
+        # El embudo entero, por plataforma y en total (lo leen `embudo.sh` y
+        # el panel de Tecnico). `None` = no se pudo calcular; ausente =
+        # servidor anterior al 2026-11-25.
+        "embudo": emb,
+        # Actividad del mes por evento, sin cohorte. NO es un embudo.
         "window_devices": window,
-        # Adopcion: en que version esta cada dispositivo activo. Contesta
-        # «¿llegan mis releases?», que hasta ahora no se podia contestar con
-        # nada del panel. Ver `_reparto_por_version`.
         "versions": versions,
-        # Solo en el embudo de movil: la vinculacion segun sync.db, al lado de
-        # la que cuentan los eventos. Ver `_vinculacion_segun_sync`.
         "vinculacion_segun_sync": vinculacion,
-        # Solo en el embudo de movil: por que puerta se abre la hoja de
-        # vincular y que salida se elige en el onboarding. Ver
-        # `_puertas_de_vinculacion`.
         "puertas_vinculacion": puertas,
-        "raw": counts,  # eventos de la cohorte (incluye los no-embudo)
+        # Eventos de la cohorte ABIERTA (altas de 30 dias, sin madurar). NO es
+        # el embudo: se queda para clientes viejos.
+        "raw": counts,
     }
 
 
@@ -2776,11 +2642,21 @@ def _puertas_de_vinculacion(adb, firsts_sql, plat_sql, plat_params) -> dict:
     `sin_dato` = cliente anterior a que el evento llevara la prop. Se vacia
     solo segun actualice el parque; no lo leas como una puerta mas.
     """
+    # La MISMA cohorte que el embudo (`embudo.ventana`: altas de hace 8 a 37
+    # dias) y lo que hicieron en sus 7 dias siguientes: hasta el 2026-11-25
+    # contaba las altas de 0 a 30 dias, otros aparatos que los del embudo.
+    desde, hasta = embudo.ventana()
     plat_e = plat_sql.replace(" AND LOWER(platform)", " AND LOWER(e.platform)")
+    en_su_semana = (
+        " AND substr({t}.timestamp, 1, 10) >= f.d0"
+        " AND substr({t}.timestamp, 1, 10) <= date(f.d0, '+{n} days')"
+    )
     cohorte = (
         "JOIN firsts f ON f.device_id = e.device_id "
-        "WHERE f.d0 >= date('now','-30 days')" + plat_e
+        "WHERE f.d0 >= ? AND f.d0 <= ?" + plat_e
+        + en_su_semana.format(t="e", n=embudo.DIAS_PARA_MADURAR)
     )
+    params = [desde, hasta] + list(plat_params)
     hoja = {}
     for origen, abrieron, vincularon in adb.execute(
         firsts_sql +
@@ -2788,11 +2664,12 @@ def _puertas_de_vinculacion(adb, firsts_sql, plat_sql, plat_params) -> dict:
         "       COUNT(DISTINCT e.device_id), "
         "       COUNT(DISTINCT CASE WHEN EXISTS ("
         "           SELECT 1 FROM events l WHERE l.device_id = e.device_id "
-        "           AND l.event_name = 'device_linked') "
+        "           AND l.event_name = 'device_linked'"
+        + en_su_semana.format(t="l", n=embudo.DIAS_PARA_MADURAR) + ") "
         "         THEN e.device_id END) "
         "FROM events e " + cohorte +
         " AND e.event_name = 'link_sheet_opened' GROUP BY o",
-        plat_params,
+        params,
     ):
         hoja[str(origen)] = {
             "abrieron": int(abrieron or 0),
@@ -2806,7 +2683,7 @@ def _puertas_de_vinculacion(adb, firsts_sql, plat_sql, plat_params) -> dict:
             "       COUNT(DISTINCT e.device_id) "
             "FROM events e " + cohorte +
             " AND e.event_name = 'onboarding_completed' GROUP BY a",
-            plat_params,
+            params,
         )
     }
     return {"hoja_por_origen": hoja, "onboarding_por_accion": onboarding}
@@ -2839,15 +2716,20 @@ def _vinculacion_segun_sync(adb, firsts_sql, plat_sql, plat_params) -> dict:
                              `sync_items.last_device_id`). Lo suyo propio no
                              cuenta: un pull full=true tambien devuelve el eco.
     """
+    # La MISMA cohorte que el embudo (altas de hace 8 a 37 dias): asi el
+    # numero de los eventos (`embudo.grupos.movil.caminos.device_linked`) y el
+    # de sync.db hablan de los mismos aparatos. Hasta el 2026-11-25 eran las
+    # altas de 0 a 30 dias.
+    desde, hasta = embudo.ventana()
     ids = [r[0] for r in adb.execute(
         firsts_sql +
         "SELECT DISTINCT f.device_id FROM firsts f "
-        "WHERE f.d0 >= date('now','-30 days')" +
+        "WHERE f.d0 >= ? AND f.d0 <= ?" +
         ("" if not plat_sql else
          " AND EXISTS (SELECT 1 FROM events e2 WHERE e2.device_id = f.device_id"
          + plat_sql.replace(" AND LOWER(platform)", " AND LOWER(e2.platform)")
          + ")"),
-        plat_params,
+        [desde, hasta] + list(plat_params),
     ).fetchall()]
     res = {
         "cohorte": len(ids),
@@ -2999,6 +2881,13 @@ def _retention(request: Request):
     except Exception as e:  # noqa: BLE001
         logger.debug(f"[Retention] trae_tu_biblioteca no disponible: {e}")
         trae = None
+    # El coste de cambio POR CUENTA (2026-11-25): la unidad del paywall.
+    # `investment` (por aparato) se queda por la serie de `funnel_data/`.
+    try:
+        inversion_cuenta = _inversion_por_cuenta()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[Retention] inversion por cuenta no disponible: {e}")
+        inversion_cuenta = None
     # La cuenta vieja se conserva bajo otro nombre: mide algo distinto y real
     # (actividad de import del trimestre), solo que no es "cuanta biblioteca
     # tiene la gente".
@@ -3012,6 +2901,8 @@ def _retention(request: Request):
         "returns_recientes": returns_recientes,
         "tool": tool,
         "investment": investment,
+        # `None` = el calculo fallo; ausente = servidor anterior.
+        "investment_por_cuenta": inversion_cuenta,
         "stalled": stalled,
         # `None` = el calculo fallo; ausente = servidor anterior. `embudo.sh`
         # los distingue (ver «el panel no miente» en CLAUDE.md).
@@ -3069,10 +2960,12 @@ def _tracks_por_device() -> Dict[str, int]:
     """
     conn = _get_sync_conn()
     try:
-        # Cuántas filas de análisis hay y la última: si no cambian, el recuento
-        # tampoco (salvo un blob legacy reescrito, que caduca por tiempo).
+        # Cuántas filas de análisis hay, la última y cuántas borradas: si no
+        # cambian, el recuento tampoco (salvo un blob legacy reescrito, que
+        # caduca por tiempo). Las borradas, porque un borrado es un UPDATE
+        # (`deleted = 1`) que no mueve ni el número de filas ni la última.
         clave = (_SYNC_DB_PATH,) + tuple(conn.execute(
-            "SELECT COUNT(*), MAX(rowid) FROM sync_items "
+            "SELECT COUNT(*), MAX(rowid), SUM(deleted) FROM sync_items "
             "WHERE data_type = 'analysis'").fetchone())
         with _por_device_cerrojo:
             g = _por_device_guardado
@@ -3087,7 +2980,7 @@ def _tracks_por_device() -> Dict[str, int]:
                     continue
                 filas = conn.execute(
                     "SELECT item_key, payload FROM sync_items "
-                    "WHERE +data_type = 'analysis' AND last_device_id = ?", (dev,))
+                    "WHERE +data_type = 'analysis' AND last_device_id = ? AND deleted = 0", (dev,))
                 ids, _prev, sin_id = _count_unique_tracks(
                     filas, check_previews=False)
                 n = len(ids) + sin_id
@@ -3097,6 +2990,94 @@ def _tracks_por_device() -> Dict[str, int]:
             return dict(out)
     finally:
         conn.close()
+
+
+_por_cuenta_guardado: dict = {"clave": None, "cuando": 0.0, "valor": None}
+_por_cuenta_cerrojo = threading.Lock()
+
+
+def _tracks_por_cuenta() -> Dict[str, dict]:
+    """`{cuenta: {"temas": n, "sin_audio": m}}` de las bibliotecas de `sync.db`.
+
+    POR CUENTA, no por aparato (2026-11-25). `_tracks_por_device` cuenta las
+    filas cuyo ULTIMO escritor es cada aparato: un DJ con el Mac y el PC parte
+    su biblioteca en dos aparatos de media biblioteca, y el movil vinculado
+    sale sin biblioteca aunque tenga la misma. Para el coste de cambio —el
+    numero del paywall— la unidad es quien pagaria: la cuenta. Un aparato sin
+    cuenta (filas de antes de las cuentas) cuenta como la suya propia.
+
+    Sin los BORRADOS (`deleted = 1`): hasta el 2026-11-25 ningun recuento del
+    panel los quitaba. `sin_audio` son las fichas de un XML sin su fichero
+    (`imp_…`): biblioteca, pero sin nada analizado.
+
+    No lee el payload de las filas incrementales (el `item_key` ES el tema);
+    solo el de los blobs de los clientes de antes de la 2.9.3.
+    """
+    conn = _get_sync_conn()
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_items)")}
+        if "user_id" in cols:
+            cuenta = ("COALESCE(NULLIF(user_id, ''), "
+                      "'aparato:' || last_device_id)")
+            sin_colectivo = " AND COALESCE(user_id, '') != '__collective__'"
+        else:
+            cuenta, sin_colectivo = "'aparato:' || last_device_id", ""
+        clave = (_SYNC_DB_PATH,) + tuple(conn.execute(
+            "SELECT COUNT(*), MAX(rowid), SUM(deleted) FROM sync_items "
+            "WHERE data_type = 'analysis'").fetchone())
+        with _por_cuenta_cerrojo:
+            g = _por_cuenta_guardado
+            if (g["valor"] is not None and g["clave"] == clave
+                    and time.monotonic() - g["cuando"] < _POR_DEVICE_VALE_S):
+                return dict(g["valor"])
+            temas: Dict[str, set] = {}
+            for c, ikey in conn.execute(
+                    f"SELECT {cuenta}, item_key FROM sync_items "
+                    "WHERE data_type = 'analysis' AND deleted = 0 "
+                    "AND item_key != 'all_analysis'" + sin_colectivo):
+                if ikey:
+                    temas.setdefault(c, set()).add(str(ikey))
+            for c, raw in conn.execute(
+                    f"SELECT {cuenta}, payload FROM sync_items "
+                    "WHERE data_type = 'analysis' AND deleted = 0 "
+                    "AND item_key = 'all_analysis'" + sin_colectivo):
+                for tkey, t in _parse_analysis_payload(raw).items():
+                    td = t if isinstance(t, dict) else {}
+                    ident = td.get("id") or td.get("fingerprint") or tkey
+                    if ident:
+                        temas.setdefault(c, set()).add(str(ident))
+            out = {
+                c: {"temas": len(ids),
+                    "sin_audio": sum(1 for i in ids if i.startswith("imp_"))}
+                for c, ids in temas.items() if ids
+            }
+            g.update(clave=clave, cuando=time.monotonic(), valor=out)
+            return dict(out)
+    finally:
+        conn.close()
+
+
+def _inversion_por_cuenta(por_cuenta: Optional[Dict[str, dict]] = None) -> dict:
+    """El coste de cambio POR CUENTA, con el mismo reparto que `investment`.
+
+    `con_audio` es lo mismo sin las fichas sin audio: un DJ que importa su
+    Rekordbox entero sin los ficheros tiene 10.000 temas de biblioteca y
+    ninguno analizado aqui. Los dos numeros dicen cosas distintas.
+    """
+    if por_cuenta is None:
+        por_cuenta = _tracks_por_cuenta()
+
+    def _reparto(conteos):
+        d = dict(_library_investment_real(conteos))
+        d["unidad"] = "cuenta"
+        d["cuentas_con_biblioteca"] = d.pop("devices_with_library", 0)
+        return d
+
+    salida = _reparto({c: v["temas"] for c, v in por_cuenta.items()})
+    salida["con_audio"] = _reparto({
+        c: v["temas"] - v["sin_audio"] for c, v in por_cuenta.items()
+        if v["temas"] - v["sin_audio"] > 0})
+    return salida
 
 
 def _library_investment_real(
@@ -3821,15 +3802,41 @@ def _conn_analysis(solo_lectura: bool = False) -> sqlite3.Connection:
 
 def _uso_del_resumen() -> dict:
     tool = _get_db().get_tool_usage_metrics() or {}
-    return {
-        "activos_30d": tool.get("active_last_30d"),
-        "volvio_alguna_vez_pct": (tool.get("ever_returned") or {}).get("rate"),
-    }
+    return {"activos_30d": tool.get("active_last_30d")}
 
 
 def _vuelven_del_resumen() -> dict:
-    ret = _get_db().get_return_rates() or {}
-    return {"d7_rolling_pct": (ret.get("d7") or {}).get("rate")}
+    """La vuelta en 7 dias de las cohortes RECIENTES, por plataforma.
+
+    Hasta el 2026-11-25 eran `d7_rolling_pct` y `volvio_alguna_vez_pct`, de
+    toda la historia: bajaban solos (la purga de `events` se lleva el «volvio»
+    de los veteranos y no su alta). Claves nuevas a proposito: con la misma
+    clave, la flecha contra la foto de ayer habria enseñado un cambio que no
+    es del producto."""
+    rec = _get_db().get_return_rates_recientes() or {}
+    grupos = rec.get("por_grupo") or {}
+    return {
+        "d7_escritorio_pct": ((grupos.get("escritorio") or {}).get("d7") or {}).get("rate"),
+        "d7_movil_pct": ((grupos.get("movil") or {}).get("d7") or {}).get("rate"),
+    }
+
+
+def _embudo_del_resumen() -> dict:
+    """Cuantas altas llegan a lo que vale la app (`embudo.py`, el paso
+    `valor`): ver su musica en el escritorio; identificar un tema o ver su
+    musica en el movil."""
+    conn = _conn_analysis(solo_lectura=True)
+    try:
+        emb = embudo.calcular(conn)
+    finally:
+        conn.close()
+
+    def _valor(g):
+        pasos = (emb["grupos"].get(g) or {}).get("pasos") or []
+        return next((p["pct"] for p in pasos if p["paso"] == "valor"), None)
+
+    return {"valor_escritorio_pct": _valor("escritorio"),
+            "valor_movil_pct": _valor("movil")}
 
 
 def _activos_y_altas_del_resumen() -> dict:
@@ -3841,8 +3848,11 @@ def _activos_y_altas_del_resumen() -> dict:
         activos_7d = conn.execute(
             "SELECT COUNT(DISTINCT device_id) FROM events "
             "WHERE device_id IS NOT NULL AND timestamp >= ?", (hace_7,)).fetchone()[0]
+        # Altas de verdad: sin aparatos de prueba ni reidentificados.
         altas = conn.execute(
-            "SELECT COUNT(*) FROM device_first_seen WHERE first_day >= ?",
+            "SELECT COUNT(*) FROM device_first_seen WHERE first_day >= ?"
+            + embudo.excluir_marcados(
+                embudo._columnas(conn, "device_first_seen")),
             (hace_30,)).fetchone()[0]
     finally:
         conn.close()
@@ -3850,11 +3860,14 @@ def _activos_y_altas_del_resumen() -> dict:
 
 
 def _biblioteca_del_resumen() -> dict:
-    inv = _library_investment_real(_tracks_por_device()) or {}
+    """El coste de cambio POR CUENTA y sin borrados (2026-11-25). Hasta ese
+    dia, `con_biblioteca`/`mediana_temas`/`gte_500`, por aparato y con los
+    temas borrados dentro; claves nuevas para no comparar con aquello."""
+    inv = _inversion_por_cuenta() or {}
     return {
-        "con_biblioteca": inv.get("devices_with_library"),
-        "mediana_temas": inv.get("median_tracks"),
-        "gte_500": (inv.get("buckets") or {}).get("gte_500"),
+        "cuentas_con_biblioteca": inv.get("cuentas_con_biblioteca"),
+        "mediana_temas_cuenta": inv.get("median_tracks"),
+        "cuentas_gte_500": (inv.get("buckets") or {}).get("gte_500"),
     }
 
 
@@ -3906,6 +3919,7 @@ def _medidas_del_resumen():
     return {
         "uso": _uso_del_resumen,
         "vuelven": _vuelven_del_resumen,
+        "embudo": _embudo_del_resumen,
         "activos_y_altas": _activos_y_altas_del_resumen,
         "biblioteca": _biblioteca_del_resumen,
         "huella": _huella_del_resumen,

@@ -34,13 +34,13 @@ def test_una_medida_rota_deja_sus_numeros_en_none_y_sigue():
         raise RuntimeError('sync.db no responde')
 
     datos = resumen_diario.calcular({
-        'uso': lambda: {'activos_30d': 312, 'volvio_alguna_vez_pct': 41.2},
+        'uso': lambda: {'activos_30d': 312},
         'biblioteca': rota,
         'audd': lambda: {'audd_30d_render': 1147, 'audd_30d_motor_local': 316},
         'basura': lambda: {'no_es_una_metrica': 1},
     })
     assert datos['activos_30d'] == 312
-    assert datos['mediana_temas'] is None, 'falló: None, no 0'
+    assert datos['mediana_temas_cuenta'] is None, 'falló: None, no 0'
     assert datos['audd_30d_total'] == 1463, 'el gasto real es la SUMA'
     assert 'no_es_una_metrica' not in datos
     assert any('biblioteca' in f for f in datos['_fallos'])

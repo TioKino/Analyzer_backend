@@ -47,14 +47,16 @@ def bases(monkeypatch):
         ('pc1', 'macos'),           # escritorio: fuera del embudo de movil
     ]
     for dev, plat in aparatos:
+        # Altas de hace 10 dias: la cohorte del embudo es la MADURA (8 a 37
+        # dias, `embudo.ventana`), y la vinculacion se cuenta sobre la misma.
         a.execute("INSERT INTO events (timestamp, device_id, event_name, platform) "
-                  "VALUES (datetime('now'), ?, 'app_opened', ?)", (dev, plat))
+                  "VALUES (datetime('now', '-10 days'), ?, 'app_opened', ?)", (dev, plat))
         a.execute("INSERT INTO device_first_seen (device_id, first_day, "
-                  "first_platform) VALUES (?, date('now'), ?)", (dev, plat))
+                  "first_platform) VALUES (?, date('now', '-10 days'), ?)", (dev, plat))
     # El evento solo lo emitio UNO: los demas tecleaban el codigo en el PC o
     # iban en una version sin el evento.
     a.execute("INSERT INTO events (timestamp, device_id, event_name, platform) "
-              "VALUES (datetime('now'), 'm_pc_ok', 'device_linked', 'ios')")
+              "VALUES (datetime('now', '-9 days'), 'm_pc_ok', 'device_linked', 'ios')")
     # Las puertas: por donde se abrio la hoja y que salida se eligio en el
     # onboarding. `m_solo` va en una version sin las props.
     for dev, evento, props, plat in [
@@ -68,7 +70,7 @@ def bases(monkeypatch):
         ('pc1', 'link_sheet_opened', '{"origen": "ajustes"}', 'macos'),
     ]:
         a.execute("INSERT INTO events (timestamp, device_id, event_name, props, "
-                  "platform) VALUES (datetime('now'), ?, ?, ?, ?)",
+                  "platform) VALUES (datetime('now', '-9 days'), ?, ?, ?, ?)",
                   (dev, evento, props, plat))
     a.commit()
     a.close()
@@ -140,9 +142,10 @@ def test_cuenta_lo_que_sync_db_sabe(bases):
 def test_sale_al_lado_del_numero_de_los_eventos(bases):
     # Es el punto: los eventos dicen 1 y sync.db dice 3. Con los dos a la vista
     # se sabe cuanto del 3-4 % era instrumentacion.
+    # Desde el 2026-11-25 el numero de los eventos sale del embudo (v3), de
+    # la misma cohorte que el de sync.db.
     body = _funnel('mobile')
-    paso = next(s for s in body['steps'] if s['event'] == 'device_linked')
-    assert paso['devices'] == 1
+    assert body['embudo']['grupos']['movil']['caminos']['device_linked'] == 1
     assert body['vinculacion_segun_sync']['vinculados'] == 3
 
 
@@ -190,9 +193,9 @@ def test_una_bd_sin_props_no_se_lleva_el_embudo(bases, monkeypatch):
               "first_day TEXT NOT NULL, first_platform TEXT, "
               "first_app_version TEXT)")
     v.execute("INSERT INTO events (timestamp, device_id, event_name, platform) "
-              "VALUES (datetime('now'), 'm1', 'app_opened', 'ios')")
+              "VALUES (datetime('now', '-10 days'), 'm1', 'app_opened', 'ios')")
     v.execute("INSERT INTO device_first_seen (device_id, first_day, "
-              "first_platform) VALUES ('m1', date('now'), 'ios')")
+              "first_platform) VALUES ('m1', date('now', '-10 days'), 'ios')")
     v.commit()
     v.close()
     monkeypatch.setenv('DATABASE_PATH', viejo)

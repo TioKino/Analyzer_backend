@@ -96,24 +96,30 @@ def test_reparte_por_plataforma_y_por_grupo():
     assert out['total']['d7']['returned'] == 3
 
 
-def test_solo_cohortes_con_edad_para_medir():
-    """Quien llego hace 3 dias no entra en D7 (saldria como perdido)."""
+def test_cada_dn_mide_sus_30_dias_de_altas_con_edad_para_medir():
+    """Desde el 2026-11-25 (`embudo.ventana`): para cada DN, los 30 dias de
+    altas que ya han tenido N dias enteros. D1 = altas de hace 2 a 31 dias,
+    D7 = de 8 a 37 (la cohorte del embudo), D28 = de 29 a 58. Quien llego hace
+    3 dias no entra en D7: saldria como perdido sin haber tenido tiempo."""
     db = _db()
-    _alta(db, 'ayer', 3, 'ios')
-    _alta(db, 'mes', 40, 'ios')
-    out = db.get_return_rates_recientes()
-    assert out['total']['d1']['cohort'] == 2
-    assert out['total']['d7']['cohort'] == 1
-    assert out['total']['d28']['cohort'] == 1
+    _alta(db, 'hace_3', 3, 'ios')
+    _alta(db, 'hace_10', 10, 'ios')
+    _alta(db, 'hace_40', 40, 'ios')
+    _alta(db, 'hace_70', 70, 'ios')
+    out = db.get_return_rates_recientes()['total']
+    assert out['d1']['cohort'] == 2      # 3 y 10
+    assert out['d7']['cohort'] == 1      # 10
+    assert out['d28']['cohort'] == 1     # 40
+    assert out['d28']['cohort'] + out['d7']['cohort'] < 4, 'el de 70 no entra'
 
 
 def test_la_vuelta_fuera_de_la_ventana_no_cuenta():
     db = _db()
-    _alta(db, 'd', 40, 'android')
-    _ev(db, 'd', 40)                         # el mismo D0 no es volver
-    _ev(db, 'd', 30)                         # dia 10: fuera de D7
+    _alta(db, 'd', 30, 'android')
+    _ev(db, 'd', 30)                         # el mismo D0 no es volver
+    _ev(db, 'd', 20)                         # dia 10: fuera de D7
     out = db.get_return_rates_recientes()['total']
-    assert out['d7']['returned'] == 0
+    assert out['d7'] == {'cohort': 1, 'returned': 0, 'rate': 0.0}
     assert out['d28']['returned'] == 1
 
 

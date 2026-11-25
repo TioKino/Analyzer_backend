@@ -250,7 +250,8 @@ class TestPorHTTP:
             'CREATE TABLE sync_items ('
             ' id INTEGER PRIMARY KEY AUTOINCREMENT, last_device_id TEXT,'
             ' device_type TEXT, data_type TEXT,'
-            " item_key TEXT NOT NULL DEFAULT '', payload TEXT)")
+            " item_key TEXT NOT NULL DEFAULT '', payload TEXT,"
+            ' deleted INTEGER DEFAULT 0)')
         conn.commit()
         conn.close()
         monkeypatch.setattr(ap, '_SYNC_DB_PATH', sync_path)
