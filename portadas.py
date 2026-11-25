@@ -38,6 +38,8 @@ CALIDAD = 85
 # Por debajo de esto no vale la pena abrirla (ya es pequeña).
 BYTES_MIN = 60 * 1024
 _EXTS = ('jpg', 'jpeg', 'png', 'webp', 'gif')
+# Lo único que Pillow puede abrir aquí (ver `reducir`).
+_FORMATOS_PIL = ('JPEG', 'PNG', 'WEBP', 'GIF')
 
 
 def reducir(datos: bytes) -> Optional[bytes]:
@@ -48,7 +50,11 @@ def reducir(datos: bytes) -> Optional[bytes]:
     if datos[:4] == b'GIF8':
         return None
     try:
-        with Image.open(io.BytesIO(datos)) as img:
+        # Solo los formatos de una portada. Sin `formats`, Pillow abre lo que
+        # reconozca, y un EPS/PostScript (que puede venir dentro de las
+        # etiquetas de cualquier audio subido) lo pasa a Ghostscript: la vía
+        # de Upload2Shell (CVE-2026-125396, aviso de Render del 2026-11-21).
+        with Image.open(io.BytesIO(datos), formats=_FORMATOS_PIL) as img:
             # Un JPEG que ya cabe no se recomprime: perdería calidad cada vez
             # que pasara la pasada, y no hay nada que ganar.
             if img.format == 'JPEG' and max(img.size) <= LADO_MAX:
