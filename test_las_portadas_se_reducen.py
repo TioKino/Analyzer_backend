@@ -84,3 +84,49 @@ def test_las_dos_puertas_guardan_reducido(tmp_path, monkeypatch):
     assert os.listdir(tmp_path) == ['fff.jpg'], 'sin la vieja de otra extensión'
     src = open('routes/analysis_artwork.py', encoding='utf-8').read()
     assert 'portadas.guardar' in src, 'la subida de una portada también reduce'
+
+
+# ---- Upload2Shell (CVE-2026-125396, aviso de Render del 2026-11-21) --------
+# Pillow pasa un EPS/PostScript a Ghostscript. Una portada puede salir de las
+# etiquetas de cualquier audio subido a /analyze, así que `reducir` solo abre
+# los cuatro formatos de una portada y Ghostscript no se llama nunca.
+
+def _eps(bytes_minimos):
+    cabecera = (b'%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 2000 2000\n'
+                b'%%EndComments\n')
+    # Líneas cortas: Pillow no lee como EPS una línea de más de 255 bytes.
+    return cabecera + b'% relleno\n' * (bytes_minimos // 10 + 1)
+
+
+def test_un_eps_no_llega_a_ghostscript(monkeypatch):
+    from PIL import EpsImagePlugin
+    llamadas = []
+    monkeypatch.setattr(EpsImagePlugin, 'Ghostscript',
+                        lambda *a, **k: llamadas.append(a) or None)
+    datos = _eps(portadas.BYTES_MIN)
+    assert portadas.reducir(datos) is None
+    assert llamadas == [], 'Pillow le ha pasado el EPS a Ghostscript'
+
+
+def test_pillow_sin_la_restriccion_si_lo_pasaria(monkeypatch):
+    """Que el test de arriba no pase por casualidad: el mismo EPS, abierto
+    como lo hacía `reducir` antes, sí llega a Ghostscript."""
+    from PIL import EpsImagePlugin
+    llamadas = []
+
+    def _gs(*a, **k):
+        llamadas.append(a)
+        raise OSError('Ghostscript de mentira')
+    monkeypatch.setattr(EpsImagePlugin, 'Ghostscript', _gs)
+    with Image.open(io.BytesIO(_eps(portadas.BYTES_MIN))) as img:
+        try:
+            img.load()
+        except OSError:
+            pass
+    assert llamadas, 'este Pillow ya no abre EPS: revisa el test de arriba'
+
+
+def test_las_portadas_de_verdad_se_siguen_abriendo():
+    for formato in ('JPEG', 'PNG', 'WEBP'):
+        datos = _imagen(1500, formato)
+        assert portadas.reducir(datos) is not None, formato
